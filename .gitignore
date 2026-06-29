@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+*.so
+*.o
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.claude/
+/plan.yaml
+/allocation.yaml
+
+# C++ build output
+transformer
+_kernel_cache/
+
+# Commercial ROMs stay local (test ROMs like nestest are tracked)
+transformer_vm/nes/examples/smb.nes

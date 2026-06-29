@@ -1,0 +1,321 @@
+"""Run the 6502 through the real weights-based transformer.
+
+This is the end of the verification chain: the same computation graph that
+the exact evaluator and the C++ kernel execute is MILP-scheduled onto
+transformer layers and compiled into actual VanillaTransformer weights
+(analytically -- no training).  Execution is then genuine transformer
+inference: per-position embeddings, Q/K/V projections, hardmax attention
+(hull cache, or a true softmax KV cache), ReGLU FFN, residual stream, and
+an output head that decides STATE vs HALT.
+
+One departure from the WASM construction: WASM tokens formed a finite
+vocabulary (each token type's values were baked into its embedding row).
+A 6502 STATE token carries ~20 wide-domain fields, so token *values*
+cannot be enumerated; instead the harness builds each position's input
+embedding directly -- the value of every input dim placed at its residual
+slot, exactly what an enumerated vocabulary row would have contained.
+The transformer layers themselves are untouched.
+
+The run loop is the same protocol as the exact evaluator: the machine's
+result dims are read back from the residual stream after the final layer
+(kept alive to the end via a synthetic READOUT output token), writes are
+appended as WRITE-token positions, and the next STATE embedding is built
+from the read-back state.
+
+Numerics caveat (documented in the README): with 16-bit addresses the
+memory-lookup attention scores reach ~2^32, where the 0.3*inv_log_pos
+recency term is below one double ulp -- rewrites of the *same high
+address* then tie.  The hull cache resolves ties by sequence (LATEST);
+true softmax averages them.  Verification programs therefore keep
+rewritten addresses low; scaling the key construction is future work.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import time
+
+import torch
+
+from transformer_vm.attention import HullKVCache, StandardKVCache
+from transformer_vm.cpu6502 import reference
+from transformer_vm.cpu6502.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
+from transformer_vm.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
+from transformer_vm.graph.core import ProgramGraph
+from transformer_vm.model.transformer import add_position_encoding
+from transformer_vm.model.weights import build_model
+from transformer_vm.scheduler.milp import asap_schedule
+
+logger = logging.getLogger(__name__)
+
+
+class Cpu6502TransformerMachine:
+    """The 6502 as actual transformer weights, stepped position by position."""
+
+    def __init__(self, *, bcd: bool = False, cache: str = "hull"):
+        # Build the graph (and keep the evaluator's dim handles; its Python
+        # step function is not used here).
+        self.rt = Cpu6502Runtime(bcd=bcd)
+        dim_by_id = {d.id: d for d in self.rt.all_dims}
+        self._dim_by_name = {
+            name: dim_by_id[dim_id] for name, dim_id in self.rt.dim_id_by_name.items()
+        }
+
+        # The run loop reads the machine outputs from the residual stream,
+        # so they must survive to the final layer: a synthetic output token
+        # marks them as outputs for the scheduler.  Its head row is ignored
+        # at prediction time (only STATE vs HALT compete).
+        output_tokens = dict(self.rt.output_tokens)
+        readout = 0
+        for name in _RUNTIME_READ_DIMS:
+            readout = readout + 1e-6 * self._dim_by_name[name]
+        output_tokens["READOUT"] = readout
+
+        pg = ProgramGraph(self.rt.input_tokens, output_tokens)
+        build_start = time.perf_counter()
+        # ASAP schedule: the optimal-width MILP does not solve at this graph
+        # size (~5M integer variables); critical-path scheduling costs some
+        # d_model but no solver time.
+        sched = asap_schedule(pg.input_tokens, pg.output_tokens, program_graph=pg)
+        self.model, all_tokens, tok_to_idx, shared = build_model(
+            program_graph=pg, schedule=sched,
+        )
+        self.model.requires_grad_(False)  # inference only
+        self.build_seconds = time.perf_counter() - build_start
+        self.n_layers = shared[3]
+        self.slot_of = shared[6]
+        self.d_model = shared[9]
+        self._state_row = tok_to_idx["STATE"]
+        self._halt_row = tok_to_idx["HALT"]
+
+        n_heads = self.model.attn[0].num_heads
+        if cache == "hull":
+            self.cache = HullKVCache(self.n_layers, n_heads)
+            for layer_idx in range(self.n_layers):
+                for h in range(n_heads):
+                    if self.model.head_tiebreak[layer_idx][h]:
+                        self.cache.set_tiebreak(layer_idx, h, True)
+        elif cache == "standard":
+            # True softmax over HARD_K-scaled scores; exact ties average,
+            # see the module docstring.
+            self.cache = StandardKVCache(self.n_layers, n_heads)
+        else:
+            raise ValueError(f"unknown cache {cache!r}")
+
+        self.pos = 0
+        self._trace_len = 0
+
+    # ── Transformer plumbing ────────────────────────────────────────
+
+    @torch.no_grad()
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        """One genuine transformer position: attention + ReGLU per layer."""
+        add_position_encoding(x, self.pos)
+        self.pos += 1
+        model = self.model
+        for layer_idx, (attn, ff_in, ff_out) in enumerate(
+            zip(model.attn, model.ff_in, model.ff_out, strict=True)
+        ):
+            q, k, v = (attn.in_proj_weight @ x).chunk(3, dim=-1)
+            out = self.cache.layer_step(layer_idx, k, q, v)
+            x = x + attn.out_proj(out)
+            gate, val = ff_in(x).chunk(2, dim=-1)
+            x = x + ff_out(torch.nn.functional.relu(gate) * val)
+        return x
+
+    def _embed(self, values: dict) -> torch.Tensor:
+        """Input embedding for one token: dim values at their slots.
+
+        Equivalent to a vocabulary embedding row for a token type that
+        enumerated exactly these values; position features are added by
+        _forward (slots 0-2 are reserved for them).
+        """
+        x = torch.zeros(self.d_model)
+        x[self.slot_of[self.rt._one]] = 1.0
+        for dim, value in values.items():
+            x[self.slot_of[dim]] = float(value)
+        return x
+
+    def _read(self, h: torch.Tensor, name: str) -> float:
+        return float(h[self.slot_of[self._dim_by_name[name]]])
+
+    # ── Machine protocol (mirrors evaluator.Cpu6502Runtime) ─────────
+
+    def boot_image(self, memory_image, *, start_pc: int):
+        rt = self.rt
+        self._forward(self._embed({
+            rt.start_pc_lo: start_pc & 0xFF,
+            rt.start_pc_hi: (start_pc >> 8) & 0xFF,
+            rt.is_start: 1,
+        }))
+        for addr, byte in enumerate(memory_image):
+            if byte:
+                self._insert_write(addr, byte)
+        self._mstate = {
+            "pc": start_pc & 0xFFFF, "a": 0, "x": 0, "y": 0, "s": 0xFD,
+            "p": reference.FLAG_U | reference.FLAG_I,
+            "ir": 0, "oplo": 0, "ophi": 0, "ea": 0, "data": 0, "halted": 0,
+        }
+        self.machine_halted = False
+
+    def _insert_write(self, addr: int, value: int):
+        rt = self.rt
+        self._forward(self._embed({
+            rt.byte_value: value & 0xFF,
+            rt.is_memory_write: 1,
+            rt.addr_lo: addr & 0xFF,
+            rt.addr_hi: (addr >> 8) & 0xFF,
+        }))
+
+    def machine_step(self) -> TraceRow:
+        rt = self.rt
+        st = self._mstate
+        p = st["p"]
+        flag = Cpu6502Runtime._flag_bit
+        h = self._forward(self._embed({
+            rt.is_state: 1,
+            rt.in_pc_lo: st["pc"] & 0xFF,
+            rt.in_pc_hi: (st["pc"] >> 8) & 0xFF,
+            rt.in_a: st["a"], rt.in_x: st["x"], rt.in_y: st["y"], rt.in_s: st["s"],
+            rt.in_p_c: flag(p, reference.FLAG_C), rt.in_p_z: flag(p, reference.FLAG_Z),
+            rt.in_p_i: flag(p, reference.FLAG_I), rt.in_p_d: flag(p, reference.FLAG_D),
+            rt.in_p_b: flag(p, reference.FLAG_B), rt.in_p_u: flag(p, reference.FLAG_U),
+            rt.in_p_v: flag(p, reference.FLAG_V), rt.in_p_n: flag(p, reference.FLAG_N),
+            rt.in_ir: st["ir"], rt.in_oplo: st["oplo"], rt.in_ophi: st["ophi"],
+            rt.in_ea_lo: st["ea"] & 0xFF, rt.in_ea_hi: (st["ea"] >> 8) & 0xFF,
+            rt.in_data: st["data"], rt.in_halted: st["halted"],
+            rt.in_nmi: 0,
+        }))
+
+        def read(name, mask):
+            return int(round(self._read(h, name))) & mask
+
+        writes = []
+        for store, addr, value in (
+            ("is_store", "write_addr_out", "write_value_out"),
+            ("is_store2", "write_addr2_out", "write_value2_out"),
+            ("is_store3", "write_addr3_out", "write_value3_out"),
+        ):
+            if read(store, 0xFF):
+                writes.append(MemWrite(self._trace_len, read(addr, 0xFFFF), read(value, 0xFF)))
+
+        halted = read("new_halted", 0xFF) != 0
+        row = TraceRow(
+            step=self._trace_len,
+            state=Cpu6502State(
+                pc=read("current_pc", 0xFFFF),
+                a=read("new_a", 0xFF), x=read("new_x", 0xFF), y=read("new_y", 0xFF),
+                s=read("new_s", 0xFF), p=read("new_p", 0xFF),
+                ir=read("fetched_opcode", 0xFF),
+                operand_lo=read("fetched_operand_lo", 0xFF),
+                operand_hi=read("fetched_operand_hi", 0xFF),
+                ea=read("ea", 0xFFFF), data=read("data_out", 0xFF),
+                halted=halted,
+            ),
+            writes=tuple(writes),
+        )
+        self._trace_len += 1
+
+        for w in row.writes:
+            self._insert_write(w.addr, w.value)
+
+        s = row.state
+        st.update(
+            pc=read("next_pc", 0xFFFF), a=s.a, x=s.x, y=s.y, s=s.s, p=s.p,
+            ir=s.ir, oplo=s.operand_lo, ophi=s.operand_hi,
+            ea=s.ea, data=s.data, halted=1 if s.halted else 0,
+        )
+        logits = self.model.head(h)
+        if halted or float(logits[self._halt_row]) > float(logits[self._state_row]):
+            self.machine_halted = True
+        return row
+
+    def run_image(self, memory_image, *, start_pc: int, max_steps: int) -> Trace:
+        self.boot_image(list(memory_image), start_pc=start_pc)
+        trace = Trace()
+        for _ in range(max_steps):
+            trace.append(self.machine_step())
+            if self.machine_halted:
+                break
+        return trace
+
+
+# ── Verification program (low addresses; see numerics caveat above) ──
+
+VERIFY_START = 0x0400
+
+
+def verify_program() -> bytes:
+    """Loop + rewrites + stack + subroutine + arithmetic, all below $0500."""
+    image = bytearray(0x10000)
+    code = bytes([
+        0xA9, 0x05,        # LDA #$05
+        0x85, 0x10,        # STA $10
+        0xA2, 0x03,        # LDX #$03
+        0xE6, 0x10,        # loop: INC $10   (rewrites the same address)
+        0xCA,              # DEX
+        0xD0, 0xFB,        # BNE loop
+        0x20, 0x20, 0x04,  # JSR $0420
+        0xA5, 0x10,        # LDA $10
+        0x38,              # SEC
+        0xE9, 0x02,        # SBC #$02
+        0x85, 0x11,        # STA $11
+        0x69, 0x10,        # ADC #$10
+        0x48,              # PHA
+        0x68,              # PLA
+        0x85, 0x12,        # STA $12
+        0x4C, 0x1B, 0x04,  # trap: JMP trap ($041B)
+    ])
+    image[VERIFY_START:VERIFY_START + len(code)] = code
+    image[0x0420:0x0426] = bytes([
+        0xA0, 0x07,        # LDY #$07
+        0x84, 0x13,        # STY $13
+        0x60,              # RTS
+    ])
+    return bytes(image)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    parser = argparse.ArgumentParser(
+        description="Verify the 6502 running as real transformer weights."
+    )
+    parser.add_argument("--steps", type=int, default=30)
+    parser.add_argument("--cache", choices=["hull", "standard"], default="hull")
+    args = parser.parse_args()
+
+    machine = Cpu6502TransformerMachine(bcd=False, cache=args.cache)
+    logger.info(
+        "transformer: d_model=%d n_layers=%d (%.1fs build)",
+        machine.d_model, machine.n_layers, machine.build_seconds,
+    )
+
+    image = verify_program()
+    run_start = time.perf_counter()
+    trace = machine.run_image(image, start_pc=VERIFY_START, max_steps=args.steps)
+    run_elapsed = time.perf_counter() - run_start
+
+    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+    ref.pc = VERIFY_START
+    failures = 0
+    for i, row in enumerate(trace):
+        ref_row = ref.step()
+        a, b = ref_row.state, row.state
+        ok = (a.pc, a.a, a.x, a.y, a.s, a.p) == (b.pc, b.a, b.x, b.y, b.s, b.p)
+        ok = ok and {(w.addr, w.value) for w in ref_row.writes} == {
+            (w.addr, w.value) for w in row.writes
+        }
+        if not ok:
+            failures += 1
+            logger.error("step %d DIVERGED:\nREF:         %s\nTRANSFORMER: %s", i, a, b)
+    status = "MATCHED" if failures == 0 else f"{failures} DIVERGENCES"
+    logger.info(
+        "transformer(%s): %s  %d steps in %.1fs (%.2f steps/s)",
+        args.cache, status, len(trace.rows), run_elapsed, len(trace.rows) / run_elapsed,
+    )
+    raise SystemExit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()
