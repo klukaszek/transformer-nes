@@ -104,37 +104,11 @@ class Console:
         self.cart = cart
         self.ppu = PPU(cart)
         self.controller = Controller()
-        self.backend = backend
         image = cart.cpu_image()
-        start_pc = cart.reset_vector
 
-        if backend == "kernel":
-            from transformer_vm.cpu6502.kernel import Cpu6502CppRuntime
-
-            self._rt = Cpu6502CppRuntime(bcd=False)
-            self.bus = KernelBus(self._rt, image, start_pc=start_pc)
-            read_cpu = self._rt.read_ram
-        elif backend == "reference":
-            from transformer_vm.cpu6502.reference import Cpu6502
-
-            cpu = Cpu6502(memory=bytearray(image), bcd_enabled=False)
-            cpu.pc = start_pc
-            self.bus = Bus(ReferenceCore(cpu), image)
-            read_cpu = lambda addr: self.bus.ram[addr & 0xFFFF]  # noqa: E731
-        elif backend == "graph":
-            from transformer_vm.cpu6502.evaluator import Cpu6502Runtime
-
-            rt = Cpu6502Runtime(bcd=False)
-            rt.boot_image(list(image), start_pc=start_pc)
-            self.bus = Bus(GraphCore(rt), image)
-            read_cpu = lambda addr: self.bus.ram[addr & 0xFFFF]  # noqa: E731
-        else:
-            raise ValueError(f"unknown backend {backend!r}")
-
-        self.dma = OamDma(self.ppu, read_cpu)
-        self.bus.attach(self.ppu, 0x2000, 0x3FFF)     # registers + mirrors
-        self.bus.attach(self.dma, 0x4014, 0x4014)
-        self.bus.attach(self.controller, 0x4016, 0x4017)
+        self._boot(backend, image, cart.reset_vector, state=None)
+        self.dma = OamDma(self.ppu, self._read_cpu)
+        self._attach_devices()
 
         self.cycles = 0        # console-side base-cycle clock
         self.frame_index = 0
@@ -148,6 +122,83 @@ class Console:
         # 0 disables; the reference backend has no log and never rebuilds.
         self.checkpoint_tokens = checkpoint_tokens
         self.checkpoint_count = 0
+
+    # ── Backend construction / handoff ──────────────────────────────
+
+    def _boot(self, backend: str, image: bytes, start_pc: int, state: dict | None):
+        """Create the CPU machine + bus for a backend, optionally resuming
+        from a snapshot (RAM image + architectural state)."""
+        self.backend = backend
+        if backend == "kernel":
+            from transformer_vm.cpu6502.kernel import Cpu6502CppRuntime
+
+            self._rt = Cpu6502CppRuntime(bcd=False)
+            self.bus = KernelBus(self._rt, image, start_pc=start_pc)
+            if state is not None:
+                self._rt.set_state(state)
+            self._read_cpu = self._rt.read_ram
+            return
+        if backend == "reference":
+            from transformer_vm.cpu6502.reference import Cpu6502
+
+            cpu = Cpu6502(memory=bytearray(image), bcd_enabled=False)
+            cpu.pc = start_pc
+            if state is not None:
+                cpu.pc, cpu.a, cpu.x, cpu.y, cpu.s, cpu.p = (
+                    int(state[k]) for k in ("pc", "a", "x", "y", "s", "p")
+                )
+            core = ReferenceCore(cpu)
+        elif backend == "graph":
+            from transformer_vm.cpu6502.evaluator import Cpu6502Runtime
+
+            rt = Cpu6502Runtime(bcd=False)
+            rt.boot_image(list(image), start_pc=start_pc, state=state)
+            core = GraphCore(rt)
+        elif backend == "weights":
+            # The real transformer: same machine protocol as the graph
+            # evaluator, so the same bus adapter drives it.
+            from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
+
+            machine = Cpu6502TransformerMachine(bcd=False, cache="hull", matmul="sparse")
+            machine.boot_image(list(image), start_pc=start_pc, state=state)
+            core = GraphCore(machine)
+        else:
+            raise ValueError(f"unknown backend {backend!r}")
+        self.bus = Bus(core, image)
+        self._read_cpu = lambda addr: self.bus.ram[addr & 0xFFFF]
+
+    def _attach_devices(self):
+        self.bus.attach(self.ppu, 0x2000, 0x3FFF)     # registers + mirrors
+        self.bus.attach(self.dma, 0x4014, 0x4014)
+        self.bus.attach(self.controller, 0x4016, 0x4017)
+
+    def _snapshot(self) -> tuple[bytes, dict]:
+        if self.backend == "kernel":
+            return self._rt.dump_ram(), self._rt.get_state()
+        ram = bytes(self.bus.ram)
+        core = self.bus.core
+        if isinstance(core, ReferenceCore):
+            cpu = core.cpu
+            state = {"pc": cpu.pc, "a": cpu.a, "x": cpu.x, "y": cpu.y,
+                     "s": cpu.s, "p": cpu.p, "halted": cpu.halted}
+        else:
+            state = core.rt.machine_state
+        return ram, state
+
+    def handoff(self, backend: str) -> None:
+        """Transfer the running console to another CPU backend mid-game.
+
+        Must happen at a frame boundary (no pending NMI or read pause);
+        run_frame() always returns at one.  The PPU, controllers, and the
+        console clock carry over untouched -- only the CPU machine and its
+        token log are rebuilt from the snapshot.
+        """
+        ram, state = self._snapshot()
+        self._boot(backend, ram, int(state["pc"]), state)
+        self.dma._read_cpu = self._read_cpu
+        self._attach_devices()
+        if isinstance(self.bus, Bus):
+            self.bus.cycles = self.cycles  # console clock continues
 
     # ── CPU driving ─────────────────────────────────────────────────
 
@@ -242,16 +293,31 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run an NES ROM (NROM) on the 6502 graph machine.")
     parser.add_argument("rom", help="path to an iNES .nes file")
     parser.add_argument("--frames", type=int, default=60)
-    parser.add_argument("--backend", choices=["kernel", "reference", "graph"], default="kernel")
+    parser.add_argument(
+        "--backend", choices=["kernel", "reference", "graph", "weights"], default="kernel"
+    )
+    parser.add_argument(
+        "--warmup-frames", type=int, default=0,
+        help="run this many frames on the kernel first, then hand the running "
+             "game off to --backend for the remaining frames",
+    )
     parser.add_argument("--out", help="write the final frame as a PPM image")
     args = parser.parse_args()
 
     build_start = time.perf_counter()
-    console = Console(args.rom, backend=args.backend)
+    first_backend = "kernel" if args.warmup_frames else args.backend
+    console = Console(args.rom, backend=first_backend)
     build_elapsed = time.perf_counter() - build_start
 
     run_start = time.perf_counter()
-    frame = console.run(args.frames)
+    if args.warmup_frames:
+        console.run(args.warmup_frames)
+        logger.info(
+            "handoff to %s backend after %d frames (PC=%04X)",
+            args.backend, console.frame_index, console._snapshot()[1]["pc"],
+        )
+        console.handoff(args.backend)
+    frame = console.run(args.frames - console.frame_index)
     run_elapsed = time.perf_counter() - run_start
 
     fps = console.frame_index / run_elapsed if run_elapsed > 0 else 0.0

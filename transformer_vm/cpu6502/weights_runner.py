@@ -36,6 +36,8 @@ import argparse
 import logging
 import time
 
+import numpy as np
+import scipy.sparse as sp
 import torch
 
 from transformer_vm.attention import HullKVCache, StandardKVCache
@@ -53,7 +55,8 @@ logger = logging.getLogger(__name__)
 class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
-    def __init__(self, *, bcd: bool = False, cache: str = "hull"):
+    def __init__(self, *, bcd: bool = False, cache: str = "hull",
+                 matmul: str = "sparse"):
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
         self.rt = Cpu6502Runtime(bcd=bcd)
@@ -103,6 +106,23 @@ class Cpu6502TransformerMachine:
         else:
             raise ValueError(f"unknown cache {cache!r}")
 
+        self.matmul = matmul
+        if matmul == "sparse":
+            # The analytic weights are ~99.9% zeros; CSR matvecs run the
+            # identical linear maps orders of magnitude faster.  All FFN
+            # and value entries are dyadic rationals, so float64 sums are
+            # exact regardless of association -- the sparse path produces
+            # the same trace as the dense one (asserted in tests).
+            self._layers = []
+            for layer_idx in range(self.n_layers):
+                ip = sp.csr_matrix(self.model.attn[layer_idx].in_proj_weight.numpy())
+                opw = sp.csr_matrix(self.model.attn[layer_idx].out_proj.weight.numpy())
+                fi = sp.csr_matrix(self.model.ff_in[layer_idx].weight.numpy())
+                fo = sp.csr_matrix(self.model.ff_out[layer_idx].weight.numpy())
+                self._layers.append((ip, opw, fi, fo))
+        elif matmul != "dense":
+            raise ValueError(f"unknown matmul {matmul!r}")
+
         self.pos = 0
         self._trace_len = 0
 
@@ -113,6 +133,8 @@ class Cpu6502TransformerMachine:
         """One genuine transformer position: attention + ReGLU per layer."""
         add_position_encoding(x, self.pos)
         self.pos += 1
+        if self.matmul == "sparse":
+            return self._forward_sparse(x)
         model = self.model
         for layer_idx, (attn, ff_in, ff_out) in enumerate(
             zip(model.attn, model.ff_in, model.ff_out, strict=True)
@@ -123,6 +145,24 @@ class Cpu6502TransformerMachine:
             gate, val = ff_in(x).chunk(2, dim=-1)
             x = x + ff_out(torch.nn.functional.relu(gate) * val)
         return x
+
+    def _forward_sparse(self, x: torch.Tensor) -> torch.Tensor:
+        """The same layer stack through CSR matvecs."""
+        xv = x.numpy()
+        d = self.d_model
+        for layer_idx, (ip, opw, fi, fo) in enumerate(self._layers):
+            qkv = ip @ xv
+            out = self.cache.layer_step(
+                layer_idx,
+                torch.from_numpy(qkv[d:2 * d]),
+                torch.from_numpy(qkv[:d]),
+                torch.from_numpy(qkv[2 * d:]),
+            )
+            xv = xv + opw @ out.numpy()
+            gv = fi @ xv
+            half = gv.shape[0] // 2
+            xv = xv + fo @ (np.maximum(gv[:half], 0.0) * gv[half:])
+        return torch.from_numpy(xv)
 
     def _embed(self, values: dict) -> torch.Tensor:
         """Input embedding for one token: dim values at their slots.
@@ -140,9 +180,10 @@ class Cpu6502TransformerMachine:
     def _read(self, h: torch.Tensor, name: str) -> float:
         return float(h[self.slot_of[self._dim_by_name[name]]])
 
-    # ── Machine protocol (mirrors evaluator.Cpu6502Runtime) ─────────
+    # ── Machine protocol (mirrors evaluator.Cpu6502Runtime, so the NES
+    # bus's GraphCore adapter can drive this machine unchanged) ──────
 
-    def boot_image(self, memory_image, *, start_pc: int):
+    def boot_image(self, memory_image, *, start_pc: int, state: dict | None = None):
         rt = self.rt
         self._forward(self._embed({
             rt.start_pc_lo: start_pc & 0xFF,
@@ -157,7 +198,21 @@ class Cpu6502TransformerMachine:
             "p": reference.FLAG_U | reference.FLAG_I,
             "ir": 0, "oplo": 0, "ophi": 0, "ea": 0, "data": 0, "halted": 0,
         }
+        if state is not None:
+            self._mstate.update({k: int(state[k]) for k in self._mstate if k in state})
+        self._nmi_pending = False
         self.machine_halted = False
+
+    @property
+    def machine_state(self) -> dict:
+        return dict(self._mstate)
+
+    def set_nmi(self):
+        """The interrupt sequence itself then runs inside the weights."""
+        self._nmi_pending = True
+
+    def inject_write(self, addr: int, value: int):
+        self._insert_write(addr & 0xFFFF, value & 0xFF)
 
     def _insert_write(self, addr: int, value: int):
         rt = self.rt
@@ -172,6 +227,8 @@ class Cpu6502TransformerMachine:
         rt = self.rt
         st = self._mstate
         p = st["p"]
+        nmi = 1 if self._nmi_pending else 0
+        self._nmi_pending = False
         flag = Cpu6502Runtime._flag_bit
         h = self._forward(self._embed({
             rt.is_state: 1,
@@ -185,7 +242,7 @@ class Cpu6502TransformerMachine:
             rt.in_ir: st["ir"], rt.in_oplo: st["oplo"], rt.in_ophi: st["ophi"],
             rt.in_ea_lo: st["ea"] & 0xFF, rt.in_ea_hi: (st["ea"] >> 8) & 0xFF,
             rt.in_data: st["data"], rt.in_halted: st["halted"],
-            rt.in_nmi: 0,
+            rt.in_nmi: nmi,
         }))
 
         def read(name, mask):
@@ -283,9 +340,10 @@ def main() -> None:
     )
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--cache", choices=["hull", "standard"], default="hull")
+    parser.add_argument("--matmul", choices=["sparse", "dense"], default="sparse")
     args = parser.parse_args()
 
-    machine = Cpu6502TransformerMachine(bcd=False, cache=args.cache)
+    machine = Cpu6502TransformerMachine(bcd=False, cache=args.cache, matmul=args.matmul)
     logger.info(
         "transformer: d_model=%d n_layers=%d (%.1fs build)",
         machine.d_model, machine.n_layers, machine.build_seconds,

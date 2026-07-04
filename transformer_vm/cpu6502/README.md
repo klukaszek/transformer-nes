@@ -54,7 +54,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `kernel.py` (generated C++) | ~450–600K | Same semantics at NES-relevant speed |
-| `weights_runner.py` (real transformer) | ~0.13 | The thesis: actual softmax-ReGLU transformer weights |
+| `weights_runner.py` (real transformer) | ~30-95 | The thesis: actual softmax-ReGLU transformer weights |
 
 The Python and C++ backends are **bit-identical**: same IEEE double
 operations in the same order, the same hull code (`hull2d_cht.h`), the same
@@ -63,16 +63,37 @@ tie-break configuration, and the same rounding on read-back.
 ### The transformer itself
 
 `weights_runner.py` (`6502-transformer`) closes the loop on the project's
-premise: the graph is ASAP-scheduled onto layers (the optimal-width MILP
-has ~5M integer variables at this graph size and does not solve; the
-critical path fixes 66 layers) and compiled by `model/weights.py` into
-actual `VanillaTransformer` weights — d_model=1800, 900 attention heads,
-d_ffn=2308, constructed analytically in ~18 s, no training.  Execution is
-genuine transformer inference: per-position embeddings, Q/K/V projections,
-attention (hull hardmax, or **true softmax** via `--cache standard`),
-ReGLU FFN, residual stream, output head.  Both attention modes execute
-6502 programs lockstep-exact against the reference core at ~0.13
-instructions/s.
+premise: the graph is scheduled onto layers and compiled by
+`model/weights.py` into actual `VanillaTransformer` weights — d_model≈1470,
+66 layers, ~730 attention heads, constructed analytically in ~10 s, no
+training.  Execution is genuine transformer inference: per-position
+embeddings, Q/K/V projections, attention (hull hardmax, or **true
+softmax** via `--cache standard`), ReGLU FFN, residual stream, output
+head.  Both attention modes execute 6502 programs lockstep-exact against
+the reference core.
+
+Scheduling: the optimal-width MILP does not scale here — the blowup is
+the formulation (per-dim/per-boundary alive indicators → ~12M rows, ~5M
+binaries; HiGHS presolve alone exceeds an hour), not the solver (SciPy's
+`milp` wraps the same HiGHS engine).  `scheduler/milp.py:asap_schedule`
+instead takes the 66-layer critical path and load-balances ops across its
+slack with a reverse-topological leveling pass (deterministic; ties go to
+the latest phase, which also shortens lifetimes).  Balancing is what
+makes the width sane: plain ASAP piles 1,538 of the 6,439 ops into one
+layer and d_model becomes head-bound at 1800; leveled, it is
+liveness-bound (~1470) and d_ffn drops 2308→~1180.
+
+Performance: the analytic weights are ~99.9% zeros, so inference runs the
+identical linear maps as `scipy` CSR matvecs (`--matmul dense` keeps the
+dense-torch path; both produce byte-identical traces — every FFN value is
+a dyadic rational, so float64 sums are exact under any association).
+Sparse + balanced schedule took the machine from 0.13 to ~30–95
+instructions/s: **the full 8,991-instruction nestest suite runs through
+the actual transformer weights in ~5 minutes, matching the reference
+exactly** (`6502-nestest --runner weights`; `6502-klaus --runner weights`
+lockstep-verifies a Klaus prefix with decimal mode).  The NES console can
+even hand a running game off to the weights backend mid-play
+(`nes-run --warmup-frames 60 --backend weights`).
 
 Two departures from the WASM construction, both documented in the module:
 STATE tokens carry ~20 wide-domain fields, so the harness builds each

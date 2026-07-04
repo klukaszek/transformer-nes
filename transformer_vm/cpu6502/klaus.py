@@ -144,6 +144,40 @@ def run_cpp(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float, f
     return matched, steps, build_elapsed, rt.last_prefix_seconds, rt.last_step_seconds
 
 
+def run_weights(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float]:
+    """Lockstep the real weights-based transformer against the reference.
+
+    Klaus at full length (30.6M instructions) is out of reach at
+    transformer speeds; this verifies a prefix, like the graph runner.
+    """
+    from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
+
+    build_start = time.perf_counter()
+    machine = Cpu6502TransformerMachine(bcd=True, cache="hull", matmul="sparse")
+    build_elapsed = time.perf_counter() - build_start
+
+    run_start = time.perf_counter()
+    trace = machine.run_image(image, start_pc=START_PC, max_steps=max_steps)
+    run_elapsed = time.perf_counter() - run_start
+
+    ref_cpu = Cpu6502(memory=bytearray(image))
+    ref_cpu.pc = START_PC
+    for i, row in enumerate(trace):
+        ref_row = ref_cpu.step()
+        s1, s2 = ref_row.state, row.state
+        if (s1.pc, s1.a, s1.x, s1.y, s1.s, s1.p) != (s2.pc, s2.a, s2.x, s2.y, s2.s, s2.p):
+            logger.error(
+                "transformer diverged from reference at step %d:\nREF:         PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X\nTRANSFORMER: PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X",
+                i, s1.pc, s1.a, s1.x, s1.y, s1.s, s1.p,
+                s2.pc, s2.a, s2.x, s2.y, s2.s, s2.p,
+            )
+            return False, i, build_elapsed, run_elapsed
+        if {(w.addr, w.value) for w in ref_row.writes} != {(w.addr, w.value) for w in row.writes}:
+            logger.error("transformer writes diverged at step %d", i)
+            return False, i, build_elapsed, run_elapsed
+    return True, len(trace.rows), build_elapsed, run_elapsed
+
+
 def run_cpp_full(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float]:
     """Run the entire suite on the C++ kernel until the success trap."""
     from transformer_vm.cpu6502.kernel import Cpu6502CppRuntime
@@ -167,7 +201,9 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description="Run the Klaus 6502 functional test suite.")
     parser.add_argument(
-        "--runner", choices=["reference", "graph", "cpp", "cpp-full", "both"], default="reference"
+        "--runner",
+        choices=["reference", "graph", "cpp", "cpp-full", "weights", "both"],
+        default="reference",
     )
     parser.add_argument("--image", default=KLAUS_BIN)
     parser.add_argument(
@@ -207,6 +243,16 @@ def main() -> None:
         logger.info(
             "cpp: %s  %d steps in %.2fs (%.0f steps/s), image prefix %.2fs, kernel build %.2fs",
             status, steps, step_s, rate, prefix_s, build_s,
+        )
+        failed |= not matched
+
+    if args.runner == "weights":
+        matched, steps, build_s, run_s = run_weights(image, max_steps=args.graph_steps)
+        rate = steps / run_s if run_s > 0 else 0.0
+        status = "MATCHED" if matched else "DIVERGED"
+        logger.info(
+            "weights transformer: %s  %d steps in %.1fs (%.1f steps/s), weights build %.1fs",
+            status, steps, run_s, rate, build_s,
         )
         failed |= not matched
 

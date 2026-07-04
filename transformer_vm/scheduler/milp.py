@@ -233,14 +233,32 @@ def _layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, i
     return num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after
 
 
-def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None):
-    """Critical-path (ASAP) schedule: every op at its earliest legal phase.
+def _legal_phases(lo, hi, op):
+    """Phases of op's parity within [lo, hi]."""
+    if isinstance(op, LookUp):
+        start, step = lo + (-lo) % 4, 4
+    elif isinstance(op, ReGLUDimension):
+        start, step = lo + (2 - lo % 4 + 4) % 4, 4
+    else:
+        start, step = lo + (0 if lo % 2 == 1 else 1), 2
+    return range(start, hi + 1, step)
+
+
+def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None, balance=True):
+    """Critical-path (ASAP) schedule, optionally load-balanced.
 
     Same output shape as milp_schedule but no solver: layer count equals
-    the dependency critical path and d_model is whatever the liveness
-    demands, rather than the MILP-minimized width.  This is the practical
-    path for large graphs (the 6502 machine's MILP has ~5M integer
-    variables and does not solve in useful time).
+    the dependency critical path.  This is the practical path for large
+    graphs (the 6502 machine's MILP has ~5M integer variables and does not
+    solve in useful time -- the blowup is the formulation's per-dim/
+    per-boundary alive indicators, not the HiGHS engine).
+
+    Plain ASAP piles ops into the earliest layers, and d_model ends up
+    dominated by the busiest layer's head/FFN demand rather than by
+    liveness.  With balance=True a reverse-topological leveling pass
+    re-places every op at the least-loaded legal phase within its
+    dependency window (ties -> latest, which also shortens lifetimes),
+    spreading persists and ReGLUs across the critical path's slack.
     """
     _log = log or logger.info
 
@@ -254,6 +272,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None):
 
     ops = graph["ops"]
     op_deps = graph["op_deps"]
+    children = graph["children"]
     if graph.get("tight_to"):
         raise NotImplementedError(
             "asap_schedule does not honor same-layer constraints of "
@@ -266,24 +285,40 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None):
         if isinstance(expr, Expression):
             output_dims |= set(expr.terms.keys())
 
-    # ASAP with phase parity (the same rule _min_layers uses).
-    pa, remaining = {}, set(ops)
+    # ASAP with phase parity (the same rule _min_layers uses).  Iterate in
+    # stable ops order, not set order: the schedule (and therefore the
+    # constructed weights) must be deterministic across processes.
+    asap, remaining = {}, set(ops)
+    topo_order = []
     while remaining:
         progress = False
-        for op in list(remaining):
-            if any(p not in pa for p in op_deps[op]):
+        for op in ops:
+            if op not in remaining or any(p not in asap for p in op_deps[op]):
                 continue
-            lo = max((pa[p] for p in op_deps[op]), default=-1) + 1
-            if isinstance(op, LookUp):
-                lo += (-lo) % 4
-            elif isinstance(op, ReGLUDimension):
-                lo += (2 - lo % 4 + 4) % 4
-            else:
-                lo += 0 if lo % 2 == 1 else 1
-            pa[op] = lo
+            lo = max((asap[p] for p in op_deps[op]), default=-1) + 1
+            asap[op] = next(iter(_legal_phases(lo, lo + 3, op)))
+            topo_order.append(op)
             remaining.discard(op)
             progress = True
         assert progress, "Cycle in dependencies"
+
+    pa = dict(asap)
+    if balance:
+        # Reverse-topological leveling: children are already placed, so
+        # each op's window is [its ASAP phase, min(children) - 1].  ASAP
+        # phases of parents are strictly below the op's, so windows stay
+        # nonempty as parents are placed after their children.
+        max_phase = max(pa.values())
+        pa = {}
+        load = defaultdict(int)
+        for op in reversed(topo_order):
+            kids = [pa[c] for c in children.get(op, ()) if c in pa]
+            hi = (min(kids) - 1) if kids else max_phase
+            hi = max(hi, asap[op])
+            candidates = list(_legal_phases(asap[op], hi, op)) or [asap[op]]
+            best = min(candidates, key=lambda p: (load[p], -p))
+            pa[op] = best
+            load[best] += 1
 
     (num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after) = (
         _layers_and_liveness(
@@ -291,8 +326,12 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None):
         )
     )
     max_dep = max((len(s) for s in alive_after.values()), default=0)
+    busiest = max(
+        (len(p1) + len(f) + len(p2) for _, p1, f, p2 in std_layers), default=0
+    )
     _log(
-        f"ASAP schedule: {len(ops)} ops, {num_layers} layers, max alive width {max_dep}"
+        f"{'Balanced' if balance else 'ASAP'} schedule: {len(ops)} ops, "
+        f"{num_layers} layers, max alive width {max_dep}, busiest layer {busiest} ops"
     )
     return dict(
         phase_assign=pa,

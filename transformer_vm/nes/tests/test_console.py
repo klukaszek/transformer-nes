@@ -161,6 +161,23 @@ def test_checkpoint_is_invisible_on_graph_backend():
     assert _ram(ref, 0x11) == _ram(graph, 0x11) == 2
 
 
+@pytest.mark.slow
+def test_backend_handoff_is_invisible():
+    """A mid-game handoff to another CPU backend changes nothing observable."""
+    straight = Console(_test_cart(), backend="reference")
+    straight_frames = [straight.run_frame() for _ in range(4)]
+
+    mixed = Console(_test_cart(), backend="kernel")
+    mixed_frames = [mixed.run_frame() for _ in range(2)]
+    mixed.handoff("reference")
+    mixed_frames += [mixed.run_frame() for _ in range(2)]
+
+    for i, (a, b) in enumerate(zip(straight_frames, mixed_frames, strict=True)):
+        assert np.array_equal(a, b), f"frame {i} differs"
+    assert straight.cycles == mixed.cycles
+    assert _ram(straight, 0x11) == _ram(mixed, 0x11) == 4
+
+
 def _nametable_text(console: Console) -> str:
     nt = console.ppu.nametables[:0x3C0]
     return "\n".join(
