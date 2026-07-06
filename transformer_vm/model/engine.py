@@ -77,6 +77,7 @@ class SparseWeightsEngine:
                 model.ff_out[layer_idx].weight.shape[1],
                 np.asarray(model.head_kinds[layer_idx], dtype=np.int32),
                 np.asarray(model.head_tiebreak[layer_idx], dtype=np.int32),
+                np.asarray(model.ffn_kinds[layer_idx], dtype=np.int32),
                 np.asarray(groups, dtype=np.int32),
                 np.asarray(mem_groups, dtype=np.int32),
             )

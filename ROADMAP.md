@@ -15,7 +15,7 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~6K after boot | default fp32 engine; full nestest MATCHED in ~1.4 s; Klaus 20K prefix MATCHED |
+| `cpu6502/weights_runner.py` (real transformer) | ~7-8K after boot | default fp32 engine; full nestest MATCHED in ~1.2 s; Klaus 20K prefix MATCHED |
 
 The weights transformer is genuine inference (d_model≈1550, 71 layers,
 analytic weights, no training).  The default path is the float32 C++ engine
@@ -77,10 +77,14 @@ Current receipt:
 - The engine now directly inserts WRITE tokens into grouped memory hulls,
   skipping full transformer passes for ROM/RAM seeding and instruction
   writes.  `nestest` boot dropped from seconds to milliseconds.
-- The engine iterates only active attention heads and skips passthrough Q/K
-  projection rows, since passthrough heads use the attend-to-self shortcut.
+- The engine iterates only active lookup heads; passthrough attention heads
+  are now handled by the structural fusion below.
+- The engine now also fuses structural passthrough/erase work: attention
+  passthrough heads and linear FFN passthrough neurons become direct D->D
+  CSR residual deltas, their projection rows/output columns are pruned, and
+  the FFN activation loop only visits live non-passthrough ReGLU neurons.
 - Measured on this machine after those optimizations: full nestest total
-  ~1.4 s, ~6.4K instr/s; Klaus 20K prefix ~3.2 s, ~6.3K instr/s.
+  ~1.2 s, ~7.7K instr/s; Klaus 20K prefix ~2.7 s, ~7.4K instr/s.
 - Decimal-mode Klaus prefix also matches through the float32 C++ engine:
   20,000 instructions.
 
@@ -89,6 +93,32 @@ Remaining caveat:
   `--cache standard` still needs separate work for latest-write semantics,
   because softmax averages exact ties instead of applying the hull sequence
   tie-break.
+
+## 2026-07-06 structural sparse-pruning research log
+
+Tracked in jj:
+- `umxxzzxr` — speed up fp32 engine with direct writes and active heads
+- `rxoqortp` — fuse linear passthrough weights in the fp32 engine
+
+What was tried:
+- Counted structural work in the grouped model.  For nestest, the attention
+  stack has 1,916 passthrough heads (3,809 V rows and 7,239 output nonzeros)
+  versus only 124 lookup heads; the FFN stack has 3,240 linear passthrough
+  neurons and 3,927 passthrough output nonzeros.
+- Added `model.ffn_kinds` metadata and taught the C++ engine to fuse
+  proven-linear passthrough/erase paths into direct sparse residual maps.
+  This is structural pruning, not magnitude pruning: no learned weights are
+  dropped, and the represented computation is algebraically identical.
+- Result: exact graph/weights tests still pass, full nestest matches, and
+  Klaus 20K still matches.  Payoff is ~1.2x single-thread speedup.  Useful,
+  but not enough by itself for NES framerate.
+
+Implication:
+- There is still enough generic CSR work left that GPU CSR / custom Metal is
+  worth investigating, but for a single strict instruction stream the port
+  must fuse many layer operations per dispatch.  Plain per-matrix GPU CSR
+  calls will likely lose to dispatch latency; batched NES instances or a
+  custom fused kernel are the more credible GPU shape.
 
 ## Prioritized next steps
 

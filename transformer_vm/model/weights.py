@@ -400,6 +400,7 @@ def build_model(
         # ── Per-layer weights ─────────────────────────────────────
         cur = frozenset(input_dims)
         all_tiebreak = []
+        all_ffn_kinds = []
 
         for layer_idx in range(n_layers):
             attn, persist1, ffn, persist2 = std_layers[layer_idx]
@@ -535,6 +536,7 @@ def build_model(
             c3 = 4 * layer_idx + 3
             nxt3 = alive_after.get(c3, cur)
             reglu_to_gate = {}
+            layer_ffn_kinds = [0] * d_ffn
             j = 0
 
             # 1) ReGLU neurons
@@ -542,6 +544,7 @@ def build_model(
                 fi[j] = expr_to_tensor(rg.b_expr)
                 fi[d_ffn + j] = expr_to_tensor(rg.a_expr)
                 reglu_to_gate[rg] = j
+                layer_ffn_kinds[j] = 1
                 if rg not in internal_reglus:
                     fo[slot_of[rg], j] = 1.0
                 j += 1
@@ -568,16 +571,22 @@ def build_model(
                 fi[d_ffn + j, src] = 1.0
                 for dst, coeff in dsts.items():
                     fo[dst, j] += coeff
+                layer_ffn_kinds[j] = 2
                 j += 1
                 n_pt_g += 1
 
             assert j <= d_ffn, f"L{layer_idx} ffn: {j} neurons > {d_ffn}"
+            all_ffn_kinds.append(layer_ffn_kinds)
 
             cur = nxt3
 
     model.attn_erase = [sorted(erased_at[(li, 1)]) for li in range(n_layers)]
     model.ffn_erase = [sorted(erased_at[(li, 3)]) for li in range(n_layers)]
     model.head_tiebreak = all_tiebreak
+    # FFN neuron classification per layer: 0 unused, 1 ReGLU, 2 linear
+    # passthrough/erase neuron.  Fast engines can fuse kind-2 neurons into a
+    # direct linear residual update without changing the represented model.
+    model.ffn_kinds = all_ffn_kinds
     # Head classification per layer (0 unused, 1 lookup, 2 passthrough).
     # Passthrough/erase heads provably attend to self (their key is 2*pos,
     # strictly increasing), which lets a fast engine skip their hulls.
