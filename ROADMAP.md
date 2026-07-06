@@ -120,6 +120,42 @@ Implication:
   calls will likely lose to dispatch latency; batched NES instances or a
   custom fused kernel are the more credible GPU shape.
 
+## 2026-07-06 GPU CSR feasibility probe
+
+Tracked in jj:
+- `posnqutp` — continue gpu csr performance research
+
+What was checked:
+- Local PyTorch has MPS (`torch.backends.mps.is_available() == True`), but
+  MPS sparse CSR tensors are not implemented here (`new_compressed_tensor`
+  fails on `mps:0`).  MLX is not installed.  So a GPU CSR backend is custom
+  Metal/Objective-C++ work, not a device swap in the existing torch path.
+- A temporary Metal CSR probe (`/private/tmp/metal_csr_ext.mm`) used a
+  simple row-per-CSR-row kernel with resident buffers.  On representative
+  model matrices:
+  - `L22.ff_in` (2492x1554, nnz=2886): scipy CSR 2.75 us/mv; Metal with a
+    wait after every dispatch 101 us/mv; 20K dispatches encoded into one
+    command buffer 1.69 us/mv.
+  - `L52.out_proj` (1554x1554, nnz=32): scipy CSR 1.64 us/mv; Metal
+    wait-each 98 us/mv; one-command-buffer 1.95 us/mv.
+- Current fused CPU engine raw `_forward` on a synthetic STATE token is
+  ~93.7 us/position (~10.7K positions/s), while full machine stepping is
+  ~7.4-7.7K instr/s because Python still assembles/readbacks state and
+  emits writes.
+
+Implication:
+- Naive per-matrix GPU CSR is not viable for one NES stream: one
+  synchronous Metal dispatch costs about as much as the entire current CPU
+  transformer forward.
+- GPU work only makes sense if either many machines are batched, or a custom
+  backend fuses a large fraction of the layer stack into one/few command
+  buffers and keeps state resident.  The hull lookup path is the hard part:
+  if lookup queries stay on CPU, CPU/GPU synchronization will dominate.
+- The CPU path still has headroom from generated/specialized sparse kernels
+  (mostly +/-1 coefficients, many singleton rows) and from moving state
+  readout/next-state assembly out of Python; those are likely better
+  single-stream targets than unfused GPU CSR.
+
 ## Prioritized next steps
 
 ### 1. Key rescaling in the memory-lookup construction
@@ -162,10 +198,11 @@ worth building; the exact-schedule prize is ≤ ~1.8× compute.
 - Mapper 1 (MMC1) to open the post-launch library; then audio.
 
 ### 5. GPU / batched fleet (after #1 only)
-One stream stays CPU-bound by dispatch latency (~400 tiny ops/token,
-strictly sequential): GPUs pay off as **throughput across many machines**
-— a batch of NES instances, fp32 weights, fused layer stack (MLX or
-torch-MPS), dense or block-sparse attention with checkpoint-bounded n.
+One stream stays CPU-bound by dispatch latency: the temporary Metal CSR
+probe measured ~100 us for a synchronous dispatch, about the same as a full
+fused CPU `_forward`.  GPUs pay off as **throughput across many machines**
+or with a custom backend that fuses much of the layer stack into one/few
+command buffers and ports/avoids CPU hull synchronization.
 
 ### 6. Write-up
 The artifacts already exist: the verification-chain table, the numerics
