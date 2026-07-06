@@ -143,12 +143,13 @@ def run_cpp(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, floa
     return matched, steps, build_elapsed, rt.last_step_seconds
 
 
-def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float]:
+def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float, str]:
     """Run the real weights-based transformer in lockstep with the reference."""
     from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
-    machine = Cpu6502TransformerMachine(bcd=False, cache="hull", matmul="engine")
+    machine = Cpu6502TransformerMachine(bcd=False)
+    mode = f"{machine.matmul}/{machine.dtype}"
     build_elapsed = time.perf_counter() - build_start
 
     run_start = time.perf_counter()
@@ -168,11 +169,11 @@ def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, 
                 i, s1.pc, s1.a, s1.x, s1.y, s1.s, s1.p,
                 s2.pc, s2.a, s2.x, s2.y, s2.s, s2.p,
             )
-            return False, i, build_elapsed, run_elapsed
+            return False, i, build_elapsed, run_elapsed, mode
         if {(w.addr, w.value) for w in ref_row.writes} != {(w.addr, w.value) for w in row.writes}:
             logger.error("transformer writes diverged at step %d", i)
-            return False, i, build_elapsed, run_elapsed
-    return True, len(trace.rows), build_elapsed, run_elapsed
+            return False, i, build_elapsed, run_elapsed, mode
+    return True, len(trace.rows), build_elapsed, run_elapsed, mode
 
 
 def main() -> None:
@@ -218,12 +219,12 @@ def main() -> None:
         failed |= not matched
 
     if args.runner == "weights":
-        matched, steps, build_s, run_s = run_weights(image, max_steps=args.graph_steps)
+        matched, steps, build_s, run_s, mode = run_weights(image, max_steps=args.graph_steps)
         status = "MATCHED" if matched else "DIVERGED"
         rate = steps / run_s if run_s > 0 else 0.0
         logger.info(
-            "weights transformer: %s  %d steps in %.1fs (%.1f steps/s), weights build %.1fs",
-            status, steps, run_s, rate, build_s,
+            "weights transformer (%s): %s  %d steps in %.1fs (%.1f steps/s), weights build %.1fs",
+            mode, status, steps, run_s, rate, build_s,
         )
         failed |= not matched
 

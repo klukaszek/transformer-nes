@@ -118,16 +118,44 @@ def _signed_byte(value: Expression) -> Expression:
 
 def _memory_at(address: Expression, name: str) -> Expression:
     """Read the latest WRITE token at the given 16-bit address."""
+    one = _graph.one
     write_addr_expr = addr_lo + 256 * addr_hi
-    value, found_addr = fetch(
-        [byte_value, write_addr_expr],
-        query=address,
-        key=write_addr_expr,
-        clear_key=1 - is_memory_write,
-        tie_break="latest",
-    )
-    exact = _match_zero(address - found_addr)
-    return persist(_multiply(value, exact), name=name)
+    # Split 64 KiB memory into 4 KiB lookup groups.  Each group uses a
+    # 12-bit local-address parabola, keeping K-side scores below 2^24 so
+    # adjacent addresses remain distinguishable after float32 Q/K rounding.
+    group_size = 4096
+    group_count = 16
+
+    value = 0
+    for group in range(group_count):
+        lo = group * group_size
+        hi = lo + group_size - 1
+
+        if group == 0:
+            query_in_group = stepglu(one, hi - address)
+            write_in_group = stepglu(one, hi - write_addr_expr)
+        elif group == group_count - 1:
+            query_in_group = stepglu(one, address - lo)
+            write_in_group = stepglu(one, write_addr_expr - lo)
+        else:
+            query_ge_lo = stepglu(one, address - lo)
+            query_le_hi = stepglu(one, hi - address)
+            query_in_group = _multiply(query_ge_lo, query_le_hi)
+            write_ge_lo = stepglu(one, write_addr_expr - lo)
+            write_le_hi = stepglu(one, hi - write_addr_expr)
+            write_in_group = _multiply(write_ge_lo, write_le_hi)
+
+        group_write = _multiply(is_memory_write, write_in_group)
+        group_value, found_addr = fetch(
+            [byte_value, write_addr_expr],
+            query=address - lo,
+            key=write_addr_expr - lo,
+            clear_key=1 - group_write,
+            tie_break="latest",
+        )
+        exact = _match_zero(address - found_addr)
+        value = value + _multiply(query_in_group, _multiply(group_value, exact))
+    return persist(value, name=name)
 
 
 # ── Graph helper implementations ───────────────────────────────────

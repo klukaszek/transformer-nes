@@ -47,12 +47,23 @@ def _csr(tensor):
 class SparseWeightsEngine:
     """The whole layer stack per call; hulls for lookup heads live in C++."""
 
-    def __init__(self, model):
+    def __init__(self, model, *, dtype: str = "float32"):
         mod = _load_module()
         d_model = model.tok.weight.shape[1]
         n_heads = model.attn[0].num_heads
+        if dtype not in ("float64", "float32"):
+            raise ValueError(f"unknown dtype {dtype!r}")
+        self.dtype = dtype
         self._engine = mod.WeightsEngine(d_model, n_heads)
         for layer_idx in range(len(model.attn)):
+            cache_groups = getattr(model, "head_cache_groups", None)
+            if cache_groups is None:
+                groups = [
+                    h if kind == 1 else -1
+                    for h, kind in enumerate(model.head_kinds[layer_idx])
+                ]
+            else:
+                groups = cache_groups[layer_idx]
             self._engine.add_layer(
                 *_csr(model.attn[layer_idx].in_proj_weight),
                 *_csr(model.attn[layer_idx].out_proj.weight),
@@ -61,6 +72,7 @@ class SparseWeightsEngine:
                 model.ff_out[layer_idx].weight.shape[1],
                 np.asarray(model.head_kinds[layer_idx], dtype=np.int32),
                 np.asarray(model.head_tiebreak[layer_idx], dtype=np.int32),
+                np.asarray(groups, dtype=np.int32),
             )
 
     def reset(self):
@@ -69,7 +81,10 @@ class SparseWeightsEngine:
     def forward(self, x: np.ndarray) -> None:
         """Run one position through all layers, updating x in place.
 
-        x must be a contiguous float64 array of size d_model (a cast would
-        make pybind operate on a copy and drop the updates).
+        x must be a contiguous float64/float32 array matching this engine's
+        dtype; a pybind cast would operate on a copy and drop the updates.
         """
-        self._engine.forward(x)
+        if self.dtype == "float32":
+            self._engine.forward_f32(x)
+        else:
+            self._engine.forward(x)

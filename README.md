@@ -118,14 +118,14 @@ query — critical for runs of millions of instructions.
 
 `6502-transformer` runs the machine as **actual transformer weights**:
 `scheduler/milp.py`'s load-balanced critical-path scheduler assigns the
-gates to 66 layers, `model/weights.py` constructs `VanillaTransformer`
-weights analytically (d_model≈1470, ~730 heads, no training, ~10 s), and
+gates to 71 layers, `model/weights.py` constructs `VanillaTransformer`
+weights analytically (d_model≈1550, ~777 heads, no training), and
 inference is genuine — Q/K/V projections, attention (hull hardmax or true
 softmax), ReGLU FFN, residual stream — run by a sparse C++ engine at
-~800–2300 instructions/s.  **The full 8,991-instruction nestest suite
-passes through the weights in ~11 seconds**, a 200K-instruction Klaus
-prefix lockstep-matches with decimal mode, and the NES console can hand a
-running game off to the weights backend mid-play
+~5K stepped instructions/s after boot in the default float32 mode.  **The
+full 8,991-instruction nestest suite passes through the weights in ~6
+seconds**, a Klaus decimal-mode prefix lockstep-matches, and the NES console
+can hand a running game off to the weights backend mid-play
 (`nes-run --warmup-frames 60 --backend weights` renders an SMB frame
 byte-identical to the C++ kernel's, in ~10 s).  See
 [`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).

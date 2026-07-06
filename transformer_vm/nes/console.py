@@ -159,7 +159,7 @@ class Console:
             # evaluator, so the same bus adapter drives it.
             from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
 
-            machine = Cpu6502TransformerMachine(bcd=False, cache="hull", matmul="engine")
+            machine = Cpu6502TransformerMachine(bcd=False)
             machine.boot_image(list(image), start_pc=start_pc, state=state)
             core = GraphCore(machine)
         else:

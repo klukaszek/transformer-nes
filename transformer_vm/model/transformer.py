@@ -8,6 +8,9 @@ import torch.nn.functional as F
 
 from transformer_vm.attention import HullKVCache
 
+# Analytical weights are constructed and serialized in float64 for stable
+# coefficient storage.  The 6502 runtime defaults to the C++ engine's float32
+# forward path after export.
 torch.set_default_dtype(torch.float64)
 
 

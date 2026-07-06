@@ -22,12 +22,11 @@ result dims are read back from the residual stream after the final layer
 appended as WRITE-token positions, and the next STATE embedding is built
 from the read-back state.
 
-Numerics caveat (documented in the README): with 16-bit addresses the
-memory-lookup attention scores reach ~2^32, where the 0.3*inv_log_pos
-recency term is below one double ulp -- rewrites of the *same high
-address* then tie.  The hull cache resolves ties by sequence (LATEST);
-true softmax averages them.  Verification programs therefore keep
-rewritten addresses low; scaling the key construction is future work.
+Numerics caveat: the default hull/engine path is float32 and uses grouped
+4 KiB memory lookups so high-address reads survive Q/K rounding.  True
+softmax (`cache="standard"`) still averages exact ties instead of applying
+the hull sequence tie-break, so arbitrary high-address rewrite-heavy
+programs remain a separate standard-cache problem.
 """
 
 from __future__ import annotations
@@ -56,7 +55,7 @@ class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
     def __init__(self, *, bcd: bool = False, cache: str = "hull",
-                 matmul: str = "sparse", dtype: str = "float64"):
+                 matmul: str = "engine", dtype: str = "float32"):
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
         self.rt = Cpu6502Runtime(bcd=bcd)
@@ -108,18 +107,14 @@ class Cpu6502TransformerMachine:
         else:
             raise ValueError(f"unknown cache {cache!r}")
 
-        # Precision experiment knob (sparse path only).  float32 keeps the
-        # residual/FFN exact (all values are dyadic rationals < 2^24) and
-        # the hull still resolves recency ties by sequence, but the K-side
-        # score construction (ky = -k^2 + ...) needs sub-unit discrimination
-        # at magnitudes up to 2^32 -- float32's ulp there is 512, so reads
-        # of high addresses scramble.  float64 is required end-to-end only
-        # because of that score range; see the README numerics note.
+        # Precision experiment knob.  The grouped memory lookup keeps K-side
+        # address scores below 2^24, so float32 Q/K rounding can distinguish
+        # adjacent high addresses; hull tie-breaks still resolve rewrites.
         if dtype not in ("float64", "float32"):
             raise ValueError(f"unknown dtype {dtype!r}")
-        if dtype == "float32" and matmul != "sparse":
-            raise ValueError("dtype=float32 is only wired into the sparse path")
+        self.dtype = dtype
         self.np_dtype = np.float32 if dtype == "float32" else np.float64
+        self.torch_dtype = torch.float32 if dtype == "float32" else torch.float64
 
         self.matmul = matmul
         if matmul == "engine":
@@ -130,15 +125,12 @@ class Cpu6502TransformerMachine:
 
             if cache != "hull":
                 raise ValueError("matmul='engine' has hull attention built in")
-            if dtype != "float64":
-                raise ValueError("matmul='engine' is float64 only")
-            self._engine = SparseWeightsEngine(self.model)
+            self._engine = SparseWeightsEngine(self.model, dtype=dtype)
         elif matmul == "sparse":
             # The analytic weights are ~99.9% zeros; CSR matvecs run the
-            # identical linear maps orders of magnitude faster.  All FFN
-            # and value entries are dyadic rationals, so float64 sums are
-            # exact regardless of association -- the sparse path produces
-            # the same trace as the dense one (asserted in tests).
+            # identical linear maps orders of magnitude faster.  This path
+            # remains useful for storage experiments and true-softmax checks;
+            # the C++ engine is the default production path.
             self._layers = []
             for layer_idx in range(self.n_layers):
                 ip = sp.csr_matrix(self.model.attn[layer_idx].in_proj_weight.numpy().astype(self.np_dtype))
@@ -146,7 +138,10 @@ class Cpu6502TransformerMachine:
                 fi = sp.csr_matrix(self.model.ff_in[layer_idx].weight.numpy().astype(self.np_dtype))
                 fo = sp.csr_matrix(self.model.ff_out[layer_idx].weight.numpy().astype(self.np_dtype))
                 self._layers.append((ip, opw, fi, fo))
-        elif matmul != "dense":
+        elif matmul == "dense":
+            if dtype != "float64":
+                raise ValueError("matmul='dense' is a float64 diagnostic path")
+        else:
             raise ValueError(f"unknown matmul {matmul!r}")
 
         self.pos = 0
@@ -160,8 +155,9 @@ class Cpu6502TransformerMachine:
         add_position_encoding(x, self.pos)
         self.pos += 1
         if self.matmul == "engine":
-            self._engine.forward(x.numpy())  # in place, whole stack
-            return x
+            xv = x.numpy().astype(self.np_dtype, copy=False)
+            self._engine.forward(xv)  # in place, whole stack
+            return torch.from_numpy(xv.astype(np.float64, copy=False))
         if self.matmul == "sparse":
             return self._forward_sparse(x)
         model = self.model
@@ -203,7 +199,7 @@ class Cpu6502TransformerMachine:
         enumerated exactly these values; position features are added by
         _forward (slots 0-2 are reserved for them).
         """
-        x = torch.zeros(self.d_model)
+        x = torch.zeros(self.d_model, dtype=self.torch_dtype)
         x[self.slot_of[self.rt._one]] = 1.0
         for dim, value in values.items():
             x[self.slot_of[dim]] = float(value)
@@ -380,12 +376,19 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--cache", choices=["hull", "standard"], default="hull")
     parser.add_argument("--matmul", choices=["engine", "sparse", "dense"], default="engine")
+    parser.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     args = parser.parse_args()
 
-    machine = Cpu6502TransformerMachine(bcd=False, cache=args.cache, matmul=args.matmul)
+    machine = Cpu6502TransformerMachine(
+        bcd=False, cache=args.cache, matmul=args.matmul, dtype=args.dtype
+    )
     logger.info(
-        "transformer: d_model=%d n_layers=%d (%.1fs build)",
-        machine.d_model, machine.n_layers, machine.build_seconds,
+        "transformer: d_model=%d n_layers=%d matmul=%s dtype=%s (%.1fs build)",
+        machine.d_model,
+        machine.n_layers,
+        machine.matmul,
+        machine.dtype,
+        machine.build_seconds,
     )
 
     image = verify_program()

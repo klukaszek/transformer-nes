@@ -423,6 +423,10 @@ def build_model(
 
             # 1) LookUp heads
             layer_heads = {}
+
+            def expr_sig(expr):
+                return tuple(sorted((d.id, c) for d, c in expr.terms.items()))
+
             for lu in attn:
                 nv = len(lu.value_exprs)
                 for p in range((nv + 1) // 2):
@@ -451,6 +455,7 @@ def build_model(
                     vals = [d0.name]
                     if p * 2 + 1 < nv:
                         vals.append(lu.dims[p * 2 + 1].name)
+                    v1_sig = expr_sig(lu.value_exprs[p * 2 + 1]) if p * 2 + 1 < nv else ()
                     q_terms = {d.name: c for d, c in lu.query_exprs_2d[0].terms.items()}
                     q_terms.update(
                         {"_qy_" + d.name: c for d, c in lu.query_exprs_2d[1].terms.items()}
@@ -464,6 +469,12 @@ def build_model(
                         "lookup": lu.name or f"lookup_{lu.id}",
                         "values": vals,
                         "tie_break": lu.tie_break,
+                        "cache_key": (
+                            expr_sig(lu.key_exprs_2d[0]),
+                            expr_sig(lu.key_exprs_2d[1]),
+                            expr_sig(lu.value_exprs[p * 2]),
+                            v1_sig,
+                        ),
                     }
             head_map[layer_idx] = layer_heads
 
@@ -570,11 +581,22 @@ def build_model(
     # Passthrough/erase heads provably attend to self (their key is 2*pos,
     # strictly increasing), which lets a fast engine skip their hulls.
     model.head_kinds = []
+    model.head_cache_groups = []
     for layer_idx in range(n_layers):
         kinds = [0] * n_heads
+        cache_groups = [-1] * n_heads
+        cache_group_of_key = {}
         for h, info in head_map.get(layer_idx, {}).items():
-            kinds[h] = 1 if info["type"] == "lookup" else 2
+            if info["type"] == "lookup":
+                kinds[h] = 1
+                key = info["cache_key"]
+                if key not in cache_group_of_key:
+                    cache_group_of_key[key] = len(cache_group_of_key)
+                cache_groups[h] = cache_group_of_key[key]
+            else:
+                kinds[h] = 2
         model.head_kinds.append(kinds)
+        model.head_cache_groups.append(cache_groups)
 
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
     logger.info(

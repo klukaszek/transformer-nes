@@ -15,12 +15,12 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~800–2300 | full nestest MATCHED in 10.8 s; Klaus 200K prefix MATCHED |
+| `cpu6502/weights_runner.py` (real transformer) | ~5K after boot | default fp32 engine; full nestest MATCHED in 5.8 s; Klaus 20K prefix MATCHED |
 
-The weights transformer is genuine inference (d_model=1468, 66 layers,
-analytic weights, no training) with three byte-identical execution paths
-(`--matmul dense|sparse|engine`); the C++ engine
-(`model/weights_engine.cpp`) runs the whole layer stack per call.
+The weights transformer is genuine inference (d_model≈1550, 71 layers,
+analytic weights, no training).  The default path is the float32 C++ engine
+(`model/weights_engine.cpp`), which runs the whole layer stack per call;
+dense/sparse Python paths remain diagnostics.
 
 **NES layer** (`nes/`): MMIO bus with shadow-decode read injection,
 in-graph NMI, frame-level PPU, OAM DMA, controllers, cycle-budget frame
@@ -32,30 +32,76 @@ transformer weights** byte-identical to the kernel in ~10 s
 
 **Scheduling**: the optimal-width MILP does not scale (formulation
 blowup, not the HiGHS engine); `scheduler/milp.py:asap_schedule` is a
-deterministic load-balanced critical-path scheduler (66 layers, D=1468
-vs liveness floor ~1100 → at most ~1.8× compute left on the table).
+deterministic load-balanced critical-path scheduler (71 layers, D≈1550
+with the grouped-memory lookup).
 
 **Numerics facts** (each has a receipt in tests or the README):
-- float64 is needed **only** for the K-side attention-score construction
-  (`ky = -k²…` reaches 2³² with gap 1; fp32 diverges at nestest step 0,
-  matches on low-address programs).
-- All residual/FFN values are dyadic rationals < 2²⁴ → sums exact under
-  any association (why dense/sparse/engine agree bytewise).
-- Rewrites of high addresses tie below one double ulp; hull LATEST
-  resolves, true softmax averages — keep rewrite-heavy verification in
-  low memory until key rescaling (below) lands.
+- In the original scalar 16-bit memory lookup, float64 was needed **only**
+  for the K-side attention-score construction (`ky = -k²…` reaches 2³²
+  with gap 1; fp32 diverged at nestest step 0, but matched low-address
+  programs).  The grouped-lookup experiment below fixes this for hull
+  hard attention.
+- All residual/FFN values are dyadic rationals < 2²⁴, so the float32 engine
+  is the default execution mode.
+- Same-address rewrites are resolved by the hull LATEST sequence tie-break.
+  True softmax still averages exact ties, so `--cache standard` remains a
+  separate latest-write semantics problem.
+
+## 2026-07-06 fp32 / grouped-lookup research log
+
+Tracked in jj:
+- `kxsxypym` — checkpoint current 6502 transformer performance work
+- `qownuxsp` — make float32 engine the default weights runtime
+
+What was tried:
+- Scalar rescaling of the 16-bit address parabola was rejected.  It lowers
+  `ky`, but also shrinks the adjacent-address score gap by the same squared
+  factor, so the fp32 error-to-gap ratio does not improve.  With the old
+  recency term, exact graph tests failed because newer neighboring bytes beat
+  exact older bytes; scaling the recency term restored exact graph/kernel
+  tests but still failed high-address float32 at nestest step 0.
+- Splitting memory into 16 groups of 4 KiB worked.  Each lookup uses a
+  12-bit local-address parabola, keeping K-side address scores below 2²⁴.
+  The grouped graph passes exact graph tests and the C++ kernel test.
+- The C++ weights engine now has `dtype="float32"` support for the engine
+  path (float32 CSR storage/accumulation; hull cache still resolves using
+  double after Q/K/V have been float32-rounded).
+- The model now emits lookup `head_cache_groups`, and the C++ engine shares
+  one hull cache for lookup heads with identical K/V expressions.  In the
+  grouped model, 124 lookup heads collapse to 92 shared hulls; the busiest
+  attention layer drops from 42 lookup insertions to 16 shared hull inserts.
+
+Current receipt:
+- `Cpu6502TransformerMachine(bcd=False)` defaults to the float32 C++ engine
+  and matches all 8,991 high-address nestest instructions.
+- Measured on this machine: boot 3.99 s, step 1.82 s, total 5.81 s,
+  ~4.95K stepped instr/s after boot.  This is a research measurement, not
+  yet a full replacement for the older README speed table.
+- Decimal-mode Klaus prefix also matches through the float32 C++ engine:
+  20,000 instructions, boot 9.00 s, step 3.51 s, ~5.70K stepped instr/s
+  after boot.
+
+Remaining caveat:
+- This solves hard-attention / hull fp32 high-address reads.  True softmax
+  `--cache standard` still needs separate work for latest-write semantics,
+  because softmax averages exact ties instead of applying the hull sequence
+  tie-break.
 
 ## Prioritized next steps
 
 ### 1. Key rescaling in the memory-lookup construction
-The single change that unblocks the most: redesign `_memory_at`'s key
-parabola in `cpu6502/interpreter.py` so scores stay < 2²⁴ (e.g. split
-addresses hi/lo across the 2D key or across heads).  Payoff:
-- full float32 end-to-end → **GPU becomes viable** (MPS has no fp64);
-- kills the high-address rewrite tie hazard → true-softmax runs work on
-  arbitrary programs (full Klaus through `--cache standard`).
-Re-verify the whole chain after (evaluator, kernel, weights all consume
-the same graph).
+The hard-attention half is now experimentally solved by grouped memory
+lookups: `_memory_at` splits 64 KiB into 16 local 4 KiB parabolas, and the
+C++ engine supports fp32 execution.  Next pieces:
+- run longer/harder suites through the fp32 engine (Klaus prefixes, then
+  NES frame parity);
+- port checkpoint/snapshot support to the weights runner so long fp32 runs
+  do not grow unbounded hull logs;
+- separately solve true-softmax latest-write semantics if `--cache standard`
+  remains a target for arbitrary high-address programs.
+
+Payoff remains: the default float32 engine path makes GPU/batched-machine
+work viable (MPS has no fp64).
 
 ### 2. Full Klaus through the transformer weights (30.6M instructions)
 ~3.7 h at current engine speed.  **Blocker first**: the weights machine
@@ -113,9 +159,9 @@ uv run pytest -m "not slow"                    # 47 fast tests
 uv run pytest                                  # + kernel/weights/console suites
 uv run 6502-klaus --runner cpp-full            # full Klaus, ~48 s, exact step count
 uv run 6502-nestest --runner both              # golden log: reference + graph + kernel
-uv run 6502-nestest --runner weights           # full nestest through the transformer, ~11 s
+uv run 6502-nestest --runner weights           # full nestest through default fp32 engine, ~6 s
 uv run 6502-klaus --runner weights --graph-steps 200000
-uv run 6502-transformer --steps 30 --cache standard --matmul sparse   # true softmax
+uv run 6502-transformer --steps 30 --cache standard --matmul sparse   # true softmax diagnostic
 uv run nes-run transformer_vm/nes/examples/smb.nes --frames 61 \
     --warmup-frames 60 --backend weights --out frame.ppm
 ```

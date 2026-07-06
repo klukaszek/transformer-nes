@@ -54,7 +54,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `kernel.py` (generated C++) | ~450–600K | Same semantics at NES-relevant speed |
-| `weights_runner.py` (real transformer) | ~800-2300 | The thesis: actual softmax-ReGLU transformer weights |
+| `weights_runner.py` (real transformer) | ~5K after boot | The thesis: actual softmax-ReGLU transformer weights |
 
 The Python and C++ backends are **bit-identical**: same IEEE double
 operations in the same order, the same hull code (`hull2d_cht.h`), the same
@@ -64,54 +64,52 @@ tie-break configuration, and the same rounding on read-back.
 
 `weights_runner.py` (`6502-transformer`) closes the loop on the project's
 premise: the graph is scheduled onto layers and compiled by
-`model/weights.py` into actual `VanillaTransformer` weights — d_model≈1470,
-66 layers, ~730 attention heads, constructed analytically in ~10 s, no
+`model/weights.py` into actual `VanillaTransformer` weights — d_model≈1550,
+71 layers, ~777 attention heads, constructed analytically, no
 training.  Execution is genuine transformer inference: per-position
 embeddings, Q/K/V projections, attention (hull hardmax, or **true
-softmax** via `--cache standard`), ReGLU FFN, residual stream, output
-head.  Both attention modes execute 6502 programs lockstep-exact against
-the reference core.
+softmax** via `--cache standard --matmul sparse`), ReGLU FFN, residual
+stream, output head.  The default path is the C++ hull engine in float32;
+true softmax is still a diagnostic path and does not implement latest-write
+tie-breaks.
 
 Scheduling: the optimal-width MILP does not scale here — the blowup is
 the formulation (per-dim/per-boundary alive indicators → ~12M rows, ~5M
 binaries; HiGHS presolve alone exceeds an hour), not the solver (SciPy's
 `milp` wraps the same HiGHS engine).  `scheduler/milp.py:asap_schedule`
-instead takes the 66-layer critical path and load-balances ops across its
+instead takes the critical path and load-balances ops across its
 slack with a reverse-topological leveling pass (deterministic; ties go to
 the latest phase, which also shortens lifetimes).  Balancing is what
 makes the width sane: plain ASAP piles 1,538 of the 6,439 ops into one
 layer and d_model becomes head-bound at 1800; leveled, it is
-liveness-bound (~1470) and d_ffn drops 2308→~1180.
+liveness-bound (~1550) under the grouped-memory lookup.
 
 Performance: the analytic weights are ~99.9% zeros, so inference runs the
-identical linear maps sparsely.  Three interchangeable execution paths
-produce byte-identical traces (every FFN value is a dyadic rational, so
-float64 sums are exact under any association):
+identical linear maps sparsely.  The C++ engine is the production default;
+dense and scipy-sparse paths remain useful diagnostics:
 
 | `--matmul` | What runs | Speed (instr/s) |
 |------------|-----------|-----------------|
-| `dense` | dense torch matvecs, per-layer Python loop | ~0.13 |
+| `dense` | dense torch matvecs, per-layer Python loop; float64 diagnostic | ~0.13 |
 | `sparse` | scipy CSR matvecs, per-layer Python loop | ~30–95 |
-| `engine` | `model/weights_engine.cpp`: whole 66-layer stack per pybind call — CSR matvecs, hull attention for lookup heads, attend-to-self shortcut for passthrough heads (their key is 2·pos, so the argmax is provably the latest token) | ~800–2300 |
+| `engine` | `model/weights_engine.cpp`: whole stack per pybind call — float32 CSR matvecs, shared hull attention for lookup heads, attend-to-self shortcut for passthrough heads (their key is 2·pos, so the argmax is provably the latest token) | ~5K after boot |
 
 With the engine, **the full 8,991-instruction nestest suite runs through
-the actual transformer weights in ~11 s** (`6502-nestest --runner
-weights`), a 200K-instruction Klaus prefix lockstep-matches in ~86 s with
-decimal mode (full Klaus ≈ 3.7 h — overnight territory), and
+the actual transformer weights in ~6 s** (`6502-nestest --runner
+weights`), and a 20K-instruction Klaus prefix lockstep-matches with
+decimal mode in ~12.5 s including boot.  Longer Klaus runs still need
+weights-runner checkpointing to keep hull logs bounded.  The NES command
 `nes-run --warmup-frames 60 --backend weights` renders an SMB frame
 through the weights in ~10 s, byte-identical to the C++ kernel's.
 
-Precision: float64 is needed in exactly one place — the K-side score
-construction (`ky = -k² + …` reaches ~2³² with a discrimination gap of 1;
-float32's ulp there is 512).  Measured: a low-address program matches
-fully under `dtype="float32"`, while nestest (code at `$C000`) diverges
-at step 0.  The residual/FFN side is float32-safe (all values are dyadic
-rationals < 2²⁴), and score ties that float32 collapses are still
-resolved correctly by the hull's sequence tie-break.  A GPU port (MPS has
-no float64) therefore requires rescaling the lookup-key construction so
-scores stay below 2²⁴ — future work, alongside batching many machines
-(GPUs buy throughput across instances, not latency on one autoregressive
-stream).
+Precision: the original scalar 16-bit lookup needed float64 because
+`ky = -k² + ...` reached ~2³² with an adjacent-address gap of 1.  `_memory_at`
+now splits memory into 16 x 4 KiB lookup groups, so each local parabola is
+12-bit and K-side address scores stay below 2²⁴.  The default
+`dtype="float32"` engine matches high-address nestest end-to-end; hull
+sequence tie-breaks still resolve same-address rewrites.  True softmax
+remains separate because exact ties are averaged instead of resolved by
+sequence.
 
 Two departures from the WASM construction, both documented in the module:
 STATE tokens carry ~20 wide-domain fields, so the harness builds each
