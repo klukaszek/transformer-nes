@@ -51,9 +51,10 @@ uv run nes-run path/to/rom.nes --frames 120 --out frame.ppm
 | `6502-transformer` | Run the 6502 as real transformer weights, lockstep vs the reference |
 | `nes-run` | Run an NES ROM (NROM) on the console layer: PPU, NMI, DMA, controllers |
 
-The 6502 machine — execution model, the three verified backends, the
+The 6502 machine — execution model, the four verified backends, the
 compilation pipeline, the MMIO/NMI layer, and the numerics rules — is
 documented in [`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).
+Current status and prioritized next steps live in [`ROADMAP.md`](ROADMAP.md).
 
 ## Layout
 
@@ -120,12 +121,13 @@ query — critical for runs of millions of instructions.
 gates to 66 layers, `model/weights.py` constructs `VanillaTransformer`
 weights analytically (d_model≈1470, ~730 heads, no training, ~10 s), and
 inference is genuine — Q/K/V projections, attention (hull hardmax or true
-softmax), ReGLU FFN, residual stream — run through sparse CSR matvecs at
-~30–95 instructions/s.  **The full 8,991-instruction nestest suite passes
-through the weights in ~5 minutes**, a Klaus prefix lockstep-matches with
-decimal mode, and the NES console can hand a running game off to the
-weights backend mid-play (`nes-run --warmup-frames 60 --backend weights`
-renders an SMB frame byte-identical to the C++ kernel's).  See
+softmax), ReGLU FFN, residual stream — run by a sparse C++ engine at
+~800–2300 instructions/s.  **The full 8,991-instruction nestest suite
+passes through the weights in ~11 seconds**, a 200K-instruction Klaus
+prefix lockstep-matches with decimal mode, and the NES console can hand a
+running game off to the weights backend mid-play
+(`nes-run --warmup-frames 60 --backend weights` renders an SMB frame
+byte-identical to the C++ kernel's, in ~10 s).  See
 [`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).
 
 ## Development

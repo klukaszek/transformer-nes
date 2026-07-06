@@ -56,7 +56,7 @@ class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
     def __init__(self, *, bcd: bool = False, cache: str = "hull",
-                 matmul: str = "sparse"):
+                 matmul: str = "sparse", dtype: str = "float64"):
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
         self.rt = Cpu6502Runtime(bcd=bcd)
@@ -93,7 +93,9 @@ class Cpu6502TransformerMachine:
         self._halt_row = tok_to_idx["HALT"]
 
         n_heads = self.model.attn[0].num_heads
-        if cache == "hull":
+        if matmul == "engine":
+            self.cache = None  # attention state lives inside the C++ engine
+        elif cache == "hull":
             self.cache = HullKVCache(self.n_layers, n_heads)
             for layer_idx in range(self.n_layers):
                 for h in range(n_heads):
@@ -106,8 +108,32 @@ class Cpu6502TransformerMachine:
         else:
             raise ValueError(f"unknown cache {cache!r}")
 
+        # Precision experiment knob (sparse path only).  float32 keeps the
+        # residual/FFN exact (all values are dyadic rationals < 2^24) and
+        # the hull still resolves recency ties by sequence, but the K-side
+        # score construction (ky = -k^2 + ...) needs sub-unit discrimination
+        # at magnitudes up to 2^32 -- float32's ulp there is 512, so reads
+        # of high addresses scramble.  float64 is required end-to-end only
+        # because of that score range; see the README numerics note.
+        if dtype not in ("float64", "float32"):
+            raise ValueError(f"unknown dtype {dtype!r}")
+        if dtype == "float32" and matmul != "sparse":
+            raise ValueError("dtype=float32 is only wired into the sparse path")
+        self.np_dtype = np.float32 if dtype == "float32" else np.float64
+
         self.matmul = matmul
-        if matmul == "sparse":
+        if matmul == "engine":
+            # Whole layer stack per pybind call; hull attention for lookup
+            # heads and the provable attend-to-self shortcut for
+            # passthrough heads live in C++ (model/weights_engine.cpp).
+            from transformer_vm.model.engine import SparseWeightsEngine
+
+            if cache != "hull":
+                raise ValueError("matmul='engine' has hull attention built in")
+            if dtype != "float64":
+                raise ValueError("matmul='engine' is float64 only")
+            self._engine = SparseWeightsEngine(self.model)
+        elif matmul == "sparse":
             # The analytic weights are ~99.9% zeros; CSR matvecs run the
             # identical linear maps orders of magnitude faster.  All FFN
             # and value entries are dyadic rationals, so float64 sums are
@@ -115,10 +141,10 @@ class Cpu6502TransformerMachine:
             # the same trace as the dense one (asserted in tests).
             self._layers = []
             for layer_idx in range(self.n_layers):
-                ip = sp.csr_matrix(self.model.attn[layer_idx].in_proj_weight.numpy())
-                opw = sp.csr_matrix(self.model.attn[layer_idx].out_proj.weight.numpy())
-                fi = sp.csr_matrix(self.model.ff_in[layer_idx].weight.numpy())
-                fo = sp.csr_matrix(self.model.ff_out[layer_idx].weight.numpy())
+                ip = sp.csr_matrix(self.model.attn[layer_idx].in_proj_weight.numpy().astype(self.np_dtype))
+                opw = sp.csr_matrix(self.model.attn[layer_idx].out_proj.weight.numpy().astype(self.np_dtype))
+                fi = sp.csr_matrix(self.model.ff_in[layer_idx].weight.numpy().astype(self.np_dtype))
+                fo = sp.csr_matrix(self.model.ff_out[layer_idx].weight.numpy().astype(self.np_dtype))
                 self._layers.append((ip, opw, fi, fo))
         elif matmul != "dense":
             raise ValueError(f"unknown matmul {matmul!r}")
@@ -133,6 +159,9 @@ class Cpu6502TransformerMachine:
         """One genuine transformer position: attention + ReGLU per layer."""
         add_position_encoding(x, self.pos)
         self.pos += 1
+        if self.matmul == "engine":
+            self._engine.forward(x.numpy())  # in place, whole stack
+            return x
         if self.matmul == "sparse":
             return self._forward_sparse(x)
         model = self.model
@@ -148,21 +177,24 @@ class Cpu6502TransformerMachine:
 
     def _forward_sparse(self, x: torch.Tensor) -> torch.Tensor:
         """The same layer stack through CSR matvecs."""
-        xv = x.numpy()
+        xv = x.numpy().astype(self.np_dtype, copy=False)
         d = self.d_model
         for layer_idx, (ip, opw, fi, fo) in enumerate(self._layers):
             qkv = ip @ xv
+            # Scores are always computed in double inside the caches; in
+            # float32 mode the rounding damage to K/Q happened in the
+            # matvec above, which is exactly what the experiment measures.
             out = self.cache.layer_step(
                 layer_idx,
-                torch.from_numpy(qkv[d:2 * d]),
-                torch.from_numpy(qkv[:d]),
-                torch.from_numpy(qkv[2 * d:]),
+                torch.from_numpy(qkv[d:2 * d].astype(np.float64, copy=False)),
+                torch.from_numpy(qkv[:d].astype(np.float64, copy=False)),
+                torch.from_numpy(qkv[2 * d:].astype(np.float64, copy=False)),
             )
-            xv = xv + opw @ out.numpy()
+            xv = xv + opw @ out.numpy().astype(self.np_dtype, copy=False)
             gv = fi @ xv
             half = gv.shape[0] // 2
             xv = xv + fo @ (np.maximum(gv[:half], 0.0) * gv[half:])
-        return torch.from_numpy(xv)
+        return torch.from_numpy(xv.astype(np.float64, copy=False))
 
     def _embed(self, values: dict) -> torch.Tensor:
         """Input embedding for one token: dim values at their slots.
@@ -184,6 +216,13 @@ class Cpu6502TransformerMachine:
     # bus's GraphCore adapter can drive this machine unchanged) ──────
 
     def boot_image(self, memory_image, *, start_pc: int, state: dict | None = None):
+        # Fresh token log: clear attention state so a machine can be reused.
+        if self.matmul == "engine":
+            self._engine.reset()
+        else:
+            self.cache.clear()
+        self.pos = 0
+        self._trace_len = 0
         rt = self.rt
         self._forward(self._embed({
             rt.start_pc_lo: start_pc & 0xFF,
@@ -340,7 +379,7 @@ def main() -> None:
     )
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--cache", choices=["hull", "standard"], default="hull")
-    parser.add_argument("--matmul", choices=["sparse", "dense"], default="sparse")
+    parser.add_argument("--matmul", choices=["engine", "sparse", "dense"], default="engine")
     args = parser.parse_args()
 
     machine = Cpu6502TransformerMachine(bcd=False, cache=args.cache, matmul=args.matmul)

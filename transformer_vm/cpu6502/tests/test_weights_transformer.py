@@ -35,7 +35,7 @@ def _lockstep_vs_reference(trace, image):
 
 @pytest.mark.slow
 def test_transformer_weights_match_reference():
-    machine = Cpu6502TransformerMachine(bcd=False, cache="hull", matmul="sparse")
+    machine = Cpu6502TransformerMachine(bcd=False, cache="hull", matmul="engine")
     image = verify_program()
     trace = machine.run_image(image, start_pc=VERIFY_START, max_steps=30)
     assert len(trace.rows) == 30
@@ -43,17 +43,19 @@ def test_transformer_weights_match_reference():
 
 
 @pytest.mark.slow
-def test_sparse_and_dense_paths_produce_identical_traces():
-    """CSR matvecs are a storage change, not a semantics change."""
+def test_all_matmul_paths_produce_identical_traces():
+    """CSR matvecs and the C++ engine are storage/dispatch changes, not
+    semantics changes: dense torch, scipy CSR, and the engine must agree."""
     image = verify_program()
-    sparse = Cpu6502TransformerMachine(bcd=False, cache="hull", matmul="sparse")
-    sparse_trace = sparse.run_image(image, start_pc=VERIFY_START, max_steps=10)
-    dense = Cpu6502TransformerMachine(bcd=False, cache="hull", matmul="dense")
-    dense_trace = dense.run_image(image, start_pc=VERIFY_START, max_steps=10)
-    for a, b in zip(sparse_trace.rows, dense_trace.rows, strict=True):
-        assert a.state == b.state
-        assert a.writes == b.writes
-    _lockstep_vs_reference(sparse_trace, image)
+    traces = {}
+    for matmul in ("dense", "sparse", "engine"):
+        machine = Cpu6502TransformerMachine(bcd=False, cache="hull", matmul=matmul)
+        traces[matmul] = machine.run_image(image, start_pc=VERIFY_START, max_steps=10)
+    for other in ("sparse", "engine"):
+        for a, b in zip(traces["dense"].rows, traces[other].rows, strict=True):
+            assert a.state == b.state, other
+            assert a.writes == b.writes, other
+    _lockstep_vs_reference(traces["engine"], image)
 
 
 @pytest.mark.slow

@@ -566,6 +566,15 @@ def build_model(
     model.attn_erase = [sorted(erased_at[(li, 1)]) for li in range(n_layers)]
     model.ffn_erase = [sorted(erased_at[(li, 3)]) for li in range(n_layers)]
     model.head_tiebreak = all_tiebreak
+    # Head classification per layer (0 unused, 1 lookup, 2 passthrough).
+    # Passthrough/erase heads provably attend to self (their key is 2*pos,
+    # strictly increasing), which lets a fast engine skip their hulls.
+    model.head_kinds = []
+    for layer_idx in range(n_layers):
+        kinds = [0] * n_heads
+        for h, info in head_map.get(layer_idx, {}).items():
+            kinds[h] = 1 if info["type"] == "lookup" else 2
+        model.head_kinds.append(kinds)
 
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
     logger.info(

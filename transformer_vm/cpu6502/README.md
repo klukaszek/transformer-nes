@@ -54,7 +54,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `kernel.py` (generated C++) | ~450–600K | Same semantics at NES-relevant speed |
-| `weights_runner.py` (real transformer) | ~30-95 | The thesis: actual softmax-ReGLU transformer weights |
+| `weights_runner.py` (real transformer) | ~800-2300 | The thesis: actual softmax-ReGLU transformer weights |
 
 The Python and C++ backends are **bit-identical**: same IEEE double
 operations in the same order, the same hull code (`hull2d_cht.h`), the same
@@ -84,16 +84,34 @@ layer and d_model becomes head-bound at 1800; leveled, it is
 liveness-bound (~1470) and d_ffn drops 2308→~1180.
 
 Performance: the analytic weights are ~99.9% zeros, so inference runs the
-identical linear maps as `scipy` CSR matvecs (`--matmul dense` keeps the
-dense-torch path; both produce byte-identical traces — every FFN value is
-a dyadic rational, so float64 sums are exact under any association).
-Sparse + balanced schedule took the machine from 0.13 to ~30–95
-instructions/s: **the full 8,991-instruction nestest suite runs through
-the actual transformer weights in ~5 minutes, matching the reference
-exactly** (`6502-nestest --runner weights`; `6502-klaus --runner weights`
-lockstep-verifies a Klaus prefix with decimal mode).  The NES console can
-even hand a running game off to the weights backend mid-play
-(`nes-run --warmup-frames 60 --backend weights`).
+identical linear maps sparsely.  Three interchangeable execution paths
+produce byte-identical traces (every FFN value is a dyadic rational, so
+float64 sums are exact under any association):
+
+| `--matmul` | What runs | Speed (instr/s) |
+|------------|-----------|-----------------|
+| `dense` | dense torch matvecs, per-layer Python loop | ~0.13 |
+| `sparse` | scipy CSR matvecs, per-layer Python loop | ~30–95 |
+| `engine` | `model/weights_engine.cpp`: whole 66-layer stack per pybind call — CSR matvecs, hull attention for lookup heads, attend-to-self shortcut for passthrough heads (their key is 2·pos, so the argmax is provably the latest token) | ~800–2300 |
+
+With the engine, **the full 8,991-instruction nestest suite runs through
+the actual transformer weights in ~11 s** (`6502-nestest --runner
+weights`), a 200K-instruction Klaus prefix lockstep-matches in ~86 s with
+decimal mode (full Klaus ≈ 3.7 h — overnight territory), and
+`nes-run --warmup-frames 60 --backend weights` renders an SMB frame
+through the weights in ~10 s, byte-identical to the C++ kernel's.
+
+Precision: float64 is needed in exactly one place — the K-side score
+construction (`ky = -k² + …` reaches ~2³² with a discrimination gap of 1;
+float32's ulp there is 512).  Measured: a low-address program matches
+fully under `dtype="float32"`, while nestest (code at `$C000`) diverges
+at step 0.  The residual/FFN side is float32-safe (all values are dyadic
+rationals < 2²⁴), and score ties that float32 collapses are still
+resolved correctly by the hull's sequence tie-break.  A GPU port (MPS has
+no float64) therefore requires rescaling the lookup-key construction so
+scores stay below 2²⁴ — future work, alongside batching many machines
+(GPUs buy throughput across instances, not latency on one autoregressive
+stream).
 
 Two departures from the WASM construction, both documented in the module:
 STATE tokens carry ~20 wide-domain fields, so the harness builds each

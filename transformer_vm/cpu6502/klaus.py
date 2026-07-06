@@ -153,7 +153,7 @@ def run_weights(image: bytes, *, max_steps: int) -> tuple[bool, int, float, floa
     from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
-    machine = Cpu6502TransformerMachine(bcd=True, cache="hull", matmul="sparse")
+    machine = Cpu6502TransformerMachine(bcd=True, cache="hull", matmul="engine")
     build_elapsed = time.perf_counter() - build_start
 
     run_start = time.perf_counter()
