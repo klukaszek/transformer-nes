@@ -54,7 +54,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `kernel.py` (generated C++) | ~450–600K | Same semantics at NES-relevant speed |
-| `weights_runner.py` (real transformer) | ~7-8K after boot | The thesis: actual softmax-ReGLU transformer weights |
+| `weights_runner.py` (real transformer) | ~8-9K after boot | The thesis: actual softmax-ReGLU transformer weights |
 
 The Python and C++ backends are **bit-identical**: same IEEE double
 operations in the same order, the same hull code (`hull2d_cht.h`), the same
@@ -92,12 +92,12 @@ dense and scipy-sparse paths remain useful diagnostics:
 |------------|-----------|-----------------|
 | `dense` | dense torch matvecs, per-layer Python loop; float64 diagnostic | ~0.13 |
 | `sparse` | scipy CSR matvecs, per-layer Python loop | ~30–95 |
-| `engine` | `model/weights_engine.cpp`: whole stack per pybind call — float32 CSR matvecs, shared hull attention for lookup heads, direct WRITE-token insertion, and structural fusion of passthrough/erase paths into direct CSR residual deltas | ~7-8K after boot |
+| `engine` | `model/weights_engine.cpp`: whole stack per pybind call — float32 CSR matvecs, shared hull attention for lookup heads, direct WRITE-token insertion, structural fusion of passthrough/erase paths into direct CSR residual deltas, and NumPy readout on the fp32 engine path | ~8-9K after boot |
 
 With the engine, **the full 8,991-instruction nestest suite runs through
-the actual transformer weights in ~1-2 s** (`6502-nestest --runner
+the actual transformer weights in ~1.1 s** (`6502-nestest --runner
 weights`), and a 20K-instruction Klaus prefix lockstep-matches with
-decimal mode in ~2-3 s including boot.  Longer Klaus runs still need
+decimal mode in ~2.4 s including boot.  Longer Klaus runs still need
 weights-runner checkpointing to keep hull logs bounded.  The NES command
 `nes-run --warmup-frames 60 --backend weights` renders an SMB frame
 through the weights in ~10 s, byte-identical to the C++ kernel's.

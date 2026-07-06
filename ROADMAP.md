@@ -15,7 +15,7 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~7-8K after boot | default fp32 engine; full nestest MATCHED in ~1.2 s; Klaus 20K prefix MATCHED |
+| `cpu6502/weights_runner.py` (real transformer) | ~8-9K after boot | default fp32 engine; full nestest MATCHED in ~1.1 s; Klaus 20K prefix MATCHED |
 
 The weights transformer is genuine inference (d_model≈1550, 71 layers,
 analytic weights, no training).  The default path is the float32 C++ engine
@@ -138,10 +138,10 @@ What was checked:
     command buffer 1.69 us/mv.
   - `L52.out_proj` (1554x1554, nnz=32): scipy CSR 1.64 us/mv; Metal
     wait-each 98 us/mv; one-command-buffer 1.95 us/mv.
-- Current fused CPU engine raw `_forward` on a synthetic STATE token is
-  ~93.7 us/position (~10.7K positions/s), while full machine stepping is
-  ~7.4-7.7K instr/s because Python still assembles/readbacks state and
-  emits writes.
+- At the time of the probe, the fused CPU engine raw `_forward` on a
+  synthetic STATE token was ~93.7 us/position (~10.7K positions/s), while
+  full machine stepping was ~7.4-7.7K instr/s because Python still
+  assembled/read back state and emitted writes.
 
 Implication:
 - Naive per-matrix GPU CSR is not viable for one NES stream: one
@@ -155,6 +155,26 @@ Implication:
   (mostly +/-1 coefficients, many singleton rows) and from moving state
   readout/next-state assembly out of Python; those are likely better
   single-stream targets than unfused GPU CSR.
+
+## 2026-07-06 engine readout/copy optimization
+
+Tracked in jj:
+- `svuxuxsq` — avoid fp32 engine readout copy
+
+What was tried:
+- The engine `_forward` path used to convert the whole fp32 residual vector
+  back to float64 torch after every C++ forward, only so `machine_step`
+  could index readout fields and run the tiny output head.
+- The engine path now keeps the C++ result as a NumPy array, caches readout
+  slots, and compares STATE/HALT using sparse output-head rows instead of
+  `self.model.head(h)`.
+
+Result:
+- Weights tests pass.
+- Full nestest remains exact and improves to ~1.1 s / ~8.5K instr/s.
+- Klaus 20K remains exact and improves to ~2.4 s / ~8.4K instr/s.
+- Raw `_forward` stays ~95 us including embedding; this was surrounding
+  Python overhead, not a C++ matvec breakthrough.
 
 ## Prioritized next steps
 

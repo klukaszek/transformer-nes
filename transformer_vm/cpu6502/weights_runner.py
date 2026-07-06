@@ -90,6 +90,10 @@ class Cpu6502TransformerMachine:
         self.d_model = shared[9]
         self._state_row = tok_to_idx["STATE"]
         self._halt_row = tok_to_idx["HALT"]
+        self._read_slots = {
+            name: self.slot_of[self._dim_by_name[name]]
+            for name in _RUNTIME_READ_DIMS
+        }
 
         n_heads = self.model.attn[0].num_heads
         if matmul == "engine":
@@ -115,12 +119,14 @@ class Cpu6502TransformerMachine:
         self.dtype = dtype
         self.np_dtype = np.float32 if dtype == "float32" else np.float64
         self.torch_dtype = torch.float32 if dtype == "float32" else torch.float64
+        self._state_head_cols, self._state_head_vals = self._head_row(self._state_row)
+        self._halt_head_cols, self._halt_head_vals = self._head_row(self._halt_row)
 
         self.matmul = matmul
         if matmul == "engine":
-            # Whole layer stack per pybind call; hull attention for lookup
-            # heads and the provable attend-to-self shortcut for
-            # passthrough heads live in C++ (model/weights_engine.cpp).
+            # Whole layer stack per pybind call; hull attention and
+            # structural passthrough fusion live in C++
+            # (model/weights_engine.cpp).
             from transformer_vm.model.engine import SparseWeightsEngine
 
             if cache != "hull":
@@ -150,14 +156,14 @@ class Cpu6502TransformerMachine:
     # ── Transformer plumbing ────────────────────────────────────────
 
     @torch.no_grad()
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward(self, x: torch.Tensor) -> torch.Tensor | np.ndarray:
         """One genuine transformer position: attention + ReGLU per layer."""
         add_position_encoding(x, self.pos)
         self.pos += 1
         if self.matmul == "engine":
             xv = x.numpy().astype(self.np_dtype, copy=False)
             self._engine.forward(xv)  # in place, whole stack
-            return torch.from_numpy(xv.astype(np.float64, copy=False))
+            return xv
         if self.matmul == "sparse":
             return self._forward_sparse(x)
         model = self.model
@@ -205,8 +211,20 @@ class Cpu6502TransformerMachine:
             x[self.slot_of[dim]] = float(value)
         return x
 
-    def _read(self, h: torch.Tensor, name: str) -> float:
-        return float(h[self.slot_of[self._dim_by_name[name]]])
+    def _head_row(self, row: int) -> tuple[np.ndarray, np.ndarray]:
+        w = self.model.head.weight[row].detach().numpy()
+        cols = np.nonzero(w)[0].astype(np.int32)
+        return cols, w[cols].astype(self.np_dtype, copy=False)
+
+    def _head_logit(self, h: np.ndarray, cols: np.ndarray, vals: np.ndarray) -> float:
+        return float(np.dot(h[cols], vals))
+
+    def _read(self, h: torch.Tensor | np.ndarray, name: str) -> float:
+        slot = self._read_slots.get(name)
+        if slot is None:
+            slot = self.slot_of[self._dim_by_name[name]]
+            self._read_slots[name] = slot
+        return float(h[slot])
 
     # ── Machine protocol (mirrors evaluator.Cpu6502Runtime, so the NES
     # bus's GraphCore adapter can drive this machine unchanged) ──────
@@ -322,8 +340,14 @@ class Cpu6502TransformerMachine:
             ir=s.ir, oplo=s.operand_lo, ophi=s.operand_hi,
             ea=s.ea, data=s.data, halted=1 if s.halted else 0,
         )
-        logits = self.model.head(h)
-        if halted or float(logits[self._halt_row]) > float(logits[self._state_row]):
+        if self.matmul == "engine":
+            halt_logit = self._head_logit(h, self._halt_head_cols, self._halt_head_vals)
+            state_logit = self._head_logit(h, self._state_head_cols, self._state_head_vals)
+        else:
+            logits = self.model.head(h)
+            halt_logit = float(logits[self._halt_row])
+            state_logit = float(logits[self._state_row])
+        if halted or halt_logit > state_logit:
             self.machine_halted = True
         return row
 
