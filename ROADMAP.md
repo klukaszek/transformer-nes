@@ -15,7 +15,7 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~8-9K after boot | default fp32 engine; full nestest MATCHED in ~1.1 s; Klaus 20K prefix MATCHED |
+| `cpu6502/weights_runner.py` (real transformer) | ~10-11K after boot | default fp32 engine; full nestest MATCHED in ~0.8 s; Klaus 20K prefix MATCHED |
 
 The weights transformer is genuine inference (d_model≈1550, 71 layers,
 analytic weights, no training).  The default path is the float32 C++ engine
@@ -175,6 +175,26 @@ Result:
 - Klaus 20K remains exact and improves to ~2.4 s / ~8.4K instr/s.
 - Raw `_forward` stays ~95 us including embedding; this was surrounding
   Python overhead, not a C++ matvec breakthrough.
+
+## 2026-07-06 engine NumPy embedding optimization
+
+Tracked in jj:
+- `uvyvnukm` — use NumPy embeddings for engine tokens
+
+What was tried:
+- The previous engine path still built every START/STATE/full-WRITE token
+  as a torch tensor, then took a NumPy view before entering C++.  A direct
+  engine-only NumPy embedding path now fills the residual slots, applies
+  the three position features, and calls the C++ engine without touching
+  torch.  Dense/sparse diagnostic paths still use the original torch
+  `_embed`/`_forward` flow.
+
+Result:
+- Weights tests pass.
+- Full nestest remains exact and improves to ~0.8 s / ~10.9K instr/s.
+- Klaus 20K remains exact and improves to ~1.9 s / ~10.6K instr/s.
+- Synthetic `_forward_values` is ~75.8 us (~13.2K positions/s), much
+  closer to direct C++ engine forward (~68.6 us in the earlier probe).
 
 ## Prioritized next steps
 

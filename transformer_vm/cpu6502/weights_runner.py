@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import time
 
 import numpy as np
@@ -94,6 +95,7 @@ class Cpu6502TransformerMachine:
             name: self.slot_of[self._dim_by_name[name]]
             for name in _RUNTIME_READ_DIMS
         }
+        self._one_slot = self.slot_of[self.rt._one]
 
         n_heads = self.model.attn[0].num_heads
         if matmul == "engine":
@@ -198,6 +200,26 @@ class Cpu6502TransformerMachine:
             xv = xv + fo @ (np.maximum(gv[:half], 0.0) * gv[half:])
         return torch.from_numpy(xv.astype(np.float64, copy=False))
 
+    def _embed_array(self, values: dict) -> np.ndarray:
+        """Engine input embedding without constructing a torch tensor."""
+        x = np.zeros(self.d_model, dtype=self.np_dtype)
+        x[self._one_slot] = 1.0
+        for dim, value in values.items():
+            x[self.slot_of[dim]] = float(value)
+        return x
+
+    def _forward_values(self, values: dict) -> torch.Tensor | np.ndarray:
+        if self.matmul != "engine":
+            return self._forward(self._embed(values))
+        x = self._embed_array(values)
+        pos = self.pos
+        x[0] += pos
+        x[1] += 1.0 / math.log(2.0) - 1.0 / math.log(pos + 2.0)
+        x[2] += pos * pos
+        self.pos += 1
+        self._engine.forward(x)
+        return x
+
     def _embed(self, values: dict) -> torch.Tensor:
         """Input embedding for one token: dim values at their slots.
 
@@ -238,11 +260,11 @@ class Cpu6502TransformerMachine:
         self.pos = 0
         self._trace_len = 0
         rt = self.rt
-        self._forward(self._embed({
+        self._forward_values({
             rt.start_pc_lo: start_pc & 0xFF,
             rt.start_pc_hi: (start_pc >> 8) & 0xFF,
             rt.is_start: 1,
-        }))
+        })
         for addr, byte in enumerate(memory_image):
             if byte:
                 self._insert_write(addr, byte)
@@ -273,12 +295,12 @@ class Cpu6502TransformerMachine:
             self.pos += 1
             return
         rt = self.rt
-        self._forward(self._embed({
+        self._forward_values({
             rt.byte_value: value & 0xFF,
             rt.is_memory_write: 1,
             rt.addr_lo: addr & 0xFF,
             rt.addr_hi: (addr >> 8) & 0xFF,
-        }))
+        })
 
     def machine_step(self) -> TraceRow:
         rt = self.rt
@@ -287,7 +309,7 @@ class Cpu6502TransformerMachine:
         nmi = 1 if self._nmi_pending else 0
         self._nmi_pending = False
         flag = Cpu6502Runtime._flag_bit
-        h = self._forward(self._embed({
+        h = self._forward_values({
             rt.is_state: 1,
             rt.in_pc_lo: st["pc"] & 0xFF,
             rt.in_pc_hi: (st["pc"] >> 8) & 0xFF,
@@ -300,7 +322,7 @@ class Cpu6502TransformerMachine:
             rt.in_ea_lo: st["ea"] & 0xFF, rt.in_ea_hi: (st["ea"] >> 8) & 0xFF,
             rt.in_data: st["data"], rt.in_halted: st["halted"],
             rt.in_nmi: nmi,
-        }))
+        })
 
         def read(name, mask):
             return int(round(self._read(h, name))) & mask
