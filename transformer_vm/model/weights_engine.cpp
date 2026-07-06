@@ -22,6 +22,8 @@
 
 namespace py = pybind11;
 
+static constexpr double LATEST_ALPHA = 0.3;
+
 using DArr = py::array_t<double, py::array::c_style | py::array::forcecast>;
 using FArr = py::array_t<float, py::array::c_style | py::array::forcecast>;
 using IArr = py::array_t<int, py::array::c_style | py::array::forcecast>;
@@ -33,18 +35,13 @@ struct Csr {
     std::vector<int> single_rows, multi_rows;
     int rows = 0, cols = 0;
 
-    void load(const IArr& p, const IArr& i, const DArr& d, int r, int c) {
-        indptr.assign(p.data(), p.data() + p.size());
-        indices.assign(i.data(), i.data() + i.size());
-        data.assign(d.data(), d.data() + d.size());
-        data_f32.assign(data.begin(), data.end());
-        rows = r;
-        cols = c;
+    void build_row_lists(const std::vector<char>* skip_rows = nullptr) {
         single_rows.clear();
         multi_rows.clear();
         single_rows.reserve(rows);
         multi_rows.reserve(rows);
         for (int row = 0; row < rows; ++row) {
+            if (skip_rows != nullptr && (*skip_rows)[row]) continue;
             const int nnz = indptr[row + 1] - indptr[row];
             if (nnz == 1) {
                 single_rows.push_back(row);
@@ -52,6 +49,21 @@ struct Csr {
                 multi_rows.push_back(row);
             }
         }
+    }
+
+    void load(const IArr& p, const IArr& i, const DArr& d, int r, int c) {
+        indptr.assign(p.data(), p.data() + p.size());
+        indices.assign(i.data(), i.data() + i.size());
+        data.assign(d.data(), d.data() + d.size());
+        data_f32.assign(data.begin(), data.end());
+        rows = r;
+        cols = c;
+        build_row_lists();
+    }
+
+    void skip_rows(const std::vector<char>& skip) {
+        if ((int)skip.size() != rows) throw std::runtime_error("skip row mask has wrong size");
+        build_row_lists(&skip);
     }
 
     // y = A x
@@ -113,6 +125,9 @@ struct Layer {
     Csr in_proj, out_proj, ff_in, ff_out;
     std::vector<int> head_kind;                    // 0 unused, 1 lookup, 2 passthrough
     std::vector<int> tiebreak;                     // 1 = LATEST (lookup heads)
+    std::vector<int> lookup_heads;
+    std::vector<int> passthrough_heads;
+    std::vector<std::vector<int>> memory_heads_by_group;
     std::vector<HardAttentionHead> hulls;          // shared by lookup heads with identical K/V
     std::vector<int> hull_of_head;                 // head -> hull index or -1
     std::vector<long> hull_insert_seq;             // hull index -> last token seq inserted
@@ -131,28 +146,53 @@ struct WeightsEngine {
                    IArr op_p, IArr op_i, DArr op_d,
                    IArr fi_p, IArr fi_i, DArr fi_d,
                    IArr fo_p, IArr fo_i, DArr fo_d,
-                   int ffn, IArr kinds, IArr latest, IArr cache_groups) {
+                   int ffn, IArr kinds, IArr latest, IArr cache_groups, IArr memory_groups) {
         layers.emplace_back();
         Layer& L = layers.back();
-        L.in_proj.load(ip_p, ip_i, ip_d, 3 * d_model, d_model);
-        L.out_proj.load(op_p, op_i, op_d, d_model, d_model);
-        L.ff_in.load(fi_p, fi_i, fi_d, 2 * ffn, d_model);
-        L.ff_out.load(fo_p, fo_i, fo_d, d_model, ffn);
         L.head_kind.assign(kinds.data(), kinds.data() + kinds.size());
         L.tiebreak.assign(latest.data(), latest.data() + latest.size());
         std::vector<int> groups(cache_groups.data(), cache_groups.data() + cache_groups.size());
+        std::vector<int> mem_groups(memory_groups.data(), memory_groups.data() + memory_groups.size());
         if ((int)L.head_kind.size() != n_heads)
             throw std::runtime_error("head_kind size != n_heads");
         if ((int)groups.size() != n_heads)
             throw std::runtime_error("cache_group size != n_heads");
+        if ((int)mem_groups.size() != n_heads)
+            throw std::runtime_error("memory_group size != n_heads");
+
+        L.in_proj.load(ip_p, ip_i, ip_d, 3 * d_model, d_model);
+        L.out_proj.load(op_p, op_i, op_d, d_model, d_model);
+        L.ff_in.load(fi_p, fi_i, fi_d, 2 * ffn, d_model);
+        L.ff_out.load(fo_p, fo_i, fo_d, d_model, ffn);
+
+        // The engine implements passthrough heads directly from V, so their
+        // Q/K rows are dead work in this backend.
+        std::vector<char> skip_ip_rows(3 * d_model, 0);
+        for (int h = 0; h < n_heads; ++h) {
+            if (L.head_kind[h] != 2) continue;
+            skip_ip_rows[2 * h] = 1;
+            skip_ip_rows[2 * h + 1] = 1;
+            skip_ip_rows[d_model + 2 * h] = 1;
+            skip_ip_rows[d_model + 2 * h + 1] = 1;
+        }
+        L.in_proj.skip_rows(skip_ip_rows);
+        L.memory_heads_by_group.assign(16, {});
         L.hull_of_head.assign(n_heads, -1);
         int max_group = -1;
         for (int h = 0; h < n_heads; ++h) {
-            if (L.head_kind[h] == 1) max_group = std::max(max_group, groups[h]);
+            if (L.head_kind[h] == 1) {
+                L.lookup_heads.push_back(h);
+                max_group = std::max(max_group, groups[h]);
+                if (mem_groups[h] >= 0) {
+                    if (mem_groups[h] >= 16) throw std::runtime_error("memory group out of range");
+                    L.memory_heads_by_group[mem_groups[h]].push_back(h);
+                }
+            } else if (L.head_kind[h] == 2) {
+                L.passthrough_heads.push_back(h);
+            }
         }
         std::vector<int> hull_of_group(max_group + 1, -1);
-        for (int h = 0; h < n_heads; ++h) {
-            if (L.head_kind[h] != 1) continue;
+        for (int h : L.lookup_heads) {
             const int group = groups[h];
             if (group < 0) throw std::runtime_error("lookup head has negative cache group");
             if (hull_of_group[group] < 0) {
@@ -191,32 +231,25 @@ struct WeightsEngine {
             const double* q = qkv.data();
             const double* k = qkv.data() + d_model;
             const double* v = qkv.data() + 2 * d_model;
-            for (int h = 0; h < n_heads; ++h) {
+            for (int h : L.lookup_heads) {
                 double* out = head_out.data() + 2 * h;
-                switch (L.head_kind[h]) {
-                    case 1: {  // lookup: genuine hull hard-attention
-                        const int hull_idx = L.hull_of_head[h];
-                        HardAttentionHead& hull = L.hulls[hull_idx];
-                        if (L.hull_insert_seq[hull_idx] != seq) {
-                            const double key[2] = {k[2 * h], k[2 * h + 1]};
-                            const double val[2] = {v[2 * h], v[2 * h + 1]};
-                            hull.insert(key, val, seq);
-                            L.hull_insert_seq[hull_idx] = seq;
-                        }
-                        const double query[2] = {q[2 * h], q[2 * h + 1]};
-                        out[0] = 0.0;
-                        out[1] = 0.0;
-                        hull.query(query, L.tiebreak[h] ? TieBreak::LATEST : TieBreak::AVERAGE, out);
-                        break;
-                    }
-                    case 2:  // passthrough: argmax is provably self
-                        out[0] = v[2 * h];
-                        out[1] = v[2 * h + 1];
-                        break;
-                    default:  // unused head: zero weights, zero output
-                        out[0] = 0.0;
-                        out[1] = 0.0;
+                const int hull_idx = L.hull_of_head[h];
+                HardAttentionHead& hull = L.hulls[hull_idx];
+                if (L.hull_insert_seq[hull_idx] != seq) {
+                    const double key[2] = {k[2 * h], k[2 * h + 1]};
+                    const double val[2] = {v[2 * h], v[2 * h + 1]};
+                    hull.insert(key, val, seq);
+                    L.hull_insert_seq[hull_idx] = seq;
                 }
+                const double query[2] = {q[2 * h], q[2 * h + 1]};
+                out[0] = 0.0;
+                out[1] = 0.0;
+                hull.query(query, L.tiebreak[h] ? TieBreak::LATEST : TieBreak::AVERAGE, out);
+            }
+            for (int h : L.passthrough_heads) {
+                double* out = head_out.data() + 2 * h;
+                out[0] = v[2 * h];
+                out[1] = v[2 * h + 1];
             }
             L.out_proj.mv_add(head_out.data(), x);
 
@@ -241,33 +274,26 @@ struct WeightsEngine {
             const float* q = qkv_f32.data();
             const float* k = qkv_f32.data() + d_model;
             const float* v = qkv_f32.data() + 2 * d_model;
-            for (int h = 0; h < n_heads; ++h) {
+            for (int h : L.lookup_heads) {
                 float* out = head_out_f32.data() + 2 * h;
-                switch (L.head_kind[h]) {
-                    case 1: {
-                        const int hull_idx = L.hull_of_head[h];
-                        HardAttentionHead& hull = L.hulls[hull_idx];
-                        if (L.hull_insert_seq[hull_idx] != seq) {
-                            const double key[2] = {(double)k[2 * h], (double)k[2 * h + 1]};
-                            const double val[2] = {(double)v[2 * h], (double)v[2 * h + 1]};
-                            hull.insert(key, val, seq);
-                            L.hull_insert_seq[hull_idx] = seq;
-                        }
-                        const double query[2] = {(double)q[2 * h], (double)q[2 * h + 1]};
-                        double out_d[2] = {0.0, 0.0};
-                        hull.query(query, L.tiebreak[h] ? TieBreak::LATEST : TieBreak::AVERAGE, out_d);
-                        out[0] = (float)out_d[0];
-                        out[1] = (float)out_d[1];
-                        break;
-                    }
-                    case 2:
-                        out[0] = v[2 * h];
-                        out[1] = v[2 * h + 1];
-                        break;
-                    default:
-                        out[0] = 0.0f;
-                        out[1] = 0.0f;
+                const int hull_idx = L.hull_of_head[h];
+                HardAttentionHead& hull = L.hulls[hull_idx];
+                if (L.hull_insert_seq[hull_idx] != seq) {
+                    const double key[2] = {(double)k[2 * h], (double)k[2 * h + 1]};
+                    const double val[2] = {(double)v[2 * h], (double)v[2 * h + 1]};
+                    hull.insert(key, val, seq);
+                    L.hull_insert_seq[hull_idx] = seq;
                 }
+                const double query[2] = {(double)q[2 * h], (double)q[2 * h + 1]};
+                double out_d[2] = {0.0, 0.0};
+                hull.query(query, L.tiebreak[h] ? TieBreak::LATEST : TieBreak::AVERAGE, out_d);
+                out[0] = (float)out_d[0];
+                out[1] = (float)out_d[1];
+            }
+            for (int h : L.passthrough_heads) {
+                float* out = head_out_f32.data() + 2 * h;
+                out[0] = v[2 * h];
+                out[1] = v[2 * h + 1];
             }
             L.out_proj.mv_add_f32(head_out_f32.data(), x);
 
@@ -280,6 +306,29 @@ struct WeightsEngine {
             L.ff_out.mv_add_f32(act_f32.data(), x);
         }
     }
+
+    void insert_write_f32(int addr, int value, long pos) {
+        ++seq;
+        if (seq != pos) throw std::runtime_error("direct WRITE position does not match engine sequence");
+
+        const int group = (addr >> 12) & 0xF;
+        const int local_i = addr - group * 4096;
+        const float local = (float)local_i;
+        const float kx_f = 2.0f * local;
+        const float inv_log_pos = (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));
+        const float ky_f = -local * local + (float)LATEST_ALPHA * inv_log_pos;
+        const double key[2] = {(double)kx_f, (double)ky_f};
+        const double val[2] = {(double)(value & 0xFF), (double)(addr & 0xFFFF)};
+
+        for (auto& L : layers) {
+            for (int h : L.memory_heads_by_group[group]) {
+                const int hull_idx = L.hull_of_head[h];
+                if (L.hull_insert_seq[hull_idx] == seq) continue;
+                L.hulls[hull_idx].insert(key, val, seq);
+                L.hull_insert_seq[hull_idx] = seq;
+            }
+        }
+    }
 };
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -288,5 +337,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("add_layer", &WeightsEngine::add_layer)
         .def("reset", &WeightsEngine::reset)
         .def("forward", &WeightsEngine::forward)
-        .def("forward_f32", &WeightsEngine::forward_f32);
+        .def("forward_f32", &WeightsEngine::forward_f32)
+        .def("insert_write_f32", &WeightsEngine::insert_write_f32);
 }

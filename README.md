@@ -122,8 +122,8 @@ gates to 71 layers, `model/weights.py` constructs `VanillaTransformer`
 weights analytically (d_model≈1550, ~777 heads, no training), and
 inference is genuine — Q/K/V projections, attention (hull hardmax or true
 softmax), ReGLU FFN, residual stream — run by a sparse C++ engine at
-~5K stepped instructions/s after boot in the default float32 mode.  **The
-full 8,991-instruction nestest suite passes through the weights in ~6
+~6K stepped instructions/s after boot in the default float32 mode.  **The
+full 8,991-instruction nestest suite passes through the weights in ~1-2
 seconds**, a Klaus decimal-mode prefix lockstep-matches, and the NES console
 can hand a running game off to the weights backend mid-play
 (`nes-run --warmup-frames 60 --backend weights` renders an SMB frame

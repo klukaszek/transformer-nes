@@ -153,6 +153,7 @@ def _memory_at(address: Expression, name: str) -> Expression:
             clear_key=1 - group_write,
             tie_break="latest",
         )
+        group_value.lookup.memory_group = group
         exact = _match_zero(address - found_addr)
         value = value + _multiply(query_in_group, _multiply(group_value, exact))
     return persist(value, name=name)

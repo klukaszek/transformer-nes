@@ -469,6 +469,7 @@ def build_model(
                         "lookup": lu.name or f"lookup_{lu.id}",
                         "values": vals,
                         "tie_break": lu.tie_break,
+                        "memory_group": getattr(lu, "memory_group", -1),
                         "cache_key": (
                             expr_sig(lu.key_exprs_2d[0]),
                             expr_sig(lu.key_exprs_2d[1]),
@@ -582,9 +583,11 @@ def build_model(
     # strictly increasing), which lets a fast engine skip their hulls.
     model.head_kinds = []
     model.head_cache_groups = []
+    model.head_memory_groups = []
     for layer_idx in range(n_layers):
         kinds = [0] * n_heads
         cache_groups = [-1] * n_heads
+        memory_groups = [-1] * n_heads
         cache_group_of_key = {}
         for h, info in head_map.get(layer_idx, {}).items():
             if info["type"] == "lookup":
@@ -593,10 +596,12 @@ def build_model(
                 if key not in cache_group_of_key:
                     cache_group_of_key[key] = len(cache_group_of_key)
                 cache_groups[h] = cache_group_of_key[key]
+                memory_groups[h] = info["memory_group"]
             else:
                 kinds[h] = 2
         model.head_kinds.append(kinds)
         model.head_cache_groups.append(cache_groups)
+        model.head_memory_groups.append(memory_groups)
 
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
     logger.info(

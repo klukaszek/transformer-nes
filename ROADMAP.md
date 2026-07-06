@@ -15,7 +15,7 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~5K after boot | default fp32 engine; full nestest MATCHED in 5.8 s; Klaus 20K prefix MATCHED |
+| `cpu6502/weights_runner.py` (real transformer) | ~6K after boot | default fp32 engine; full nestest MATCHED in ~1.4 s; Klaus 20K prefix MATCHED |
 
 The weights transformer is genuine inference (d_model≈1550, 71 layers,
 analytic weights, no training).  The default path is the float32 C++ engine
@@ -74,12 +74,15 @@ What was tried:
 Current receipt:
 - `Cpu6502TransformerMachine(bcd=False)` defaults to the float32 C++ engine
   and matches all 8,991 high-address nestest instructions.
-- Measured on this machine: boot 3.99 s, step 1.82 s, total 5.81 s,
-  ~4.95K stepped instr/s after boot.  This is a research measurement, not
-  yet a full replacement for the older README speed table.
+- The engine now directly inserts WRITE tokens into grouped memory hulls,
+  skipping full transformer passes for ROM/RAM seeding and instruction
+  writes.  `nestest` boot dropped from seconds to milliseconds.
+- The engine iterates only active attention heads and skips passthrough Q/K
+  projection rows, since passthrough heads use the attend-to-self shortcut.
+- Measured on this machine after those optimizations: full nestest total
+  ~1.4 s, ~6.4K instr/s; Klaus 20K prefix ~3.2 s, ~6.3K instr/s.
 - Decimal-mode Klaus prefix also matches through the float32 C++ engine:
-  20,000 instructions, boot 9.00 s, step 3.51 s, ~5.70K stepped instr/s
-  after boot.
+  20,000 instructions.
 
 Remaining caveat:
 - This solves hard-attention / hull fp32 high-address reads.  True softmax
@@ -93,8 +96,8 @@ Remaining caveat:
 The hard-attention half is now experimentally solved by grouped memory
 lookups: `_memory_at` splits 64 KiB into 16 local 4 KiB parabolas, and the
 C++ engine supports fp32 execution.  Next pieces:
-- run longer/harder suites through the fp32 engine (Klaus prefixes, then
-  NES frame parity);
+- run NES frame parity through the fp32 engine after the direct-WRITE
+  optimization;
 - port checkpoint/snapshot support to the weights runner so long fp32 runs
   do not grow unbounded hull logs;
 - separately solve true-softmax latest-write semantics if `--cache standard`
@@ -159,7 +162,7 @@ uv run pytest -m "not slow"                    # 47 fast tests
 uv run pytest                                  # + kernel/weights/console suites
 uv run 6502-klaus --runner cpp-full            # full Klaus, ~48 s, exact step count
 uv run 6502-nestest --runner both              # golden log: reference + graph + kernel
-uv run 6502-nestest --runner weights           # full nestest through default fp32 engine, ~6 s
+uv run 6502-nestest --runner weights           # full nestest through default fp32 engine, ~1-2 s
 uv run 6502-klaus --runner weights --graph-steps 200000
 uv run 6502-transformer --steps 30 --cache standard --matmul sparse   # true softmax diagnostic
 uv run nes-run transformer_vm/nes/examples/smb.nes --frames 61 \

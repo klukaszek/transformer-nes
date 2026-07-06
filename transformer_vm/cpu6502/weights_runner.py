@@ -250,6 +250,10 @@ class Cpu6502TransformerMachine:
         self._insert_write(addr & 0xFFFF, value & 0xFF)
 
     def _insert_write(self, addr: int, value: int):
+        if self.matmul == "engine" and self.dtype == "float32":
+            self._engine.insert_write(addr & 0xFFFF, value & 0xFF, self.pos)
+            self.pos += 1
+            return
         rt = self.rt
         self._forward(self._embed({
             rt.byte_value: value & 0xFF,

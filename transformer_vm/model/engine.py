@@ -64,6 +64,11 @@ class SparseWeightsEngine:
                 ]
             else:
                 groups = cache_groups[layer_idx]
+            memory_groups = getattr(model, "head_memory_groups", None)
+            if memory_groups is None:
+                mem_groups = [-1] * n_heads
+            else:
+                mem_groups = memory_groups[layer_idx]
             self._engine.add_layer(
                 *_csr(model.attn[layer_idx].in_proj_weight),
                 *_csr(model.attn[layer_idx].out_proj.weight),
@@ -73,6 +78,7 @@ class SparseWeightsEngine:
                 np.asarray(model.head_kinds[layer_idx], dtype=np.int32),
                 np.asarray(model.head_tiebreak[layer_idx], dtype=np.int32),
                 np.asarray(groups, dtype=np.int32),
+                np.asarray(mem_groups, dtype=np.int32),
             )
 
     def reset(self):
@@ -88,3 +94,9 @@ class SparseWeightsEngine:
             self._engine.forward_f32(x)
         else:
             self._engine.forward(x)
+
+    def insert_write(self, addr: int, value: int, pos: int) -> None:
+        """Fast-path a WRITE token into the engine's memory lookup hulls."""
+        if self.dtype != "float32":
+            raise RuntimeError("direct WRITE insertion is currently float32-only")
+        self._engine.insert_write_f32(addr, value, pos)
