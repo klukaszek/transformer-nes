@@ -181,6 +181,13 @@ class GraphCore:
 
     def checkpoint(self, ram: bytearray) -> None:
         """Reseed the token log from a RAM snapshot; resume mid-program."""
+        rebuild = getattr(self.rt, "checkpoint", None)
+        if rebuild is not None:
+            # The runtime's own snapshot-and-rebuild also keeps the trace
+            # numbering and any pending NMI (its RAM mirror is kept in sync
+            # with ours through inject_write).
+            rebuild()
+            return
         state = self.rt.machine_state
         self.rt.boot_image(list(ram), start_pc=state["pc"], state=state)
 

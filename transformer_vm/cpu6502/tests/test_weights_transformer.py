@@ -84,6 +84,33 @@ def test_all_matmul_paths_produce_identical_traces():
 
 
 @pytest.mark.slow
+def test_checkpoint_rebuild_is_invisible():
+    """Snapshot-and-rebuild mid-run: the hull logs reseed from the RAM
+    mirror without perturbing the executed trace.  Uses the nestest prefix
+    so high-address reads cross checkpoint boundaries."""
+    from transformer_vm.cpu6502.nestest import START_PC, load_image
+
+    image = load_image()
+    machine = Cpu6502TransformerMachine(bcd=False, checkpoint_tokens=8)
+    machine.boot_image(list(image), start_pc=START_PC)
+    rows = [machine.machine_step() for _ in range(10)]
+    assert machine.checkpoint()  # explicit rebuild between steps
+    rows += [machine.machine_step() for _ in range(10)]
+    assert machine.checkpoints >= 2  # the tiny auto threshold fired too
+
+    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+    ref.pc = START_PC
+    for i, row in enumerate(rows):
+        assert row.step == i  # trace numbering survives rebuilds
+        ref_row = ref.step()
+        a, b = ref_row.state, row.state
+        assert (a.pc, a.a, a.x, a.y, a.s, a.p) == (b.pc, b.a, b.x, b.y, b.s, b.p), (
+            f"step {i}: ref={a} transformer={b}"
+        )
+        assert ref_row.writes == row.writes, f"step {i} writes"
+
+
+@pytest.mark.slow
 def test_transformer_true_softmax_matches_reference():
     machine = Cpu6502TransformerMachine(bcd=False, cache="standard", matmul="sparse")
     image = verify_program()

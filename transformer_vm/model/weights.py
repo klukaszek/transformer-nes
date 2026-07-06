@@ -586,7 +586,10 @@ def build_model(
     # FFN neuron classification per layer: 0 unused, 1 ReGLU, 2 linear
     # passthrough/erase neuron.  Fast engines can fuse kind-2 neurons into a
     # direct linear residual update without changing the represented model.
+    # The fusion drops the gate, which is only sound because kind-2 gates are
+    # the constant-one expression; one_slot lets consumers verify that.
     model.ffn_kinds = all_ffn_kinds
+    model.one_slot = slot_of[next(iter(one_expr.terms))]
     # Head classification per layer (0 unused, 1 lookup, 2 passthrough).
     # Passthrough/erase heads provably attend to self (their key is 2*pos,
     # strictly increasing), which lets a fast engine skip their hulls.

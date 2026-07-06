@@ -315,6 +315,14 @@ struct WeightsEngine {
             L.out_proj, L.in_proj, attn_col_to_src_row, d_model, d_model);
         L.in_proj.skip_rows(skip_ip_rows);
 
+        // forward() only writes head_out for lookup heads, so head_out is
+        // stale everywhere else; the filtered out_proj must not read there.
+        for (int idx : L.out_proj.indices) {
+            const int h = idx / 2;
+            if (idx >= 2 * n_heads || L.head_kind[h] != 1)
+                throw std::runtime_error("out_proj column survives at a non-lookup head slot");
+        }
+
         std::vector<int> ffn_col_to_src_row(ffn, -1);
         for (int j = 0; j < ffn; ++j) {
             if (L.ffn_kind[j] == 2) ffn_col_to_src_row[j] = ffn + j;

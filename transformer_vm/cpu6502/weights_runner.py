@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import time
 
 import numpy as np
@@ -56,7 +55,8 @@ class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
     def __init__(self, *, bcd: bool = False, cache: str = "hull",
-                 matmul: str = "engine", dtype: str = "float32"):
+                 matmul: str = "engine", dtype: str = "float32",
+                 checkpoint_tokens: int | None = None):
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
         self.rt = Cpu6502Runtime(bcd=bcd)
@@ -125,6 +125,7 @@ class Cpu6502TransformerMachine:
         self._halt_head_cols, self._halt_head_vals = self._head_row(self._halt_row)
 
         self.matmul = matmul
+        self._direct_writes = False
         if matmul == "engine":
             # Whole layer stack per pybind call; hull attention and
             # structural passthrough fusion live in C++
@@ -134,6 +135,7 @@ class Cpu6502TransformerMachine:
             if cache != "hull":
                 raise ValueError("matmul='engine' has hull attention built in")
             self._engine = SparseWeightsEngine(self.model, dtype=dtype)
+            self._direct_writes = self._engine.supports_direct_writes
         elif matmul == "sparse":
             # The analytic weights are ~99.9% zeros; CSR matvecs run the
             # identical linear maps orders of magnitude faster.  This path
@@ -154,6 +156,14 @@ class Cpu6502TransformerMachine:
 
         self.pos = 0
         self._trace_len = 0
+        # RAM mirror for snapshot-and-rebuild checkpointing (KernelBus
+        # keeps the same mirror for the C++ kernel).  checkpoint_tokens, if
+        # set, rebuilds automatically once the token log grows past it, so
+        # long runs do not grow unbounded hull logs.
+        self._ram = bytearray(0x10000)
+        self._checkpoint_tokens = checkpoint_tokens
+        self._seed_pos = 0
+        self.checkpoints = 0
 
     # ── Transformer plumbing ────────────────────────────────────────
 
@@ -212,10 +222,7 @@ class Cpu6502TransformerMachine:
         if self.matmul != "engine":
             return self._forward(self._embed(values))
         x = self._embed_array(values)
-        pos = self.pos
-        x[0] += pos
-        x[1] += 1.0 / math.log(2.0) - 1.0 / math.log(pos + 2.0)
-        x[2] += pos * pos
+        add_position_encoding(x, self.pos)
         self.pos += 1
         self._engine.forward(x)
         return x
@@ -259,15 +266,19 @@ class Cpu6502TransformerMachine:
             self.cache.clear()
         self.pos = 0
         self._trace_len = 0
+        ram = bytearray(0x10000)
+        ram[: len(memory_image)] = bytes(memory_image)
+        self._ram = ram
         rt = self.rt
         self._forward_values({
             rt.start_pc_lo: start_pc & 0xFF,
             rt.start_pc_hi: (start_pc >> 8) & 0xFF,
             rt.is_start: 1,
         })
-        for addr, byte in enumerate(memory_image):
+        for addr, byte in enumerate(ram):
             if byte:
                 self._insert_write(addr, byte)
+        self._seed_pos = self.pos
         self._mstate = {
             "pc": start_pc & 0xFFFF, "a": 0, "x": 0, "y": 0, "s": 0xFD,
             "p": reference.FLAG_U | reference.FLAG_I,
@@ -290,8 +301,11 @@ class Cpu6502TransformerMachine:
         self._insert_write(addr & 0xFFFF, value & 0xFF)
 
     def _insert_write(self, addr: int, value: int):
-        if self.matmul == "engine" and self.dtype == "float32":
-            self._engine.insert_write(addr & 0xFFFF, value & 0xFF, self.pos)
+        addr &= 0xFFFF
+        value &= 0xFF
+        self._ram[addr] = value
+        if self._direct_writes:
+            self._engine.insert_write(addr, value, self.pos)
             self.pos += 1
             return
         rt = self.rt
@@ -302,7 +316,33 @@ class Cpu6502TransformerMachine:
             rt.addr_hi: (addr >> 8) & 0xFF,
         })
 
+    def checkpoint(self) -> bool:
+        """Snapshot-and-rebuild the token log from the RAM mirror.
+
+        Mirrors KernelBus.checkpoint: captures the architectural state,
+        reseeds the attention state (hull logs) with a fresh WRITE-token
+        prefix from the mirror, and restores the state.  Semantically
+        invisible: unwritten and zero bytes both read as 0 through the
+        exact-address mask, so dropping the history and reseeding only the
+        nonzero RAM bytes preserves every future read.
+        """
+        if self.machine_halted:
+            return False
+        state = self.machine_state
+        trace_len = self._trace_len
+        nmi = self._nmi_pending
+        self.boot_image(self._ram, start_pc=state["pc"], state=state)
+        self._trace_len = trace_len
+        self._nmi_pending = nmi
+        self.checkpoints += 1
+        return True
+
     def machine_step(self) -> TraceRow:
+        if (
+            self._checkpoint_tokens
+            and self.pos - self._seed_pos >= self._checkpoint_tokens
+        ):
+            self.checkpoint()
         rt = self.rt
         st = self._mstate
         p = st["p"]

@@ -144,7 +144,8 @@ def run_cpp(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float, f
     return matched, steps, build_elapsed, rt.last_prefix_seconds, rt.last_step_seconds
 
 
-def run_weights(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float, str]:
+def run_weights(image: bytes, *, max_steps: int,
+                checkpoint_tokens: int | None = None) -> tuple[bool, int, float, float, str]:
     """Lockstep the real weights-based transformer against the reference.
 
     Klaus at full length (30.6M instructions) is out of reach at
@@ -153,17 +154,19 @@ def run_weights(image: bytes, *, max_steps: int) -> tuple[bool, int, float, floa
     from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
-    machine = Cpu6502TransformerMachine(bcd=True)
+    machine = Cpu6502TransformerMachine(bcd=True, checkpoint_tokens=checkpoint_tokens)
     mode = f"{machine.matmul}/{machine.dtype}"
     build_elapsed = time.perf_counter() - build_start
 
-    run_start = time.perf_counter()
-    trace = machine.run_image(image, start_pc=START_PC, max_steps=max_steps)
-    run_elapsed = time.perf_counter() - run_start
-
+    # Lockstep incrementally instead of materializing the whole trace:
+    # the full suite is 30.6M rows.
+    machine.boot_image(list(image), start_pc=START_PC)
     ref_cpu = Cpu6502(memory=bytearray(image))
     ref_cpu.pc = START_PC
-    for i, row in enumerate(trace):
+    run_start = time.perf_counter()
+    steps = 0
+    for i in range(max_steps):
+        row = machine.machine_step()
         ref_row = ref_cpu.step()
         s1, s2 = ref_row.state, row.state
         if (s1.pc, s1.a, s1.x, s1.y, s1.s, s1.p) != (s2.pc, s2.a, s2.x, s2.y, s2.s, s2.p):
@@ -172,11 +175,19 @@ def run_weights(image: bytes, *, max_steps: int) -> tuple[bool, int, float, floa
                 i, s1.pc, s1.a, s1.x, s1.y, s1.s, s1.p,
                 s2.pc, s2.a, s2.x, s2.y, s2.s, s2.p,
             )
-            return False, i, build_elapsed, run_elapsed, mode
+            return False, i, build_elapsed, time.perf_counter() - run_start, mode
         if {(w.addr, w.value) for w in ref_row.writes} != {(w.addr, w.value) for w in row.writes}:
             logger.error("transformer writes diverged at step %d", i)
-            return False, i, build_elapsed, run_elapsed, mode
-    return True, len(trace.rows), build_elapsed, run_elapsed, mode
+            return False, i, build_elapsed, time.perf_counter() - run_start, mode
+        steps += 1
+        if steps % 1_000_000 == 0:
+            elapsed = time.perf_counter() - run_start
+            logger.info("  %dM steps, %.0f steps/s, %d checkpoints",
+                        steps // 1_000_000, steps / elapsed, machine.checkpoints)
+        if machine.machine_halted:
+            break
+    run_elapsed = time.perf_counter() - run_start
+    return True, steps, build_elapsed, run_elapsed, mode
 
 
 def run_cpp_full(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float]:
@@ -212,6 +223,13 @@ def main() -> None:
         help="instruction count for the graph evaluator run (default 5000)",
     )
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
+    parser.add_argument(
+        "--checkpoint-tokens", type=int, default=250_000,
+        help="weights runner: snapshot-and-rebuild the hull logs every N "
+             "token positions (0 disables; default 250000 -- every forward "
+             "inserts into all shared hulls, so the window bounds memory at "
+             "roughly 100 bytes/token/hull-insert)",
+    )
     args = parser.parse_args()
 
     image = load_image(args.image)
@@ -248,7 +266,10 @@ def main() -> None:
         failed |= not matched
 
     if args.runner == "weights":
-        matched, steps, build_s, run_s, mode = run_weights(image, max_steps=args.graph_steps)
+        matched, steps, build_s, run_s, mode = run_weights(
+            image, max_steps=args.graph_steps,
+            checkpoint_tokens=args.checkpoint_tokens or None,
+        )
         rate = steps / run_s if run_s > 0 else 0.0
         status = "MATCHED" if matched else "DIVERGED"
         logger.info(
