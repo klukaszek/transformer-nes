@@ -1,0 +1,5485 @@
+{
+ "union": {
+  "label": "union",
+  "reglus": 5282,
+  "persists": 3546,
+  "lookups": 113,
+  "terms": 29136,
+  "depth": 71,
+  "const_roots": [
+   "one"
+  ]
+ },
+ "NMI": {
+  "label": "NMI",
+  "reglus": 850,
+  "persists": 516,
+  "lookups": 52,
+  "terms": 4771,
+  "depth": 9,
+  "const_roots": [
+   "ea",
+   "is_store",
+   "is_store2",
+   "is_store3",
+   "one"
+  ]
+ },
+ "per_opcode": {
+  "A9": {
+   "label": "LDA imm A9",
+   "reglus": 1042,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5626,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDA",
+   "operation": "load_a",
+   "mode": "imm",
+   "byte": 169
+  },
+  "A5": {
+   "label": "LDA zpg A5",
+   "reglus": 1042,
+   "persists": 602,
+   "lookups": 65,
+   "terms": 5623,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDA",
+   "operation": "load_a",
+   "mode": "zpg",
+   "byte": 165
+  },
+  "B5": {
+   "label": "LDA zpx B5",
+   "reglus": 1046,
+   "persists": 604,
+   "lookups": 65,
+   "terms": 5645,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDA",
+   "operation": "load_a",
+   "mode": "zpx",
+   "byte": 181
+  },
+  "AD": {
+   "label": "LDA abs AD",
+   "reglus": 1042,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5625,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDA",
+   "operation": "load_a",
+   "mode": "abs",
+   "byte": 173
+  },
+  "BD": {
+   "label": "LDA abx BD",
+   "reglus": 1046,
+   "persists": 605,
+   "lookups": 65,
+   "terms": 5647,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDA",
+   "operation": "load_a",
+   "mode": "abx",
+   "byte": 189
+  },
+  "B9": {
+   "label": "LDA aby B9",
+   "reglus": 1046,
+   "persists": 605,
+   "lookups": 65,
+   "terms": 5647,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDA",
+   "operation": "load_a",
+   "mode": "aby",
+   "byte": 185
+  },
+  "A1": {
+   "label": "LDA idx A1",
+   "reglus": 1482,
+   "persists": 831,
+   "lookups": 97,
+   "terms": 7668,
+   "depth": 11,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDA",
+   "operation": "load_a",
+   "mode": "idx",
+   "byte": 161
+  },
+  "B1": {
+   "label": "LDA idy B1",
+   "reglus": 1482,
+   "persists": 831,
+   "lookups": 97,
+   "terms": 7672,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDA",
+   "operation": "load_a",
+   "mode": "idy",
+   "byte": 177
+  },
+  "A2": {
+   "label": "LDX imm A2",
+   "reglus": 1042,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5626,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDX",
+   "operation": "load_x",
+   "mode": "imm",
+   "byte": 162
+  },
+  "A6": {
+   "label": "LDX zpg A6",
+   "reglus": 1042,
+   "persists": 602,
+   "lookups": 65,
+   "terms": 5623,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDX",
+   "operation": "load_x",
+   "mode": "zpg",
+   "byte": 166
+  },
+  "B6": {
+   "label": "LDX zpy B6",
+   "reglus": 1046,
+   "persists": 604,
+   "lookups": 65,
+   "terms": 5645,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDX",
+   "operation": "load_x",
+   "mode": "zpy",
+   "byte": 182
+  },
+  "AE": {
+   "label": "LDX abs AE",
+   "reglus": 1042,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5625,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDX",
+   "operation": "load_x",
+   "mode": "abs",
+   "byte": 174
+  },
+  "BE": {
+   "label": "LDX aby BE",
+   "reglus": 1046,
+   "persists": 605,
+   "lookups": 65,
+   "terms": 5647,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDX",
+   "operation": "load_x",
+   "mode": "aby",
+   "byte": 190
+  },
+  "A0": {
+   "label": "LDY imm A0",
+   "reglus": 1042,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5626,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDY",
+   "operation": "load_y",
+   "mode": "imm",
+   "byte": 160
+  },
+  "A4": {
+   "label": "LDY zpg A4",
+   "reglus": 1042,
+   "persists": 602,
+   "lookups": 65,
+   "terms": 5623,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDY",
+   "operation": "load_y",
+   "mode": "zpg",
+   "byte": 164
+  },
+  "B4": {
+   "label": "LDY zpx B4",
+   "reglus": 1046,
+   "persists": 604,
+   "lookups": 65,
+   "terms": 5645,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDY",
+   "operation": "load_y",
+   "mode": "zpx",
+   "byte": 180
+  },
+  "AC": {
+   "label": "LDY abs AC",
+   "reglus": 1042,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5625,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDY",
+   "operation": "load_y",
+   "mode": "abs",
+   "byte": 172
+  },
+  "BC": {
+   "label": "LDY abx BC",
+   "reglus": 1046,
+   "persists": 605,
+   "lookups": 65,
+   "terms": 5647,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LDY",
+   "operation": "load_y",
+   "mode": "abx",
+   "byte": 188
+  },
+  "85": {
+   "label": "STA zpg 85",
+   "reglus": 1038,
+   "persists": 599,
+   "lookups": 65,
+   "terms": 5600,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STA",
+   "operation": "store_a",
+   "mode": "zpg",
+   "byte": 133
+  },
+  "95": {
+   "label": "STA zpx 95",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5622,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STA",
+   "operation": "store_a",
+   "mode": "zpx",
+   "byte": 149
+  },
+  "8D": {
+   "label": "STA abs 8D",
+   "reglus": 1038,
+   "persists": 600,
+   "lookups": 65,
+   "terms": 5602,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STA",
+   "operation": "store_a",
+   "mode": "abs",
+   "byte": 141
+  },
+  "9D": {
+   "label": "STA abx 9D",
+   "reglus": 1042,
+   "persists": 602,
+   "lookups": 65,
+   "terms": 5624,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STA",
+   "operation": "store_a",
+   "mode": "abx",
+   "byte": 157
+  },
+  "99": {
+   "label": "STA aby 99",
+   "reglus": 1042,
+   "persists": 602,
+   "lookups": 65,
+   "terms": 5624,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STA",
+   "operation": "store_a",
+   "mode": "aby",
+   "byte": 153
+  },
+  "81": {
+   "label": "STA idx 81",
+   "reglus": 1478,
+   "persists": 828,
+   "lookups": 97,
+   "terms": 7645,
+   "depth": 11,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STA",
+   "operation": "store_a",
+   "mode": "idx",
+   "byte": 129
+  },
+  "91": {
+   "label": "STA idy 91",
+   "reglus": 1478,
+   "persists": 828,
+   "lookups": 97,
+   "terms": 7649,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STA",
+   "operation": "store_a",
+   "mode": "idy",
+   "byte": 145
+  },
+  "86": {
+   "label": "STX zpg 86",
+   "reglus": 1038,
+   "persists": 599,
+   "lookups": 65,
+   "terms": 5600,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STX",
+   "operation": "store_x",
+   "mode": "zpg",
+   "byte": 134
+  },
+  "96": {
+   "label": "STX zpy 96",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5622,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STX",
+   "operation": "store_x",
+   "mode": "zpy",
+   "byte": 150
+  },
+  "8E": {
+   "label": "STX abs 8E",
+   "reglus": 1038,
+   "persists": 600,
+   "lookups": 65,
+   "terms": 5602,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STX",
+   "operation": "store_x",
+   "mode": "abs",
+   "byte": 142
+  },
+  "84": {
+   "label": "STY zpg 84",
+   "reglus": 1038,
+   "persists": 599,
+   "lookups": 65,
+   "terms": 5600,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STY",
+   "operation": "store_y",
+   "mode": "zpg",
+   "byte": 132
+  },
+  "94": {
+   "label": "STY zpx 94",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5622,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STY",
+   "operation": "store_y",
+   "mode": "zpx",
+   "byte": 148
+  },
+  "8C": {
+   "label": "STY abs 8C",
+   "reglus": 1038,
+   "persists": 600,
+   "lookups": 65,
+   "terms": 5602,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "STY",
+   "operation": "store_y",
+   "mode": "abs",
+   "byte": 140
+  },
+  "AA": {
+   "label": "TAX imp AA",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "TAX",
+   "operation": "tax",
+   "mode": "imp",
+   "byte": 170
+  },
+  "A8": {
+   "label": "TAY imp A8",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "TAY",
+   "operation": "tay",
+   "mode": "imp",
+   "byte": 168
+  },
+  "8A": {
+   "label": "TXA imp 8A",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "TXA",
+   "operation": "txa",
+   "mode": "imp",
+   "byte": 138
+  },
+  "98": {
+   "label": "TYA imp 98",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "TYA",
+   "operation": "tya",
+   "mode": "imp",
+   "byte": 152
+  },
+  "BA": {
+   "label": "TSX imp BA",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "TSX",
+   "operation": "tsx",
+   "mode": "imp",
+   "byte": 186
+  },
+  "9A": {
+   "label": "TXS imp 9A",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4637,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "TXS",
+   "operation": "txs",
+   "mode": "imp",
+   "byte": 154
+  },
+  "48": {
+   "label": "PHA imp 48",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "PHA",
+   "operation": "pha",
+   "mode": "imp",
+   "byte": 72
+  },
+  "08": {
+   "label": "PHP imp 08",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4664,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "PHP",
+   "operation": "php",
+   "mode": "imp",
+   "byte": 8
+  },
+  "68": {
+   "label": "PLA imp 68",
+   "reglus": 1054,
+   "persists": 610,
+   "lookups": 66,
+   "terms": 5681,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "PLA",
+   "operation": "pla",
+   "mode": "imp",
+   "byte": 104
+  },
+  "28": {
+   "label": "PLP imp 28",
+   "reglus": 3090,
+   "persists": 2152,
+   "lookups": 66,
+   "terms": 15370,
+   "depth": 11,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "PLP",
+   "operation": "plp",
+   "mode": "imp",
+   "byte": 40
+  },
+  "69": {
+   "label": "ADC imm 69",
+   "reglus": 1060,
+   "persists": 614,
+   "lookups": 65,
+   "terms": 5723,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ADC",
+   "operation": "adc",
+   "mode": "imm",
+   "byte": 105
+  },
+  "65": {
+   "label": "ADC zpg 65",
+   "reglus": 1060,
+   "persists": 613,
+   "lookups": 65,
+   "terms": 5720,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ADC",
+   "operation": "adc",
+   "mode": "zpg",
+   "byte": 101
+  },
+  "75": {
+   "label": "ADC zpx 75",
+   "reglus": 1064,
+   "persists": 615,
+   "lookups": 65,
+   "terms": 5742,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ADC",
+   "operation": "adc",
+   "mode": "zpx",
+   "byte": 117
+  },
+  "6D": {
+   "label": "ADC abs 6D",
+   "reglus": 1060,
+   "persists": 614,
+   "lookups": 65,
+   "terms": 5722,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ADC",
+   "operation": "adc",
+   "mode": "abs",
+   "byte": 109
+  },
+  "7D": {
+   "label": "ADC abx 7D",
+   "reglus": 1064,
+   "persists": 616,
+   "lookups": 65,
+   "terms": 5744,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ADC",
+   "operation": "adc",
+   "mode": "abx",
+   "byte": 125
+  },
+  "79": {
+   "label": "ADC aby 79",
+   "reglus": 1064,
+   "persists": 616,
+   "lookups": 65,
+   "terms": 5744,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ADC",
+   "operation": "adc",
+   "mode": "aby",
+   "byte": 121
+  },
+  "61": {
+   "label": "ADC idx 61",
+   "reglus": 1500,
+   "persists": 842,
+   "lookups": 97,
+   "terms": 7765,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ADC",
+   "operation": "adc",
+   "mode": "idx",
+   "byte": 97
+  },
+  "71": {
+   "label": "ADC idy 71",
+   "reglus": 1500,
+   "persists": 842,
+   "lookups": 97,
+   "terms": 7769,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ADC",
+   "operation": "adc",
+   "mode": "idy",
+   "byte": 113
+  },
+  "E9": {
+   "label": "SBC imm E9",
+   "reglus": 1060,
+   "persists": 614,
+   "lookups": 65,
+   "terms": 5724,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SBC",
+   "operation": "sbc",
+   "mode": "imm",
+   "byte": 233
+  },
+  "E5": {
+   "label": "SBC zpg E5",
+   "reglus": 1060,
+   "persists": 613,
+   "lookups": 65,
+   "terms": 5721,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SBC",
+   "operation": "sbc",
+   "mode": "zpg",
+   "byte": 229
+  },
+  "F5": {
+   "label": "SBC zpx F5",
+   "reglus": 1064,
+   "persists": 615,
+   "lookups": 65,
+   "terms": 5743,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SBC",
+   "operation": "sbc",
+   "mode": "zpx",
+   "byte": 245
+  },
+  "ED": {
+   "label": "SBC abs ED",
+   "reglus": 1060,
+   "persists": 614,
+   "lookups": 65,
+   "terms": 5723,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SBC",
+   "operation": "sbc",
+   "mode": "abs",
+   "byte": 237
+  },
+  "FD": {
+   "label": "SBC abx FD",
+   "reglus": 1064,
+   "persists": 616,
+   "lookups": 65,
+   "terms": 5745,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SBC",
+   "operation": "sbc",
+   "mode": "abx",
+   "byte": 253
+  },
+  "F9": {
+   "label": "SBC aby F9",
+   "reglus": 1064,
+   "persists": 616,
+   "lookups": 65,
+   "terms": 5745,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SBC",
+   "operation": "sbc",
+   "mode": "aby",
+   "byte": 249
+  },
+  "E1": {
+   "label": "SBC idx E1",
+   "reglus": 1500,
+   "persists": 842,
+   "lookups": 97,
+   "terms": 7766,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SBC",
+   "operation": "sbc",
+   "mode": "idx",
+   "byte": 225
+  },
+  "F1": {
+   "label": "SBC idy F1",
+   "reglus": 1500,
+   "persists": 842,
+   "lookups": 97,
+   "terms": 7770,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SBC",
+   "operation": "sbc",
+   "mode": "idy",
+   "byte": 241
+  },
+  "C9": {
+   "label": "CMP imm C9",
+   "reglus": 1050,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5666,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CMP",
+   "operation": "cmp",
+   "mode": "imm",
+   "byte": 201
+  },
+  "C5": {
+   "label": "CMP zpg C5",
+   "reglus": 1050,
+   "persists": 602,
+   "lookups": 65,
+   "terms": 5663,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CMP",
+   "operation": "cmp",
+   "mode": "zpg",
+   "byte": 197
+  },
+  "D5": {
+   "label": "CMP zpx D5",
+   "reglus": 1054,
+   "persists": 604,
+   "lookups": 65,
+   "terms": 5685,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CMP",
+   "operation": "cmp",
+   "mode": "zpx",
+   "byte": 213
+  },
+  "CD": {
+   "label": "CMP abs CD",
+   "reglus": 1050,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5665,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CMP",
+   "operation": "cmp",
+   "mode": "abs",
+   "byte": 205
+  },
+  "DD": {
+   "label": "CMP abx DD",
+   "reglus": 1054,
+   "persists": 605,
+   "lookups": 65,
+   "terms": 5687,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CMP",
+   "operation": "cmp",
+   "mode": "abx",
+   "byte": 221
+  },
+  "D9": {
+   "label": "CMP aby D9",
+   "reglus": 1054,
+   "persists": 605,
+   "lookups": 65,
+   "terms": 5687,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CMP",
+   "operation": "cmp",
+   "mode": "aby",
+   "byte": 217
+  },
+  "C1": {
+   "label": "CMP idx C1",
+   "reglus": 1490,
+   "persists": 831,
+   "lookups": 97,
+   "terms": 7708,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CMP",
+   "operation": "cmp",
+   "mode": "idx",
+   "byte": 193
+  },
+  "D1": {
+   "label": "CMP idy D1",
+   "reglus": 1490,
+   "persists": 831,
+   "lookups": 97,
+   "terms": 7712,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CMP",
+   "operation": "cmp",
+   "mode": "idy",
+   "byte": 209
+  },
+  "E0": {
+   "label": "CPX imm E0",
+   "reglus": 1050,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5666,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CPX",
+   "operation": "cpx",
+   "mode": "imm",
+   "byte": 224
+  },
+  "E4": {
+   "label": "CPX zpg E4",
+   "reglus": 1050,
+   "persists": 602,
+   "lookups": 65,
+   "terms": 5663,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CPX",
+   "operation": "cpx",
+   "mode": "zpg",
+   "byte": 228
+  },
+  "EC": {
+   "label": "CPX abs EC",
+   "reglus": 1050,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5665,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CPX",
+   "operation": "cpx",
+   "mode": "abs",
+   "byte": 236
+  },
+  "C0": {
+   "label": "CPY imm C0",
+   "reglus": 1050,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5666,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CPY",
+   "operation": "cpy",
+   "mode": "imm",
+   "byte": 192
+  },
+  "C4": {
+   "label": "CPY zpg C4",
+   "reglus": 1050,
+   "persists": 602,
+   "lookups": 65,
+   "terms": 5663,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CPY",
+   "operation": "cpy",
+   "mode": "zpg",
+   "byte": 196
+  },
+  "CC": {
+   "label": "CPY abs CC",
+   "reglus": 1050,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5665,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CPY",
+   "operation": "cpy",
+   "mode": "abs",
+   "byte": 204
+  },
+  "29": {
+   "label": "AND imm 29",
+   "reglus": 1090,
+   "persists": 644,
+   "lookups": 65,
+   "terms": 5936,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "AND",
+   "operation": "and",
+   "mode": "imm",
+   "byte": 41
+  },
+  "25": {
+   "label": "AND zpg 25",
+   "reglus": 1090,
+   "persists": 643,
+   "lookups": 65,
+   "terms": 5933,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "AND",
+   "operation": "and",
+   "mode": "zpg",
+   "byte": 37
+  },
+  "35": {
+   "label": "AND zpx 35",
+   "reglus": 1094,
+   "persists": 645,
+   "lookups": 65,
+   "terms": 5955,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "AND",
+   "operation": "and",
+   "mode": "zpx",
+   "byte": 53
+  },
+  "2D": {
+   "label": "AND abs 2D",
+   "reglus": 1090,
+   "persists": 644,
+   "lookups": 65,
+   "terms": 5935,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "AND",
+   "operation": "and",
+   "mode": "abs",
+   "byte": 45
+  },
+  "3D": {
+   "label": "AND abx 3D",
+   "reglus": 1094,
+   "persists": 646,
+   "lookups": 65,
+   "terms": 5957,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "AND",
+   "operation": "and",
+   "mode": "abx",
+   "byte": 61
+  },
+  "39": {
+   "label": "AND aby 39",
+   "reglus": 1094,
+   "persists": 646,
+   "lookups": 65,
+   "terms": 5957,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "AND",
+   "operation": "and",
+   "mode": "aby",
+   "byte": 57
+  },
+  "21": {
+   "label": "AND idx 21",
+   "reglus": 1530,
+   "persists": 872,
+   "lookups": 97,
+   "terms": 7978,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "AND",
+   "operation": "and",
+   "mode": "idx",
+   "byte": 33
+  },
+  "31": {
+   "label": "AND idy 31",
+   "reglus": 1530,
+   "persists": 872,
+   "lookups": 97,
+   "terms": 7982,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "AND",
+   "operation": "and",
+   "mode": "idy",
+   "byte": 49
+  },
+  "09": {
+   "label": "ORA imm 09",
+   "reglus": 1090,
+   "persists": 644,
+   "lookups": 65,
+   "terms": 5952,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ORA",
+   "operation": "ora",
+   "mode": "imm",
+   "byte": 9
+  },
+  "05": {
+   "label": "ORA zpg 05",
+   "reglus": 1090,
+   "persists": 643,
+   "lookups": 65,
+   "terms": 5949,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ORA",
+   "operation": "ora",
+   "mode": "zpg",
+   "byte": 5
+  },
+  "15": {
+   "label": "ORA zpx 15",
+   "reglus": 1094,
+   "persists": 645,
+   "lookups": 65,
+   "terms": 5971,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ORA",
+   "operation": "ora",
+   "mode": "zpx",
+   "byte": 21
+  },
+  "0D": {
+   "label": "ORA abs 0D",
+   "reglus": 1090,
+   "persists": 644,
+   "lookups": 65,
+   "terms": 5951,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ORA",
+   "operation": "ora",
+   "mode": "abs",
+   "byte": 13
+  },
+  "1D": {
+   "label": "ORA abx 1D",
+   "reglus": 1094,
+   "persists": 646,
+   "lookups": 65,
+   "terms": 5973,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ORA",
+   "operation": "ora",
+   "mode": "abx",
+   "byte": 29
+  },
+  "19": {
+   "label": "ORA aby 19",
+   "reglus": 1094,
+   "persists": 646,
+   "lookups": 65,
+   "terms": 5973,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ORA",
+   "operation": "ora",
+   "mode": "aby",
+   "byte": 25
+  },
+  "01": {
+   "label": "ORA idx 01",
+   "reglus": 1530,
+   "persists": 872,
+   "lookups": 97,
+   "terms": 7994,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ORA",
+   "operation": "ora",
+   "mode": "idx",
+   "byte": 1
+  },
+  "11": {
+   "label": "ORA idy 11",
+   "reglus": 1530,
+   "persists": 872,
+   "lookups": 97,
+   "terms": 7998,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ORA",
+   "operation": "ora",
+   "mode": "idy",
+   "byte": 17
+  },
+  "49": {
+   "label": "EOR imm 49",
+   "reglus": 1090,
+   "persists": 644,
+   "lookups": 65,
+   "terms": 5952,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "EOR",
+   "operation": "eor",
+   "mode": "imm",
+   "byte": 73
+  },
+  "45": {
+   "label": "EOR zpg 45",
+   "reglus": 1090,
+   "persists": 643,
+   "lookups": 65,
+   "terms": 5949,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "EOR",
+   "operation": "eor",
+   "mode": "zpg",
+   "byte": 69
+  },
+  "55": {
+   "label": "EOR zpx 55",
+   "reglus": 1094,
+   "persists": 645,
+   "lookups": 65,
+   "terms": 5971,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "EOR",
+   "operation": "eor",
+   "mode": "zpx",
+   "byte": 85
+  },
+  "4D": {
+   "label": "EOR abs 4D",
+   "reglus": 1090,
+   "persists": 644,
+   "lookups": 65,
+   "terms": 5951,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "EOR",
+   "operation": "eor",
+   "mode": "abs",
+   "byte": 77
+  },
+  "5D": {
+   "label": "EOR abx 5D",
+   "reglus": 1094,
+   "persists": 646,
+   "lookups": 65,
+   "terms": 5973,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "EOR",
+   "operation": "eor",
+   "mode": "abx",
+   "byte": 93
+  },
+  "59": {
+   "label": "EOR aby 59",
+   "reglus": 1094,
+   "persists": 646,
+   "lookups": 65,
+   "terms": 5973,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "EOR",
+   "operation": "eor",
+   "mode": "aby",
+   "byte": 89
+  },
+  "41": {
+   "label": "EOR idx 41",
+   "reglus": 1530,
+   "persists": 872,
+   "lookups": 97,
+   "terms": 7994,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "EOR",
+   "operation": "eor",
+   "mode": "idx",
+   "byte": 65
+  },
+  "51": {
+   "label": "EOR idy 51",
+   "reglus": 1530,
+   "persists": 872,
+   "lookups": 97,
+   "terms": 7998,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "EOR",
+   "operation": "eor",
+   "mode": "idy",
+   "byte": 81
+  },
+  "24": {
+   "label": "BIT zpg 24",
+   "reglus": 1088,
+   "persists": 641,
+   "lookups": 65,
+   "terms": 5924,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BIT",
+   "operation": "bit",
+   "mode": "zpg",
+   "byte": 36
+  },
+  "2C": {
+   "label": "BIT abs 2C",
+   "reglus": 1088,
+   "persists": 642,
+   "lookups": 65,
+   "terms": 5926,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BIT",
+   "operation": "bit",
+   "mode": "abs",
+   "byte": 44
+  },
+  "0A": {
+   "label": "ASL acc 0A",
+   "reglus": 842,
+   "persists": 504,
+   "lookups": 50,
+   "terms": 4701,
+   "depth": 12,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ASL",
+   "operation": "asl",
+   "mode": "acc",
+   "byte": 10
+  },
+  "06": {
+   "label": "ASL zpg 06",
+   "reglus": 1050,
+   "persists": 611,
+   "lookups": 65,
+   "terms": 5659,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ASL",
+   "operation": "asl",
+   "mode": "zpg",
+   "byte": 6
+  },
+  "16": {
+   "label": "ASL zpx 16",
+   "reglus": 1054,
+   "persists": 613,
+   "lookups": 65,
+   "terms": 5681,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ASL",
+   "operation": "asl",
+   "mode": "zpx",
+   "byte": 22
+  },
+  "0E": {
+   "label": "ASL abs 0E",
+   "reglus": 1050,
+   "persists": 612,
+   "lookups": 65,
+   "terms": 5661,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ASL",
+   "operation": "asl",
+   "mode": "abs",
+   "byte": 14
+  },
+  "1E": {
+   "label": "ASL abx 1E",
+   "reglus": 1054,
+   "persists": 614,
+   "lookups": 65,
+   "terms": 5683,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ASL",
+   "operation": "asl",
+   "mode": "abx",
+   "byte": 30
+  },
+  "4A": {
+   "label": "LSR acc 4A",
+   "reglus": 852,
+   "persists": 517,
+   "lookups": 50,
+   "terms": 4802,
+   "depth": 19,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LSR",
+   "operation": "lsr",
+   "mode": "acc",
+   "byte": 74
+  },
+  "46": {
+   "label": "LSR zpg 46",
+   "reglus": 1060,
+   "persists": 624,
+   "lookups": 65,
+   "terms": 5760,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LSR",
+   "operation": "lsr",
+   "mode": "zpg",
+   "byte": 70
+  },
+  "56": {
+   "label": "LSR zpx 56",
+   "reglus": 1064,
+   "persists": 626,
+   "lookups": 65,
+   "terms": 5782,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LSR",
+   "operation": "lsr",
+   "mode": "zpx",
+   "byte": 86
+  },
+  "4E": {
+   "label": "LSR abs 4E",
+   "reglus": 1060,
+   "persists": 625,
+   "lookups": 65,
+   "terms": 5762,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LSR",
+   "operation": "lsr",
+   "mode": "abs",
+   "byte": 78
+  },
+  "5E": {
+   "label": "LSR abx 5E",
+   "reglus": 1064,
+   "persists": 627,
+   "lookups": 65,
+   "terms": 5784,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LSR",
+   "operation": "lsr",
+   "mode": "abx",
+   "byte": 94
+  },
+  "2A": {
+   "label": "ROL acc 2A",
+   "reglus": 842,
+   "persists": 504,
+   "lookups": 50,
+   "terms": 4707,
+   "depth": 12,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROL",
+   "operation": "rol",
+   "mode": "acc",
+   "byte": 42
+  },
+  "26": {
+   "label": "ROL zpg 26",
+   "reglus": 1050,
+   "persists": 611,
+   "lookups": 65,
+   "terms": 5665,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROL",
+   "operation": "rol",
+   "mode": "zpg",
+   "byte": 38
+  },
+  "36": {
+   "label": "ROL zpx 36",
+   "reglus": 1054,
+   "persists": 613,
+   "lookups": 65,
+   "terms": 5687,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROL",
+   "operation": "rol",
+   "mode": "zpx",
+   "byte": 54
+  },
+  "2E": {
+   "label": "ROL abs 2E",
+   "reglus": 1050,
+   "persists": 612,
+   "lookups": 65,
+   "terms": 5667,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROL",
+   "operation": "rol",
+   "mode": "abs",
+   "byte": 46
+  },
+  "3E": {
+   "label": "ROL abx 3E",
+   "reglus": 1054,
+   "persists": 614,
+   "lookups": 65,
+   "terms": 5689,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROL",
+   "operation": "rol",
+   "mode": "abx",
+   "byte": 62
+  },
+  "6A": {
+   "label": "ROR acc 6A",
+   "reglus": 852,
+   "persists": 517,
+   "lookups": 50,
+   "terms": 4803,
+   "depth": 19,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROR",
+   "operation": "ror",
+   "mode": "acc",
+   "byte": 106
+  },
+  "66": {
+   "label": "ROR zpg 66",
+   "reglus": 1060,
+   "persists": 624,
+   "lookups": 65,
+   "terms": 5761,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROR",
+   "operation": "ror",
+   "mode": "zpg",
+   "byte": 102
+  },
+  "76": {
+   "label": "ROR zpx 76",
+   "reglus": 1064,
+   "persists": 626,
+   "lookups": 65,
+   "terms": 5783,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROR",
+   "operation": "ror",
+   "mode": "zpx",
+   "byte": 118
+  },
+  "6E": {
+   "label": "ROR abs 6E",
+   "reglus": 1060,
+   "persists": 625,
+   "lookups": 65,
+   "terms": 5763,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROR",
+   "operation": "ror",
+   "mode": "abs",
+   "byte": 110
+  },
+  "7E": {
+   "label": "ROR abx 7E",
+   "reglus": 1064,
+   "persists": 627,
+   "lookups": 65,
+   "terms": 5785,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ROR",
+   "operation": "ror",
+   "mode": "abx",
+   "byte": 126
+  },
+  "E6": {
+   "label": "INC zpg E6",
+   "reglus": 1046,
+   "persists": 609,
+   "lookups": 65,
+   "terms": 5648,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "INC",
+   "operation": "inc",
+   "mode": "zpg",
+   "byte": 230
+  },
+  "F6": {
+   "label": "INC zpx F6",
+   "reglus": 1050,
+   "persists": 611,
+   "lookups": 65,
+   "terms": 5670,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "INC",
+   "operation": "inc",
+   "mode": "zpx",
+   "byte": 246
+  },
+  "EE": {
+   "label": "INC abs EE",
+   "reglus": 1046,
+   "persists": 610,
+   "lookups": 65,
+   "terms": 5650,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "INC",
+   "operation": "inc",
+   "mode": "abs",
+   "byte": 238
+  },
+  "FE": {
+   "label": "INC abx FE",
+   "reglus": 1050,
+   "persists": 612,
+   "lookups": 65,
+   "terms": 5672,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "INC",
+   "operation": "inc",
+   "mode": "abx",
+   "byte": 254
+  },
+  "C6": {
+   "label": "DEC zpg C6",
+   "reglus": 1046,
+   "persists": 609,
+   "lookups": 65,
+   "terms": 5647,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DEC",
+   "operation": "dec",
+   "mode": "zpg",
+   "byte": 198
+  },
+  "D6": {
+   "label": "DEC zpx D6",
+   "reglus": 1050,
+   "persists": 611,
+   "lookups": 65,
+   "terms": 5669,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DEC",
+   "operation": "dec",
+   "mode": "zpx",
+   "byte": 214
+  },
+  "CE": {
+   "label": "DEC abs CE",
+   "reglus": 1046,
+   "persists": 610,
+   "lookups": 65,
+   "terms": 5649,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DEC",
+   "operation": "dec",
+   "mode": "abs",
+   "byte": 206
+  },
+  "DE": {
+   "label": "DEC abx DE",
+   "reglus": 1050,
+   "persists": 612,
+   "lookups": 65,
+   "terms": 5671,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DEC",
+   "operation": "dec",
+   "mode": "abx",
+   "byte": 222
+  },
+  "E8": {
+   "label": "INX imp E8",
+   "reglus": 838,
+   "persists": 497,
+   "lookups": 50,
+   "terms": 4678,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "INX",
+   "operation": "inx",
+   "mode": "imp",
+   "byte": 232
+  },
+  "C8": {
+   "label": "INY imp C8",
+   "reglus": 838,
+   "persists": 497,
+   "lookups": 50,
+   "terms": 4678,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "INY",
+   "operation": "iny",
+   "mode": "imp",
+   "byte": 200
+  },
+  "CA": {
+   "label": "DEX imp CA",
+   "reglus": 838,
+   "persists": 497,
+   "lookups": 50,
+   "terms": 4677,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DEX",
+   "operation": "dex",
+   "mode": "imp",
+   "byte": 202
+  },
+  "88": {
+   "label": "DEY imp 88",
+   "reglus": 838,
+   "persists": 497,
+   "lookups": 50,
+   "terms": 4677,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DEY",
+   "operation": "dey",
+   "mode": "imp",
+   "byte": 136
+  },
+  "4C": {
+   "label": "JMP abs 4C",
+   "reglus": 1038,
+   "persists": 597,
+   "lookups": 65,
+   "terms": 5601,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "JMP",
+   "operation": "jmp",
+   "mode": "abs",
+   "byte": 76
+  },
+  "6C": {
+   "label": "JMP ind 6C",
+   "reglus": 1478,
+   "persists": 824,
+   "lookups": 97,
+   "terms": 7637,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "JMP",
+   "operation": "jmp",
+   "mode": "ind",
+   "byte": 108
+  },
+  "20": {
+   "label": "JSR abs 20",
+   "reglus": 1046,
+   "persists": 607,
+   "lookups": 65,
+   "terms": 5651,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "JSR",
+   "operation": "jsr",
+   "mode": "abs",
+   "byte": 32
+  },
+  "60": {
+   "label": "RTS imp 60",
+   "reglus": 1274,
+   "persists": 721,
+   "lookups": 82,
+   "terms": 6694,
+   "depth": 10,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RTS",
+   "operation": "rts",
+   "mode": "imp",
+   "byte": 96
+  },
+  "40": {
+   "label": "RTI imp 40",
+   "reglus": 3530,
+   "persists": 2382,
+   "lookups": 98,
+   "terms": 17407,
+   "depth": 11,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RTI",
+   "operation": "rti",
+   "mode": "imp",
+   "byte": 64
+  },
+  "00": {
+   "label": "BRK imp 00",
+   "reglus": 864,
+   "persists": 517,
+   "lookups": 52,
+   "terms": 4811,
+   "depth": 11,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BRK",
+   "operation": "brk",
+   "mode": "imp",
+   "byte": 0
+  },
+  "10": {
+   "label": "BPL rel 10",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BPL",
+   "operation": "bpl",
+   "mode": "rel",
+   "byte": 16
+  },
+  "30": {
+   "label": "BMI rel 30",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5619,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BMI",
+   "operation": "bmi",
+   "mode": "rel",
+   "byte": 48
+  },
+  "50": {
+   "label": "BVC rel 50",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BVC",
+   "operation": "bvc",
+   "mode": "rel",
+   "byte": 80
+  },
+  "70": {
+   "label": "BVS rel 70",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5619,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BVS",
+   "operation": "bvs",
+   "mode": "rel",
+   "byte": 112
+  },
+  "90": {
+   "label": "BCC rel 90",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BCC",
+   "operation": "bcc",
+   "mode": "rel",
+   "byte": 144
+  },
+  "B0": {
+   "label": "BCS rel B0",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5619,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BCS",
+   "operation": "bcs",
+   "mode": "rel",
+   "byte": 176
+  },
+  "D0": {
+   "label": "BNE rel D0",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BNE",
+   "operation": "bne",
+   "mode": "rel",
+   "byte": 208
+  },
+  "F0": {
+   "label": "BEQ rel F0",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5619,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "BEQ",
+   "operation": "beq",
+   "mode": "rel",
+   "byte": 240
+  },
+  "18": {
+   "label": "CLC imp 18",
+   "reglus": 830,
+   "persists": 485,
+   "lookups": 50,
+   "terms": 4630,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CLC",
+   "operation": "clc",
+   "mode": "imp",
+   "byte": 24
+  },
+  "38": {
+   "label": "SEC imp 38",
+   "reglus": 830,
+   "persists": 485,
+   "lookups": 50,
+   "terms": 4630,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SEC",
+   "operation": "sec",
+   "mode": "imp",
+   "byte": 56
+  },
+  "58": {
+   "label": "CLI imp 58",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4636,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CLI",
+   "operation": "cli",
+   "mode": "imp",
+   "byte": 88
+  },
+  "78": {
+   "label": "SEI imp 78",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4637,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SEI",
+   "operation": "sei",
+   "mode": "imp",
+   "byte": 120
+  },
+  "B8": {
+   "label": "CLV imp B8",
+   "reglus": 830,
+   "persists": 490,
+   "lookups": 50,
+   "terms": 4637,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CLV",
+   "operation": "clv",
+   "mode": "imp",
+   "byte": 184
+  },
+  "D8": {
+   "label": "CLD imp D8",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4636,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "CLD",
+   "operation": "cld",
+   "mode": "imp",
+   "byte": 216
+  },
+  "F8": {
+   "label": "SED imp F8",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4637,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SED",
+   "operation": "sed",
+   "mode": "imp",
+   "byte": 248
+  },
+  "EA": {
+   "label": "NOP imp EA",
+   "reglus": 830,
+   "persists": 488,
+   "lookups": 50,
+   "terms": 4634,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "imp",
+   "byte": 234
+  },
+  "1A": {
+   "label": "NOP imp 1A",
+   "reglus": 830,
+   "persists": 488,
+   "lookups": 50,
+   "terms": 4634,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "imp",
+   "byte": 26
+  },
+  "3A": {
+   "label": "NOP imp 3A",
+   "reglus": 830,
+   "persists": 488,
+   "lookups": 50,
+   "terms": 4634,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "imp",
+   "byte": 58
+  },
+  "5A": {
+   "label": "NOP imp 5A",
+   "reglus": 830,
+   "persists": 488,
+   "lookups": 50,
+   "terms": 4634,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "imp",
+   "byte": 90
+  },
+  "7A": {
+   "label": "NOP imp 7A",
+   "reglus": 830,
+   "persists": 488,
+   "lookups": 50,
+   "terms": 4634,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "imp",
+   "byte": 122
+  },
+  "DA": {
+   "label": "NOP imp DA",
+   "reglus": 830,
+   "persists": 488,
+   "lookups": 50,
+   "terms": 4634,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "imp",
+   "byte": 218
+  },
+  "FA": {
+   "label": "NOP imp FA",
+   "reglus": 830,
+   "persists": 488,
+   "lookups": 50,
+   "terms": 4634,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "imp",
+   "byte": 250
+  },
+  "80": {
+   "label": "NOP imm 80",
+   "reglus": 1038,
+   "persists": 596,
+   "lookups": 65,
+   "terms": 5599,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "imm",
+   "byte": 128
+  },
+  "04": {
+   "label": "NOP zpg 04",
+   "reglus": 1038,
+   "persists": 595,
+   "lookups": 65,
+   "terms": 5596,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "zpg",
+   "byte": 4
+  },
+  "44": {
+   "label": "NOP zpg 44",
+   "reglus": 1038,
+   "persists": 595,
+   "lookups": 65,
+   "terms": 5596,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "zpg",
+   "byte": 68
+  },
+  "64": {
+   "label": "NOP zpg 64",
+   "reglus": 1038,
+   "persists": 595,
+   "lookups": 65,
+   "terms": 5596,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "zpg",
+   "byte": 100
+  },
+  "14": {
+   "label": "NOP zpx 14",
+   "reglus": 1042,
+   "persists": 597,
+   "lookups": 65,
+   "terms": 5618,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "zpx",
+   "byte": 20
+  },
+  "34": {
+   "label": "NOP zpx 34",
+   "reglus": 1042,
+   "persists": 597,
+   "lookups": 65,
+   "terms": 5618,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "zpx",
+   "byte": 52
+  },
+  "54": {
+   "label": "NOP zpx 54",
+   "reglus": 1042,
+   "persists": 597,
+   "lookups": 65,
+   "terms": 5618,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "zpx",
+   "byte": 84
+  },
+  "74": {
+   "label": "NOP zpx 74",
+   "reglus": 1042,
+   "persists": 597,
+   "lookups": 65,
+   "terms": 5618,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "zpx",
+   "byte": 116
+  },
+  "D4": {
+   "label": "NOP zpx D4",
+   "reglus": 1042,
+   "persists": 597,
+   "lookups": 65,
+   "terms": 5618,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "zpx",
+   "byte": 212
+  },
+  "F4": {
+   "label": "NOP zpx F4",
+   "reglus": 1042,
+   "persists": 597,
+   "lookups": 65,
+   "terms": 5618,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "zpx",
+   "byte": 244
+  },
+  "0C": {
+   "label": "NOP abs 0C",
+   "reglus": 1038,
+   "persists": 596,
+   "lookups": 65,
+   "terms": 5598,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "abs",
+   "byte": 12
+  },
+  "1C": {
+   "label": "NOP abx 1C",
+   "reglus": 1042,
+   "persists": 598,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "abx",
+   "byte": 28
+  },
+  "3C": {
+   "label": "NOP abx 3C",
+   "reglus": 1042,
+   "persists": 598,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "abx",
+   "byte": 60
+  },
+  "5C": {
+   "label": "NOP abx 5C",
+   "reglus": 1042,
+   "persists": 598,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "abx",
+   "byte": 92
+  },
+  "7C": {
+   "label": "NOP abx 7C",
+   "reglus": 1042,
+   "persists": 598,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "abx",
+   "byte": 124
+  },
+  "DC": {
+   "label": "NOP abx DC",
+   "reglus": 1042,
+   "persists": 598,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "abx",
+   "byte": 220
+  },
+  "FC": {
+   "label": "NOP abx FC",
+   "reglus": 1042,
+   "persists": 598,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "NOP",
+   "operation": "nop",
+   "mode": "abx",
+   "byte": 252
+  },
+  "A7": {
+   "label": "LAX zpg A7",
+   "reglus": 1042,
+   "persists": 603,
+   "lookups": 65,
+   "terms": 5626,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LAX",
+   "operation": "lax",
+   "mode": "zpg",
+   "byte": 167
+  },
+  "B7": {
+   "label": "LAX zpy B7",
+   "reglus": 1046,
+   "persists": 605,
+   "lookups": 65,
+   "terms": 5648,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LAX",
+   "operation": "lax",
+   "mode": "zpy",
+   "byte": 183
+  },
+  "AF": {
+   "label": "LAX abs AF",
+   "reglus": 1042,
+   "persists": 604,
+   "lookups": 65,
+   "terms": 5628,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LAX",
+   "operation": "lax",
+   "mode": "abs",
+   "byte": 175
+  },
+  "BF": {
+   "label": "LAX aby BF",
+   "reglus": 1046,
+   "persists": 606,
+   "lookups": 65,
+   "terms": 5650,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LAX",
+   "operation": "lax",
+   "mode": "aby",
+   "byte": 191
+  },
+  "A3": {
+   "label": "LAX idx A3",
+   "reglus": 1482,
+   "persists": 832,
+   "lookups": 97,
+   "terms": 7671,
+   "depth": 11,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LAX",
+   "operation": "lax",
+   "mode": "idx",
+   "byte": 163
+  },
+  "B3": {
+   "label": "LAX idy B3",
+   "reglus": 1482,
+   "persists": 832,
+   "lookups": 97,
+   "terms": 7675,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "LAX",
+   "operation": "lax",
+   "mode": "idy",
+   "byte": 179
+  },
+  "87": {
+   "label": "SAX zpg 87",
+   "reglus": 1086,
+   "persists": 640,
+   "lookups": 65,
+   "terms": 5910,
+   "depth": 11,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SAX",
+   "operation": "sax",
+   "mode": "zpg",
+   "byte": 135
+  },
+  "97": {
+   "label": "SAX zpy 97",
+   "reglus": 1090,
+   "persists": 642,
+   "lookups": 65,
+   "terms": 5932,
+   "depth": 11,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SAX",
+   "operation": "sax",
+   "mode": "zpy",
+   "byte": 151
+  },
+  "8F": {
+   "label": "SAX abs 8F",
+   "reglus": 1086,
+   "persists": 641,
+   "lookups": 65,
+   "terms": 5912,
+   "depth": 11,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SAX",
+   "operation": "sax",
+   "mode": "abs",
+   "byte": 143
+  },
+  "83": {
+   "label": "SAX idx 83",
+   "reglus": 1526,
+   "persists": 869,
+   "lookups": 97,
+   "terms": 7955,
+   "depth": 11,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SAX",
+   "operation": "sax",
+   "mode": "idx",
+   "byte": 131
+  },
+  "EB": {
+   "label": "SBC imm EB",
+   "reglus": 1060,
+   "persists": 614,
+   "lookups": 65,
+   "terms": 5724,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SBC",
+   "operation": "sbc",
+   "mode": "imm",
+   "byte": 235
+  },
+  "C7": {
+   "label": "DCP zpg C7",
+   "reglus": 1054,
+   "persists": 608,
+   "lookups": 65,
+   "terms": 5707,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DCP",
+   "operation": "dcp",
+   "mode": "zpg",
+   "byte": 199
+  },
+  "D7": {
+   "label": "DCP zpx D7",
+   "reglus": 1058,
+   "persists": 610,
+   "lookups": 65,
+   "terms": 5729,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DCP",
+   "operation": "dcp",
+   "mode": "zpx",
+   "byte": 215
+  },
+  "CF": {
+   "label": "DCP abs CF",
+   "reglus": 1054,
+   "persists": 609,
+   "lookups": 65,
+   "terms": 5709,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DCP",
+   "operation": "dcp",
+   "mode": "abs",
+   "byte": 207
+  },
+  "DF": {
+   "label": "DCP abx DF",
+   "reglus": 1058,
+   "persists": 611,
+   "lookups": 65,
+   "terms": 5731,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DCP",
+   "operation": "dcp",
+   "mode": "abx",
+   "byte": 223
+  },
+  "DB": {
+   "label": "DCP aby DB",
+   "reglus": 1058,
+   "persists": 611,
+   "lookups": 65,
+   "terms": 5731,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DCP",
+   "operation": "dcp",
+   "mode": "aby",
+   "byte": 219
+  },
+  "C3": {
+   "label": "DCP idx C3",
+   "reglus": 1494,
+   "persists": 837,
+   "lookups": 97,
+   "terms": 7752,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DCP",
+   "operation": "dcp",
+   "mode": "idx",
+   "byte": 195
+  },
+  "D3": {
+   "label": "DCP idy D3",
+   "reglus": 1494,
+   "persists": 837,
+   "lookups": 97,
+   "terms": 7756,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "DCP",
+   "operation": "dcp",
+   "mode": "idy",
+   "byte": 211
+  },
+  "E7": {
+   "label": "ISB zpg E7",
+   "reglus": 1064,
+   "persists": 619,
+   "lookups": 65,
+   "terms": 5751,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ISB",
+   "operation": "isb",
+   "mode": "zpg",
+   "byte": 231
+  },
+  "F7": {
+   "label": "ISB zpx F7",
+   "reglus": 1068,
+   "persists": 621,
+   "lookups": 65,
+   "terms": 5773,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ISB",
+   "operation": "isb",
+   "mode": "zpx",
+   "byte": 247
+  },
+  "EF": {
+   "label": "ISB abs EF",
+   "reglus": 1064,
+   "persists": 620,
+   "lookups": 65,
+   "terms": 5753,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ISB",
+   "operation": "isb",
+   "mode": "abs",
+   "byte": 239
+  },
+  "FF": {
+   "label": "ISB abx FF",
+   "reglus": 1068,
+   "persists": 622,
+   "lookups": 65,
+   "terms": 5775,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ISB",
+   "operation": "isb",
+   "mode": "abx",
+   "byte": 255
+  },
+  "FB": {
+   "label": "ISB aby FB",
+   "reglus": 1068,
+   "persists": 622,
+   "lookups": 65,
+   "terms": 5775,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ISB",
+   "operation": "isb",
+   "mode": "aby",
+   "byte": 251
+  },
+  "E3": {
+   "label": "ISB idx E3",
+   "reglus": 1504,
+   "persists": 848,
+   "lookups": 97,
+   "terms": 7796,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ISB",
+   "operation": "isb",
+   "mode": "idx",
+   "byte": 227
+  },
+  "F3": {
+   "label": "ISB idy F3",
+   "reglus": 1504,
+   "persists": 848,
+   "lookups": 97,
+   "terms": 7800,
+   "depth": 14,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "ISB",
+   "operation": "isb",
+   "mode": "idy",
+   "byte": 243
+  },
+  "07": {
+   "label": "SLO zpg 07",
+   "reglus": 1094,
+   "persists": 648,
+   "lookups": 65,
+   "terms": 5967,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SLO",
+   "operation": "slo",
+   "mode": "zpg",
+   "byte": 7
+  },
+  "17": {
+   "label": "SLO zpx 17",
+   "reglus": 1098,
+   "persists": 650,
+   "lookups": 65,
+   "terms": 5989,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SLO",
+   "operation": "slo",
+   "mode": "zpx",
+   "byte": 23
+  },
+  "0F": {
+   "label": "SLO abs 0F",
+   "reglus": 1094,
+   "persists": 649,
+   "lookups": 65,
+   "terms": 5969,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SLO",
+   "operation": "slo",
+   "mode": "abs",
+   "byte": 15
+  },
+  "1F": {
+   "label": "SLO abx 1F",
+   "reglus": 1098,
+   "persists": 651,
+   "lookups": 65,
+   "terms": 5991,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SLO",
+   "operation": "slo",
+   "mode": "abx",
+   "byte": 31
+  },
+  "1B": {
+   "label": "SLO aby 1B",
+   "reglus": 1098,
+   "persists": 651,
+   "lookups": 65,
+   "terms": 5991,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SLO",
+   "operation": "slo",
+   "mode": "aby",
+   "byte": 27
+  },
+  "03": {
+   "label": "SLO idx 03",
+   "reglus": 1534,
+   "persists": 877,
+   "lookups": 97,
+   "terms": 8012,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SLO",
+   "operation": "slo",
+   "mode": "idx",
+   "byte": 3
+  },
+  "13": {
+   "label": "SLO idy 13",
+   "reglus": 1534,
+   "persists": 877,
+   "lookups": 97,
+   "terms": 8016,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SLO",
+   "operation": "slo",
+   "mode": "idy",
+   "byte": 19
+  },
+  "27": {
+   "label": "RLA zpg 27",
+   "reglus": 1096,
+   "persists": 649,
+   "lookups": 65,
+   "terms": 5964,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RLA",
+   "operation": "rla",
+   "mode": "zpg",
+   "byte": 39
+  },
+  "37": {
+   "label": "RLA zpx 37",
+   "reglus": 1100,
+   "persists": 651,
+   "lookups": 65,
+   "terms": 5986,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RLA",
+   "operation": "rla",
+   "mode": "zpx",
+   "byte": 55
+  },
+  "2F": {
+   "label": "RLA abs 2F",
+   "reglus": 1096,
+   "persists": 650,
+   "lookups": 65,
+   "terms": 5966,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RLA",
+   "operation": "rla",
+   "mode": "abs",
+   "byte": 47
+  },
+  "3F": {
+   "label": "RLA abx 3F",
+   "reglus": 1100,
+   "persists": 652,
+   "lookups": 65,
+   "terms": 5988,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RLA",
+   "operation": "rla",
+   "mode": "abx",
+   "byte": 63
+  },
+  "3B": {
+   "label": "RLA aby 3B",
+   "reglus": 1100,
+   "persists": 652,
+   "lookups": 65,
+   "terms": 5988,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RLA",
+   "operation": "rla",
+   "mode": "aby",
+   "byte": 59
+  },
+  "23": {
+   "label": "RLA idx 23",
+   "reglus": 1536,
+   "persists": 878,
+   "lookups": 97,
+   "terms": 8009,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RLA",
+   "operation": "rla",
+   "mode": "idx",
+   "byte": 35
+  },
+  "33": {
+   "label": "RLA idy 33",
+   "reglus": 1536,
+   "persists": 878,
+   "lookups": 97,
+   "terms": 8013,
+   "depth": 19,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RLA",
+   "operation": "rla",
+   "mode": "idy",
+   "byte": 51
+  },
+  "47": {
+   "label": "SRE zpg 47",
+   "reglus": 1090,
+   "persists": 647,
+   "lookups": 65,
+   "terms": 5952,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SRE",
+   "operation": "sre",
+   "mode": "zpg",
+   "byte": 71
+  },
+  "57": {
+   "label": "SRE zpx 57",
+   "reglus": 1094,
+   "persists": 649,
+   "lookups": 65,
+   "terms": 5974,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SRE",
+   "operation": "sre",
+   "mode": "zpx",
+   "byte": 87
+  },
+  "4F": {
+   "label": "SRE abs 4F",
+   "reglus": 1090,
+   "persists": 648,
+   "lookups": 65,
+   "terms": 5954,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SRE",
+   "operation": "sre",
+   "mode": "abs",
+   "byte": 79
+  },
+  "5F": {
+   "label": "SRE abx 5F",
+   "reglus": 1094,
+   "persists": 650,
+   "lookups": 65,
+   "terms": 5976,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SRE",
+   "operation": "sre",
+   "mode": "abx",
+   "byte": 95
+  },
+  "5B": {
+   "label": "SRE aby 5B",
+   "reglus": 1094,
+   "persists": 650,
+   "lookups": 65,
+   "terms": 5976,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SRE",
+   "operation": "sre",
+   "mode": "aby",
+   "byte": 91
+  },
+  "43": {
+   "label": "SRE idx 43",
+   "reglus": 1530,
+   "persists": 876,
+   "lookups": 97,
+   "terms": 7997,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SRE",
+   "operation": "sre",
+   "mode": "idx",
+   "byte": 67
+  },
+  "53": {
+   "label": "SRE idy 53",
+   "reglus": 1530,
+   "persists": 876,
+   "lookups": 97,
+   "terms": 8001,
+   "depth": 20,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "SRE",
+   "operation": "sre",
+   "mode": "idy",
+   "byte": 83
+  },
+  "67": {
+   "label": "RRA zpg 67",
+   "reglus": 1076,
+   "persists": 634,
+   "lookups": 65,
+   "terms": 5846,
+   "depth": 22,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RRA",
+   "operation": "rra",
+   "mode": "zpg",
+   "byte": 103
+  },
+  "77": {
+   "label": "RRA zpx 77",
+   "reglus": 1080,
+   "persists": 636,
+   "lookups": 65,
+   "terms": 5868,
+   "depth": 22,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RRA",
+   "operation": "rra",
+   "mode": "zpx",
+   "byte": 119
+  },
+  "6F": {
+   "label": "RRA abs 6F",
+   "reglus": 1076,
+   "persists": 635,
+   "lookups": 65,
+   "terms": 5848,
+   "depth": 22,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RRA",
+   "operation": "rra",
+   "mode": "abs",
+   "byte": 111
+  },
+  "7F": {
+   "label": "RRA abx 7F",
+   "reglus": 1080,
+   "persists": 637,
+   "lookups": 65,
+   "terms": 5870,
+   "depth": 22,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RRA",
+   "operation": "rra",
+   "mode": "abx",
+   "byte": 127
+  },
+  "7B": {
+   "label": "RRA aby 7B",
+   "reglus": 1080,
+   "persists": 637,
+   "lookups": 65,
+   "terms": 5870,
+   "depth": 22,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RRA",
+   "operation": "rra",
+   "mode": "aby",
+   "byte": 123
+  },
+  "63": {
+   "label": "RRA idx 63",
+   "reglus": 1516,
+   "persists": 863,
+   "lookups": 97,
+   "terms": 7891,
+   "depth": 22,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RRA",
+   "operation": "rra",
+   "mode": "idx",
+   "byte": 99
+  },
+  "73": {
+   "label": "RRA idy 73",
+   "reglus": 1516,
+   "persists": 863,
+   "lookups": 97,
+   "terms": 7895,
+   "depth": 22,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "mnemonic": "RRA",
+   "operation": "rra",
+   "mode": "idy",
+   "byte": 115
+  }
+ },
+ "per_family": {
+  "load_a": {
+   "label": "family load_a",
+   "reglus": 1560,
+   "persists": 882,
+   "lookups": 97,
+   "terms": 8136,
+   "depth": 36,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 8
+  },
+  "load_x": {
+   "label": "family load_x",
+   "reglus": 1090,
+   "persists": 633,
+   "lookups": 65,
+   "terms": 5893,
+   "depth": 29,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 5
+  },
+  "load_y": {
+   "label": "family load_y",
+   "reglus": 1090,
+   "persists": 633,
+   "lookups": 65,
+   "terms": 5893,
+   "depth": 29,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 5
+  },
+  "store_a": {
+   "label": "family store_a",
+   "reglus": 1544,
+   "persists": 874,
+   "lookups": 97,
+   "terms": 8028,
+   "depth": 31,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 7
+  },
+  "store_x": {
+   "label": "family store_x",
+   "reglus": 1064,
+   "persists": 618,
+   "lookups": 65,
+   "terms": 5733,
+   "depth": 22,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 3
+  },
+  "store_y": {
+   "label": "family store_y",
+   "reglus": 1064,
+   "persists": 618,
+   "lookups": 65,
+   "terms": 5733,
+   "depth": 22,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 3
+  },
+  "tax": {
+   "label": "family tax",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "tay": {
+   "label": "family tay",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "txa": {
+   "label": "family txa",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "tya": {
+   "label": "family tya",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "tsx": {
+   "label": "family tsx",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "txs": {
+   "label": "family txs",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4637,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "pha": {
+   "label": "family pha",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4661,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "php": {
+   "label": "family php",
+   "reglus": 834,
+   "persists": 495,
+   "lookups": 50,
+   "terms": 4664,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "pla": {
+   "label": "family pla",
+   "reglus": 1054,
+   "persists": 610,
+   "lookups": 66,
+   "terms": 5681,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "plp": {
+   "label": "family plp",
+   "reglus": 3090,
+   "persists": 2152,
+   "lookups": 66,
+   "terms": 15370,
+   "depth": 11,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "adc": {
+   "label": "family adc",
+   "reglus": 1584,
+   "persists": 894,
+   "lookups": 97,
+   "terms": 8309,
+   "depth": 38,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 8
+  },
+  "sbc": {
+   "label": "family sbc",
+   "reglus": 1588,
+   "persists": 897,
+   "lookups": 97,
+   "terms": 8345,
+   "depth": 38,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 9
+  },
+  "cmp": {
+   "label": "family cmp",
+   "reglus": 1566,
+   "persists": 883,
+   "lookups": 97,
+   "terms": 8174,
+   "depth": 35,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 8
+  },
+  "cpx": {
+   "label": "family cpx",
+   "reglus": 1076,
+   "persists": 620,
+   "lookups": 65,
+   "terms": 5797,
+   "depth": 26,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 3
+  },
+  "cpy": {
+   "label": "family cpy",
+   "reglus": 1076,
+   "persists": 620,
+   "lookups": 65,
+   "terms": 5797,
+   "depth": 26,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 3
+  },
+  "and": {
+   "label": "family and",
+   "reglus": 1608,
+   "persists": 923,
+   "lookups": 97,
+   "terms": 8446,
+   "depth": 45,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 8
+  },
+  "ora": {
+   "label": "family ora",
+   "reglus": 1608,
+   "persists": 923,
+   "lookups": 97,
+   "terms": 8462,
+   "depth": 45,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 8
+  },
+  "eor": {
+   "label": "family eor",
+   "reglus": 1608,
+   "persists": 923,
+   "lookups": 97,
+   "terms": 8462,
+   "depth": 45,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 8
+  },
+  "bit": {
+   "label": "family bit",
+   "reglus": 1108,
+   "persists": 652,
+   "lookups": 65,
+   "terms": 6012,
+   "depth": 33,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 2
+  },
+  "asl": {
+   "label": "family asl",
+   "reglus": 1106,
+   "persists": 644,
+   "lookups": 65,
+   "terms": 5998,
+   "depth": 29,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 5
+  },
+  "lsr": {
+   "label": "family lsr",
+   "reglus": 1116,
+   "persists": 657,
+   "lookups": 65,
+   "terms": 6095,
+   "depth": 37,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 5
+  },
+  "rol": {
+   "label": "family rol",
+   "reglus": 1106,
+   "persists": 644,
+   "lookups": 65,
+   "terms": 6006,
+   "depth": 29,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 5
+  },
+  "ror": {
+   "label": "family ror",
+   "reglus": 1116,
+   "persists": 657,
+   "lookups": 65,
+   "terms": 6096,
+   "depth": 37,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 5
+  },
+  "inc": {
+   "label": "family inc",
+   "reglus": 1092,
+   "persists": 635,
+   "lookups": 65,
+   "terms": 5908,
+   "depth": 29,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 4
+  },
+  "dec": {
+   "label": "family dec",
+   "reglus": 1092,
+   "persists": 635,
+   "lookups": 65,
+   "terms": 5907,
+   "depth": 29,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 4
+  },
+  "inx": {
+   "label": "family inx",
+   "reglus": 838,
+   "persists": 497,
+   "lookups": 50,
+   "terms": 4678,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "iny": {
+   "label": "family iny",
+   "reglus": 838,
+   "persists": 497,
+   "lookups": 50,
+   "terms": 4678,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "dex": {
+   "label": "family dex",
+   "reglus": 838,
+   "persists": 497,
+   "lookups": 50,
+   "terms": 4677,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "dey": {
+   "label": "family dey",
+   "reglus": 838,
+   "persists": 497,
+   "lookups": 50,
+   "terms": 4677,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "jmp": {
+   "label": "family jmp",
+   "reglus": 1498,
+   "persists": 835,
+   "lookups": 97,
+   "terms": 7725,
+   "depth": 28,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 2
+  },
+  "jsr": {
+   "label": "family jsr",
+   "reglus": 1046,
+   "persists": 607,
+   "lookups": 65,
+   "terms": 5651,
+   "depth": 10,
+   "const_roots": [
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "rts": {
+   "label": "family rts",
+   "reglus": 1274,
+   "persists": 721,
+   "lookups": 82,
+   "terms": 6694,
+   "depth": 10,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "rti": {
+   "label": "family rti",
+   "reglus": 3530,
+   "persists": 2382,
+   "lookups": 98,
+   "terms": 17407,
+   "depth": 11,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "brk": {
+   "label": "family brk",
+   "reglus": 864,
+   "persists": 517,
+   "lookups": 52,
+   "terms": 4811,
+   "depth": 11,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "bpl": {
+   "label": "family bpl",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "bmi": {
+   "label": "family bmi",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5619,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "bvc": {
+   "label": "family bvc",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "bvs": {
+   "label": "family bvs",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5619,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "bcc": {
+   "label": "family bcc",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "bcs": {
+   "label": "family bcs",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5619,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "bne": {
+   "label": "family bne",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5620,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "beq": {
+   "label": "family beq",
+   "reglus": 1042,
+   "persists": 601,
+   "lookups": 65,
+   "terms": 5619,
+   "depth": 13,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "clc": {
+   "label": "family clc",
+   "reglus": 830,
+   "persists": 485,
+   "lookups": 50,
+   "terms": 4630,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "sec": {
+   "label": "family sec",
+   "reglus": 830,
+   "persists": 485,
+   "lookups": 50,
+   "terms": 4630,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "cli": {
+   "label": "family cli",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4636,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "sei": {
+   "label": "family sei",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4637,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "clv": {
+   "label": "family clv",
+   "reglus": 830,
+   "persists": 490,
+   "lookups": 50,
+   "terms": 4637,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "cld": {
+   "label": "family cld",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4636,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "sed": {
+   "label": "family sed",
+   "reglus": 830,
+   "persists": 489,
+   "lookups": 50,
+   "terms": 4637,
+   "depth": 9,
+   "const_roots": [
+    "ea",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 1
+  },
+  "nop": {
+   "label": "family nop",
+   "reglus": 1154,
+   "persists": 684,
+   "lookups": 65,
+   "terms": 6172,
+   "depth": 24,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 24
+  },
+  "lax": {
+   "label": "family lax",
+   "reglus": 1548,
+   "persists": 872,
+   "lookups": 97,
+   "terms": 8052,
+   "depth": 36,
+   "const_roots": [
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 6
+  },
+  "sax": {
+   "label": "family sax",
+   "reglus": 1564,
+   "persists": 893,
+   "lookups": 97,
+   "terms": 8142,
+   "depth": 29,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 4
+  },
+  "dcp": {
+   "label": "family dcp",
+   "reglus": 1566,
+   "persists": 884,
+   "lookups": 97,
+   "terms": 8208,
+   "depth": 36,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 7
+  },
+  "isb": {
+   "label": "family isb",
+   "reglus": 1584,
+   "persists": 895,
+   "lookups": 97,
+   "terms": 8322,
+   "depth": 39,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 7
+  },
+  "slo": {
+   "label": "family slo",
+   "reglus": 1610,
+   "persists": 924,
+   "lookups": 97,
+   "terms": 8502,
+   "depth": 45,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 7
+  },
+  "rla": {
+   "label": "family rla",
+   "reglus": 1612,
+   "persists": 925,
+   "lookups": 97,
+   "terms": 8500,
+   "depth": 45,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 7
+  },
+  "sre": {
+   "label": "family sre",
+   "reglus": 1606,
+   "persists": 923,
+   "lookups": 97,
+   "terms": 8485,
+   "depth": 44,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 7
+  },
+  "rra": {
+   "label": "family rra",
+   "reglus": 1596,
+   "persists": 910,
+   "lookups": 97,
+   "terms": 8414,
+   "depth": 47,
+   "const_roots": [
+    "is_store2",
+    "is_store3",
+    "one"
+   ],
+   "n_opcodes": 7
+  }
+ }
+}

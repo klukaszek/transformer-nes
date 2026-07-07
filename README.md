@@ -93,7 +93,10 @@ Standard softmax attention is O(n) per step.  Since this model uses hardmax atte
 
 `6502-transformer` runs the machine as **actual transformer weights**:
 `scheduler/milp.py`'s load-balanced critical-path scheduler assigns the gates to 71 layers, `model/weights.py` constructs `VanillaTransformer` weights analytically (d_model≈1550, ~777 heads, no training), and inference is genuine — Q/K/V projections, attention (hull hardmax or true softmax), ReGLU FFN, residual stream — run by generated straight-line C++ at
-~90-112K stepped instructions/s after boot in the default exact-int32 mode.
+~98-116K stepped instructions/s after boot in the default exact-int32 mode
+(attention state is O(1): memory groups resolve through an exact
+nearest-address structure and constant-query heads through running-argmax
+registers, so nothing grows with the token log).
 **The full 8,991-instruction nestest suite passes through the weights in
 ~0.1 seconds**, the full 30.6M-instruction Klaus suite lockstep-matches
 with decimal mode, and the NES console can hand a running game off to the

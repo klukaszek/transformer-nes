@@ -54,7 +54,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `kernel.py` (generated C++) | ~450–600K | Same semantics at NES-relevant speed |
-| `weights_runner.py` (real transformer) | ~90-112K after boot | The thesis: actual softmax-ReGLU transformer weights |
+| `weights_runner.py` (real transformer) | ~98-116K after boot | The thesis: actual softmax-ReGLU transformer weights |
 
 The Python and C++ backends are **bit-identical**: same IEEE double
 operations in the same order, the same hull code (`hull2d_cht.h`), the same
@@ -94,13 +94,14 @@ paths remain useful diagnostics:
 | `dense` | dense torch matvecs, per-layer Python loop; float64 diagnostic | ~0.13 |
 | `sparse` | scipy CSR matvecs, per-layer Python loop | ~30–95 |
 | `engine` | `model/weights_engine.cpp`: generic CSR C++, whole stack per pybind call — float32 CSR matvecs, shared hull attention for lookup heads, direct WRITE-token insertion, structural fusion of passthrough/erase paths into direct CSR residual deltas | ~10-11K after boot |
-| `codegen` | `model/engine_gen.py`: model-specific generated C++ with the same arithmetic — column indices as immediates, ±1 coefficients as add/sub, coefficients as float32 hexfloat literals; compiled once per model digest (~5-10 s, cached); with a step_spec the whole machine_step (embed, readout, write inserts, halt logits) runs as one generated C++ call; default arith is an exact fixed-point int32 residual (guarded shifts, wrap-exact sums, cleared inserts skipped) and memory-group attention resolved by an exact O(1) nearest-written-address structure, with int64/f32-replica variants | ~90-112K after boot |
+| `codegen` | `model/engine_gen.py`: model-specific generated C++ with the same arithmetic — column indices as immediates, ±1 coefficients as add/sub, coefficients as float32 hexfloat literals; compiled once per model digest (~5-10 s, cached); with a step_spec the whole machine_step (embed, readout, write inserts, halt logits) runs as one generated C++ call; default arith is an exact fixed-point int32 residual (guarded shifts, wrap-exact sums, cleared inserts skipped) and O(1) attention state: memory groups on an exact nearest-written-address structure, constant-query heads on running-argmax registers (zero hull2d calls in the forward; nothing grows with the token log), with int64/f32-replica variants | ~98-116K after boot |
 
 With the generated engine, **the full 8,991-instruction nestest suite runs
 through the actual transformer weights in ~0.1 s** (`6502-nestest --runner
 weights`), a 200K-instruction Klaus prefix lockstep-matches with decimal
-mode in ~2.2 s, and the full 30.6M-instruction Klaus suite matches with
-snapshot-and-rebuild checkpointing keeping hull logs bounded.  The NES
+mode in ~2.0 s, and the full 30.6M-instruction Klaus suite matches in ~6 min
+with checkpointing disabled entirely (engine state is O(1); the
+snapshot-and-rebuild machinery remains for the NES console).  The NES
 command `nes-run --warmup-frames 60 --backend weights` renders SMB frames
 through the weights at ~0.09 s/frame (~11 fps), byte-identical to the
 C++ kernel's.

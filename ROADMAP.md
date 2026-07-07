@@ -15,7 +15,7 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~90-112K after boot | default generated engine (codegen: exact fixed-point int32, C++ machine_step, O(1) memory attention); full nestest MATCHED in ~0.1 s; **full Klaus MATCHED: 30,646,177 steps exact** (with invisible checkpointing) |
+| `cpu6502/weights_runner.py` (real transformer) | ~98-116K after boot | default generated engine (codegen: exact fixed-point int32, C++ machine_step, O(1) attention state); full nestest MATCHED in ~0.1 s; **full Klaus MATCHED: 30,646,177 steps exact in ~6 min, checkpoint-free** |
 
 The weights transformer is genuine inference (d_model≈1550, 71 layers,
 analytic weights, no training).  The default path is the generated
@@ -496,6 +496,161 @@ Next, in payoff order:
    Python for MMIO).  Removes the ~3 µs/step Python protocol floor — at
    the current ~6 µs C++ step that is worth ~1.5×.
 3. Batched machines across cores after that.
+
+## 2026-07-07 running-argmax registers — nothing grows anymore
+
+Tracked in jj:
+- `vnwtsory` — convert constant-query hulls to running-argmax registers
+
+What was built:
+- The 12 remaining non-memory lookup heads all have **constant queries**
+  ([QX, QY], both rows a lone term on the one-slot — the hardmax
+  temperature).  With a constant query, every token's attention score
+  QX·kx + QY·ky is a fixed function of its key, so the historical argmax
+  can be maintained **incrementally at insert time**: a register per head
+  holds (best score, best values); a live insert (cleared tokens skipped
+  as before) folds in with replace-on-≥, which reproduces the LATEST
+  tie-break exactly (ilp is monotone in double, so a later equal-key
+  token never compares below an earlier one).  A query is a register
+  read; empty register returns (0,0), matching an empty hull.
+- Generation is guarded like everything else: eligibility is checked per
+  head (constant query, LATEST tie-break, integer value rows), with the
+  real-hull path as fallback.  For this model all 12 convert, so **the
+  generated forward contains zero hull2d calls** — grep the emitted
+  source: no .query, no .insert.
+- Consequence: with memory on the O(1) structure and these on registers,
+  **no engine state grows with the token log**.  Snapshot-and-rebuild
+  checkpointing is now optional for the weights machine (still supported,
+  still used by the NES console; the growth motivation is gone).
+
+Receipts:
+- **Full Klaus with checkpointing DISABLED: MATCHED — 30,646,177 steps in
+  373 s (6.2 min, ~82K instr/s including the lockstep reference), zero
+  rebuilds, throughput flat from the 1M-step mark to the last** — the
+  flat curve is itself the nothing-grows receipt.
+- Full nestest MATCHED: 0.1 s, ~100K instr/s.  Klaus 200K decimal,
+  checkpoint-free: 2.0 s, ~98K instr/s.
+- SMB through the weights: ~0.09 s/frame (~11 fps), frames byte-identical
+  to the kernel and all prior engines.  6 weights + 47 fast tests green;
+  machine_step 8.6 µs synthetic.
+- Two-day arc totals: full-suite Klaus 57 → 6.2 min; SMB 0.1 → 11 fps
+  (~110×); the weights machine now runs the 6502 with O(1) state through
+  genuine 71-layer transformer inference.
+
+Next: the C++ run loop (KernelBus shape — mem_val already is the RAM
+mirror) to remove the ~3 µs/step Python protocol floor, then batched
+machines across cores.
+
+## 2026-07-07 ceiling analysis: where single-stream CPU tops out
+
+Real-time SMB needs ~590K instr/s (measured ~9,800 instructions/frame ×
+60 fps).  The weights machine is at ~110-116K effective (~11 fps).  The
+8.6 µs step splits ~3 µs Python protocol / ~4 µs linear math / ~1.6 µs
+everything else — and the linear part executes ~36K indexed loads in
+~4 µs, i.e. **~3 loads per cycle, the M-series load-port hardware limit**
+(hull-ablation receipt).  The linear math is no longer unoptimized code;
+it runs at the speed the memory subsystem can feed it.
+
+What implementation still buys, honestly bounded:
+- **C++ run loop** (KernelBus shape; `mem_val` already is the RAM
+  mirror): removes the ~3 µs Python floor → ~180K instr/s ≈ ~18 fps.
+- **Schedule/width compaction** (old #3): fewer live persists →
+  somewhat less nnz; realistically 1.2–1.4× → low-20s fps.
+- Nothing else: single-stream threading is dead (71 sequential layers,
+  ~70 ns each), int16 is dead (804/1551 slots exceed it), the gather is
+  at the port floor.  **The current construction tops out ~20-25 fps on
+  one core.**  Batching still buys fleet throughput (state is O(1) per
+  machine now), just not single-game latency.
+
+The remaining ~3× to real-time is a *construction* gap, not an
+engineering gap.  Candidates, in expected payoff order:
+1. **Opcode-routed conditional computation (MoE-style)**: the graph
+   evaluates every instruction family every step — all ALU families,
+   all addressing modes, BCD — and one-hot decode gates discard ~95%
+   of it.  Sparse routing where the fetched opcode selects the expert
+   subgraph is worth an order of magnitude, not a factor of 1.3.  This
+   is a genuine transformer-architecture change (token-routed experts),
+   with its own equivalence/verification story to build.
+2. **Multi-instruction tokens**: amortizes per-forward fixed costs;
+   modest once the run loop lands (the fixed costs are what it removes).
+3. **Depth compaction**: fewer than 71 layers via graph restructuring
+   (gadget fusion, wider per-layer FFN); bounded by the critical path.
+
+## 2026-07-07 MoE routing scouting probe (measured, not guessed)
+
+No repo code changes; probe lives in `experiments/moe_probe/`
+(`moe_probe.py` = partial evaluation + liveness + depth, `smb_weighting.py`
+= real-gameplay opcode histogram; results JSONs checked in alongside).
+
+Method: partial-evaluate the built graph per candidate expert by pinning
+the decode one-hot gates (`is_op_XX`, `is_nmi`) to constants — exactly the
+information a hard router supplies.  Constant folding with linear inlining
+for known-gate multiplies (so `mux(gate=1, a, b)` folds to `a` and dead
+branches prune), backward liveness from `_RUNTIME_READ_DIMS`, then the
+scheduler's own phase-parity critical path (`_min_layers`) on the pruned
+graph.  **Self-validation: the unpinned baseline reproduces the union
+graph at exactly 71 layers**, terms=29,136 (the measured engine visits
+38,067 CSR nnz — the ~1.3× structural gap is fusion composition; ratios
+transfer).
+
+Per-expert results (ratios vs the 71-layer / 29,136-term union):
+- Per-opcode experts: depth min/med/max = **9/13/22** layers, terms
+  0.16–0.28×.  Family experts cost barely more than their worst member
+  (in-family decode is cheap), *except* where modes diverge: family jmp
+  is depth 28 (JMP ind's pointer read) while JMP abs alone is depth 10.
+- Outliers: PLP/RTI at 15–17K terms — that's `_low_bit`'s 256-way match
+  gadgets ×6 flags; an expert build replaces them with 8-bit extraction
+  (deep-narrow is fine inside an 11-layer expert).  NMI expert: 4.8K
+  terms, depth 9.
+- Floor: even CLC is ~4.6K terms / 9 layers — the shared machinery
+  (3-read instruction fetch across 16 memory groups, latest-state,
+  write-channel key construction, trace readout).  Routing alone cannot
+  go below ~0.16×; further reduction means attacking the fetch gadgets.
+
+SMB workload (reference backend, scripted Start + hold-right + jumps,
+Mario verifiably crosses page 1; 750 frames, ~10.7K instr/frame):
+- **87% of executed instructions are 4 opcodes** — LDA abs / AND imm /
+  BEQ rel (the frame-wait poll loop) + JMP abs (idle spin).  Top-16
+  opcodes cover 93.7%.
+- Gameplay-weighted per-opcode experts: **depth 12.8 (0.18×), terms
+  0.194×, live lookups 64.6 of 113**.  Family-only experts are notably
+  worse (0.25×, depth 0.42×) because hot families drag in cold modes —
+  granularity should be per-opcode for the hot ~16, family for the rest.
+
+Implications:
+- On the CPU engine (straight-line codegen), depth is free; the win is
+  loads: linear part ~4 µs × 0.194 ≈ 0.8 µs, lookup-structure work
+  ~×0.57.  Stacked on the C++ run loop (kills the ~3 µs Python floor),
+  the routed step lands ~1.6–2.0 µs ≈ **500–630K instr/s ≈ 45–60 fps**
+  — SMB real-time needs ~640K (10.7K instr/frame × 60).  Width/schedule
+  compaction or trimming the 4 poll-loop experts covers the remainder.
+- The depth result (71 → ~13 median) is what matters for the batched/GPU
+  path (fewer sequential dispatches) and for the write-up: the routed
+  model is a genuine top-1 hard-routed MoE (Switch-style) whose router
+  is the existing one-hot decode hoisted out of multiplicative gating.
+- Engine-side dispatch is nearly free: the run loop reads `mem_val[pc]`
+  (the RAM mirror the engine already maintains) and jumps to the expert
+  step function before the forward.  Verification story: partial
+  evaluation is algebraic (fold rules mirror the emission), receipts =
+  the existing lockstep chain per expert; full Klaus + nestest sweep
+  every opcode through every expert.
+- Caveats recorded: probe terms undercount real nnz ~1.3× (structural);
+  `operand_mem`/`data_out` stay live in every expert because the trace
+  convention reports `data` — an expert build could trim further if the
+  trace field is relaxed for non-memory ops; ~60–70 expert functions is
+  fine for I-cache since the hot 4 stay resident.
+
+Next, in payoff order:
+1. **C++ run loop** (unchanged from the previous log; KernelBus shape,
+   `mem_val` is already the RAM mirror).  Worth ~1.5× on its own and it
+   is where the expert dispatch will live, so it lands first.
+2. **Routed expert construction**: partial-eval expert emission in
+   `engine_gen.py` (per-opcode for the hot ~16, per-family otherwise,
+   union fallback for anything unproven), router = `mem_val[pc]` table;
+   then the same construction as a real routed-MoE weights model for
+   the thesis.  ~3–3.5× on top of the run loop.
+3. Width compaction / poll-loop expert micro-optimization if the last
+   ~1.2× to 60 fps needs it.
 
 ## Prioritized next steps
 

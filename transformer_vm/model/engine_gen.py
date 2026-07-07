@@ -209,6 +209,8 @@ def generate_source(model, step_spec: dict | None = None,
     mem_hulls: list[list[int]] = [[] for _ in range(16)]  # group -> flat hull ids
     mem_fallback_hulls: list[int] = []  # memory hulls kept on the hull path
     n_memory_heads = 0
+    n_regs = 0  # running-argmax registers for constant-query heads
+    n_hull_heads = 0  # heads still on real hulls
 
     # Residual references.  In int mode the position features (slots 0-2)
     # never feed integer rows -- only hull-bound Q/K/V rows read them, via
@@ -336,6 +338,31 @@ def generate_source(model, step_spec: dict | None = None,
                         and np.all(np.abs(q_round) < 2**24)
                         and not any(int(i) <= 2 for i in q_idx)):
                     mem_ok = False
+
+            # Non-memory heads with a CONSTANT query [QX, QY] (both rows a
+            # lone term on the one-slot): each token's score QX*kx + QY*ky
+            # is a fixed function of its key, so the historical argmax can
+            # be maintained incrementally at insert time.  Replace-on->=
+            # reproduces the LATEST tie-break (ilp is monotone in double,
+            # so a later equal-key token never compares below an earlier
+            # one), and cleared tokens are skipped as before.
+            reg_ok = False
+            v0_i = v1_i = None
+            if is_int and not mem_ok and tiebreak[h]:
+                q0_idx, q0_dat = _row(ip, 2 * h)
+                reg_ok = (
+                    len(q0_idx) == 1 and int(q0_idx[0]) == model.one_slot
+                    and len(q1_idx) == 1 and int(q1_idx[0]) == model.one_slot
+                )
+                if reg_ok:
+                    try:
+                        v0_i = _expr_int(*_row(ip, 2 * d_model + 2 * h),
+                                         xref, f"L{li} reg v0")
+                        v1_i = _expr_int(*_row(ip, 2 * d_model + 2 * h + 1),
+                                         xref, f"L{li} reg v1")
+                    except RuntimeError:
+                        reg_ok = False
+
             if mem_ok:
                 # Memory-group lookup served by the exact nearest-address
                 # structure: with qy == 1, the parabola score makes the
@@ -362,7 +389,30 @@ def generate_source(model, step_spec: dict | None = None,
                 b.append(f"            ho{2 * h} = ({elem})(mo[0] << F);")
                 b.append(f"            ho{2 * h + 1} = ({elem})(mo[1] << F);")
                 b.append("        }")
+            elif reg_ok:
+                r = n_regs
+                n_regs += 1
+                qx = float(q0_dat[0])
+                qy = float(q1_dat[0])
+                k0 = _expr_dbl(*_row(ip, d_model + 2 * h), dref)
+                k1 = _expr_dbl(*_row(ip, d_model + 2 * h + 1), dref)
+                b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
+                b.append("        {")
+                b.append(f"            const double kyv = {k1};")
+                b.append("            if (kyv > -1.0e29) {  // live: fold into the running argmax")
+                b.append(f"                const double s = {_lit_d(qx)}*({k0}) + {_lit_d(qy)}*kyv;")
+                b.append(f"                if (!reg_any[{r}] || s >= reg_s[{r}]) {{")
+                b.append(f"                    reg_any[{r}] = true;")
+                b.append(f"                    reg_s[{r}] = s;")
+                b.append(f"                    reg_v0[{r}] = {v0_i};")
+                b.append(f"                    reg_v1[{r}] = {v1_i};")
+                b.append("                }")
+                b.append("            }")
+                b.append(f"            ho{2 * h} = reg_any[{r}] ? reg_v0[{r}] : 0;")
+                b.append(f"            ho{2 * h + 1} = reg_any[{r}] ? reg_v1[{r}] : 0;")
+                b.append("        }")
             elif is_int:
+                n_hull_heads += 1
                 if mem_groups[h] >= 0:
                     mem_fallback_hulls.append(hid)
                 # Q/K/V straight to double: the hull resolves in double
@@ -568,6 +618,15 @@ def generate_source(model, step_spec: dict | None = None,
         emit("        out[0] = mem_val[g][win];")
         emit("        out[1] = ((long long)g << 12) + win;")
         emit("    }")
+        if n_regs:
+            emit("")
+            emit("    // Running-argmax registers for constant-query lookup")
+            emit("    // heads: the score of each token is a fixed function")
+            emit("    // of its key, so the argmax is maintained at insert")
+            emit("    // time and a query is a register read.")
+            emit(f"    double reg_s[{n_regs}];")
+            emit(f"    {elem} reg_v0[{n_regs}], reg_v1[{n_regs}];")
+            emit(f"    bool reg_any[{n_regs}];")
     emit("")
     emit("    ENGINE_T() { reset(); }")
     emit("")
@@ -579,6 +638,8 @@ def generate_source(model, step_spec: dict | None = None,
     if is_int:
         emit("        for (int g = 0; g < 16; ++g)")
         emit("            for (int w = 0; w < 64; ++w) mem_bits[g][w] = 0ULL;")
+    if n_regs:
+        emit(f"        for (int r = 0; r < {n_regs}; ++r) reg_any[r] = false;")
     emit("        seq = -1;")
     emit("    }")
     emit("")
