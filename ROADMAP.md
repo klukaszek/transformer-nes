@@ -15,22 +15,22 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~36-53K after boot | default generated fp32 engine (codegen, C++ machine_step); full nestest MATCHED in ~0.2 s; **full Klaus MATCHED: 30,646,177 steps exact** (with invisible checkpointing) |
+| `cpu6502/weights_runner.py` (real transformer) | ~62-107K after boot | default generated engine (codegen, exact fixed-point int32, C++ machine_step); full nestest MATCHED in ~0.1 s; **full Klaus MATCHED: 30,646,177 steps exact** (with invisible checkpointing) |
 
 The weights transformer is genuine inference (d_model≈1550, 71 layers,
 analytic weights, no training).  The default path is the generated
-straight-line float32 C++ engine (`model/engine_gen.py`), which runs the
-whole machine step per call; the generic CSR engine
-(`model/weights_engine.cpp`) and the dense/sparse Python paths remain
-diagnostics.
+straight-line C++ engine (`model/engine_gen.py`) with an exact
+fixed-point int32 residual, which runs the whole machine step per call;
+the generic CSR engine (`model/weights_engine.cpp`) and the dense/sparse
+Python paths remain diagnostics.
 
 **NES layer** (`nes/`): MMIO bus with shadow-decode read injection,
 in-graph NMI, frame-level PPU, OAM DMA, controllers, cycle-budget frame
 pacing, invisible snapshot-and-rebuild checkpointing, and mid-game
 backend handoff.  nestest boots and passes its suite interactively; SMB
 plays at ~45 fps on the kernel; SMB frames render **through the
-transformer weights** byte-identical to the kernel at ~0.20 s/frame
-(~5.1 fps with the generated engine + C++ machine_step, 2026-07-07;
+transformer weights** byte-identical to the kernel at ~0.12 s/frame
+(~8.3 fps with the int32 generated engine, 2026-07-07;
 `nes-run --warmup-frames 60 --backend weights`).
 
 **Scheduling**: the optimal-width MILP does not scale (formulation
@@ -44,8 +44,9 @@ with the grouped-memory lookup).
   with gap 1; fp32 diverged at nestest step 0, but matched low-address
   programs).  The grouped-lookup experiment below fixes this for hull
   hard attention.
-- All residual/FFN values are dyadic rationals < 2²⁴, so the float32 engine
-  is the default execution mode.
+- All residual/FFN values are dyadic rationals < 2²⁴ with at most one
+  fractional bit (certified 2026-07-07), so float32 execution is exact and
+  the default engine runs an exact fixed-point int32 residual (F=1).
 - Same-address rewrites are resolved by the hull LATEST sequence tie-break.
   True softmax still averages exact ties, so `--cache standard` remains a
   separate latest-write semantics problem.
@@ -369,6 +370,66 @@ Where the remaining time is:
   the exact fixed-point int/NEON research item is next on the CPU path,
   and batching/Metal remain the throughput plays beyond that.
 
+## 2026-07-07 exact fixed-point int32 forward + cleared-insert skip
+
+Tracked in jj:
+- `zozvwnqs` — exact integer forward for the generated engine
+
+What was built (`engine_gen.py` grew `arith` modes; int32 is the default):
+- **Certification pass first**: every residual-feeding coefficient is an
+  integer ≤ 65536 except four ±0.5 direct-map coefficients; no
+  residual-feeding row reads position slots 0–2 (only hull-bound Q/K
+  rows do); all lookup heads are LATEST tie-break; STATE/HALT head rows
+  are ±100000.  These invariants make an exact integer residual viable.
+- **Fixed-point int32 residual at scale 2^F (F=1)**: embeds shift in,
+  readouts shift out, the four ±0.5 coefficients become always-exact
+  shifts, ReGLU products rescale with a guard.  Every guard throws
+  instead of rounding, so an insufficient F fails loudly (and did:
+  the diagnostic depth scan showed the only fractional values are
+  halves — F=1 exactly covers the model).  Partial sums may wrap mod
+  2^32 (`-fwrapv`); every final graph value fits int32, so results are
+  exact.  Q/K/V and position features feed the hulls in double.
+- **int64 variant measured and rejected**: 20.0 µs vs f32's 18.9 µs —
+  the linear part is load-bound, so value density is what matters;
+  int32 alone gave 16.5 µs.
+- **Hull ablation probe**: with the linear part this fast, the hulls
+  were ~60% of the step (ablated step 6.8 µs vs 16.5 µs).  Which led to:
+- **Cleared-insert skip**: every forward inserted the current token into
+  all 92 shared hulls, but most inserts are clear_key-gated
+  (ky −= 1e30) and provably can never win a query — a hull that stays
+  empty returns (0,0), exactly what a cleared winner returns.  The int
+  emission now skips them (and their value-expression computation)
+  behind a `ky > -1e29` test.  16.5 µs → **9.3 µs**.
+
+Receipts (traces identical to the generic engine incl. checkpoint
+rebuilds; frames byte-identical to the kernel and all prior engines):
+- `machine_step`: 18.9 µs → **9.3 µs (107K steps/s synthetic)**.
+- Full nestest MATCHED: **0.1 s, ~64K instr/s**.
+- Klaus 200K decimal prefix MATCHED: **3.2 s, ~62K instr/s** (incl. the
+  lockstep reference).
+- SMB through the weights: **~0.12 s/frame (~8.3 fps)** — 0.1 fps at the
+  start of this arc, so ~80× cumulative.
+- **Full Klaus re-validated: MATCHED — 30,646,177 steps in 563 s
+  (9.4 min, ~54.4K instr/s sustained including the lockstep reference)**,
+  146 checkpoints, flat throughput.  The full-suite run has gone
+  57 min → 18.9 → 15.3 → 9.4 across four engine generations in two days.
+- Debugging war story for the record: the first int builds threw the
+  fixed-point guards at F=1/2/4 — not deep fractional values but an
+  unscaled `machine_step` embed (inputs entered 2^F too small).  The
+  guards did their job: loud failure, no silent corruption.  The depth
+  scan that "found" 53-bit fractions was measuring the position-feature
+  slots (1/log2 − 1/log(pos+2)), which the int design already excludes.
+
+Where the remaining 9.3 µs lives:
+- ~3 µs Python protocol floor, ~6 µs C++ (roughly half linear/glue,
+  half hull queries on populated memory hulls).  The next big CPU lever
+  is replacing the memory-group hull queries with an exact
+  nearest-written-address structure (sorted set + per-address latest
+  array): the parabola scoring makes the winner the nearest written
+  address with recency breaking equidistant ties, which a lower_bound
+  probe reproduces exactly — same trick class as hull-vs-softmax, with
+  the same receipt obligations.  Beyond that: batched machines.
+
 ## Prioritized next steps
 
 ### 1. Key rescaling in the memory-lookup construction
@@ -442,7 +503,7 @@ uv run pytest -m "not slow"                    # 47 fast tests
 uv run pytest                                  # + kernel/weights/console suites
 uv run 6502-klaus --runner cpp-full            # full Klaus, ~48 s, exact step count
 uv run 6502-nestest --runner both              # golden log: reference + graph + kernel
-uv run 6502-nestest --runner weights           # full nestest through the generated fp32 engine, ~0.2 s
+uv run 6502-nestest --runner weights           # full nestest through the generated int32 engine, ~0.1 s
 uv run 6502-klaus --runner weights --graph-steps 200000
 uv run 6502-transformer --steps 30 --cache standard --matmul sparse   # true softmax diagnostic
 uv run nes-run transformer_vm/nes/examples/smb.nes --frames 61 \

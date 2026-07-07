@@ -56,6 +56,7 @@ class Cpu6502TransformerMachine:
 
     def __init__(self, *, bcd: bool = False, cache: str = "hull",
                  matmul: str = "codegen", dtype: str = "float32",
+                 codegen_arith: str = "int32",
                  checkpoint_tokens: int | None = None):
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
@@ -142,7 +143,8 @@ class Cpu6502TransformerMachine:
                 from transformer_vm.model.engine_gen import GeneratedWeightsEngine
 
                 self._engine = GeneratedWeightsEngine(
-                    self.model, dtype=dtype, step_spec=self._step_spec()
+                    self.model, dtype=dtype, step_spec=self._step_spec(),
+                    arith=codegen_arith,
                 )
             else:
                 from transformer_vm.model.engine import SparseWeightsEngine

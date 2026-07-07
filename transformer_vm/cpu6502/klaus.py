@@ -158,7 +158,8 @@ def run_weights(image: bytes, *, max_steps: int,
     machine = Cpu6502TransformerMachine(
         bcd=True, matmul=matmul, checkpoint_tokens=checkpoint_tokens,
     )
-    mode = f"{machine.matmul}/{machine.dtype}"
+    arith = getattr(machine._engine, "arith", None)
+    mode = f"{machine.matmul}-{arith}" if arith else f"{machine.matmul}/{machine.dtype}"
     build_elapsed = time.perf_counter() - build_start
 
     # Lockstep incrementally instead of materializing the whole trace:

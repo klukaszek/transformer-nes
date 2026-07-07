@@ -150,7 +150,8 @@ def run_weights(image: bytearray, *, max_steps: int,
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(bcd=False, matmul=matmul)
-    mode = f"{machine.matmul}/{machine.dtype}"
+    arith = getattr(machine._engine, "arith", None)
+    mode = f"{machine.matmul}-{arith}" if arith else f"{machine.matmul}/{machine.dtype}"
     build_elapsed = time.perf_counter() - build_start
 
     run_start = time.perf_counter()

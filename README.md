@@ -93,12 +93,12 @@ Standard softmax attention is O(n) per step.  Since this model uses hardmax atte
 
 `6502-transformer` runs the machine as **actual transformer weights**:
 `scheduler/milp.py`'s load-balanced critical-path scheduler assigns the gates to 71 layers, `model/weights.py` constructs `VanillaTransformer` weights analytically (d_model≈1550, ~777 heads, no training), and inference is genuine — Q/K/V projections, attention (hull hardmax or true softmax), ReGLU FFN, residual stream — run by generated straight-line C++ at
-~36-53K stepped instructions/s after boot in the default float32 mode.
+~62-107K stepped instructions/s after boot in the default exact-int32 mode.
 **The full 8,991-instruction nestest suite passes through the weights in
-~0.2 seconds**, the full 30.6M-instruction Klaus suite lockstep-matches
+~0.1 seconds**, the full 30.6M-instruction Klaus suite lockstep-matches
 with decimal mode, and the NES console can hand a running game off to the
 weights backend mid-play (`nes-run --warmup-frames 60 --backend weights`
-renders SMB frames byte-identical to the C++ kernel's at ~5 fps).  See
+renders SMB frames byte-identical to the C++ kernel's at ~8 fps).  See
 [`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).
 
 ## Development
