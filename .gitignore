@@ -20,3 +20,4 @@ _kernel_cache/
 
 # Commercial ROMs stay local (test ROMs like nestest are tracked)
 transformer_vm/nes/examples/smb.nes
+_engine_cache/

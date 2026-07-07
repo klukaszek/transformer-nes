@@ -55,7 +55,7 @@ class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
     def __init__(self, *, bcd: bool = False, cache: str = "hull",
-                 matmul: str = "engine", dtype: str = "float32",
+                 matmul: str = "codegen", dtype: str = "float32",
                  checkpoint_tokens: int | None = None):
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
@@ -98,7 +98,10 @@ class Cpu6502TransformerMachine:
         self._one_slot = self.slot_of[self.rt._one]
 
         n_heads = self.model.attn[0].num_heads
-        if matmul == "engine":
+        # "engine" (generic CSR C++) and "codegen" (generated straight-line
+        # C++) share every runner code path; only the engine class differs.
+        self._cpp_stack = matmul in ("engine", "codegen")
+        if self._cpp_stack:
             self.cache = None  # attention state lives inside the C++ engine
         elif cache == "hull":
             self.cache = HullKVCache(self.n_layers, n_heads)
@@ -126,15 +129,22 @@ class Cpu6502TransformerMachine:
 
         self.matmul = matmul
         self._direct_writes = False
-        if matmul == "engine":
+        if self._cpp_stack:
             # Whole layer stack per pybind call; hull attention and
-            # structural passthrough fusion live in C++
-            # (model/weights_engine.cpp).
-            from transformer_vm.model.engine import SparseWeightsEngine
-
+            # structural passthrough fusion live in C++.  "engine" loads
+            # the generic CSR engine (model/weights_engine.cpp); "codegen"
+            # compiles model-specific straight-line code
+            # (model/engine_gen.py).
             if cache != "hull":
-                raise ValueError("matmul='engine' has hull attention built in")
-            self._engine = SparseWeightsEngine(self.model, dtype=dtype)
+                raise ValueError(f"matmul={matmul!r} has hull attention built in")
+            if matmul == "codegen":
+                from transformer_vm.model.engine_gen import GeneratedWeightsEngine
+
+                self._engine = GeneratedWeightsEngine(self.model, dtype=dtype)
+            else:
+                from transformer_vm.model.engine import SparseWeightsEngine
+
+                self._engine = SparseWeightsEngine(self.model, dtype=dtype)
             self._direct_writes = self._engine.supports_direct_writes
         elif matmul == "sparse":
             # The analytic weights are ~99.9% zeros; CSR matvecs run the
@@ -172,7 +182,7 @@ class Cpu6502TransformerMachine:
         """One genuine transformer position: attention + ReGLU per layer."""
         add_position_encoding(x, self.pos)
         self.pos += 1
-        if self.matmul == "engine":
+        if self._cpp_stack:
             xv = x.numpy().astype(self.np_dtype, copy=False)
             self._engine.forward(xv)  # in place, whole stack
             return xv
@@ -219,7 +229,7 @@ class Cpu6502TransformerMachine:
         return x
 
     def _forward_values(self, values: dict) -> torch.Tensor | np.ndarray:
-        if self.matmul != "engine":
+        if not self._cpp_stack:
             return self._forward(self._embed(values))
         x = self._embed_array(values)
         add_position_encoding(x, self.pos)
@@ -260,7 +270,7 @@ class Cpu6502TransformerMachine:
 
     def boot_image(self, memory_image, *, start_pc: int, state: dict | None = None):
         # Fresh token log: clear attention state so a machine can be reused.
-        if self.matmul == "engine":
+        if self._cpp_stack:
             self._engine.reset()
         else:
             self.cache.clear()
@@ -402,7 +412,7 @@ class Cpu6502TransformerMachine:
             ir=s.ir, oplo=s.operand_lo, ophi=s.operand_hi,
             ea=s.ea, data=s.data, halted=1 if s.halted else 0,
         )
-        if self.matmul == "engine":
+        if self._cpp_stack:
             halt_logit = self._head_logit(h, self._halt_head_cols, self._halt_head_vals)
             state_logit = self._head_logit(h, self._state_head_cols, self._state_head_vals)
         else:

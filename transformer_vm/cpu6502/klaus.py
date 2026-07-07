@@ -145,7 +145,8 @@ def run_cpp(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float, f
 
 
 def run_weights(image: bytes, *, max_steps: int,
-                checkpoint_tokens: int | None = None) -> tuple[bool, int, float, float, str]:
+                checkpoint_tokens: int | None = None,
+                matmul: str = "codegen") -> tuple[bool, int, float, float, str]:
     """Lockstep the real weights-based transformer against the reference.
 
     Klaus at full length (30.6M instructions) is out of reach at
@@ -154,7 +155,9 @@ def run_weights(image: bytes, *, max_steps: int,
     from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
-    machine = Cpu6502TransformerMachine(bcd=True, checkpoint_tokens=checkpoint_tokens)
+    machine = Cpu6502TransformerMachine(
+        bcd=True, matmul=matmul, checkpoint_tokens=checkpoint_tokens,
+    )
     mode = f"{machine.matmul}/{machine.dtype}"
     build_elapsed = time.perf_counter() - build_start
 
@@ -224,6 +227,11 @@ def main() -> None:
     )
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument(
+        "--matmul", choices=["codegen", "engine", "sparse", "dense"], default="codegen",
+        help="weights runner: engine (generic CSR C++) or codegen "
+             "(generated straight-line C++); sparse/dense are diagnostics",
+    )
+    parser.add_argument(
         "--checkpoint-tokens", type=int, default=250_000,
         help="weights runner: snapshot-and-rebuild the hull logs every N "
              "token positions (0 disables; default 250000 -- every forward "
@@ -267,7 +275,7 @@ def main() -> None:
 
     if args.runner == "weights":
         matched, steps, build_s, run_s, mode = run_weights(
-            image, max_steps=args.graph_steps,
+            image, max_steps=args.graph_steps, matmul=args.matmul,
             checkpoint_tokens=args.checkpoint_tokens or None,
         )
         rate = steps / run_s if run_s > 0 else 0.0

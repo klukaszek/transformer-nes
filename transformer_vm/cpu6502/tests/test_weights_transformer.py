@@ -36,7 +36,7 @@ def _lockstep_vs_reference(trace, image):
 @pytest.mark.slow
 def test_transformer_weights_match_reference():
     machine = Cpu6502TransformerMachine(bcd=False)
-    assert machine.matmul == "engine"
+    assert machine.matmul == "codegen"
     assert machine.dtype == "float32"
     image = verify_program()
     trace = machine.run_image(image, start_pc=VERIFY_START, max_steps=30)
@@ -50,7 +50,7 @@ def test_transformer_float32_engine_matches_high_address_nestest_prefix():
 
     image = load_image()
     machine = Cpu6502TransformerMachine(bcd=False)
-    assert machine.matmul == "engine"
+    assert machine.matmul == "codegen"
     assert machine.dtype == "float32"
     trace = machine.run_image(bytes(image), start_pc=START_PC, max_steps=20)
 
@@ -108,6 +108,37 @@ def test_checkpoint_rebuild_is_invisible():
             f"step {i}: ref={a} transformer={b}"
         )
         assert ref_row.writes == row.writes, f"step {i} writes"
+
+
+@pytest.mark.slow
+def test_codegen_engine_matches_generic_engine():
+    """The generated straight-line engine is a dispatch change, not a
+    semantics change: its traces must be identical to the generic CSR
+    engine's, checkpoint rebuilds included.  Uses the nestest prefix so
+    high-address fp32 reads and direct WRITEs are exercised."""
+    from transformer_vm.cpu6502.nestest import START_PC, load_image
+
+    image = load_image()
+    traces = {}
+    for matmul in ("engine", "codegen"):
+        machine = Cpu6502TransformerMachine(
+            bcd=False, matmul=matmul, checkpoint_tokens=64
+        )
+        machine.boot_image(list(image), start_pc=START_PC)
+        traces[matmul] = [machine.machine_step() for _ in range(60)]
+        assert machine.checkpoints >= 1, matmul
+    for a, b in zip(traces["engine"], traces["codegen"], strict=True):
+        assert a.state == b.state
+        assert a.writes == b.writes
+
+    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+    ref.pc = START_PC
+    for i, row in enumerate(traces["codegen"]):
+        ref_row = ref.step()
+        a, b = ref_row.state, row.state
+        assert (a.pc, a.a, a.x, a.y, a.s, a.p) == (b.pc, b.a, b.x, b.y, b.s, b.p), (
+            f"step {i}: ref={a} codegen={b}"
+        )
 
 
 @pytest.mark.slow

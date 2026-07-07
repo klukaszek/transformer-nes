@@ -15,7 +15,7 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~10-11K after boot | default fp32 engine; full nestest MATCHED in ~0.8 s; Klaus 20K prefix MATCHED |
+| `cpu6502/weights_runner.py` (real transformer) | ~30-38K after boot | default generated fp32 engine (codegen); full nestest MATCHED in ~0.3 s; **full Klaus MATCHED: 30,646,177 steps exact** (with invisible checkpointing) |
 
 The weights transformer is genuine inference (d_model≈1550, 71 layers,
 analytic weights, no training).  The default path is the float32 C++ engine
@@ -26,9 +26,10 @@ dense/sparse Python paths remain diagnostics.
 in-graph NMI, frame-level PPU, OAM DMA, controllers, cycle-budget frame
 pacing, invisible snapshot-and-rebuild checkpointing, and mid-game
 backend handoff.  nestest boots and passes its suite interactively; SMB
-plays at ~45 fps on the kernel; an SMB frame renders **through the
-transformer weights** byte-identical to the kernel in ~10 s
-(`nes-run --warmup-frames 60 --backend weights`).
+plays at ~45 fps on the kernel; SMB frames render **through the
+transformer weights** byte-identical to the kernel at ~0.26 s/frame
+(~3.8 fps with the generated engine, 2026-07-07;
+`nes-run --warmup-frames 60 --backend weights`).
 
 **Scheduling**: the optimal-width MILP does not scale (formulation
 blowup, not the HiGHS engine); `scheduler/milp.py:asap_schedule` is a
@@ -196,29 +197,159 @@ Result:
 - Synthetic `_forward_values` is ~75.8 us (~13.2K positions/s), much
   closer to direct C++ engine forward (~68.6 us in the earlier probe).
 
+## 2026-07-06 hardening, weights checkpointing, forward-cost profile
+
+Tracked in jj:
+- `lxrykyso` — harden fp32 engine invariants; add weights-runner checkpointing
+- `ynowvzrx` — scout optimization targets; land the generated fp32 engine
+
+Hardening (from a review of the fusion/direct-write optimizations):
+- `SparseWeightsEngine.insert_write` now refuses models without
+  memory-tagged lookup heads (a direct write would otherwise be silently
+  dropped); the runner gates the fast path on `supports_direct_writes`.
+- The C++ engine throws at load if a filtered `out_proj` column survives
+  at a non-lookup head slot — forward() no longer zeroes stale `head_out`
+  entries, so the column structure is exactly what makes that safe.
+- `build_model` exports `model.one_slot`, and the engine wrapper checks at
+  load that every kind-2 FFN neuron's gate row is exactly the constant
+  one.  The fusion drops the gate, so a mislabel must fail loudly.
+- Known cross-language duplication to keep in mind: `insert_write_f32`
+  hand-builds the WRITE key (`kx = 2·local`, `ky = −local² +
+  LATEST_ALPHA·inv_log_pos`), baking in `KEY_OFFSET == 0`,
+  `LATEST_ALPHA = 0.3`, and the 16×4 KiB grouping.  graph/core.py
+  documents KEY_OFFSET as tunable — change any of these and the fast path
+  desyncs.  The fp32 bit-exactness argument also dies if groups grow past
+  4 KiB (8191² > 2²⁴).  Skipping WRITE tokens in non-memory hulls is
+  equivalent only because every non-memory lookup head clear-gates them.
+
+Checkpointing (the roadmap-#2 blocker, now done):
+- `Cpu6502TransformerMachine` keeps a 64 KiB RAM mirror (updated by every
+  `_insert_write`) and `checkpoint()` reseeds the hull logs from it,
+  preserving architectural state, trace numbering, and pending NMI — the
+  same shape as `KernelBus.checkpoint`.
+- `checkpoint_tokens=N` rebuilds automatically once the token log outgrows
+  N; `6502-klaus --checkpoint-tokens` (default 1M) wires it up, and the
+  klaus weights lockstep now streams instead of materializing the trace.
+  The NES `GraphCore` adapter delegates to the runtime's own checkpoint.
+- Receipts: `test_checkpoint_rebuild_is_invisible` (nestest prefix with a
+  rebuild every 8 tokens: lockstep-exact, trace numbering intact); Klaus
+  100K prefix MATCHED with a rebuild every 20K tokens at ~10.4K instr/s —
+  checkpointing costs approximately nothing.
+- **Full Klaus through the weights: MATCHED.**  All 30,646,177
+  instructions (decimal mode included, bcd=True) lockstep-exact against
+  the reference through the fp32 engine in 3443 s (~57 min, ~8.9K
+  instr/s sustained), 36 invisible checkpoints, flat memory.  Run with a
+  1M-token window (~6 GB hull logs; the default is now 250K).
+
+Forward-cost profile (where the ~11K instr/s ceiling lives):
+- `machine_step` ≈ 84.6 µs: ~78 µs inside the C++ forward (92%), ~7 µs of
+  Python glue.  Porting readout/state assembly to C++ caps out at ~1.1×.
+- Per forward: 38,067 CSR nnz visited (ff_in 19.5K, attn_direct 7.2K,
+  ff_out 5.6K, ffn_direct 3.9K, in_proj 1.5K, out_proj 0.2K), 5,299 live
+  ReGLU neurons, 124 hull queries + 92 shared-hull inserts.
+- Instrumented section shares: ff_in 39%, out_proj+attn_direct 21%,
+  in_proj 17%, ff_out+ffn_direct 13%, hull 8%, activations 3%.
+- Removing every mv() zero-fill is a wash (0.97×): the cost is the
+  dependent scalar CSR gather (~1.5–2 ns/nnz), not memset.
+- Of the kept in_proj/out_proj/ff_out coefficients, 6,253 of 7,373 are ±1;
+  kept in_proj rows: 289 singletons, 455 multi-nnz.
+- SMB via weights: ~0.90 s marginal per frame (~1.1 fps), ~11× better than
+  the previous ~10 s receipt, still byte-identical to the kernel frame.
+- Experiment gotcha: benchmarking a modified engine side by side requires
+  renaming the C++ struct — two loaded extensions that both define
+  `WeightsEngine` cross-resolve symbols and silently time the wrong code.
+
+Implications, in payoff order:
+1. **Generated per-layer sparse kernels** (the kernel.py trick applied to
+   the weights engine): emit straight-line code per layer with column
+   indices as immediates, ±1 coefficients as add/sub, singleton rows as
+   plain moves.  Kills the indices/data loads that dominate today and
+   frees the compiler to schedule independent loads.  Est. 2–4×
+   single-thread, byte-exact by construction (same arithmetic, same
+   order).
+2. **Exact fixed-point integer path**: every residual/FFN value is a
+   dyadic rational < 2²⁴, so int32 (int16 where provable) NEON arithmetic
+   is semantically exact and vectorizes what fp32 scalar gather cannot.
+   Research needed: per-slot scale factors, overflow proofs.  Pairs with
+   codegen.
+3. Together with a C++ machine_step (~1.1×) and MILP width compaction
+   (≤1.8×), the realistic scalar ceiling is ~5–8× → ~60–90K instr/s →
+   SMB at ~6–9 fps.  True 30+ fps needs 1+2 to land well, or the
+   fused-Metal resident stack / batched-fleet throughput from the GPU
+   probe.
+
+## 2026-07-07 generated straight-line engine (codegen), new default
+
+Tracked in jj:
+- `ynowvzrx` — scout optimization targets; land the generated fp32 engine
+
+What was built (`model/engine_gen.py`, scouting recommendation #1):
+- A generator that emits one C++ translation unit specific to the built
+  model: per-layer member functions with column indices as immediates,
+  ±1 coefficients as add/sub, all other coefficients as float32 hexfloat
+  literals, hull calls inlined with immediate hull ids, and the direct
+  WRITE key construction generated from `graph/core.py`'s
+  `LATEST_ALPHA`/`KEY_OFFSET` (it refuses `KEY_OFFSET != 0`), which
+  retires that duplication hazard for the default path.
+- The emission replicates the generic engine's arithmetic exactly: CSR
+  column order, left-to-right accumulation, the same fusion composition
+  (float64 merge, exact zeros dropped), the same residual-update order,
+  the same hull insert/query sequence.  Digest-named source + struct
+  (`Engine_<sha256[:16]>`) in `model/_engine_cache/`, compiled once per
+  model (~5–10 s, cached), `py::module_local` — the kernel.py pattern,
+  which also avoids the two-extensions-one-struct ODR trap.
+- `matmul="codegen"` is the runner/CLI/console default; `engine` (generic
+  CSR), `sparse`, `dense` remain diagnostics.  float64 stays on `engine`.
+
+Receipts:
+- `test_codegen_engine_matches_generic_engine`: nestest prefix traces are
+  identical between codegen and the generic engine, checkpoint rebuilds
+  included, and lockstep the reference.  All 6 weights tests + 47 fast
+  tests pass with codegen as default.
+- Full nestest MATCHED: **0.3 s, ~33–35K instr/s** (was ~0.8 s / 11K).
+- Klaus 200K prefix MATCHED with decimal mode: **7.0 s, ~28.5K instr/s**
+  (was 85.8 s at the 2026-07-04 receipt — 12× in three days).
+- SMB frames through the weights: **~0.26 s/frame, ~3.8 fps** (was ~0.9 s),
+  byte-identical to both the kernel frame and the generic-engine frame.
+- Raw C++ forward: 76 µs → **15.7 µs (4.8×)**; whole `machine_step`
+  26.1 µs (~38K steps/s synthetic).
+- **Full Klaus re-run through codegen: MATCHED — 30,646,177 steps in
+  1136 s (18.9 min, ~27K instr/s sustained)**, 146 checkpoints at the
+  250K-token default, throughput flat for the entire run (the tighter
+  window also removed the ~10% mid-run dip seen at 1M).
+
+Implication for the next round:
+- Python glue (embedding dict, per-field readout, TraceRow assembly) is
+  now ~10 µs of the 26 µs step — **40%**.  Porting the machine_step loop
+  into the generated C++ (read slots, extract writes, assemble next
+  state, halt check; Python only for MMIO pauses, like the kernel) is
+  promoted from ~1.1× to ~1.6×, and is the natural next step toward the
+  kernel's architecture.  After that, the exact fixed-point int/NEON
+  research item from the scouting log is what remains on the CPU path.
+
 ## Prioritized next steps
 
 ### 1. Key rescaling in the memory-lookup construction
 The hard-attention half is now experimentally solved by grouped memory
 lookups: `_memory_at` splits 64 KiB into 16 local 4 KiB parabolas, and the
-C++ engine supports fp32 execution.  Next pieces:
-- run NES frame parity through the fp32 engine after the direct-WRITE
-  optimization;
-- port checkpoint/snapshot support to the weights runner so long fp32 runs
-  do not grow unbounded hull logs;
+C++ engine supports fp32 execution.  NES frame parity through the fp32
+engine and weights-runner checkpointing are done (2026-07-06, see the
+hardening/checkpointing log).  Remaining piece:
 - separately solve true-softmax latest-write semantics if `--cache standard`
   remains a target for arbitrary high-address programs.
 
 Payoff remains: the default float32 engine path makes GPU/batched-machine
 work viable (MPS has no fp64).
 
-### 2. Full Klaus through the transformer weights (30.6M instructions)
-~3.7 h at current engine speed.  **Blocker first**: the weights machine
-has no checkpointing, and 30M instructions ≈ 45M token positions will
-blow up the 19 lookup-head hulls.  Port snapshot-and-rebuild to
-`Cpu6502TransformerMachine` (needs a RAM mirror in the runner — track
-writes like `nes/bus.py` does — then reseed like `KernelBus.checkpoint`).
-Then run overnight: `6502-klaus --runner weights --graph-steps 30646177`.
+### 2. Full Klaus through the transformer weights — DONE 2026-07-06
+MATCHED: 30,646,177 steps exact through the fp32 engine in ~57 min with
+36 invisible checkpoints (see the hardening/checkpointing log); re-run
+through the generated engine 2026-07-07 in **18.9 min** at ~27K instr/s
+sustained with 146 checkpoints.  Rerun:
+`6502-klaus --runner weights --graph-steps 30646177` (checkpointing
+defaults to every 250K tokens; every forward inserts into all 92 shared
+hulls, so a 1M-token window costs ~6 GB of hull log — the rebuild itself
+is milliseconds).
 
 ### 3. MILP formulation compaction (then, optionally, GNN warm starts)
 Reformulate with mobility windows (variables only for ops with slack;
@@ -269,7 +400,7 @@ uv run pytest -m "not slow"                    # 47 fast tests
 uv run pytest                                  # + kernel/weights/console suites
 uv run 6502-klaus --runner cpp-full            # full Klaus, ~48 s, exact step count
 uv run 6502-nestest --runner both              # golden log: reference + graph + kernel
-uv run 6502-nestest --runner weights           # full nestest through default fp32 engine, ~1-2 s
+uv run 6502-nestest --runner weights           # full nestest through the generated fp32 engine, ~0.3 s
 uv run 6502-klaus --runner weights --graph-steps 200000
 uv run 6502-transformer --steps 30 --cache standard --matmul sparse   # true softmax diagnostic
 uv run nes-run transformer_vm/nes/examples/smb.nes --frames 61 \

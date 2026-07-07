@@ -69,9 +69,9 @@ premise: the graph is scheduled onto layers and compiled by
 training.  Execution is genuine transformer inference: per-position
 embeddings, Q/K/V projections, attention (hull hardmax, or **true
 softmax** via `--cache standard --matmul sparse`), ReGLU FFN, residual
-stream, output head.  The default path is the C++ hull engine in float32;
-true softmax is still a diagnostic path and does not implement latest-write
-tie-breaks.
+stream, output head.  The default path is the generated straight-line C++
+hull engine in float32; true softmax is still a diagnostic path and does
+not implement latest-write tie-breaks.
 
 Scheduling: the optimal-width MILP does not scale here — the blowup is
 the formulation (per-dim/per-boundary alive indicators → ~12M rows, ~5M
@@ -85,22 +85,25 @@ layer and d_model becomes head-bound at 1800; leveled, it is
 liveness-bound (~1550) under the grouped-memory lookup.
 
 Performance: the analytic weights are ~99.9% zeros, so inference runs the
-identical linear maps sparsely.  The C++ engine is the production default;
-dense and scipy-sparse paths remain useful diagnostics:
+identical linear maps sparsely.  The generated straight-line engine is the
+production default; the generic CSR engine and the dense/scipy-sparse
+paths remain useful diagnostics:
 
 | `--matmul` | What runs | Speed (instr/s) |
 |------------|-----------|-----------------|
 | `dense` | dense torch matvecs, per-layer Python loop; float64 diagnostic | ~0.13 |
 | `sparse` | scipy CSR matvecs, per-layer Python loop | ~30–95 |
-| `engine` | `model/weights_engine.cpp`: whole stack per pybind call — float32 CSR matvecs, shared hull attention for lookup heads, direct WRITE-token insertion, structural fusion of passthrough/erase paths into direct CSR residual deltas, and NumPy embedding/readout on the fp32 engine path | ~10-11K after boot |
+| `engine` | `model/weights_engine.cpp`: generic CSR C++, whole stack per pybind call — float32 CSR matvecs, shared hull attention for lookup heads, direct WRITE-token insertion, structural fusion of passthrough/erase paths into direct CSR residual deltas | ~10-11K after boot |
+| `codegen` | `model/engine_gen.py`: model-specific generated C++ with the same arithmetic — column indices as immediates, ±1 coefficients as add/sub, coefficients as float32 hexfloat literals; compiled once per model digest (~5-10 s, cached) | ~30-38K after boot |
 
-With the engine, **the full 8,991-instruction nestest suite runs through
-the actual transformer weights in ~0.8 s** (`6502-nestest --runner
-weights`), and a 20K-instruction Klaus prefix lockstep-matches with
-decimal mode in ~1.9 s including boot.  Longer Klaus runs still need
-weights-runner checkpointing to keep hull logs bounded.  The NES command
-`nes-run --warmup-frames 60 --backend weights` renders an SMB frame
-through the weights in ~10 s, byte-identical to the C++ kernel's.
+With the generated engine, **the full 8,991-instruction nestest suite runs
+through the actual transformer weights in ~0.3 s** (`6502-nestest --runner
+weights`), a 200K-instruction Klaus prefix lockstep-matches with decimal
+mode in ~7 s, and the full 30.6M-instruction Klaus suite matches with
+snapshot-and-rebuild checkpointing keeping hull logs bounded.  The NES
+command `nes-run --warmup-frames 60 --backend weights` renders SMB frames
+through the weights at ~0.26 s/frame (~3.8 fps), byte-identical to the
+C++ kernel's.
 
 Precision: the original scalar 16-bit lookup needed float64 because
 `ky = -k² + ...` reached ~2³² with an adjacent-address gap of 1.  `_memory_at`
