@@ -54,7 +54,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `kernel.py` (generated C++) | ~450–600K | Same semantics at NES-relevant speed |
-| `weights_runner.py` (real transformer) | ~10-11K after boot | The thesis: actual softmax-ReGLU transformer weights |
+| `weights_runner.py` (real transformer) | ~36-53K after boot | The thesis: actual softmax-ReGLU transformer weights |
 
 The Python and C++ backends are **bit-identical**: same IEEE double
 operations in the same order, the same hull code (`hull2d_cht.h`), the same
@@ -94,15 +94,15 @@ paths remain useful diagnostics:
 | `dense` | dense torch matvecs, per-layer Python loop; float64 diagnostic | ~0.13 |
 | `sparse` | scipy CSR matvecs, per-layer Python loop | ~30–95 |
 | `engine` | `model/weights_engine.cpp`: generic CSR C++, whole stack per pybind call — float32 CSR matvecs, shared hull attention for lookup heads, direct WRITE-token insertion, structural fusion of passthrough/erase paths into direct CSR residual deltas | ~10-11K after boot |
-| `codegen` | `model/engine_gen.py`: model-specific generated C++ with the same arithmetic — column indices as immediates, ±1 coefficients as add/sub, coefficients as float32 hexfloat literals; compiled once per model digest (~5-10 s, cached) | ~30-38K after boot |
+| `codegen` | `model/engine_gen.py`: model-specific generated C++ with the same arithmetic — column indices as immediates, ±1 coefficients as add/sub, coefficients as float32 hexfloat literals; compiled once per model digest (~5-10 s, cached); with a step_spec the whole machine_step (embed, readout, write inserts, halt logits) runs as one generated C++ call | ~36-53K after boot |
 
 With the generated engine, **the full 8,991-instruction nestest suite runs
-through the actual transformer weights in ~0.3 s** (`6502-nestest --runner
+through the actual transformer weights in ~0.2 s** (`6502-nestest --runner
 weights`), a 200K-instruction Klaus prefix lockstep-matches with decimal
-mode in ~7 s, and the full 30.6M-instruction Klaus suite matches with
+mode in ~5.6 s, and the full 30.6M-instruction Klaus suite matches with
 snapshot-and-rebuild checkpointing keeping hull logs bounded.  The NES
 command `nes-run --warmup-frames 60 --backend weights` renders SMB frames
-through the weights at ~0.26 s/frame (~3.8 fps), byte-identical to the
+through the weights at ~0.20 s/frame (~5.1 fps), byte-identical to the
 C++ kernel's.
 
 Precision: the original scalar 16-bit lookup needed float64 because

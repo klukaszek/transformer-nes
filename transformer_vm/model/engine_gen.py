@@ -102,7 +102,17 @@ def _compose(outer: sp.csr_matrix, cols, inner_rows: sp.csr_matrix) -> sp.csr_ma
     return direct
 
 
-def generate_source(model) -> tuple[str, int]:
+def generate_source(model, step_spec: dict | None = None) -> tuple[str, int]:
+    """Emit the C++ source; returns (source, n_memory_heads).
+
+    step_spec, if given, additionally emits a machine_step member that runs
+    one whole 6502 instruction in C++ -- STATE-token embedding, position
+    features, the layer stack, readout (nearbyint: Python round() is
+    half-to-even), write extraction with direct hull inserts, and the
+    STATE/HALT head logits -- writing results into a caller-provided int64
+    buffer.  Layout: {"inputs": {name: slot}, "p_flags": [(slot, mask)],
+    "outputs": {name: slot}, "halt_head"/"state_head": (cols, vals)}.
+    """
     if KEY_OFFSET != 0:
         raise RuntimeError(
             "generated engine assumes KEY_OFFSET == 0 in the lookup key "
@@ -252,6 +262,7 @@ def generate_source(model) -> tuple[str, int]:
     emit("")
     emit("namespace py = pybind11;")
     emit("using FArr = py::array_t<float, py::array::c_style | py::array::forcecast>;")
+    emit("using LArr = py::array_t<long long, py::array::c_style | py::array::forcecast>;")
     emit("")
     emit("struct ENGINE_T {")
     emit(f"    static constexpr int D = {d_model};")
@@ -308,6 +319,89 @@ def generate_source(model) -> tuple[str, int]:
     else:
         emit("        (void)offs; (void)key; (void)val;")
     emit("    }")
+
+    has_step = step_spec is not None and bool(flat)
+    if has_step:
+        ins = step_spec["inputs"]
+        outs = step_spec["outputs"]
+
+        def out_slot(name):
+            return outs[name]
+
+        emit("")
+        emit("    // One whole 6502 instruction: STATE embed -> layers ->")
+        emit("    // readout -> direct WRITE inserts -> halt logits.")
+        emit(f"    float xbuf[{d_model}];")
+        emit("")
+        emit("    static long long rd(float v) {")
+        emit("        // Python round() is half-to-even; nearbyint under the")
+        emit("        // default FE_TONEAREST matches it (llround does not).")
+        emit("        return (long long)std::nearbyint((double)v);")
+        emit("    }")
+        emit("")
+        emit("    void machine_step(int pc, int a, int xr, int yr, int sr,")
+        emit("                      int p, int ir, int oplo, int ophi,")
+        emit("                      int ea, int data, int halted, int nmi,")
+        emit("                      LArr out_arr) {")
+        emit('        if ((int)out_arr.size() != 21) throw std::runtime_error("step out buffer must have 21 slots");')
+        emit("        long long* out = out_arr.mutable_data();")
+        emit("        float* x = xbuf;")
+        emit(f"        for (int i = 0; i < {d_model}; ++i) x[i] = 0.0f;")
+        emit(f"        x[{model.one_slot}] = 1.0f;")
+        emit(f"        x[{ins['is_state']}] = 1.0f;")
+        emit(f"        x[{ins['pc_lo']}] = (float)(pc & 0xFF);")
+        emit(f"        x[{ins['pc_hi']}] = (float)((pc >> 8) & 0xFF);")
+        emit(f"        x[{ins['a']}] = (float)a;")
+        emit(f"        x[{ins['x']}] = (float)xr;")
+        emit(f"        x[{ins['y']}] = (float)yr;")
+        emit(f"        x[{ins['s']}] = (float)sr;")
+        for slot, mask in step_spec["p_flags"]:
+            emit(f"        x[{slot}] = (p & {mask}) ? 1.0f : 0.0f;")
+        emit(f"        x[{ins['ir']}] = (float)ir;")
+        emit(f"        x[{ins['oplo']}] = (float)oplo;")
+        emit(f"        x[{ins['ophi']}] = (float)ophi;")
+        emit(f"        x[{ins['ea_lo']}] = (float)(ea & 0xFF);")
+        emit(f"        x[{ins['ea_hi']}] = (float)((ea >> 8) & 0xFF);")
+        emit(f"        x[{ins['data']}] = (float)data;")
+        emit(f"        x[{ins['halted']}] = (float)halted;")
+        emit(f"        x[{ins['nmi']}] = (float)nmi;")
+        emit("        const long long pos = seq + 1;")
+        emit("        x[0] += (float)pos;")
+        emit("        x[1] += (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
+        emit("        // integer square converted once, like NumPy's int -> float32")
+        emit("        x[2] += (float)((unsigned long long)pos * (unsigned long long)pos);")
+        emit("        ++seq;")
+        for li in range(n_layers):
+            emit(f"        layer_{li}(x);")
+        for i, (name, mask) in enumerate((
+            ("current_pc", 0xFFFF), ("new_a", 0xFF), ("new_x", 0xFF),
+            ("new_y", 0xFF), ("new_s", 0xFF), ("new_p", 0xFF),
+            ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
+            ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF), ("data_out", 0xFF),
+            ("new_halted", 0xFF), ("next_pc", 0xFFFF),
+        )):
+            emit(f"        out[{i}] = rd(x[{out_slot(name)}]) & 0x{mask:X};")
+        emit("        long long n_writes = 0;")
+        for store, addr, value in (
+            ("is_store", "write_addr_out", "write_value_out"),
+            ("is_store2", "write_addr2_out", "write_value2_out"),
+            ("is_store3", "write_addr3_out", "write_value3_out"),
+        ):
+            emit(f"        if ((rd(x[{out_slot(store)}]) & 0xFF) != 0) {{")
+            emit(f"            out[15 + 2 * n_writes] = rd(x[{out_slot(addr)}]) & 0xFFFF;")
+            emit(f"            out[16 + 2 * n_writes] = rd(x[{out_slot(value)}]) & 0xFF;")
+            emit("            ++n_writes;")
+            emit("        }")
+        emit("        out[14] = n_writes;")
+        emit("        for (long long i = 0; i < n_writes; ++i)")
+        emit("            insert_write_f32((int)out[15 + 2 * i], (int)out[16 + 2 * i], seq + 1);")
+        hc, hv = step_spec["halt_head"]
+        sc, sv = step_spec["state_head"]
+        emit(f"        const float halt_logit = {_expr(hc, hv, lambda i: f'x[{i}]')};")
+        emit(f"        const float state_logit = {_expr(sc, sv, lambda i: f'x[{i}]')};")
+        emit("        out[13] = halt_logit > state_logit ? 1 : 0;")
+        emit("    }")
+
     emit("};")
     emit("")
     emit("PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {")
@@ -315,22 +409,27 @@ def generate_source(model) -> tuple[str, int]:
     emit("        .def(py::init<>())")
     emit("        .def(\"reset\", &ENGINE_T::reset)")
     emit("        .def(\"forward_f32\", &ENGINE_T::forward_f32)")
+    if has_step:
+        emit("        .def(\"machine_step\", &ENGINE_T::machine_step)")
     emit("        .def(\"insert_write_f32\", &ENGINE_T::insert_write_f32);")
     emit("}")
 
     source = "\n".join(lines) + "\n"
-    return source, n_memory_heads
+    return source, n_memory_heads, has_step
 
 
 class GeneratedWeightsEngine:
     """Drop-in for SparseWeightsEngine, float32 only, codegen inside."""
 
-    def __init__(self, model, *, dtype: str = "float32"):
+    def __init__(self, model, *, dtype: str = "float32",
+                 step_spec: dict | None = None):
         if dtype != "float32":
             raise ValueError("the generated engine is float32-only; use "
                              "matmul='engine' for the float64 diagnostic path")
         self.dtype = dtype
-        source, self.n_memory_heads = generate_source(model)
+        source, self.n_memory_heads, self.has_machine_step = generate_source(
+            model, step_spec
+        )
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         source = source.replace("ENGINE_T", f"Engine_{digest}")
         os.makedirs(_CACHE_DIR, exist_ok=True)
@@ -351,6 +450,10 @@ class GeneratedWeightsEngine:
         )
         self.compile_seconds = time.perf_counter() - build_start
         self._engine = module.Engine()
+        if self.has_machine_step:
+            # Bound method exposed directly: the runner's hot loop calls it
+            # once per instruction with no wrapper frame in between.
+            self.machine_step = self._engine.machine_step
 
     def reset(self):
         self._engine.reset()

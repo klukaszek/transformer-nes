@@ -129,6 +129,7 @@ class Cpu6502TransformerMachine:
 
         self.matmul = matmul
         self._direct_writes = False
+        self._cpp_step = False
         if self._cpp_stack:
             # Whole layer stack per pybind call; hull attention and
             # structural passthrough fusion live in C++.  "engine" loads
@@ -140,12 +141,17 @@ class Cpu6502TransformerMachine:
             if matmul == "codegen":
                 from transformer_vm.model.engine_gen import GeneratedWeightsEngine
 
-                self._engine = GeneratedWeightsEngine(self.model, dtype=dtype)
+                self._engine = GeneratedWeightsEngine(
+                    self.model, dtype=dtype, step_spec=self._step_spec()
+                )
             else:
                 from transformer_vm.model.engine import SparseWeightsEngine
 
                 self._engine = SparseWeightsEngine(self.model, dtype=dtype)
             self._direct_writes = self._engine.supports_direct_writes
+            self._cpp_step = getattr(self._engine, "has_machine_step", False)
+            if self._cpp_step:
+                self._step_out = np.empty(21, dtype=np.int64)
         elif matmul == "sparse":
             # The analytic weights are ~99.9% zeros; CSR matvecs run the
             # identical linear maps orders of magnitude faster.  This path
@@ -250,6 +256,33 @@ class Cpu6502TransformerMachine:
             x[self.slot_of[dim]] = float(value)
         return x
 
+    def _step_spec(self) -> dict:
+        """Slot map for the generated C++ machine_step (engine_gen.py)."""
+        rt = self.rt
+        s = lambda dim: self.slot_of[dim]  # noqa: E731
+        return {
+            "inputs": {
+                "is_state": s(rt.is_state),
+                "pc_lo": s(rt.in_pc_lo), "pc_hi": s(rt.in_pc_hi),
+                "a": s(rt.in_a), "x": s(rt.in_x), "y": s(rt.in_y), "s": s(rt.in_s),
+                "ir": s(rt.in_ir), "oplo": s(rt.in_oplo), "ophi": s(rt.in_ophi),
+                "ea_lo": s(rt.in_ea_lo), "ea_hi": s(rt.in_ea_hi),
+                "data": s(rt.in_data), "halted": s(rt.in_halted),
+                "nmi": s(rt.in_nmi),
+            },
+            "p_flags": [
+                (s(rt.in_p_c), reference.FLAG_C), (s(rt.in_p_z), reference.FLAG_Z),
+                (s(rt.in_p_i), reference.FLAG_I), (s(rt.in_p_d), reference.FLAG_D),
+                (s(rt.in_p_b), reference.FLAG_B), (s(rt.in_p_u), reference.FLAG_U),
+                (s(rt.in_p_v), reference.FLAG_V), (s(rt.in_p_n), reference.FLAG_N),
+            ],
+            "outputs": dict(self._read_slots),
+            "halt_head": (self._halt_head_cols.tolist(),
+                          self._halt_head_vals.tolist()),
+            "state_head": (self._state_head_cols.tolist(),
+                           self._state_head_vals.tolist()),
+        }
+
     def _head_row(self, row: int) -> tuple[np.ndarray, np.ndarray]:
         w = self.model.head.weight[row].detach().numpy()
         cols = np.nonzero(w)[0].astype(np.int32)
@@ -326,6 +359,47 @@ class Cpu6502TransformerMachine:
             rt.addr_hi: (addr >> 8) & 0xFF,
         })
 
+    def _machine_step_cpp(self) -> TraceRow:
+        """One instruction entirely in generated C++ (embed, layers,
+        readout, direct WRITE inserts, halt logits); Python only unpacks
+        the 21-slot result and keeps the mirrors in sync."""
+        st = self._mstate
+        nmi = 1 if self._nmi_pending else 0
+        self._nmi_pending = False
+        self._engine.machine_step(
+            st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
+            st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"],
+            st["halted"], nmi, self._step_out,
+        )
+        o = self._step_out.tolist()  # one C call instead of 21 scalar reads
+        n_writes = o[14]
+        writes = []
+        for i in range(n_writes):
+            addr, value = o[15 + 2 * i], o[16 + 2 * i]
+            self._ram[addr] = value
+            writes.append(MemWrite(self._trace_len, addr, value))
+        self.pos += 1 + n_writes
+
+        halted = o[11] != 0
+        row = TraceRow(
+            step=self._trace_len,
+            state=Cpu6502State(
+                pc=o[0], a=o[1], x=o[2], y=o[3], s=o[4], p=o[5], ir=o[6],
+                operand_lo=o[7], operand_hi=o[8],
+                ea=o[9], data=o[10], halted=halted,
+            ),
+            writes=tuple(writes),
+        )
+        self._trace_len += 1
+        st.update(
+            pc=o[12], a=o[1], x=o[2], y=o[3], s=o[4], p=o[5], ir=o[6],
+            oplo=o[7], ophi=o[8], ea=o[9], data=o[10],
+            halted=1 if halted else 0,
+        )
+        if halted or o[13]:
+            self.machine_halted = True
+        return row
+
     def checkpoint(self) -> bool:
         """Snapshot-and-rebuild the token log from the RAM mirror.
 
@@ -353,6 +427,8 @@ class Cpu6502TransformerMachine:
             and self.pos - self._seed_pos >= self._checkpoint_tokens
         ):
             self.checkpoint()
+        if self._cpp_step:
+            return self._machine_step_cpp()
         rt = self.rt
         st = self._mstate
         p = st["p"]

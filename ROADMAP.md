@@ -15,20 +15,22 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~30-38K after boot | default generated fp32 engine (codegen); full nestest MATCHED in ~0.3 s; **full Klaus MATCHED: 30,646,177 steps exact** (with invisible checkpointing) |
+| `cpu6502/weights_runner.py` (real transformer) | ~36-53K after boot | default generated fp32 engine (codegen, C++ machine_step); full nestest MATCHED in ~0.2 s; **full Klaus MATCHED: 30,646,177 steps exact** (with invisible checkpointing) |
 
 The weights transformer is genuine inference (d_model≈1550, 71 layers,
-analytic weights, no training).  The default path is the float32 C++ engine
-(`model/weights_engine.cpp`), which runs the whole layer stack per call;
-dense/sparse Python paths remain diagnostics.
+analytic weights, no training).  The default path is the generated
+straight-line float32 C++ engine (`model/engine_gen.py`), which runs the
+whole machine step per call; the generic CSR engine
+(`model/weights_engine.cpp`) and the dense/sparse Python paths remain
+diagnostics.
 
 **NES layer** (`nes/`): MMIO bus with shadow-decode read injection,
 in-graph NMI, frame-level PPU, OAM DMA, controllers, cycle-budget frame
 pacing, invisible snapshot-and-rebuild checkpointing, and mid-game
 backend handoff.  nestest boots and passes its suite interactively; SMB
 plays at ~45 fps on the kernel; SMB frames render **through the
-transformer weights** byte-identical to the kernel at ~0.26 s/frame
-(~3.8 fps with the generated engine, 2026-07-07;
+transformer weights** byte-identical to the kernel at ~0.20 s/frame
+(~5.1 fps with the generated engine + C++ machine_step, 2026-07-07;
 `nes-run --warmup-frames 60 --backend weights`).
 
 **Scheduling**: the optimal-width MILP does not scale (formulation
@@ -327,6 +329,46 @@ Implication for the next round:
   kernel's architecture.  After that, the exact fixed-point int/NEON
   research item from the scouting log is what remains on the CPU path.
 
+## 2026-07-07 machine_step in generated C++
+
+Tracked in jj:
+- `vysrktlq` — port machine_step into the generated engine
+
+What was built:
+- When the runner passes a `step_spec` (input/output dim slots, P-flag
+  bit masks, STATE/HALT head rows), `engine_gen.py` additionally emits a
+  `machine_step` member: STATE-token embedding with slots as immediates,
+  position features, the whole layer stack, readout via `nearbyint`
+  (Python `round()` is half-to-even — the kernel's old llround lesson),
+  write extraction with direct hull inserts, and the halt-logit
+  comparison, all in one pybind call that fills a caller-provided
+  21-slot int64 buffer.
+- Python's per-step work is now: 13 int args in, one `tolist()` out,
+  TraceRow assembly, RAM-mirror/pos bookkeeping, and the checkpoint
+  hook.  The machine protocol (GraphCore adapter, NMI, inject_write,
+  checkpointing) is unchanged; non-codegen paths keep the Python step.
+
+Receipts (all lockstep-exact, frames byte-identical to the kernel and to
+every earlier engine):
+- `machine_step`: 26.1 µs → **18.9 µs (53K steps/s synthetic)**.
+- Full nestest MATCHED: **0.2 s, ~45K instr/s** (11K two days ago).
+- Klaus 200K decimal prefix MATCHED: **5.6 s, ~36K instr/s**.
+- SMB through the weights: **~0.20 s/frame (~5.1 fps)** — from ~10 s/frame
+  (0.1 fps) at the start of this arc, a ~50× cumulative improvement.
+- The codegen-vs-engine identity test now exercises the C++ step against
+  the generic engine's Python step: traces identical, checkpoint
+  rebuilds included.
+- **Full Klaus re-validated: MATCHED — 30,646,177 steps in 920 s
+  (15.3 min, ~33.3K instr/s sustained including the lockstep reference)**,
+  146 checkpoints, flat throughput.  57 min → 18.9 min → 15.3 min across
+  the three engine generations in two days.
+
+Where the remaining time is:
+- ~15.7 µs forward + ~3 µs Python (TraceRow/dict bookkeeping is now the
+  floor of the per-step protocol).  The forward is again the target:
+  the exact fixed-point int/NEON research item is next on the CPU path,
+  and batching/Metal remain the throughput plays beyond that.
+
 ## Prioritized next steps
 
 ### 1. Key rescaling in the memory-lookup construction
@@ -400,7 +442,7 @@ uv run pytest -m "not slow"                    # 47 fast tests
 uv run pytest                                  # + kernel/weights/console suites
 uv run 6502-klaus --runner cpp-full            # full Klaus, ~48 s, exact step count
 uv run 6502-nestest --runner both              # golden log: reference + graph + kernel
-uv run 6502-nestest --runner weights           # full nestest through the generated fp32 engine, ~0.3 s
+uv run 6502-nestest --runner weights           # full nestest through the generated fp32 engine, ~0.2 s
 uv run 6502-klaus --runner weights --graph-steps 200000
 uv run 6502-transformer --steps 30 --cache standard --matmul sparse   # true softmax diagnostic
 uv run nes-run transformer_vm/nes/examples/smb.nes --frames 61 \
