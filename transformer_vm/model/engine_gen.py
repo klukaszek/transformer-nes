@@ -207,6 +207,7 @@ def generate_source(model, step_spec: dict | None = None,
     body: list[str] = []  # per-layer member functions
     hull_tiebreak: list[int] = []  # flat hull id -> latest?
     mem_hulls: list[list[int]] = [[] for _ in range(16)]  # group -> flat hull ids
+    mem_fallback_hulls: list[int] = []  # memory hulls kept on the hull path
     n_memory_heads = 0
 
     # Residual references.  In int mode the position features (slots 0-2)
@@ -313,7 +314,57 @@ def generate_source(model, step_spec: dict | None = None,
         for h in lookup:
             hid = hull_of_head[h]
             tb = "TieBreak::LATEST" if tiebreak[h] else "TieBreak::AVERAGE"
-            if is_int:
+            # Memory heads qualify for the structure when the query is a
+            # positive scalar multiple of [address - lo, 1]: qy is a lone
+            # positive constant on the one-slot (the hardmax temperature),
+            # and qx / qy has integer coefficients.  A positive scale
+            # multiplies every score, so the argmax is unchanged.
+            q1_idx, q1_dat = _row(ip, 2 * h + 1)
+            mem_ok = (
+                is_int
+                and mem_groups[h] >= 0
+                and len(q1_idx) == 1
+                and int(q1_idx[0]) == model.one_slot
+                and float(q1_dat[0]) > 0.0
+            )
+            if mem_ok:
+                q_scale = float(q1_dat[0])
+                q_idx, q_dat = _row(ip, 2 * h)
+                q_int = np.asarray(q_dat, dtype=np.float64) / q_scale
+                q_round = np.round(q_int)
+                if not (np.all(np.abs(q_int - q_round) < 1e-6)
+                        and np.all(np.abs(q_round) < 2**24)
+                        and not any(int(i) <= 2 for i in q_idx)):
+                    mem_ok = False
+            if mem_ok:
+                # Memory-group lookup served by the exact nearest-address
+                # structure: with qy == 1, the parabola score makes the
+                # argmax the nearest written address, recency breaking
+                # equidistant ties toward the later write (below the
+                # double ulp the hull's LATEST tie-break picks the same
+                # winner).  Writes arrive only via insert_write; the hull
+                # stays empty and its guard makes that contract loud.
+                g = mem_groups[h]
+                qi_expr = _expr_int(q_idx, q_round, xref, f"L{li} mem query")
+                k1 = _expr_dbl(*_row(ip, d_model + 2 * h + 1), dref)
+                b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
+                b.append("        {")
+                b.append(f"            if (hull_seen[{hid}] != seq) {{")
+                b.append(f"                const double kyg = {k1};")
+                b.append("                if (kyg > -1.0e29)")
+                b.append('                    throw std::runtime_error('
+                         '"live forward insert into a memory-group hull");')
+                b.append(f"                hull_seen[{hid}] = seq;")
+                b.append("            }")
+                b.append(f"            const long long qi = shr2({qi_expr});")
+                b.append("            long long mo[2];")
+                b.append(f"            mem_query({g}, qi, mo);")
+                b.append(f"            ho{2 * h} = ({elem})(mo[0] << F);")
+                b.append(f"            ho{2 * h + 1} = ({elem})(mo[1] << F);")
+                b.append("        }")
+            elif is_int:
+                if mem_groups[h] >= 0:
+                    mem_fallback_hulls.append(hid)
                 # Q/K/V straight to double: the hull resolves in double
                 # anyway, and only these rows may read position features.
                 q0 = _expr_dbl(*_row(ip, 2 * h), dref)
@@ -469,6 +520,54 @@ def generate_source(model, step_spec: dict | None = None,
         emit('            throw std::runtime_error("odd value under a 0.5 coefficient");')
         emit("        return v >> 1;")
         emit("    }")
+        emit("")
+        emit("    // Exact replacement for the memory-group hull argmax: the")
+        emit("    // grouped parabola score -(q-a)^2 + q^2 + alpha*ilp(seq) is")
+        emit("    // maximized by the nearest written address; recency breaks")
+        emit("    // equidistant ties toward the later write, and below the")
+        emit("    // double ulp the hull's LATEST tie-break agrees.  One shared")
+        emit("    // structure per 4 KiB group serves every layer's heads (all")
+        emit("    // per-layer memory hulls held identical data).")
+        emit("    int mem_val[16][4096];")
+        emit("    long long mem_seq[16][4096];")
+        emit("    unsigned long long mem_bits[16][64];")
+        emit("")
+        emit("    void mem_query(const int g, const long long q, long long out[2]) const {")
+        emit("        const unsigned long long* bits = mem_bits[g];")
+        emit("        long long below = -1, above = -1;")
+        emit("        if (q >= 0) {")
+        emit("            const long long start = q < 4095 ? q : 4095;")
+        emit("            int w = (int)(start >> 6);")
+        emit("            unsigned long long m = bits[w] & (~0ULL >> (63 - (start & 63)));")
+        emit("            while (true) {")
+        emit("                if (m) { below = ((long long)w << 6) + (63 - __builtin_clzll(m)); break; }")
+        emit("                if (--w < 0) break;")
+        emit("                m = bits[w];")
+        emit("            }")
+        emit("        }")
+        emit("        if (q <= 4095) {")
+        emit("            const long long start = q > 0 ? q : 0;")
+        emit("            int w = (int)(start >> 6);")
+        emit("            unsigned long long m = bits[w] & (~0ULL << (start & 63));")
+        emit("            while (true) {")
+        emit("                if (m) { above = ((long long)w << 6) + __builtin_ctzll(m); break; }")
+        emit("                if (++w > 63) break;")
+        emit("                m = bits[w];")
+        emit("            }")
+        emit("        }")
+        emit("        long long win;")
+        emit("        if (below < 0 && above < 0) { out[0] = 0; out[1] = 0; return; }")
+        emit("        else if (below < 0) win = above;")
+        emit("        else if (above < 0) win = below;")
+        emit("        else {")
+        emit("            const long long db = q - below, da = above - q;")
+        emit("            if (db < da) win = below;")
+        emit("            else if (da < db) win = above;")
+        emit("            else win = mem_seq[g][below] > mem_seq[g][above] ? below : above;")
+        emit("        }")
+        emit("        out[0] = mem_val[g][win];")
+        emit("        out[1] = ((long long)g << 12) + win;")
+        emit("    }")
     emit("")
     emit("    ENGINE_T() { reset(); }")
     emit("")
@@ -477,6 +576,9 @@ def generate_source(model, step_spec: dict | None = None,
     emit("            hulls[i].clear();")
     emit("            hull_seen[i] = -1;")
     emit("        }")
+    if is_int:
+        emit("        for (int g = 0; g < 16; ++g)")
+        emit("            for (int w = 0; w < 64; ++w) mem_bits[g][w] = 0ULL;")
     emit("        seq = -1;")
     emit("    }")
     emit("")
@@ -502,34 +604,48 @@ def generate_source(model, step_spec: dict | None = None,
             emit(f"        layer_{li}(x);")
     emit("    }")
     emit("")
+    offs = [0]
+    flat: list[int] = []
+    fb_set = set(mem_fallback_hulls)
+    fb_offs = [0]
+    fb_flat: list[int] = []
+    for g in range(16):
+        flat.extend(mem_hulls[g])
+        offs.append(len(flat))
+        fb_flat.extend(i for i in mem_hulls[g] if i in fb_set)
+        fb_offs.append(len(fb_flat))
+
     emit("    void insert_write_f32(int addr, int value, long pos) {")
     emit("        ++seq;")
     emit("        if (seq != pos)")
     emit('            throw std::runtime_error("direct WRITE position does not match engine sequence");')
     emit("        const int group = (addr >> 12) & 0xF;")
-    emit("        const int local_i = addr - group * 4096;")
-    emit("        const float local = (float)local_i;")
-    emit("        const float kx_f = 2.0f * local;")
-    emit("        const float inv_log_pos = (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
-    emit(f"        const float ky_f = -local * local + {_lit(LATEST_ALPHA)} * inv_log_pos;")
-    emit("        const double key[2] = {(double)kx_f, (double)ky_f};")
-    emit("        const double val[2] = {(double)(value & 0xFF), (double)(addr & 0xFFFF)};")
-    offs = [0]
-    flat: list[int] = []
-    for g in range(16):
-        flat.extend(mem_hulls[g])
-        offs.append(len(flat))
-    emit(f"        static const int offs[17] = {{{', '.join(map(str, offs))}}};")
-    if flat:
-        emit(f"        static const int ids[{len(flat)}] = {{{', '.join(map(str, flat))}}};")
+    if is_int:
+        # Structure-served memory: a write is three stores; no key math.
+        emit("        const int wl = addr & 0xFFF;")
+        emit("        mem_val[group][wl] = value & 0xFF;")
+        emit("        mem_seq[group][wl] = pos;")
+        emit("        mem_bits[group][wl >> 6] |= 1ULL << (wl & 63);")
+    hull_targets = fb_flat if is_int else flat
+    hull_offs = fb_offs if is_int else offs
+    if hull_targets:
+        emit("        const int local_i = addr - group * 4096;")
+        emit("        const float local = (float)local_i;")
+        emit("        const float kx_f = 2.0f * local;")
+        emit("        const float inv_log_pos = (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
+        emit(f"        const float ky_f = -local * local + {_lit(LATEST_ALPHA)} * inv_log_pos;")
+        emit("        const double key[2] = {(double)kx_f, (double)ky_f};")
+        emit("        const double val[2] = {(double)(value & 0xFF), (double)(addr & 0xFFFF)};")
+        emit(f"        static const int offs[17] = {{{', '.join(map(str, hull_offs))}}};")
+        emit(f"        static const int ids[{len(hull_targets)}] = {{{', '.join(map(str, hull_targets))}}};")
         emit("        for (int i = offs[group]; i < offs[group + 1]; ++i) {")
         emit("            const int hid = ids[i];")
         emit("            if (hull_seen[hid] == seq) continue;")
         emit("            hulls[hid].insert(key, val, seq);")
         emit("            hull_seen[hid] = seq;")
         emit("        }")
-    else:
-        emit("        (void)offs; (void)key; (void)val;")
+    elif not is_int:
+        emit("        (void)group;")
     emit("    }")
 
     has_step = step_spec is not None and bool(flat)

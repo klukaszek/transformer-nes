@@ -15,7 +15,7 @@ weights transformer`):
 | `cpu6502/reference.py` | ~2.5M | oracle; full Klaus + nestest pass |
 | `cpu6502/evaluator.py` (exact graph) | ~6K | lockstep-exact |
 | `cpu6502/kernel.py` (generated C++) | ~600K | full Klaus: 30,646,177 steps exact, ~48 s |
-| `cpu6502/weights_runner.py` (real transformer) | ~62-107K after boot | default generated engine (codegen, exact fixed-point int32, C++ machine_step); full nestest MATCHED in ~0.1 s; **full Klaus MATCHED: 30,646,177 steps exact** (with invisible checkpointing) |
+| `cpu6502/weights_runner.py` (real transformer) | ~90-112K after boot | default generated engine (codegen: exact fixed-point int32, C++ machine_step, O(1) memory attention); full nestest MATCHED in ~0.1 s; **full Klaus MATCHED: 30,646,177 steps exact** (with invisible checkpointing) |
 
 The weights transformer is genuine inference (d_model≈1550, 71 layers,
 analytic weights, no training).  The default path is the generated
@@ -29,8 +29,8 @@ in-graph NMI, frame-level PPU, OAM DMA, controllers, cycle-budget frame
 pacing, invisible snapshot-and-rebuild checkpointing, and mid-game
 backend handoff.  nestest boots and passes its suite interactively; SMB
 plays at ~45 fps on the kernel; SMB frames render **through the
-transformer weights** byte-identical to the kernel at ~0.12 s/frame
-(~8.3 fps with the int32 generated engine, 2026-07-07;
+transformer weights** byte-identical to the kernel at ~0.09 s/frame
+(~11 fps with the int32 generated engine + O(1) memory attention;
 `nes-run --warmup-frames 60 --backend weights`).
 
 **Scheduling**: the optimal-width MILP does not scale (formulation
@@ -429,6 +429,73 @@ Where the remaining 9.3 µs lives:
   address with recency breaking equidistant ties, which a lower_bound
   probe reproduces exactly — same trick class as hull-vs-softmax, with
   the same receipt obligations.  Beyond that: batched machines.
+
+## 2026-07-07 density limits + memory attention as an exact structure
+
+Tracked in jj:
+- `oypxuppy` — replace memory-group hulls with exact nearest-address structure
+
+Density beyond int32 — answered with data, and a discovery:
+- **int16 is dead**: 804 of 1551 residual slots exceed int16 range even on
+  the tame verify program (pc, addresses, and match-gadget squares).
+  Mixed per-slot width is possible in principle but the certification
+  story is weak and the linear part is no longer dominant.
+- **Discovery**: the value scan found residuals reaching 65535² ≈ 2³² —
+  beyond int32 too, and beyond the "dyadic < 2²⁴" f32-exactness claim.
+  These are `(address − found_addr)²` match gadgets when a memory group
+  is *empty* (found_addr = 0): exactly the case where the graph
+  multiplies the result by a zero value, masking the wrap (int32) or the
+  rounding (f32 — which stays sign-true, so its step thresholds still
+  land right).  So int32's correctness at these sites is
+  masked-by-construction and receipt-certified (30.6M-step Klaus), not
+  range-proven; the int64 mode remains the belt-and-suspenders variant.
+
+Memory attention as an exact structure:
+- All per-layer memory-group hulls held identical data per group (every
+  write inserted into all of them), so **one structure per 4 KiB group
+  replaces all 92**: `latest[4096]` value/seq arrays plus a 64-word
+  written-bitset.  A query is a two-direction bit-scan for the nearest
+  written address; the grouped parabola score −(q−a)² + q² + α·ilp(seq)
+  is maximized by exactly that address, recency breaks equidistant ties
+  toward the later write, and below the double ulp the hull's LATEST
+  tie-break picks the same winner — the same equivalence class of
+  argument as hull-vs-softmax.
+- The queries turned out to be scaled by the hardmax temperature
+  (q = [C·(addr−lo), C], C ≈ 1.414e10): a positive scalar multiple of
+  every score, so the argmax is unchanged; the generator divides C out
+  and computes the query in pure integer arithmetic (no doubles at all).
+- A write (`insert_write`) is now three stores; **memory state no longer
+  grows with the token log**.  Guards everywhere: a live forward insert
+  into a memory hull throws (the direct-WRITE contract made loud), and
+  hulls that would go unused stay empty.  12 non-memory lookup heads
+  (constant-query latest-live-token lookups) remain on real hulls.
+
+Receipts (traces identical to the generic engine, frames byte-identical
+to the kernel and all engines, 6 weights + 47 fast tests green):
+- Full nestest MATCHED: **0.1 s, ~93K instr/s** (incl. the reference).
+- Klaus 200K decimal prefix MATCHED: **2.2 s, ~89K instr/s** — 1.44× over
+  the pre-structure engine on real runs (the synthetic bench understated
+  it: old memory hulls grew between checkpoints and queries slowed with
+  them; the structure is O(1) regardless of history).
+- SMB through the weights: **~0.09 s/frame (~11 fps)** — double digits;
+  ~110× cumulative over the arc.
+- **Full Klaus re-validated: MATCHED — 30,646,177 steps in 378 s
+  (6.3 min, ~81K instr/s sustained including the lockstep reference)**,
+  146 checkpoints, throughput flat-to-rising the whole run.  The
+  full-suite run: 57 min → 18.9 → 15.3 → 9.4 → 6.3 across five engine
+  generations in two days — a 9× on the flagship receipt.
+
+Next, in payoff order:
+1. Convert the 12 remaining constant-query hulls to running-argmax
+   registers (insert-time comparison; query returns the register).  Ends
+   *all* unbounded growth — long runs would no longer need checkpointing
+   at all — and removes hull2d from the forward entirely.  Needs care at
+   the double-ulp tie margin; receipts arbitrate.
+2. Port the run loop into the generated C++ (KernelBus shape: RAM mirror
+   already lives in the engine as mem_val; watch ranges pause back to
+   Python for MMIO).  Removes the ~3 µs/step Python protocol floor — at
+   the current ~6 µs C++ step that is worth ~1.5×.
+3. Batched machines across cores after that.
 
 ## Prioritized next steps
 
