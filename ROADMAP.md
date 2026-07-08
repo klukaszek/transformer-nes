@@ -576,6 +576,68 @@ engineering gap.  Candidates, in expected payoff order:
 3. **Depth compaction**: fewer than 71 layers via graph restructuring
    (gadget fusion, wider per-layer FFN); bounded by the critical path.
 
+## 2026-07-08 opcode-routed experts (MoE) — the construction lever lands
+
+What was built (`model/engine_gen.py`, `cpu6502/weights_runner.py`;
+scouting recommendation #2 / the MoE probe): the generated engine now emits,
+alongside the union `step_core`, a pruned `step_core__<op>` per hot opcode, and
+the run loop / `machine_step` dispatch on `ram[st_pc]` (== the graph's fetched
+opcode) — a hard router that hoists the decode one-hot the graph already
+computes.  A pending NMI and any opcode without an expert fall back to the exact
+union step, so correctness is workload-agnostic.
+
+- **Approach: prune the union model in place** (not a rebuilt per-expert model).
+  Per opcode, partial-evaluate the graph with `is_op_<byte>` pinned, then take
+  liveness over the *unfolded* dependency graph with the zero-folded dims
+  removed as edges: a residual dim is live iff it still reaches a readout root
+  (incl. the STATE/HALT head dims) through non-zero contributions.  Dead work
+  (memory reads of unused addressing modes, other operations' ALU neurons)
+  drops out; the taken branch's `gate=1` multiplies fold to a live linear map
+  and are kept (they must still run in the union arithmetic).  The emitter keeps
+  only a row's live columns — dropping a zero/dead column is exact term
+  elimination — so passthrough/erase slot bookkeeping, memory (updated
+  unconditionally via `insert_write`), and the running-argmax registers are
+  untouched.  Register pruning is safe because a step that reads a register also
+  folds the current, highest-position token, so a step that pruned an earlier
+  fold cannot leave a stale winner.
+- The per-layer emission was refactored to a **plan-then-emit** shape: hull/
+  register id assignment happens once (shared by every body); the union body is
+  byte-for-byte what it was, and expert bodies are the same lines with dead
+  columns/units elided.  Default expert set = the SMB gameplay top-16 opcodes
+  (~94%: the frame-poll `LDA abs`/`AND imm`/`BEQ` + idle `JMP abs` spin, plus
+  common ALU/branch/store ops); `expert_opcodes=()` disables.
+
+Receipts (all byte-identical; every expert swept by nestest + Klaus):
+- Full nestest **MATCHED** (~155K instr/s, was ~129K); Klaus 200K decimal
+  **MATCHED** (~130K/s, was ~119K); the codegen-vs-generic identity test,
+  7 weights + 8 console + 47 fast tests all green; **SMB frame 61
+  byte-identical to the kernel**, cycles exact.
+- **Full Klaus re-validated: MATCHED — 30,646,177 steps (decimal) in 229.8 s
+  (3.83 min, ~133K instr/s incl. the lockstep reference, throughput flat)**,
+  checkpoint-free.  Full-suite arc: 57 → 18.9 → 15.3 → 9.4 → 6.3 → 6.2 → 4.55 →
+  **3.83 min** across the engine generations (decimal Klaus only partly hits the
+  expert set, so the aggregate gain understates the hot-path 2–2.7×).
+- **Hot-path win**: the JMP-to-self synthetic loop (pure expert path) went
+  **7.80 → 2.90 µs/step (2.7×, 128K → 345K instr/s)**.  A real SMB *gameplay*
+  CPU stream (mixed hot opcodes, MMIO/render excluded) went **7.15 → 3.28
+  µs/step (2.18×, 140K → 305K instr/s)**.  Mean kept 1522/5308 ReGLU neurons
+  (0.29×) and 73/114 lookup heads (0.64×) — above the probe's 0.20× because the
+  in-place approach keeps the `gate=1` folded-linear neurons the union computes
+  (a rebuilt-expert model would reach 0.20× and is the thesis MoE artifact).
+- **Honest caveat**: the SMB *frame* time is unchanged (~34 ms) — it is bound
+  by the numpy PPU render plus the per-poll MMIO round-trips (each device read
+  pauses the native loop back to Python), not the CPU step.  Routing speeds up
+  CPU-bound streams (Klaus-hot, gameplay CPU); moving SMB *fps* now needs render
+  / MMIO-batching work, not more CPU throughput.
+
+Next, in payoff order:
+1. Rebuilt-expert weights model (inline the `gate=1` multiplies → the probe's
+   0.20× and a genuine Switch-style top-1 MoE for the write-up) and/or wider
+   expert coverage (per-family for cold opcodes) if a CPU-bound target needs it.
+2. The SMB frame is now render/MMIO-bound: batch device reads / speed the PPU
+   renderer to convert the CPU headroom into fps.
+3. Batched machines across cores (state is O(1) per machine).
+
 ## 2026-07-07 C++ run loop (KernelBus shape) — Python floor removed
 
 What was built (`model/engine_gen.py`, `cpu6502/weights_runner.py`,

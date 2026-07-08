@@ -224,7 +224,7 @@ def _compose(outer: sp.csr_matrix, cols, inner_rows: sp.csr_matrix) -> sp.csr_ma
 
 
 def generate_source(model, step_spec: dict | None = None,
-                    arith: str = "int64") -> tuple[str, int, bool]:
+                    arith: str = "int64", experts=None) -> tuple[str, int, bool]:
     """Emit the C++ source; returns (source, n_memory_heads, has_step).
 
     step_spec, if given, additionally emits a machine_step member that runs
@@ -234,7 +234,24 @@ def generate_source(model, step_spec: dict | None = None,
     caller-provided int64 buffer.  Layout: {"inputs": {name: slot},
     "p_flags": [(slot, mask)], "outputs": {name: slot},
     "halt_head"/"state_head": (cols, vals)}.
+
+    experts, if given, is a list of opcode-routed experts.  Each is a dict
+    ``{"name": "4C", "byte": 0x4C, "keep_neurons": {li: set[int]},
+    "keep_heads": {li: set[int]}}`` giving, per layer, which ReGLU neurons and
+    which lookup heads survive when the fetched opcode is pinned to ``byte``
+    (an opcode-routed MoE: the decode one-hot the graph already computes is
+    hoisted into a hard router).  A specialized ``step_core__<name>`` runs the
+    pruned layer stack -- a residual row keeps only its live columns, and a row
+    with no live column is dropped -- while the run loop / machine_step dispatch
+    on ``ram[st_pc]`` (== the fetched opcode) and fall back to the full union
+    step for opcodes without an expert and for NMIs.  The pruning is safe by
+    construction: passthrough/erase slot bookkeeping is kept whole, memory is
+    updated unconditionally through insert_write, and the running-argmax
+    registers are self-correcting (a step that reads a register also folds the
+    current, highest-position token, so a step that pruned an earlier fold
+    cannot leave a stale winner).
     """
+    experts = experts or []
     if KEY_OFFSET != 0:
         raise RuntimeError(
             "generated engine assumes KEY_OFFSET == 0 in the lookup key "
@@ -286,6 +303,9 @@ def generate_source(model, step_spec: dict | None = None,
 
         def row_int(csr_m, r, ref, where):
             return _expr_int(*_row(csr_m, r), ref, where)
+
+        def row_raw(indices, data, ref, where):
+            return _expr_int(indices, data, ref, where)
     else:
         elem, zero = "float", "0.0f"
 
@@ -298,8 +318,12 @@ def generate_source(model, step_spec: dict | None = None,
         def row_int(csr_m, r, ref, where):
             return _expr(*_row(csr_m, r), ref)
 
+        def row_raw(indices, data, ref, where):
+            return _expr(indices, data, ref)
+
     layer_sig = f"{elem}* x, const double* pf" if is_int else "float* x"
 
+    layer_plans: list[dict] = []
     for li in range(n_layers):
         _check_ffn_kinds(model, li)
         ip = _csr(model.attn[li].in_proj_weight)
@@ -357,11 +381,16 @@ def generate_source(model, step_spec: dict | None = None,
         fo_kept = _zero_columns(fo, pt_j)
         live = sorted(int(j) for j in np.unique(fo_kept.indices))
 
-        b: list[str] = []
-        b.append(f"    void layer_{li}({layer_sig}) {{")
+        # Per-head emission blocks (each self-contained: it defines ho{2h}
+        # and ho{2h+1}).  Collected keyed by head so a routed expert can skip
+        # a head wholesale when it produces no live value; the id assignment
+        # (hull ids, running-argmax register indices) happens here once and is
+        # shared by the union body and every expert body.
+        head_blocks: dict[int, list[str]] = {}
 
         # ── Attention: hull heads, then residual updates ─────────────
         for h in lookup:
+            b = head_blocks.setdefault(h, [])
             hid = hull_of_head[h]
             tb = "TieBreak::LATEST" if tiebreak[h] else "TieBreak::AVERAGE"
             # Memory heads qualify for the structure when the query is a
@@ -524,45 +553,117 @@ def generate_source(model, step_spec: dict | None = None,
                 b.append("        }")
             b.append(f"        (void)ho{2 * h}; (void)ho{2 * h + 1};")
 
-        # attn_direct reads pre-attention x; capture before updating.
+        # attn_direct reads pre-attention x; capture before updating.  These
+        # fused rows are passthrough/erase (slot-hygiene) work; they are kept
+        # whole in every body -- a routed expert prunes value-producing units
+        # (hull heads, ReGLU neurons), never the slot bookkeeping.
         ad_rows = [r for r in range(d_model)
                    if attn_direct.indptr[r + 1] > attn_direct.indptr[r]]
-        for r in ad_rows:
-            b.append(f"        const {elem} ad{r} = "
-                     f"{row_int(attn_direct, r, xref, f'L{li} attn_direct')};")
+        ad_def = [f"        const {elem} ad{r} = "
+                  f"{row_int(attn_direct, r, xref, f'L{li} attn_direct')};"
+                  for r in ad_rows]
+        # out_proj rows read the hull outputs ho{..}.  A routed expert keeps
+        # only the columns whose head survives; a head column is dropped only
+        # when the head is dead (produces no live value), so the term it would
+        # contribute is unused.
+        opkept: list[tuple[int, list[int], list[float]]] = []
         for r in range(d_model):
             if op_kept.indptr[r + 1] > op_kept.indptr[r]:
-                b.append(f"        x[{r}] += "
-                         f"{row_int(op_kept, r, lambda i: f'ho{i}', f'L{li} out_proj')};")
-        for r in ad_rows:
-            b.append(f"        x[{r}] += ad{r};")
+                idxs, dat = _row(op_kept, r)
+                opkept.append((r, [int(c) for c in idxs], list(dat)))
+        ad_apply = [f"        x[{r}] += ad{r};" for r in ad_rows]
 
         # ── FFN: direct map and activations read post-attention x ────
         fd_rows = [r for r in range(d_model)
                    if ffn_direct.indptr[r + 1] > ffn_direct.indptr[r]]
-        for r in fd_rows:
-            b.append(f"        const {elem} fd{r} = "
-                     f"{row_int(ffn_direct, r, xref, f'L{li} ffn_direct')};")
+        fd_def = [f"        const {elem} fd{r} = "
+                  f"{row_int(ffn_direct, r, xref, f'L{li} ffn_direct')};"
+                  for r in fd_rows]
+        neuron_blocks: dict[int, list[str]] = {}
         for j in live:
             g = row_int(fi, j, xref, f"L{li} ff_gate")
             v = row_int(fi, ffn + j, xref, f"L{li} ff_value")
-            b.append(f"        {elem} a{j};")
+            nb = [f"        {elem} a{j};"]
             if is_int:
-                b.append(f"        {{ const {elem} g = {g}; "
-                         f"const {elem} v = {v}; "
-                         f"a{j} = g > 0 ? shr(g*v) : 0; }}")
+                nb.append(f"        {{ const {elem} g = {g}; "
+                          f"const {elem} v = {v}; "
+                          f"a{j} = g > 0 ? shr(g*v) : 0; }}")
             else:
-                b.append(f"        {{ const {elem} g = {g}; const {elem} v = {v}; "
-                         f"a{j} = g > {zero} ? g*v : {zero}; }}")
+                nb.append(f"        {{ const {elem} g = {g}; const {elem} v = {v}; "
+                          f"a{j} = g > {zero} ? g*v : {zero}; }}")
+            neuron_blocks[j] = nb
+        # ff_out rows read the ReGLU activations a{..}.  A routed expert drops
+        # the columns whose neuron folds to zero for that opcode (an exact
+        # elimination -- the dropped terms are provably 0); the row's remaining
+        # terms and its target slot are untouched.
+        fokept: list[tuple[int, list[int], list[float]]] = []
         for r in range(d_model):
             if fo_kept.indptr[r + 1] > fo_kept.indptr[r]:
-                b.append(f"        x[{r}] += "
-                         f"{row_int(fo_kept, r, lambda i: f'a{i}', f'L{li} ff_out')};")
-        for r in fd_rows:
-            b.append(f"        x[{r}] += fd{r};")
+                idxs, dat = _row(fo_kept, r)
+                fokept.append((r, [int(c) for c in idxs], list(dat)))
+        fd_apply = [f"        x[{r}] += fd{r};" for r in fd_rows]
 
-        b.append("    }")
-        body.extend(b)
+        layer_plans.append({
+            "li": li, "lookup": lookup, "head_blocks": head_blocks,
+            "ad_def": ad_def, "opkept": opkept, "ad_apply": ad_apply,
+            "fd_def": fd_def, "live": live, "neuron_blocks": neuron_blocks,
+            "fokept": fokept, "fd_apply": fd_apply,
+        })
+
+    # ── Emit the layer functions: the union body plus one pruned body per
+    # routed expert.  keep_heads / keep_neurons are None for the union
+    # (everything kept) or the expert's per-layer survivor sets otherwise; a
+    # residual row keeps only its live columns and is dropped when none
+    # survive (exact term elimination). ──
+    def emit_layer_fn(plan, suffix, keep_heads, keep_neurons):
+        li = plan["li"]
+        out = [f"    void layer_{li}{suffix}({layer_sig}) {{"]
+        for h in plan["lookup"]:
+            if keep_heads is None or h in keep_heads:
+                out.extend(plan["head_blocks"][h])
+        out.extend(plan["ad_def"])
+        for r, idxs, dat in plan["opkept"]:
+            if keep_heads is None:
+                ki, kc = idxs, dat
+            else:
+                pairs = [(i, c) for i, c in zip(idxs, dat, strict=True)
+                         if i // 2 in keep_heads]
+                ki = [i for i, _ in pairs]
+                kc = [c for _, c in pairs]
+                if not ki:
+                    continue
+            out.append(f"        x[{r}] += "
+                       f"{row_raw(ki, kc, lambda i: f'ho{i}', f'L{li} out_proj')};")
+        out.extend(plan["ad_apply"])
+        out.extend(plan["fd_def"])
+        for j in plan["live"]:
+            if keep_neurons is None or j in keep_neurons:
+                out.extend(plan["neuron_blocks"][j])
+        for r, idxs, dat in plan["fokept"]:
+            if keep_neurons is None:
+                ki, kc = idxs, dat
+            else:
+                pairs = [(i, c) for i, c in zip(idxs, dat, strict=True)
+                         if i in keep_neurons]
+                ki = [i for i, _ in pairs]
+                kc = [c for _, c in pairs]
+                if not ki:
+                    continue
+            out.append(f"        x[{r}] += "
+                       f"{row_raw(ki, kc, lambda i: f'a{i}', f'L{li} ff_out')};")
+        out.extend(plan["fd_apply"])
+        out.append("    }")
+        return out
+
+    for plan in layer_plans:
+        body.extend(emit_layer_fn(plan, "", None, None))
+    for exp in experts:
+        for plan in layer_plans:
+            body.extend(emit_layer_fn(
+                plan, f"__{exp['name']}",
+                exp["keep_heads"].get(plan["li"], set()),
+                exp["keep_neurons"].get(plan["li"], set()),
+            ))
 
     n_hulls = len(hull_tiebreak)
     # The C++ run loop (KernelBus shape) needs the same memory-write path the
@@ -826,85 +927,112 @@ def generate_source(model, step_spec: dict | None = None,
             emit("        return (long long)std::nearbyint((double)v);")
             emit("    }")
         emit("")
-        emit("    void step_core(long long* out) {")
-        emit(f"        {elem}* x = xbuf;")
-        emit(f"        for (int i = 0; i < {d_model}; ++i) x[i] = {zero};")
-        emit(f"        x[{model.one_slot}] = {one_e};")
-        emit(f"        x[{ins['is_state']}] = {one_e};")
-        emit(f"        x[{ins['pc_lo']}] = {sc('st_pc & 0xFF')};")
-        emit(f"        x[{ins['pc_hi']}] = {sc('(st_pc >> 8) & 0xFF')};")
-        emit(f"        x[{ins['a']}] = {sc('st_a')};")
-        emit(f"        x[{ins['x']}] = {sc('st_x')};")
-        emit(f"        x[{ins['y']}] = {sc('st_y')};")
-        emit(f"        x[{ins['s']}] = {sc('st_s')};")
-        for slot, mask in step_spec["p_flags"]:
-            emit(f"        x[{slot}] = (st_p & {mask}) ? {one_e} : {zero_l};")
-        emit(f"        x[{ins['ir']}] = {sc('st_ir')};")
-        emit(f"        x[{ins['oplo']}] = {sc('st_oplo')};")
-        emit(f"        x[{ins['ophi']}] = {sc('st_ophi')};")
-        emit(f"        x[{ins['ea_lo']}] = {sc('st_ea & 0xFF')};")
-        emit(f"        x[{ins['ea_hi']}] = {sc('(st_ea >> 8) & 0xFF')};")
-        emit(f"        x[{ins['data']}] = {sc('st_data')};")
-        emit(f"        x[{ins['halted']}] = {sc('st_halted ? 1 : 0')};")
-        emit(f"        x[{ins['nmi']}] = {sc('nmi_pending ? 1 : 0')};")
-        emit("        nmi_pending = false;")
-        emit("        const long long pos = seq + 1;")
-        if is_int:
-            emit("        const double pf[3] = {")
-            emit("            (double)pos,")
-            emit("            1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0),")
-            emit("            (double)pos * (double)pos,")
-            emit("        };")
-        else:
-            emit("        x[0] += (float)pos;")
-            emit("        x[1] += (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
-            emit("        // integer square converted once, like NumPy's int -> float32")
-            emit("        x[2] += (float)((unsigned long long)pos * (unsigned long long)pos);")
-        emit("        ++seq;")
-        for li in range(n_layers):
-            emit(f"        layer_{li}(x{', pf' if is_int else ''});")
         rdv = (lambda s: f"shr2(x[{s}])") if is_int else (lambda s: f"rd(x[{s}])")
-        for i, (name, mask) in enumerate((
-            ("current_pc", 0xFFFF), ("new_a", 0xFF), ("new_x", 0xFF),
-            ("new_y", 0xFF), ("new_s", 0xFF), ("new_p", 0xFF),
-            ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
-            ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF), ("data_out", 0xFF),
-            ("new_halted", 0xFF), ("next_pc", 0xFFFF),
-        )):
-            emit(f"        out[{i}] = {rdv(out_slot(name))} & 0x{mask:X};")
-        emit("        long long n_writes = 0;")
-        for store, addr, value in (
-            ("is_store", "write_addr_out", "write_value_out"),
-            ("is_store2", "write_addr2_out", "write_value2_out"),
-            ("is_store3", "write_addr3_out", "write_value3_out"),
-        ):
-            emit(f"        if (({rdv(out_slot(store))} & 0xFF) != 0) {{")
-            emit(f"            out[15 + 2 * n_writes] = {rdv(out_slot(addr))} & 0xFFFF;")
-            emit(f"            out[16 + 2 * n_writes] = {rdv(out_slot(value))} & 0xFF;")
-            emit("            ++n_writes;")
-            emit("        }")
-        emit("        out[14] = n_writes;")
-        emit("        for (long long i = 0; i < n_writes; ++i)")
-        emit("            insert_write_f32((int)out[15 + 2 * i], (int)out[16 + 2 * i], seq + 1);")
         hc, hv = step_spec["halt_head"]
         shc, shv = step_spec["state_head"]
-        if is_int:
-            emit(f"        const long long halt_logit = "
-                 f"{_expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
-            emit(f"        const long long state_logit = "
-                 f"{_expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
-        else:
-            emit(f"        const float halt_logit = {_expr(hc, hv, lambda i: f'x[{i}]')};")
-            emit(f"        const float state_logit = {_expr(shc, shv, lambda i: f'x[{i}]')};")
-        emit("        out[13] = halt_logit > state_logit ? 1 : 0;")
-        emit("        // Advance the architectural state (inputs are fully")
-        emit("        // consumed by the embed above before this update).")
-        emit("        st_pc = (int)out[12];")
-        emit("        st_a = (int)out[1]; st_x = (int)out[2]; st_y = (int)out[3];")
-        emit("        st_s = (int)out[4]; st_p = (int)out[5];")
-        emit("        st_ir = (int)out[6]; st_oplo = (int)out[7]; st_ophi = (int)out[8];")
-        emit("        st_ea = (int)out[9]; st_data = (int)out[10];")
-        emit("        st_halted = out[11] != 0;")
+
+        def emit_step_core(fn_name, layer_suffix):
+            # One whole instruction, sharing the embed/readout/write/halt
+            # protocol; layer_suffix selects the union stack ("") or a routed
+            # expert's pruned stack ("__<name>").
+            emit(f"    void {fn_name}(long long* out) {{")
+            emit(f"        {elem}* x = xbuf;")
+            emit(f"        for (int i = 0; i < {d_model}; ++i) x[i] = {zero};")
+            emit(f"        x[{model.one_slot}] = {one_e};")
+            emit(f"        x[{ins['is_state']}] = {one_e};")
+            emit(f"        x[{ins['pc_lo']}] = {sc('st_pc & 0xFF')};")
+            emit(f"        x[{ins['pc_hi']}] = {sc('(st_pc >> 8) & 0xFF')};")
+            emit(f"        x[{ins['a']}] = {sc('st_a')};")
+            emit(f"        x[{ins['x']}] = {sc('st_x')};")
+            emit(f"        x[{ins['y']}] = {sc('st_y')};")
+            emit(f"        x[{ins['s']}] = {sc('st_s')};")
+            for slot, mask in step_spec["p_flags"]:
+                emit(f"        x[{slot}] = (st_p & {mask}) ? {one_e} : {zero_l};")
+            emit(f"        x[{ins['ir']}] = {sc('st_ir')};")
+            emit(f"        x[{ins['oplo']}] = {sc('st_oplo')};")
+            emit(f"        x[{ins['ophi']}] = {sc('st_ophi')};")
+            emit(f"        x[{ins['ea_lo']}] = {sc('st_ea & 0xFF')};")
+            emit(f"        x[{ins['ea_hi']}] = {sc('(st_ea >> 8) & 0xFF')};")
+            emit(f"        x[{ins['data']}] = {sc('st_data')};")
+            emit(f"        x[{ins['halted']}] = {sc('st_halted ? 1 : 0')};")
+            emit(f"        x[{ins['nmi']}] = {sc('nmi_pending ? 1 : 0')};")
+            emit("        nmi_pending = false;")
+            emit("        const long long pos = seq + 1;")
+            if is_int:
+                emit("        const double pf[3] = {")
+                emit("            (double)pos,")
+                emit("            1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0),")
+                emit("            (double)pos * (double)pos,")
+                emit("        };")
+            else:
+                emit("        x[0] += (float)pos;")
+                emit("        x[1] += (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
+                emit("        // integer square converted once, like NumPy's int -> float32")
+                emit("        x[2] += (float)((unsigned long long)pos * (unsigned long long)pos);")
+            emit("        ++seq;")
+            for li in range(n_layers):
+                emit(f"        layer_{li}{layer_suffix}(x{', pf' if is_int else ''});")
+            for i, (name, mask) in enumerate((
+                ("current_pc", 0xFFFF), ("new_a", 0xFF), ("new_x", 0xFF),
+                ("new_y", 0xFF), ("new_s", 0xFF), ("new_p", 0xFF),
+                ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
+                ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF), ("data_out", 0xFF),
+                ("new_halted", 0xFF), ("next_pc", 0xFFFF),
+            )):
+                emit(f"        out[{i}] = {rdv(out_slot(name))} & 0x{mask:X};")
+            emit("        long long n_writes = 0;")
+            for store, addr, value in (
+                ("is_store", "write_addr_out", "write_value_out"),
+                ("is_store2", "write_addr2_out", "write_value2_out"),
+                ("is_store3", "write_addr3_out", "write_value3_out"),
+            ):
+                emit(f"        if (({rdv(out_slot(store))} & 0xFF) != 0) {{")
+                emit(f"            out[15 + 2 * n_writes] = {rdv(out_slot(addr))} & 0xFFFF;")
+                emit(f"            out[16 + 2 * n_writes] = {rdv(out_slot(value))} & 0xFF;")
+                emit("            ++n_writes;")
+                emit("        }")
+            emit("        out[14] = n_writes;")
+            emit("        for (long long i = 0; i < n_writes; ++i)")
+            emit("            insert_write_f32((int)out[15 + 2 * i], (int)out[16 + 2 * i], seq + 1);")
+            if is_int:
+                emit(f"        const long long halt_logit = "
+                     f"{_expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
+                emit(f"        const long long state_logit = "
+                     f"{_expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
+            else:
+                emit(f"        const float halt_logit = {_expr(hc, hv, lambda i: f'x[{i}]')};")
+                emit(f"        const float state_logit = {_expr(shc, shv, lambda i: f'x[{i}]')};")
+            emit("        out[13] = halt_logit > state_logit ? 1 : 0;")
+            emit("        // Advance the architectural state (inputs are fully")
+            emit("        // consumed by the embed above before this update).")
+            emit("        st_pc = (int)out[12];")
+            emit("        st_a = (int)out[1]; st_x = (int)out[2]; st_y = (int)out[3];")
+            emit("        st_s = (int)out[4]; st_p = (int)out[5];")
+            emit("        st_ir = (int)out[6]; st_oplo = (int)out[7]; st_ophi = (int)out[8];")
+            emit("        st_ea = (int)out[9]; st_data = (int)out[10];")
+            emit("        st_halted = out[11] != 0;")
+            emit("    }")
+
+        emit_step_core("step_core_union", "")
+        for exp in experts:
+            emit("")
+            emit_step_core(f"step_core__{exp['name']}", f"__{exp['name']}")
+
+        # Opcode-routed dispatch (the MoE router): the fetched opcode is
+        # ram[st_pc] (== the graph's memory read at pc), so an expert built by
+        # pinning is_op_<byte> runs exactly when that byte is fetched.  A
+        # pending NMI overrides the instruction, so it takes the union step.
+        emit("")
+        emit("    void step_core(long long* out) {")
+        if experts:
+            emit("        if (!nmi_pending) {")
+            emit("            switch (ram[st_pc]) {")
+            for exp in experts:
+                emit(f"                case 0x{exp['byte']:02X}: "
+                     f"step_core__{exp['name']}(out); return;")
+            emit("            }")
+            emit("        }")
+        emit("        step_core_union(out);")
         emit("    }")
         emit("")
         emit("    // Per-instruction entry point: seed st_* from arguments, run one")
@@ -1080,14 +1208,16 @@ class GeneratedWeightsEngine:
     """Drop-in for SparseWeightsEngine; exact int64 default, f32 replica."""
 
     def __init__(self, model, *, dtype: str = "float32",
-                 step_spec: dict | None = None, arith: str = "int32"):
+                 step_spec: dict | None = None, arith: str = "int32",
+                 experts=None):
         if dtype != "float32":
             raise ValueError("the generated engine is float32-only; use "
                              "matmul='engine' for the float64 diagnostic path")
         self.dtype = dtype
         self.arith = arith
+        self.n_experts = len(experts or [])
         source, self.n_memory_heads, self.has_machine_step = generate_source(
-            model, step_spec, arith
+            model, step_spec, arith, experts=experts
         )
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         source = source.replace("ENGINE_T", f"Engine_{digest}")

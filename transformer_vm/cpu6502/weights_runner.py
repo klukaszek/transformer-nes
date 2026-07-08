@@ -42,13 +42,32 @@ import torch
 from transformer_vm.attention import HullKVCache, StandardKVCache
 from transformer_vm.cpu6502 import reference
 from transformer_vm.cpu6502.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
+from transformer_vm.cpu6502.spec import OPCODES
 from transformer_vm.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
-from transformer_vm.graph.core import ProgramGraph
+from transformer_vm.graph.core import (
+    Expression,
+    InputDimension,
+    LookUpDimension,
+    PersistDimension,
+    ProgramGraph,
+    ReGLUDimension,
+)
 from transformer_vm.model.transformer import add_position_encoding
 from transformer_vm.model.weights import build_model
 from transformer_vm.scheduler.milp import asap_schedule
 
 logger = logging.getLogger(__name__)
+
+# Opcode-routed experts, on by default for the generated int engine.  These
+# are the hot opcodes of the SMB gameplay histogram (experiments/moe_probe):
+# the frame-wait poll loop (LDA abs / AND imm / BEQ) plus the idle JMP spin
+# dominate (~87%), and the top ~16 cover ~94%.  Every other opcode (and every
+# NMI) falls back to the exact union step, so correctness is workload-agnostic;
+# the set only decides which opcodes get the faster pruned step.
+DEFAULT_EXPERT_OPCODES = (
+    0xF0, 0xAD, 0x29, 0x4C, 0xC8, 0xD0, 0x85, 0xC9,
+    0x4A, 0x99, 0xA5, 0xBD, 0x20, 0x60, 0x90, 0x18,
+)
 
 
 class Cpu6502TransformerMachine:
@@ -57,7 +76,8 @@ class Cpu6502TransformerMachine:
     def __init__(self, *, bcd: bool = False, cache: str = "hull",
                  matmul: str = "codegen", dtype: str = "float32",
                  codegen_arith: str = "int32",
-                 checkpoint_tokens: int | None = None):
+                 checkpoint_tokens: int | None = None,
+                 expert_opcodes=DEFAULT_EXPERT_OPCODES):
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
         self.rt = Cpu6502Runtime(bcd=bcd)
@@ -88,6 +108,7 @@ class Cpu6502TransformerMachine:
         self.model.requires_grad_(False)  # inference only
         self.build_seconds = time.perf_counter() - build_start
         self.n_layers = shared[3]
+        self._std_layers = shared[4]
         self.slot_of = shared[6]
         self.d_model = shared[9]
         self._state_row = tok_to_idx["STATE"]
@@ -142,9 +163,10 @@ class Cpu6502TransformerMachine:
             if matmul == "codegen":
                 from transformer_vm.model.engine_gen import GeneratedWeightsEngine
 
+                experts = self._build_experts(expert_opcodes)
                 self._engine = GeneratedWeightsEngine(
                     self.model, dtype=dtype, step_spec=self._step_spec(),
-                    arith=codegen_arith,
+                    arith=codegen_arith, experts=experts,
                 )
             else:
                 from transformer_vm.model.engine import SparseWeightsEngine
@@ -257,6 +279,154 @@ class Cpu6502TransformerMachine:
         for dim, value in values.items():
             x[self.slot_of[dim]] = float(value)
         return x
+
+    def _build_experts(self, opcodes) -> list[dict]:
+        """Per-opcode keep-sets for the opcode-routed engine.
+
+        For each expert opcode, partial-evaluate the graph with the decode
+        one-hot gates pinned (is_op_<byte>=1, every other is_op_*=0, is_nmi=0)
+        -- exactly what a hard router supplies.  A ReGLU whose gate resolves to
+        <=0 (or whose value resolves to 0) is the zero function under this
+        opcode: a non-taken instruction / addressing-mode branch.
+
+        The scheduled model is the union of every opcode, so pruning is done as
+        liveness over its *unfolded* dependency graph with the zero-folded dims
+        removed as edges: a residual dim is live iff it still reaches a readout
+        root through non-zero contributions.  Dead dims (e.g. the memory reads
+        of addressing modes this opcode never uses, and the ALU neurons of
+        other operations) drop out; the taken branch's gate=1 neurons stay live
+        (they fold to a real linear map and must still run).  A live ff_out /
+        out_proj row keeps only its live columns -- dropping a zero/dead column
+        is exact term elimination -- so passthrough/erase slot bookkeeping,
+        memory, and the registers are all untouched.
+
+        Correctness rests on ram[pc] == the graph's fetched opcode (the run
+        loop dispatches on the same byte the memory read returns) and on the
+        pruning-safety invariants in engine_gen.generate_source.  The full
+        lockstep chain (every opcode swept through its expert by nestest and
+        Klaus) is the receipt.
+        """
+        opcodes = [int(b) for b in (opcodes or []) if int(b) in OPCODES]
+        if not opcodes:
+            return []
+
+        all_dims = list(self.rt.all_dims)
+        one = self.rt._one
+
+        # Readout roots plus everything the STATE/HALT output heads read: the
+        # step reads those logits, so their inputs must survive pruning too.
+        roots = [self._dim_by_name[n] for n in _RUNTIME_READ_DIMS]
+        for tok in ("STATE", "HALT"):
+            expr = self.rt.output_tokens.get(tok)
+            if isinstance(expr, Expression):
+                roots.extend(d for d in expr.terms if not isinstance(d, InputDimension))
+
+        def const_of(e):
+            for d in e.terms:
+                if d is not one:
+                    return None
+            return e.terms.get(one, 0.0)
+
+        def subst(expr, val):
+            out = Expression()
+            for d, c in expr.terms.items():
+                v = val.get(d)
+                out = out + (Expression({d: c}) if v is None else v * c)
+            return out
+
+        def keep_sets(pins):
+            # 1) Fold: find the dims that are provably zero under these pins.
+            val = {one: Expression({one: 1.0})}
+            zero = set()
+            for d in all_dims:
+                if isinstance(d, PersistDimension) and d.name in pins:
+                    val[d] = Expression({one: float(pins[d.name])})
+                    continue
+                if isinstance(d, ReGLUDimension):
+                    a = subst(d.a_expr, val)
+                    b = subst(d.b_expr, val)
+                    bc, ac = const_of(b), const_of(a)
+                    if (bc is not None and bc <= 0) or (ac is not None and ac == 0):
+                        val[d] = Expression()
+                        zero.add(d)
+                    elif bc is not None and ac is not None:
+                        val[d] = Expression({one: ac * bc})
+                        if ac * bc == 0:
+                            zero.add(d)
+                    elif bc is not None:
+                        val[d] = a * bc
+                elif isinstance(d, PersistDimension):
+                    e = subst(d.expr, val)
+                    c = const_of(e)
+                    if c is not None:
+                        val[d] = Expression({one: c})
+                        if c == 0:
+                            zero.add(d)
+            # 2) Liveness over the UNFOLDED graph, stopping at zero dims: a dim
+            #    is live iff it reaches a root through non-zero contributions.
+            live = set()
+            stack = [r for r in roots]
+            while stack:
+                d = stack.pop()
+                if (d in live or d in zero or isinstance(d, InputDimension)):
+                    continue
+                live.add(d)
+                deps = set()
+                if isinstance(d, ReGLUDimension):
+                    deps |= set(d.a_expr.terms) | set(d.b_expr.terms)
+                elif isinstance(d, PersistDimension):
+                    deps |= set(d.expr.terms)
+                elif isinstance(d, LookUpDimension):
+                    lu = d.lookup
+                    for e in (lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs):
+                        deps |= set(e.terms)
+                    live.update(lu.dims)  # a live lookup produces all its values
+                stack.extend(deps)
+            return live
+
+        experts = []
+        for byte in opcodes:
+            pins = {"is_nmi": 0.0}
+            for op in OPCODES.values():
+                pins[f"is_op_{op.byte:02X}"] = 1.0 if op.byte == byte else 0.0
+            live = keep_sets(pins)
+
+            keep_heads: dict[int, set] = {}
+            keep_neurons: dict[int, set] = {}
+            for li, (attn, _p1, ffn, _p2) in enumerate(self._std_layers):
+                # Head numbering mirrors build_model: lookup heads first, in
+                # LookUp order, two value components per head.
+                kh = set()
+                h = 0
+                for lu in attn:
+                    nv = len(lu.value_exprs)
+                    for p in range((nv + 1) // 2):
+                        served = [lu.dims[2 * p]]
+                        if 2 * p + 1 < nv:
+                            served.append(lu.dims[2 * p + 1])
+                        if any(d in live for d in served):
+                            kh.add(h)
+                        h += 1
+                keep_heads[li] = kh
+                keep_neurons[li] = {j for j, rg in enumerate(ffn) if rg in live}
+
+            experts.append({
+                "name": f"{byte:02X}", "byte": byte,
+                "keep_heads": keep_heads, "keep_neurons": keep_neurons,
+                "_nk": sum(len(v) for v in keep_neurons.values()),
+                "_hk": sum(len(v) for v in keep_heads.values()),
+            })
+        n_neurons = sum(len(ffn) for _a, _p, ffn, _q in self._std_layers)
+        n_heads = sum(len(a) for a, _p, _f, _q in self._std_layers)
+        logger.info(
+            "routed experts: %d opcodes; mean kept %d/%d ReGLU neurons, "
+            "%d/%d lookup heads (e.g. %s)",
+            len(experts),
+            sum(e["_nk"] for e in experts) // max(len(experts), 1), n_neurons,
+            sum(e["_hk"] for e in experts) // max(len(experts), 1), n_heads,
+            experts[0]["name"],
+        )
+        return experts
 
     def _step_spec(self) -> dict:
         """Slot map for the generated C++ machine_step (engine_gen.py)."""
