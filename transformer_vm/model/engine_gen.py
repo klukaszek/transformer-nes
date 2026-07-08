@@ -1,11 +1,11 @@
 """Generated straight-line C++ engine for the analytic transformer weights.
 
-The generic engine (weights_engine.cpp) spends its forward almost entirely
-on the dependent scalar CSR gather -- loading indices[k]/data[k] and chasing
-them (measured ~1.5-2 ns/nnz; the hulls are only ~8%).  This module applies
-the kernel.py trick to the weights: it emits one C++ translation unit
-specific to the built model, with column indices as immediates and +-1
-coefficients as add/sub.
+A generic CSR forward spends almost all its time on the dependent scalar
+gather -- loading indices[k]/data[k] and chasing them (~1.5-2 ns/nnz; the
+hulls are only ~8%).  This module applies the kernel.py trick to the weights:
+it emits one C++ translation unit specific to the built model, with column
+indices as immediates and +-1 coefficients as add/sub, so those loads
+disappear.
 
 Three arithmetic modes:
 
@@ -26,14 +26,13 @@ Three arithmetic modes:
   needed); measured slower than int32 -- the linear part is load-bound,
   so value density wins.
 
-- ``arith="f32"``: bit-for-bit replica of the generic engine's float32
-  arithmetic (CSR column order, left-to-right accumulation, float32
-  hexfloat literals); kept as the cross-check and benchmarking reference.
+- ``arith="f32"``: float32 arithmetic (CSR column order, left-to-right
+  accumulation, float32 hexfloat literals); kept as a benchmarking
+  reference for the int paths.
 
-Both modes generate the direct-WRITE key construction from graph.core's
+All modes generate the direct-WRITE key construction from graph.core's
 LATEST_ALPHA/KEY_OFFSET instead of hand-copying it, so the generated
-engine cannot silently desync from the graph.  The float64 diagnostic
-path stays on the generic engine.
+engine cannot silently desync from the graph.
 """
 
 from __future__ import annotations
@@ -130,9 +129,9 @@ def _join(terms) -> str:
 def _expr(indices, data, ref) -> str:
     """One CSR row as a float32 left-to-right accumulation expression.
 
-    Matches the generic engine's `acc += data[k] * x[indices[k]]` order:
+    Accumulates in CSR column order (`acc += data[k] * x[indices[k]]`):
     C++ `+`/`-` are left-associative, so a single chained expression
-    rounds identically.
+    rounds identically to that loop.
     """
     terms = []
     for idx, c in zip(indices, data, strict=True):
@@ -221,6 +220,25 @@ def _compose(outer: sp.csr_matrix, cols, inner_rows: sp.csr_matrix) -> sp.csr_ma
     direct.eliminate_zeros()
     direct.sort_indices()
     return direct
+
+
+def _check_ffn_kinds(model, layer_idx):
+    """Validate the fusion contract behind ffn_kinds == 2.
+
+    Kind-2 (linear passthrough/erase) neurons are folded into a direct
+    residual map using only their value row, dropping the gate.  That is
+    exact only if the gate is the constant-one expression, so a mislabeled
+    neuron must fail here instead of silently computing the wrong activation.
+    """
+    w = model.ff_in[layer_idx].weight
+    for j, kind in enumerate(model.ffn_kinds[layer_idx]):
+        if kind != 2:
+            continue
+        gate = w[j]
+        if gate[model.one_slot] != 1.0 or int((gate != 0).sum()) != 1:
+            raise RuntimeError(
+                f"L{layer_idx} ffn neuron {j}: kind-2 gate is not the constant one"
+            )
 
 
 # ── Static C++ blocks ───────────────────────────────────────────────────
@@ -510,7 +528,6 @@ def generate_source(model, step_spec: dict | None = None,
     if arith not in ("int64", "int32", "f32"):
         raise ValueError(f"unknown arith {arith!r}")
     is_int = arith in ("int64", "int32")
-    from transformer_vm.model.engine import _check_ffn_kinds
 
     d_model = model.tok.weight.shape[1]
     n_heads = model.attn[0].num_heads
@@ -613,7 +630,8 @@ def generate_source(model, step_spec: dict | None = None,
                 mem_hulls[mem_groups[h]].append(hull_of_head[h])
                 n_memory_heads += 1
 
-        # Fusion, mirroring weights_engine.cpp add_layer.
+        # Structural passthrough/erase fusion: fold kind-2 heads and neurons
+        # into direct D->D residual maps (they never need a hull/ReGLU).
         pt_cols = [2 * h + c for h in passthrough for c in range(2)]
         attn_direct = _compose(op, pt_cols, ip[[2 * d_model + c for c in pt_cols], :])
         op_kept = _zero_columns(op, pt_cols)
@@ -926,8 +944,8 @@ def generate_source(model, step_spec: dict | None = None,
         emit("// associative, so the compiler may tree-reduce/vectorize);")
         emit("// Q/K/V and position features are double, hull-resolved.")
     else:
-        emit("// Arithmetic replicates weights_engine.cpp exactly: CSR column")
-        emit("// order, left-to-right accumulation, float32 hexfloat literals.")
+        emit("// float32 arithmetic: CSR column order, left-to-right")
+        emit("// accumulation, float32 hexfloat literals.")
     emit(_INCLUDES)
     emit("")
     emit("struct ENGINE_T {")
@@ -1242,15 +1260,11 @@ def generate_source(model, step_spec: dict | None = None,
 
 
 class GeneratedWeightsEngine:
-    """Drop-in for SparseWeightsEngine; exact int64 default, f32 replica."""
+    """The 6502 transformer as generated C++; exact int32 residual by default."""
 
-    def __init__(self, model, *, dtype: str = "float32",
-                 step_spec: dict | None = None, arith: str = "int32",
-                 experts=None):
-        if dtype != "float32":
-            raise ValueError("the generated engine is float32-only; use "
-                             "matmul='engine' for the float64 diagnostic path")
-        self.dtype = dtype
+    def __init__(self, model, *, step_spec: dict | None = None,
+                 arith: str = "int32", experts=None):
+        self.dtype = "float32"
         self.arith = arith
         self.n_experts = len(experts or [])
         source, self.n_memory_heads, self.has_machine_step = generate_source(

@@ -3,8 +3,8 @@
 Builds the analytic weights (ASAP schedule, no training) and runs genuine
 transformer inference -- per-position embeddings, Q/K/V projections, hull
 hardmax attention, ReGLU FFN, output head -- lockstep against the
-reference core.  Expensive: real inference through the default float32
-codegen C++ engine, cross-checked against the generic CSR engine.
+reference core.  Expensive: real inference through the generated float32
+codegen C++ engine, lockstep against the reference oracle.
 """
 
 from __future__ import annotations
@@ -90,37 +90,6 @@ def test_checkpoint_rebuild_is_invisible():
             f"step {i}: ref={a} transformer={b}"
         )
         assert ref_row.writes == row.writes, f"step {i} writes"
-
-
-@pytest.mark.slow
-def test_codegen_engine_matches_generic_engine():
-    """The generated straight-line engine is a dispatch change, not a
-    semantics change: its traces must be identical to the generic CSR
-    engine's, checkpoint rebuilds included.  Uses the nestest prefix so
-    high-address fp32 reads and direct WRITEs are exercised."""
-    from transformer_vm.nes.nestest import START_PC, load_image
-
-    image = load_image()
-    traces = {}
-    for matmul in ("engine", "codegen"):
-        machine = Cpu6502TransformerMachine(
-            bcd=False, matmul=matmul, checkpoint_tokens=64
-        )
-        machine.boot_image(list(image), start_pc=START_PC)
-        traces[matmul] = [machine.machine_step() for _ in range(60)]
-        assert machine.checkpoints >= 1, matmul
-    for a, b in zip(traces["engine"], traces["codegen"], strict=True):
-        assert a.state == b.state
-        assert a.writes == b.writes
-
-    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
-    ref.pc = START_PC
-    for i, row in enumerate(traces["codegen"]):
-        ref_row = ref.step()
-        a, b = ref_row.state, row.state
-        assert (a.pc, a.a, a.x, a.y, a.s, a.p) == (b.pc, b.a, b.x, b.y, b.s, b.p), (
-            f"step {i}: ref={a} codegen={b}"
-        )
 
 
 @pytest.mark.slow

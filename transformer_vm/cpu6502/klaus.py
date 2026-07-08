@@ -146,7 +146,7 @@ def run_cpp(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float, f
 
 def run_weights(image: bytes, *, max_steps: int,
                 checkpoint_tokens: int | None = None,
-                matmul: str = "codegen") -> tuple[bool, int, float, float, str]:
+                ) -> tuple[bool, int, float, float, str]:
     """Lockstep the real weights-based transformer against the reference.
 
     Klaus at full length (30.6M instructions) is out of reach at
@@ -156,7 +156,7 @@ def run_weights(image: bytes, *, max_steps: int,
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(
-        bcd=True, matmul=matmul, checkpoint_tokens=checkpoint_tokens,
+        bcd=True, checkpoint_tokens=checkpoint_tokens,
     )
     arith = getattr(machine._engine, "arith", None)
     mode = f"{machine.matmul}-{arith}" if arith else f"{machine.matmul}/{machine.dtype}"
@@ -184,7 +184,7 @@ def run_weights(image: bytes, *, max_steps: int,
                 logger.info("  %.1fM steps, %.0f steps/s", steps / 1e6, steps / elapsed)
         return True, steps, build_elapsed, time.perf_counter() - run_start, mode
 
-    # Per-step fallback (generic CSR / sparse engines have no run loop).
+    # Per-step fallback for any engine without a native run loop.
     machine.boot_image(list(image), start_pc=START_PC)
     run_start = time.perf_counter()
     steps = 0
@@ -247,11 +247,6 @@ def main() -> None:
     )
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument(
-        "--matmul", choices=["codegen", "engine"], default="codegen",
-        help="weights runner: codegen (generated straight-line C++, default) "
-             "or engine (generic CSR C++ cross-check)",
-    )
-    parser.add_argument(
         "--checkpoint-tokens", type=int, default=250_000,
         help="weights runner: snapshot-and-rebuild the hull logs every N "
              "token positions (0 disables; default 250000 -- every forward "
@@ -295,7 +290,7 @@ def main() -> None:
 
     if args.runner == "weights":
         matched, steps, build_s, run_s, mode = run_weights(
-            image, max_steps=args.graph_steps, matmul=args.matmul,
+            image, max_steps=args.graph_steps,
             checkpoint_tokens=args.checkpoint_tokens or None,
         )
         rate = steps / run_s if run_s > 0 else 0.0

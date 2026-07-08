@@ -86,14 +86,20 @@ layer and d_model becomes head-bound at 1800; leveled, it is
 liveness-bound (~1550) under the grouped-memory lookup.
 
 Performance: the analytic weights are ~99.9% zeros, so inference runs the
-identical linear maps sparsely.  The generated straight-line engine is the
-production default; the generic CSR engine remains as an independent
-cross-check:
-
-| `--matmul` | What runs | Speed (instr/s) |
-|------------|-----------|-----------------|
-| `engine` | `model/weights_engine.cpp`: generic CSR C++, whole stack per pybind call — float32 CSR matvecs, shared hull attention for lookup heads, direct WRITE-token insertion, structural fusion of passthrough/erase paths into direct CSR residual deltas | ~10-11K after boot |
-| `codegen` | `model/engine_gen.py`: model-specific generated C++ with the same arithmetic — column indices as immediates, ±1 coefficients as add/sub, coefficients as float32 hexfloat literals; compiled once per model digest (~5-10 s, cached); with a step_spec the whole machine_step (embed, readout, write inserts, halt logits) runs as one generated C++ call; default arith is an exact fixed-point int32 residual (guarded shifts, wrap-exact sums, cleared inserts skipped) and O(1) attention state: memory groups on an exact nearest-written-address structure, constant-query heads on running-argmax registers (zero hull2d calls in the forward; nothing grows with the token log), native run loop, and opcode-routed experts for hot paths; int64/f32-replica variants remain available | ~130K Klaus / ~305K routed SMB gameplay |
+identical linear maps sparsely.  The engine is `model/engine_gen.py`, which
+emits model-specific generated C++: column indices as immediates, ±1
+coefficients as add/sub, other coefficients as float32 hexfloat literals,
+compiled once per model digest (~5–10 s, cached).  With a step_spec the whole
+machine_step (embed, readout, write inserts, halt logits) runs as one
+generated call; the default arith is an exact fixed-point int32 residual
+(guarded shifts, wrap-exact sums, cleared inserts skipped) with O(1) attention
+state — memory groups on an exact nearest-written-address structure,
+constant-query heads on running-argmax registers (zero hull2d calls in the
+forward; nothing grows with the token log) — a native run loop, and
+opcode-routed experts for hot paths.  It sustains **~130K instr/s on Klaus /
+~305K on routed SMB gameplay**; int64 and f32-replica arith variants remain
+for diagnostics.  Correctness is verified by lockstep against `reference.py`
+(the oracle), not against a second slow engine.
 
 With the generated engine, **the full 8,991-instruction nestest suite runs
 through the actual transformer weights in ~0.1 s** (`6502-nestest --runner

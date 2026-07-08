@@ -69,7 +69,6 @@ class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
     def __init__(self, *, bcd: bool = False,
-                 matmul: str = "codegen", dtype: str = "float32",
                  codegen_arith: str = "int32",
                  checkpoint_tokens: int | None = None,
                  expert_opcodes=DEFAULT_EXPERT_OPCODES):
@@ -115,39 +114,24 @@ class Cpu6502TransformerMachine:
         self._one_slot = self.slot_of[self.rt._one]
 
         # The whole layer stack -- hull attention plus the structural
-        # passthrough fusion -- runs inside C++.  "codegen" (default) compiles
-        # model-specific straight-line code (model/engine_gen.py); "engine"
-        # loads the generic CSR engine (model/weights_engine.cpp) as an
-        # independent cross-check.  There is no Python-stepped path anymore.
-        if matmul not in ("codegen", "engine"):
-            raise ValueError(
-                f"unknown matmul {matmul!r}; use 'codegen' (default) or "
-                "'engine' (generic CSR cross-check)"
-            )
-        # Precision knob.  The grouped memory lookup keeps K-side address
-        # scores below 2^24, so float32 Q/K rounding can distinguish adjacent
-        # high addresses; hull tie-breaks still resolve rewrites.  codegen is
-        # float32-only; the generic engine also supports float64.
-        if dtype not in ("float64", "float32"):
-            raise ValueError(f"unknown dtype {dtype!r}")
-        self.dtype = dtype
-        self.np_dtype = np.float32 if dtype == "float32" else np.float64
+        # passthrough fusion -- runs inside the generated C++ engine
+        # (model/engine_gen.py): model-specific straight-line code with an
+        # exact fixed-point int32 residual.  The grouped memory lookup keeps
+        # K-side address scores below 2^24, so float32 Q/K rounding still
+        # distinguishes adjacent high addresses.
+        self.matmul = "codegen"
+        self.dtype = "float32"
+        self.np_dtype = np.float32
         self._state_head_cols, self._state_head_vals = self._head_row(self._state_row)
         self._halt_head_cols, self._halt_head_vals = self._head_row(self._halt_row)
 
-        self.matmul = matmul
-        if matmul == "codegen":
-            from transformer_vm.model.engine_gen import GeneratedWeightsEngine
+        from transformer_vm.model.engine_gen import GeneratedWeightsEngine
 
-            experts = self._build_experts(expert_opcodes)
-            self._engine = GeneratedWeightsEngine(
-                self.model, dtype=dtype, step_spec=self._step_spec(),
-                arith=codegen_arith, experts=experts,
-            )
-        else:
-            from transformer_vm.model.engine import SparseWeightsEngine
-
-            self._engine = SparseWeightsEngine(self.model, dtype=dtype)
+        experts = self._build_experts(expert_opcodes)
+        self._engine = GeneratedWeightsEngine(
+            self.model, step_spec=self._step_spec(),
+            arith=codegen_arith, experts=experts,
+        )
         self._direct_writes = self._engine.supports_direct_writes
         self._cpp_step = getattr(self._engine, "has_machine_step", False)
         if self._cpp_step:
@@ -754,32 +738,24 @@ def main() -> None:
     )
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument(
-        "--matmul", choices=["codegen", "engine"], default="codegen",
-        help="codegen is the production generated C++ engine; engine is the "
-             "generic CSR C++ cross-check",
-    )
-    parser.add_argument(
         "--codegen-arith", choices=["int32", "int64", "f32"], default="int32",
-        help="arithmetic mode for --matmul codegen (default: int32)",
+        help="arithmetic mode for the generated engine (default: int32)",
     )
     parser.add_argument(
         "--no-experts", action="store_true",
         help="disable opcode-routed generated experts and run the union model",
     )
-    parser.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     args = parser.parse_args()
 
     machine = Cpu6502TransformerMachine(
-        bcd=False, matmul=args.matmul, dtype=args.dtype,
-        codegen_arith=args.codegen_arith,
+        bcd=False, codegen_arith=args.codegen_arith,
         expert_opcodes=() if args.no_experts else DEFAULT_EXPERT_OPCODES,
     )
     logger.info(
-        "transformer: d_model=%d n_layers=%d matmul=%s dtype=%s (%.1fs build)",
+        "transformer: d_model=%d n_layers=%d arith=%s (%.1fs build)",
         machine.d_model,
         machine.n_layers,
-        machine.matmul,
-        machine.dtype,
+        args.codegen_arith,
         machine.build_seconds,
     )
 
@@ -803,8 +779,8 @@ def main() -> None:
             logger.error("step %d DIVERGED:\nREF:         %s\nTRANSFORMER: %s", i, a, b)
     status = "MATCHED" if failures == 0 else f"{failures} DIVERGENCES"
     logger.info(
-        "transformer(%s): %s  %d steps in %.1fs (%.2f steps/s)",
-        args.cache, status, len(trace.rows), run_elapsed, len(trace.rows) / run_elapsed,
+        "transformer: %s  %d steps in %.1fs (%.2f steps/s)",
+        status, len(trace.rows), run_elapsed, len(trace.rows) / run_elapsed,
     )
     raise SystemExit(1 if failures else 0)
 

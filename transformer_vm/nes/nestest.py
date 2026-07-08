@@ -143,13 +143,12 @@ def run_cpp(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, floa
     return matched, steps, build_elapsed, rt.last_step_seconds
 
 
-def run_weights(image: bytearray, *, max_steps: int,
-                matmul: str = "codegen") -> tuple[bool, int, float, float, str]:
+def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float, str]:
     """Run the real weights-based transformer in lockstep with the reference."""
     from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
-    machine = Cpu6502TransformerMachine(bcd=False, matmul=matmul)
+    machine = Cpu6502TransformerMachine(bcd=False)
     arith = getattr(machine._engine, "arith", None)
     mode = f"{machine.matmul}-{arith}" if arith else f"{machine.matmul}/{machine.dtype}"
     build_elapsed = time.perf_counter() - build_start
@@ -200,11 +199,6 @@ def main() -> None:
         "--graph-steps", type=int, default=8991,
         help="instruction count for the graph run (default: the full log)",
     )
-    parser.add_argument(
-        "--matmul", choices=["codegen", "engine"], default="codegen",
-        help="weights runner: codegen (generated straight-line C++, default) "
-             "or engine (generic CSR C++ cross-check)",
-    )
     args = parser.parse_args()
 
     image = load_image()
@@ -239,7 +233,7 @@ def main() -> None:
 
     if args.runner == "weights":
         matched, steps, build_s, run_s, mode = run_weights(
-            image, max_steps=args.graph_steps, matmul=args.matmul,
+            image, max_steps=args.graph_steps,
         )
         status = "MATCHED" if matched else "DIVERGED"
         rate = steps / run_s if run_s > 0 else 0.0
