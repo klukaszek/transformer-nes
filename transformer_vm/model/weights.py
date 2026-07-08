@@ -19,7 +19,6 @@ from collections import defaultdict
 from typing import NamedTuple
 
 import numpy as np
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -75,47 +74,6 @@ class WeightModel:
         self.ff_in = [_Weight((2 * d_ffn, d_model)) for _ in range(n_layers)]
         self.ff_out = [_Weight((d_model, d_ffn)) for _ in range(n_layers)]
         self.head = _Weight((vocab, d_model))
-
-
-def _dump_allocation(
-    n_layers, std_layers, slot_of, head_map, internal_dims, alloc_path="allocation.yaml"
-):
-    """Write allocation.yaml showing dim-to-slot and head assignments per layer."""
-
-    slot_to_dims = {}
-    for d, s in slot_of.items():
-        if d in internal_dims:
-            continue
-        slot_to_dims.setdefault(s, []).append(d.name)
-
-    doc = {"slot_map": {s: sorted(names) for s, names in sorted(slot_to_dims.items())}}
-
-    layers = []
-    for li in range(n_layers):
-        attn, persist1, ffn, persist2 = std_layers[li]
-        layer_info = {"layer": li}
-
-        heads = []
-        if li in head_map:
-            for h, info in sorted(head_map[li].items()):
-                heads.append({"head": h, **info})
-        layer_info["attention_heads"] = heads
-
-        layer_info["persist1"] = [d.name for d in persist1]
-
-        ffn_names = []
-        for rg in ffn:
-            ffn_names.append(rg.name)
-        layer_info["ffn"] = ffn_names
-
-        layer_info["persist2"] = [d.name for d in persist2]
-        layers.append(layer_info)
-
-    doc["layers"] = layers
-
-    with open(alloc_path, "w") as f:
-        yaml.dump(doc, f, default_flow_style=False, sort_keys=False, width=120)
-    logger.info("Wrote allocation to %s", alloc_path)
 
 
 def build_model(program_graph=None, schedule=None):
@@ -576,8 +534,6 @@ def build_model(program_graph=None, schedule=None):
         n_pt_h,
         n_pt_g,
     )
-
-    _dump_allocation(n_layers, std_layers, slot_of, head_map, internal_dims)
 
     info = BuildInfo(n_layers=n_layers, std_layers=std_layers,
                      slot_of=slot_of, d_model=D)
