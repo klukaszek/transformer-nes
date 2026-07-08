@@ -678,6 +678,83 @@ payoff order:
   width are secondary but should combine with poll-loop-specific experts for
   the remaining ~1.3-1.5× to 60 fps.
 
+## 2026-07-08 rebuilt expert models land — a genuine top-1 routed MoE
+
+Follows stage 1 below in the same session.
+
+What was built (`model/weights.py`, `model/engine_gen.py`,
+`cpu6502/weights_runner.py`):
+- `build_model` now records per-head lookup provenance
+  (`head_lookup_ids`/`head_pairs`), so an engine hosting several models
+  built from folds of one union graph can map every model's heads onto
+  shared attention state.
+- `generate_source` experts are now **full rebuilt models** (fold →
+  asap_schedule → build_model per hot opcode), each with its own residual
+  layout and `step_core__<op>`; the in-place keep-set pruning is retired.
+  The per-layer planning is one `plan_model(mdl, label, union_lookup_of)`:
+  the union pass allocates hull ids / memory insert targets / running-
+  argmax registers (keyed by union lookup id + value pair) in head-scan
+  order, and expert passes resolve onto that state through provenance,
+  with hard errors for any classification disagreement (memory head not
+  structure-eligible, register missing, head needing a real hull).  The
+  st_* registers + RAM mirror + memory structure + registers are the
+  cross-model interface; expert d_model/layout never has to match.
+- **Union byte-identity receipt**: the refactored generator emits the
+  byte-identical no-expert source (int32 and f32) as the committed
+  pre-refactor generator, checked by diffing the two emissions on the same
+  model in one process.
+- The runner's `_build_experts` (keep-sets) became `_build_expert_models`;
+  it refuses folds with insert-side hazards, builds per-expert step_specs
+  from the fold's name map, and disables experts for f32 arith.  Default
+  16 experts add ~6 s to machine build; the 17-model TU compiles in ~40 s
+  (cached by digest).
+
+Receipts (all lockstep-exact / byte-identical; 72 tests green, ruff clean):
+- Full nestest MATCHED: **~176K instr/s** (was ~155K in-place).
+- Klaus 200K decimal MATCHED: ~140K instr/s (was ~130K; Klaus barely hits
+  the SMB-tuned expert set).
+- **Full Klaus re-validated: MATCHED — 30,646,177 steps (decimal) in
+  216.3 s (3.60 min, ~142K instr/s sustained incl. the lockstep reference,
+  throughput flat), checkpoint-free.**  Full-suite arc: 57 → 18.9 → 15.3 →
+  9.4 → 6.3 → 6.2 → 4.55 → 3.83 → **3.60 min** across the engine
+  generations.
+- SMB frame 61 byte-identical to the kernel, cycles exact (1,816,641).
+- **JMP-to-self hot path: 7.76 → 1.75 µs/step (571K instr/s)** — 1.66×
+  over the in-place experts' 2.90 µs, and at SMB's real-time budget.
+- **Frame-poll loop (LDA abs / AND imm / BEQ): 8.29 → 2.15 µs/step**
+  (465K instr/s).
+- Union↔expert transition probe (NOP+JMP alternating): ~0.26 µs/step
+  overhead — dispatch/I-cache cost is small.
+- **SMB gameplay: 29.68 fps** (33.7 ms/frame; was 28.24 in-place),
+  title-screen marginal frame ~27 ms (~37 fps, was ~73 ms).
+
+Why gameplay didn't follow the hot path (measured, not guessed):
+- Coverage: top-16 opcodes cover 93.7% of gameplay instructions; the 6.3%
+  cold tail at ~7.8 µs costs ~0.5 µs/step on the frame average.  A top-48
+  expert build (99.1% coverage, from the checked-in gameplay histogram)
+  measured **33.30 fps** (30.0 ms/frame) — +12%, matching the tail model.
+  Kept top-16 as the default (top-48 adds ~25 s of fold+build per machine
+  construction; wrong tradeoff for tests) — widening is a one-line
+  `expert_opcodes=` away.
+- The rest of the frame is *busy-frame logic*: active gameplay frames are
+  logic-dominated (the poll fraction shrinks exactly when the frame is
+  expensive), and the broad logic mix runs at ~2.5-3.5 µs/step through the
+  mid-size experts (JSR/RTS/STA abs,Y are 25-31 layers, d_model up to 540).
+  Real-time (~1.7 µs/step average) therefore needs the *per-expert step
+  cheaper*, not more coverage.
+
+Next, in payoff order:
+1. **Per-expert width/schedule compaction** — the exact-width MILP is
+   plausibly tractable at expert scale (~1,700 ops / 17-31 layers vs the
+   union's 6.4K ops / 71 layers where it blew up).  Fewer live slots →
+   fewer passthrough heads/neurons → fewer indexed loads, on exactly the
+   graphs that ship.
+2. **Pin the fetched opcode byte** in the fold (the router predicate
+   `ram[pc] == byte` is stronger than `is_op=1`): deletes one of the three
+   fetch reads and the 256-way decode residue from every expert.
+3. Poll-loop sequence expert (LDA/AND/BEQ as one folded step) for the
+   frame-wait fraction; then batching for fleet throughput.
+
 ## 2026-07-08 rebuilt experts stage 1: the fold is real and receipted
 
 Not yet in jj (this session's working copy).

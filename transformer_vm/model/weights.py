@@ -373,6 +373,8 @@ def build_model(program_graph=None, schedule=None):
                 layer_heads[h] = {
                     "type": "lookup",
                     "lookup": lu.name or f"lookup_{lu.id}",
+                    "lookup_id": lu.id,
+                    "pair": p,
                     "values": vals,
                     "tie_break": lu.tie_break,
                     "memory_group": getattr(lu, "memory_group", -1),
@@ -499,10 +501,18 @@ def build_model(program_graph=None, schedule=None):
     model.head_kinds = []
     model.head_cache_groups = []
     model.head_memory_groups = []
+    # Lookup provenance per head: the graph LookUp id and value-pair index
+    # (-1 for non-lookup heads).  An engine hosting several models built
+    # from folds of one union graph uses these to map every model's heads
+    # onto the union's shared attention state (memory structure, registers).
+    model.head_lookup_ids = []
+    model.head_pairs = []
     for layer_idx in range(n_layers):
         kinds = [0] * n_heads
         cache_groups = [-1] * n_heads
         memory_groups = [-1] * n_heads
+        lookup_ids = [-1] * n_heads
+        pairs = [-1] * n_heads
         cache_group_of_key = {}
         for h, info in head_map.get(layer_idx, {}).items():
             if info["type"] == "lookup":
@@ -512,11 +522,15 @@ def build_model(program_graph=None, schedule=None):
                     cache_group_of_key[key] = len(cache_group_of_key)
                 cache_groups[h] = cache_group_of_key[key]
                 memory_groups[h] = info["memory_group"]
+                lookup_ids[h] = info["lookup_id"]
+                pairs[h] = info["pair"]
             else:
                 kinds[h] = 2
         model.head_kinds.append(kinds)
         model.head_cache_groups.append(cache_groups)
         model.head_memory_groups.append(memory_groups)
+        model.head_lookup_ids.append(lookup_ids)
+        model.head_pairs.append(pairs)
 
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
     logger.info(

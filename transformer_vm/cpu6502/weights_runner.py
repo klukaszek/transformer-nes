@@ -39,14 +39,8 @@ from transformer_vm.cpu6502 import reference
 from transformer_vm.cpu6502.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_vm.cpu6502.spec import OPCODES
 from transformer_vm.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
-from transformer_vm.graph.core import (
-    Expression,
-    InputDimension,
-    LookUpDimension,
-    PersistDimension,
-    ProgramGraph,
-    ReGLUDimension,
-)
+from transformer_vm.graph.core import ProgramGraph
+from transformer_vm.graph.fold import GraphFolder, opcode_pins
 from transformer_vm.model.weights import add_position_encoding, build_model
 from transformer_vm.scheduler.milp import asap_schedule
 
@@ -90,6 +84,7 @@ class Cpu6502TransformerMachine:
         output_tokens["READOUT"] = readout
 
         pg = ProgramGraph(self.rt.input_tokens, output_tokens)
+        self._pg = pg  # kept for the expert folds (graph/fold.py)
         build_start = time.perf_counter()
         # ASAP schedule: the optimal-width MILP does not solve at this graph
         # size (~5M integer variables); critical-path scheduling costs some
@@ -100,7 +95,6 @@ class Cpu6502TransformerMachine:
         )
         self.build_seconds = time.perf_counter() - build_start
         self.n_layers = info.n_layers
-        self._std_layers = info.std_layers
         self.slot_of = info.slot_of
         self.d_model = info.d_model
         self._state_row = tok_to_idx["STATE"]
@@ -125,7 +119,14 @@ class Cpu6502TransformerMachine:
 
         from transformer_vm.model.engine_gen import GeneratedWeightsEngine
 
-        experts = self._build_experts(expert_opcodes)
+        experts = []
+        if codegen_arith != "f32":
+            experts = self._build_expert_models(expert_opcodes)
+        elif expert_opcodes:
+            logger.info(
+                "opcode-routed experts disabled: f32 arith keeps every lookup "
+                "head on a real hull, which cannot be shared across models"
+            )
         self._engine = GeneratedWeightsEngine(
             self.model, step_spec=self._step_spec(),
             arith=codegen_arith, experts=experts,
@@ -170,153 +171,95 @@ class Cpu6502TransformerMachine:
         self._engine.forward(x)  # in place, whole stack
         return x
 
-    def _build_experts(self, opcodes) -> list[dict]:
-        """Per-opcode keep-sets for the opcode-routed engine.
+    def _build_expert_models(self, opcodes) -> list[dict]:
+        """Rebuilt per-opcode expert models for the opcode-routed engine.
 
-        For each expert opcode, partial-evaluate the graph with the decode
-        one-hot gates pinned (is_op_<byte>=1, every other is_op_*=0, is_nmi=0)
-        -- exactly what a hard router supplies.  A ReGLU whose gate resolves to
-        <=0 (or whose value resolves to 0) is the zero function under this
-        opcode: a non-taken instruction / addressing-mode branch.
+        For each expert opcode, the union graph is partially evaluated with
+        the decode one-hot gates pinned (is_op_<byte>=1, every other
+        is_op_*=0, is_nmi=0 -- exactly what the hard router supplies), and
+        the *folded* graph (graph/fold.py) is scheduled and weight-compiled
+        into its own transformer.  Unlike the earlier in-place pruning of
+        the union model, a mux whose gate folds to 1 really disappears here
+        -- its linear map inlines into consumers -- which is the measured
+        0.29x -> ~0.2x terms gap.
 
-        The scheduled model is the union of every opcode, so pruning is done as
-        liveness over its *unfolded* dependency graph with the zero-folded dims
-        removed as edges: a residual dim is live iff it still reaches a readout
-        root through non-zero contributions.  Dead dims (e.g. the memory reads
-        of addressing modes this opcode never uses, and the ALU neurons of
-        other operations) drop out; the taken branch's gate=1 neurons stay live
-        (they fold to a real linear map and must still run).  A live ff_out /
-        out_proj row keeps only its live columns -- dropping a zero/dead column
-        is exact term elimination -- so passthrough/erase slot bookkeeping,
-        memory, and the registers are all untouched.
-
-        Correctness rests on ram[pc] == the graph's fetched opcode (the run
-        loop dispatches on the same byte the memory read returns) and on the
-        pruning-safety invariants in engine_gen.generate_source.  The full
-        lockstep chain (every opcode swept through its expert by nestest and
-        Klaus) is the receipt.
+        Safety is checked, not assumed: the fold refuses lookups whose
+        insert-side expressions can reach a pin (shared attention state must
+        be pin-independent), and engine_gen refuses any expert head whose
+        classification (memory structure / running-argmax register, resolved
+        by lookup provenance) disagrees with the union's.  Correctness rests
+        on ram[pc] == the graph's fetched opcode; the lockstep chain (every
+        opcode swept through its expert by nestest and Klaus) is the receipt.
         """
         opcodes = [int(b) for b in (opcodes or []) if int(b) in OPCODES]
         if not opcodes:
             return []
 
-        all_dims = list(self.rt.all_dims)
-        one = self.rt._one
-
-        # Readout roots plus everything the STATE/HALT output heads read: the
-        # step reads those logits, so their inputs must survive pruning too.
-        roots = [self._dim_by_name[n] for n in _RUNTIME_READ_DIMS]
-        for tok in ("STATE", "HALT"):
-            expr = self.rt.output_tokens.get(tok)
-            if isinstance(expr, Expression):
-                roots.extend(d for d in expr.terms if not isinstance(d, InputDimension))
-
-        def const_of(e):
-            for d in e.terms:
-                if d is not one:
-                    return None
-            return e.terms.get(one, 0.0)
-
-        def subst(expr, val):
-            out = Expression()
-            for d, c in expr.terms.items():
-                v = val.get(d)
-                out = out + (Expression({d: c}) if v is None else v * c)
-            return out
-
-        def keep_sets(pins):
-            # 1) Fold: find the dims that are provably zero under these pins.
-            val = {one: Expression({one: 1.0})}
-            zero = set()
-            for d in all_dims:
-                if isinstance(d, PersistDimension) and d.name in pins:
-                    val[d] = Expression({one: float(pins[d.name])})
-                    continue
-                if isinstance(d, ReGLUDimension):
-                    a = subst(d.a_expr, val)
-                    b = subst(d.b_expr, val)
-                    bc, ac = const_of(b), const_of(a)
-                    if (bc is not None and bc <= 0) or (ac is not None and ac == 0):
-                        val[d] = Expression()
-                        zero.add(d)
-                    elif bc is not None and ac is not None:
-                        val[d] = Expression({one: ac * bc})
-                        if ac * bc == 0:
-                            zero.add(d)
-                    elif bc is not None:
-                        val[d] = a * bc
-                elif isinstance(d, PersistDimension):
-                    e = subst(d.expr, val)
-                    c = const_of(e)
-                    if c is not None:
-                        val[d] = Expression({one: c})
-                        if c == 0:
-                            zero.add(d)
-            # 2) Liveness over the UNFOLDED graph, stopping at zero dims: a dim
-            #    is live iff it reaches a root through non-zero contributions.
-            live = set()
-            stack = [r for r in roots]
-            while stack:
-                d = stack.pop()
-                if (d in live or d in zero or isinstance(d, InputDimension)):
-                    continue
-                live.add(d)
-                deps = set()
-                if isinstance(d, ReGLUDimension):
-                    deps |= set(d.a_expr.terms) | set(d.b_expr.terms)
-                elif isinstance(d, PersistDimension):
-                    deps |= set(d.expr.terms)
-                elif isinstance(d, LookUpDimension):
-                    lu = d.lookup
-                    for e in (lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs):
-                        deps |= set(e.terms)
-                    live.update(lu.dims)  # a live lookup produces all its values
-                stack.extend(deps)
-            return live
-
+        folder = GraphFolder(self._pg, root_names=_RUNTIME_READ_DIMS)
         experts = []
         for byte in opcodes:
-            pins = {"is_nmi": 0.0}
-            for op in OPCODES.values():
-                pins[f"is_op_{op.byte:02X}"] = 1.0 if op.byte == byte else 0.0
-            live = keep_sets(pins)
-
-            keep_heads: dict[int, set] = {}
-            keep_neurons: dict[int, set] = {}
-            for li, (attn, _p1, ffn, _p2) in enumerate(self._std_layers):
-                # Head numbering mirrors build_model: lookup heads first, in
-                # LookUp order, two value components per head.
-                kh = set()
-                h = 0
-                for lu in attn:
-                    nv = len(lu.value_exprs)
-                    for p in range((nv + 1) // 2):
-                        served = [lu.dims[2 * p]]
-                        if 2 * p + 1 < nv:
-                            served.append(lu.dims[2 * p + 1])
-                        if any(d in live for d in served):
-                            kh.add(h)
-                        h += 1
-                keep_heads[li] = kh
-                keep_neurons[li] = {j for j, rg in enumerate(ffn) if rg in live}
-
+            r = folder.fold(opcode_pins(byte, OPCODES), label=f"{byte:02X}")
+            if r.insert_side_hazards:
+                raise RuntimeError(
+                    f"expert {byte:02X}: decode pins reach insert-side "
+                    f"expressions of {r.insert_side_hazards}; shared attention "
+                    "state would diverge"
+                )
+            fp = r.program_graph
+            sched = asap_schedule(fp.input_tokens, fp.output_tokens,
+                                  program_graph=fp, log=logger.debug)
+            model, _tokens, tok_to_idx, info = build_model(
+                program_graph=fp, schedule=sched,
+            )
             experts.append({
-                "name": f"{byte:02X}", "byte": byte,
-                "keep_heads": keep_heads, "keep_neurons": keep_neurons,
-                "_nk": sum(len(v) for v in keep_neurons.values()),
-                "_hk": sum(len(v) for v in keep_heads.values()),
+                "name": f"{byte:02X}", "byte": byte, "model": model,
+                "step_spec": self._expert_step_spec(r, model, tok_to_idx, info),
+                "union_lookup_of": r.union_lookup_of,
+                "_layers": info.n_layers, "_d": info.d_model,
             })
-        n_neurons = sum(len(ffn) for _a, _p, ffn, _q in self._std_layers)
-        n_heads = sum(len(a) for a, _p, _f, _q in self._std_layers)
         logger.info(
-            "routed experts: %d opcodes; mean kept %d/%d ReGLU neurons, "
-            "%d/%d lookup heads (e.g. %s)",
+            "routed experts: %d rebuilt models, %d-%d layers, d_model %d-%d "
+            "(union: %d layers, d_model %d)",
             len(experts),
-            sum(e["_nk"] for e in experts) // max(len(experts), 1), n_neurons,
-            sum(e["_hk"] for e in experts) // max(len(experts), 1), n_heads,
-            experts[0]["name"],
+            min(e["_layers"] for e in experts), max(e["_layers"] for e in experts),
+            min(e["_d"] for e in experts), max(e["_d"] for e in experts),
+            self.n_layers, self.d_model,
         )
         return experts
+
+    def _expert_step_spec(self, fold_result, model, tok_to_idx, info) -> dict:
+        """The generated-step slot map for one expert model: same shape as
+        _step_spec, resolved through the fold's name map and the expert's
+        own schedule/slot assignment."""
+
+        def s(name):
+            return info.slot_of[fold_result.dim_of_name[name]]
+
+        def head_row(row):
+            w = model.head.weight[row]
+            cols = np.nonzero(w)[0]
+            return ([int(c) for c in cols], [float(w[c]) for c in cols])
+
+        return {
+            "inputs": {
+                "is_state": s("is_state"),
+                "pc_lo": s("in_pc_lo"), "pc_hi": s("in_pc_hi"),
+                "a": s("in_a"), "x": s("in_x"), "y": s("in_y"), "s": s("in_s"),
+                "ir": s("in_ir"), "oplo": s("in_oplo"), "ophi": s("in_ophi"),
+                "ea_lo": s("in_ea_lo"), "ea_hi": s("in_ea_hi"),
+                "data": s("in_data"), "halted": s("in_halted"),
+                "nmi": s("in_nmi"),
+            },
+            "p_flags": [
+                (s("in_p_c"), reference.FLAG_C), (s("in_p_z"), reference.FLAG_Z),
+                (s("in_p_i"), reference.FLAG_I), (s("in_p_d"), reference.FLAG_D),
+                (s("in_p_b"), reference.FLAG_B), (s("in_p_u"), reference.FLAG_U),
+                (s("in_p_v"), reference.FLAG_V), (s("in_p_n"), reference.FLAG_N),
+            ],
+            "outputs": {name: s(name) for name in _RUNTIME_READ_DIMS},
+            "halt_head": head_row(tok_to_idx["HALT"]),
+            "state_head": head_row(tok_to_idx["STATE"]),
+        }
 
     def _step_spec(self) -> dict:
         """Slot map for the generated C++ machine_step (engine_gen.py)."""
