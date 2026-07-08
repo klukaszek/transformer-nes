@@ -194,8 +194,8 @@ def _row(csr, r):
     return csr.indices[lo:hi], csr.data[lo:hi]
 
 
-def _csr(tensor) -> sp.csr_matrix:
-    m = sp.csr_matrix(tensor.numpy())
+def _csr(array) -> sp.csr_matrix:
+    m = sp.csr_matrix(array)
     m.sort_indices()
     return m
 

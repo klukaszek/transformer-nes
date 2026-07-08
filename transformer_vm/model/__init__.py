@@ -1,4 +1,3 @@
-__all__ = ["VanillaTransformer", "build_model"]
+__all__ = ["WeightModel", "build_model", "add_position_encoding"]
 
-from transformer_vm.model.transformer import VanillaTransformer
-from transformer_vm.model.weights import build_model
+from transformer_vm.model.weights import WeightModel, add_position_encoding, build_model

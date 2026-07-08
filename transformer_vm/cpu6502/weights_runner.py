@@ -1,11 +1,11 @@
 """Run the 6502 through the real weights-based transformer.
 
 This is the end of the verification chain: the same computation graph that
-the exact evaluator and the C++ kernel execute is MILP-scheduled onto
-transformer layers and compiled into actual VanillaTransformer weights
-(analytically -- no training).  Execution is then genuine transformer
-inference: per-position embeddings, Q/K/V projections, hardmax attention
-(hull cache, or a true softmax KV cache), ReGLU FFN, residual stream, and
+the exact evaluator and the C++ kernel execute is scheduled onto transformer
+layers and compiled into actual transformer weights (analytically -- no
+training).  Execution is then genuine transformer inference: per-position
+embeddings, Q/K/V projections, hardmax (hull) attention, ReGLU FFN,
+residual stream, and
 an output head that decides STATE vs HALT.
 
 One departure from the WASM construction: WASM tokens formed a finite
@@ -47,8 +47,7 @@ from transformer_vm.graph.core import (
     ProgramGraph,
     ReGLUDimension,
 )
-from transformer_vm.model.transformer import add_position_encoding
-from transformer_vm.model.weights import build_model
+from transformer_vm.model.weights import add_position_encoding, build_model
 from transformer_vm.scheduler.milp import asap_schedule
 
 logger = logging.getLogger(__name__)
@@ -99,7 +98,6 @@ class Cpu6502TransformerMachine:
         self.model, all_tokens, tok_to_idx, shared = build_model(
             program_graph=pg, schedule=sched,
         )
-        self.model.requires_grad_(False)  # inference only
         self.build_seconds = time.perf_counter() - build_start
         self.n_layers = shared[3]
         self._std_layers = shared[4]
@@ -348,7 +346,7 @@ class Cpu6502TransformerMachine:
         }
 
     def _head_row(self, row: int) -> tuple[np.ndarray, np.ndarray]:
-        w = self.model.head.weight[row].detach().numpy()
+        w = self.model.head.weight[row]
         cols = np.nonzero(w)[0].astype(np.int32)
         return cols, w[cols].astype(self.np_dtype, copy=False)
 

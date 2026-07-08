@@ -1,24 +1,70 @@
 """Analytical weight construction for the transformer.
 
-Reads a schedule plan (plan.yaml or MILP-generated) and constructs weights
-for a VanillaTransformer from the computation graph.
+Reads a schedule plan (plan.yaml or MILP-generated) and constructs the weight
+matrices of the transformer from the computation graph.
 
 Each half-layer is a transform: input dims -> latent (gates + passthrough) -> output dims.
 The persist/output phase is a linear projection. For each output slot:
   delta[slot] = persist_expr evaluated over gate/passthrough outputs
               - old_value (if slot was reused from a dead dim)
+
+The weights live in plain numpy arrays (WeightModel); nothing runs a forward
+here -- inference is entirely in the generated C++ engine.  Torch is used only
+to compile that engine (torch.utils.cpp_extension), not as a tensor library.
 """
 
 import logging
 import math
 from collections import defaultdict
 
-import torch
+import numpy as np
 import yaml
 
 logger = logging.getLogger(__name__)
 
 HARD_K = 1e10  # softmax temperature scaling to approximate hardmax (argmax) attention
+
+
+def add_position_encoding(x, pos):
+    """Add the three deterministic position features to a residual vector."""
+    x[0] += pos
+    x[1] += 1.0 / math.log(2) - 1.0 / math.log(pos + 2)
+    x[2] += pos * pos
+
+
+class _Weight:
+    """A named weight matrix (mimics the ``.weight`` attribute access that the
+    construction and the codegen reader use)."""
+
+    __slots__ = ("weight",)
+
+    def __init__(self, shape):
+        self.weight = np.zeros(shape, dtype=np.float64)
+
+
+class _Attn:
+    """One attention layer's weights: a fused Q/K/V projection (rows 0..D-1 Q,
+    D..2D-1 K, 2D..3D-1 V) and an output projection."""
+
+    __slots__ = ("in_proj_weight", "out_proj", "num_heads")
+
+    def __init__(self, d_model, num_heads):
+        self.in_proj_weight = np.zeros((3 * d_model, d_model), dtype=np.float64)
+        self.out_proj = _Weight((d_model, d_model))
+        self.num_heads = num_heads
+
+
+class WeightModel:
+    """Numpy weight container the analytic construction populates and the
+    generated C++ engine reads.  Not a torch module -- there is no forward."""
+
+    def __init__(self, vocab, d_model, n_heads, n_layers, d_ffn, stop_token_id=0):
+        self.stop_token_id = stop_token_id
+        self.tok = _Weight((vocab, d_model))
+        self.attn = [_Attn(d_model, n_heads) for _ in range(n_layers)]
+        self.ff_in = [_Weight((2 * d_ffn, d_model)) for _ in range(n_layers)]
+        self.ff_out = [_Weight((d_model, d_ffn)) for _ in range(n_layers)]
+        self.head = _Weight((vocab, d_model))
 
 
 def _dump_allocation(
@@ -134,7 +180,6 @@ def build_model(
         PersistDimension,
         ReGLUDimension,
     )
-    from transformer_vm.model.transformer import VanillaTransformer as TinyTransformerLM
 
     if _shared is not None:
         (
@@ -301,7 +346,7 @@ def build_model(
         erase_k2d = [pos_expr * 2, one_expr]
 
     def expr_to_tensor(expr):
-        w = torch.zeros(D, dtype=torch.float64)
+        w = np.zeros(D, dtype=np.float64)
         for dim, coeff in expr.terms.items():
             if dim in internal_dims:
                 continue
@@ -366,7 +411,7 @@ def build_model(
         vocab_size = len(all_tokens)
 
     # ── Create model ──────────────────────────────────────────────
-    model = TinyTransformerLM(
+    model = WeightModel(
         vocab=vocab_size,
         d_model=D,
         n_heads=n_heads,
@@ -380,204 +425,197 @@ def build_model(
     n_hulls = n_pt_h = n_pt_g = 0
     head_map = {}  # layer_idx -> {head_idx -> info}
 
-    with torch.no_grad():
-        # Embedding
-        model.tok.weight.zero_()
-        for tok_name, expr in input_tokens.items():
-            idx = tok_to_idx_map[tok_name]
-            model.tok.weight[idx] = expr_to_tensor(expr)
-            model.tok.weight[idx, 0] = 0.0
-            model.tok.weight[idx, 1] = 0.0
-            model.tok.weight[idx, 2] = 0.0
+    # Embedding
+    for tok_name, expr in input_tokens.items():
+        idx = tok_to_idx_map[tok_name]
+        model.tok.weight[idx] = expr_to_tensor(expr)
+        model.tok.weight[idx, 0] = 0.0
+        model.tok.weight[idx, 1] = 0.0
+        model.tok.weight[idx, 2] = 0.0
 
-        # Output head
-        model.head.weight.zero_()
-        for tok_name, expr in output_tokens.items():
-            idx = tok_to_idx_map[tok_name]
-            model.head.weight[idx] = expr_to_tensor(expr)
+    # Output head
+    for tok_name, expr in output_tokens.items():
+        idx = tok_to_idx_map[tok_name]
+        model.head.weight[idx] = expr_to_tensor(expr)
 
-        # ── Per-layer weights ─────────────────────────────────────
-        cur = frozenset(input_dims)
-        all_tiebreak = []
-        all_ffn_kinds = []
+    # ── Per-layer weights ─────────────────────────────────────
+    cur = frozenset(input_dims)
+    all_tiebreak = []
+    all_ffn_kinds = []
 
-        for layer_idx in range(n_layers):
-            attn, persist1, ffn, persist2 = std_layers[layer_idx]
+    for layer_idx in range(n_layers):
+        attn, persist1, ffn, persist2 = std_layers[layer_idx]
 
-            ip = model.attn[layer_idx].in_proj_weight.data
-            op_w = model.attn[layer_idx].out_proj.weight.data
-            ip.zero_()
-            op_w.zero_()
+        ip = model.attn[layer_idx].in_proj_weight
+        op_w = model.attn[layer_idx].out_proj.weight
 
-            fi = model.ff_in[layer_idx].weight.data
-            fo = model.ff_out[layer_idx].weight.data
-            fi.zero_()
-            fo.zero_()
+        fi = model.ff_in[layer_idx].weight
+        fo = model.ff_out[layer_idx].weight
 
-            # ── ATTENTION HALF-LAYER ──────────────────────────────
-            c1 = 4 * layer_idx + 1
-            nxt1 = alive_after.get(c1, cur)
-            head_idx = 0
-            lookup_dim_to_head = {}
-            layer_tiebreak = []
+        # ── ATTENTION HALF-LAYER ──────────────────────────────
+        c1 = 4 * layer_idx + 1
+        nxt1 = alive_after.get(c1, cur)
+        head_idx = 0
+        lookup_dim_to_head = {}
+        layer_tiebreak = []
 
-            # 1) LookUp heads
-            layer_heads = {}
+        # 1) LookUp heads
+        layer_heads = {}
 
-            def expr_sig(expr):
-                return tuple(sorted((d.id, c) for d, c in expr.terms.items()))
+        def expr_sig(expr):
+            return tuple(sorted((d.id, c) for d, c in expr.terms.items()))
 
-            for lu in attn:
-                nv = len(lu.value_exprs)
-                for p in range((nv + 1) // 2):
-                    h = head_idx
-                    head_idx += 1
-                    n_hulls += 1
-                    layer_tiebreak.append(1 if lu.tie_break == "latest" else 0)
-                    ip[h * 2] = expr_to_tensor(lu.query_exprs_2d[0]) * HARD_K * sqrt_dh
-                    ip[h * 2 + 1] = expr_to_tensor(lu.query_exprs_2d[1]) * HARD_K * sqrt_dh
-                    ip[D + h * 2] = expr_to_tensor(lu.key_exprs_2d[0])
-                    ip[D + h * 2 + 1] = expr_to_tensor(lu.key_exprs_2d[1])
-                    ip[2 * D + h * 2] = expr_to_tensor(lu.value_exprs[p * 2])
-                    if p * 2 + 1 < nv:
-                        ip[2 * D + h * 2 + 1] = expr_to_tensor(lu.value_exprs[p * 2 + 1])
-
-                    d0 = lu.dims[p * 2]
-                    lookup_dim_to_head[d0] = (h, 0)
-                    if d0 not in internal_lookups:
-                        op_w[slot_of[d0], h * 2] = 1.0
-                    if p * 2 + 1 < nv:
-                        d1 = lu.dims[p * 2 + 1]
-                        lookup_dim_to_head[d1] = (h, 1)
-                        if d1 not in internal_lookups:
-                            op_w[slot_of[d1], h * 2 + 1] = 1.0
-
-                    vals = [d0.name]
-                    if p * 2 + 1 < nv:
-                        vals.append(lu.dims[p * 2 + 1].name)
-                    v1_sig = expr_sig(lu.value_exprs[p * 2 + 1]) if p * 2 + 1 < nv else ()
-                    q_terms = {d.name: c for d, c in lu.query_exprs_2d[0].terms.items()}
-                    q_terms.update(
-                        {"_qy_" + d.name: c for d, c in lu.query_exprs_2d[1].terms.items()}
-                    )
-                    k_terms = {d.name: c for d, c in lu.key_exprs_2d[0].terms.items()}
-                    k_terms.update(
-                        {"_ky_" + d.name: c for d, c in lu.key_exprs_2d[1].terms.items()}
-                    )
-                    layer_heads[h] = {
-                        "type": "lookup",
-                        "lookup": lu.name or f"lookup_{lu.id}",
-                        "values": vals,
-                        "tie_break": lu.tie_break,
-                        "memory_group": getattr(lu, "memory_group", -1),
-                        "cache_key": (
-                            expr_sig(lu.key_exprs_2d[0]),
-                            expr_sig(lu.key_exprs_2d[1]),
-                            expr_sig(lu.value_exprs[p * 2]),
-                            v1_sig,
-                        ),
-                    }
-            head_map[layer_idx] = layer_heads
-
-            # 2) Passthrough contributions: src_slot -> {dst_slot: coeff}
-            #    Persist terms referencing non-lookup dims need passthrough.
-            pt = defaultdict(lambda: defaultdict(float))
-
-            for pd in persist1:
-                if pd not in slot_of:
-                    continue
-                for d, c in pd.expr.terms.items():
-                    if d in lookup_dim_to_head:
-                        h, comp = lookup_dim_to_head[d]
-                        op_w[slot_of[pd], h * 2 + comp] += c
-                    elif d in slot_of:
-                        pt[slot_of[d]][slot_of[pd]] += c
-
-            if use_erase:
-                for s in erased_at[(layer_idx, 1)]:
-                    pt[s][s] -= 1.0
-
-            # 3) Pack passthroughs 2 per head (each reads one src_slot)
-            pt_items = list(pt.items())
-            for pair_idx in range(0, len(pt_items), 2):
+        for lu in attn:
+            nv = len(lu.value_exprs)
+            for p in range((nv + 1) // 2):
                 h = head_idx
                 head_idx += 1
-                ip[h * 2] = expr_to_tensor(erase_q2d[0]) * HARD_K * sqrt_dh
-                ip[h * 2 + 1] = expr_to_tensor(erase_q2d[1]) * HARD_K * sqrt_dh
-                ip[D + h * 2] = expr_to_tensor(erase_k2d[0])
-                ip[D + h * 2 + 1] = expr_to_tensor(erase_k2d[1])
+                n_hulls += 1
+                layer_tiebreak.append(1 if lu.tie_break == "latest" else 0)
+                ip[h * 2] = expr_to_tensor(lu.query_exprs_2d[0]) * HARD_K * sqrt_dh
+                ip[h * 2 + 1] = expr_to_tensor(lu.query_exprs_2d[1]) * HARD_K * sqrt_dh
+                ip[D + h * 2] = expr_to_tensor(lu.key_exprs_2d[0])
+                ip[D + h * 2 + 1] = expr_to_tensor(lu.key_exprs_2d[1])
+                ip[2 * D + h * 2] = expr_to_tensor(lu.value_exprs[p * 2])
+                if p * 2 + 1 < nv:
+                    ip[2 * D + h * 2 + 1] = expr_to_tensor(lu.value_exprs[p * 2 + 1])
 
-                src1, dsts1 = pt_items[pair_idx]
-                ip[2 * D + h * 2, src1] = 1.0
-                for dst, coeff in dsts1.items():
-                    op_w[dst, h * 2] += coeff
+                d0 = lu.dims[p * 2]
+                lookup_dim_to_head[d0] = (h, 0)
+                if d0 not in internal_lookups:
+                    op_w[slot_of[d0], h * 2] = 1.0
+                if p * 2 + 1 < nv:
+                    d1 = lu.dims[p * 2 + 1]
+                    lookup_dim_to_head[d1] = (h, 1)
+                    if d1 not in internal_lookups:
+                        op_w[slot_of[d1], h * 2 + 1] = 1.0
 
-                pt_info = {"type": "passthrough", "slot_v0": src1}
-                if pair_idx + 1 < len(pt_items):
-                    src2, dsts2 = pt_items[pair_idx + 1]
-                    ip[2 * D + h * 2 + 1, src2] = 1.0
-                    for dst, coeff in dsts2.items():
-                        op_w[dst, h * 2 + 1] += coeff
-                    pt_info["slot_v1"] = src2
-                layer_heads[h] = pt_info
+                vals = [d0.name]
+                if p * 2 + 1 < nv:
+                    vals.append(lu.dims[p * 2 + 1].name)
+                v1_sig = expr_sig(lu.value_exprs[p * 2 + 1]) if p * 2 + 1 < nv else ()
+                q_terms = {d.name: c for d, c in lu.query_exprs_2d[0].terms.items()}
+                q_terms.update(
+                    {"_qy_" + d.name: c for d, c in lu.query_exprs_2d[1].terms.items()}
+                )
+                k_terms = {d.name: c for d, c in lu.key_exprs_2d[0].terms.items()}
+                k_terms.update(
+                    {"_ky_" + d.name: c for d, c in lu.key_exprs_2d[1].terms.items()}
+                )
+                layer_heads[h] = {
+                    "type": "lookup",
+                    "lookup": lu.name or f"lookup_{lu.id}",
+                    "values": vals,
+                    "tie_break": lu.tie_break,
+                    "memory_group": getattr(lu, "memory_group", -1),
+                    "cache_key": (
+                        expr_sig(lu.key_exprs_2d[0]),
+                        expr_sig(lu.key_exprs_2d[1]),
+                        expr_sig(lu.value_exprs[p * 2]),
+                        v1_sig,
+                    ),
+                }
+        head_map[layer_idx] = layer_heads
 
-            n_pt_h += len(pt_items)
-            while len(layer_tiebreak) < head_idx:
-                layer_tiebreak.append(0)
-            assert head_idx <= n_heads, f"L{layer_idx} attn: {head_idx} heads > {n_heads}"
-            while len(layer_tiebreak) < n_heads:
-                layer_tiebreak.append(0)
-            all_tiebreak.append(layer_tiebreak)
+        # 2) Passthrough contributions: src_slot -> {dst_slot: coeff}
+        #    Persist terms referencing non-lookup dims need passthrough.
+        pt = defaultdict(lambda: defaultdict(float))
 
-            cur = nxt1
+        for pd in persist1:
+            if pd not in slot_of:
+                continue
+            for d, c in pd.expr.terms.items():
+                if d in lookup_dim_to_head:
+                    h, comp = lookup_dim_to_head[d]
+                    op_w[slot_of[pd], h * 2 + comp] += c
+                elif d in slot_of:
+                    pt[slot_of[d]][slot_of[pd]] += c
 
-            # ── FFN HALF-LAYER ────────────────────────────────────
-            c3 = 4 * layer_idx + 3
-            nxt3 = alive_after.get(c3, cur)
-            reglu_to_gate = {}
-            layer_ffn_kinds = [0] * d_ffn
-            j = 0
+        if use_erase:
+            for s in erased_at[(layer_idx, 1)]:
+                pt[s][s] -= 1.0
 
-            # 1) ReGLU neurons
-            for rg in ffn:
-                fi[j] = expr_to_tensor(rg.b_expr)
-                fi[d_ffn + j] = expr_to_tensor(rg.a_expr)
-                reglu_to_gate[rg] = j
-                layer_ffn_kinds[j] = 1
-                if rg not in internal_reglus:
-                    fo[slot_of[rg], j] = 1.0
-                j += 1
+        # 3) Pack passthroughs 2 per head (each reads one src_slot)
+        pt_items = list(pt.items())
+        for pair_idx in range(0, len(pt_items), 2):
+            h = head_idx
+            head_idx += 1
+            ip[h * 2] = expr_to_tensor(erase_q2d[0]) * HARD_K * sqrt_dh
+            ip[h * 2 + 1] = expr_to_tensor(erase_q2d[1]) * HARD_K * sqrt_dh
+            ip[D + h * 2] = expr_to_tensor(erase_k2d[0])
+            ip[D + h * 2 + 1] = expr_to_tensor(erase_k2d[1])
 
-            # 2) Passthrough contributions: src_slot -> {dst_slot: coeff}
-            pt_ffn = defaultdict(lambda: defaultdict(float))
+            src1, dsts1 = pt_items[pair_idx]
+            ip[2 * D + h * 2, src1] = 1.0
+            for dst, coeff in dsts1.items():
+                op_w[dst, h * 2] += coeff
 
-            for pd in persist2:
-                if pd not in slot_of:
-                    continue
-                for d, c in pd.expr.terms.items():
-                    if d in reglu_to_gate:
-                        fo[slot_of[pd], reglu_to_gate[d]] += c
-                    elif d in slot_of:
-                        pt_ffn[slot_of[d]][slot_of[pd]] += c
+            pt_info = {"type": "passthrough", "slot_v0": src1}
+            if pair_idx + 1 < len(pt_items):
+                src2, dsts2 = pt_items[pair_idx + 1]
+                ip[2 * D + h * 2 + 1, src2] = 1.0
+                for dst, coeff in dsts2.items():
+                    op_w[dst, h * 2 + 1] += coeff
+                pt_info["slot_v1"] = src2
+            layer_heads[h] = pt_info
 
-            if use_erase:
-                for s in erased_at[(layer_idx, 3)]:
-                    pt_ffn[s][s] -= 1.0
+        n_pt_h += len(pt_items)
+        while len(layer_tiebreak) < head_idx:
+            layer_tiebreak.append(0)
+        assert head_idx <= n_heads, f"L{layer_idx} attn: {head_idx} heads > {n_heads}"
+        while len(layer_tiebreak) < n_heads:
+            layer_tiebreak.append(0)
+        all_tiebreak.append(layer_tiebreak)
 
-            # 3) One neuron per source slot
-            for src, dsts in pt_ffn.items():
-                fi[j] = expr_to_tensor(one_expr)
-                fi[d_ffn + j, src] = 1.0
-                for dst, coeff in dsts.items():
-                    fo[dst, j] += coeff
-                layer_ffn_kinds[j] = 2
-                j += 1
-                n_pt_g += 1
+        cur = nxt1
 
-            assert j <= d_ffn, f"L{layer_idx} ffn: {j} neurons > {d_ffn}"
-            all_ffn_kinds.append(layer_ffn_kinds)
+        # ── FFN HALF-LAYER ────────────────────────────────────
+        c3 = 4 * layer_idx + 3
+        nxt3 = alive_after.get(c3, cur)
+        reglu_to_gate = {}
+        layer_ffn_kinds = [0] * d_ffn
+        j = 0
 
-            cur = nxt3
+        # 1) ReGLU neurons
+        for rg in ffn:
+            fi[j] = expr_to_tensor(rg.b_expr)
+            fi[d_ffn + j] = expr_to_tensor(rg.a_expr)
+            reglu_to_gate[rg] = j
+            layer_ffn_kinds[j] = 1
+            if rg not in internal_reglus:
+                fo[slot_of[rg], j] = 1.0
+            j += 1
+
+        # 2) Passthrough contributions: src_slot -> {dst_slot: coeff}
+        pt_ffn = defaultdict(lambda: defaultdict(float))
+
+        for pd in persist2:
+            if pd not in slot_of:
+                continue
+            for d, c in pd.expr.terms.items():
+                if d in reglu_to_gate:
+                    fo[slot_of[pd], reglu_to_gate[d]] += c
+                elif d in slot_of:
+                    pt_ffn[slot_of[d]][slot_of[pd]] += c
+
+        if use_erase:
+            for s in erased_at[(layer_idx, 3)]:
+                pt_ffn[s][s] -= 1.0
+
+        # 3) One neuron per source slot
+        for src, dsts in pt_ffn.items():
+            fi[j] = expr_to_tensor(one_expr)
+            fi[d_ffn + j, src] = 1.0
+            for dst, coeff in dsts.items():
+                fo[dst, j] += coeff
+            layer_ffn_kinds[j] = 2
+            j += 1
+            n_pt_g += 1
+
+        assert j <= d_ffn, f"L{layer_idx} ffn: {j} neurons > {d_ffn}"
+        all_ffn_kinds.append(layer_ffn_kinds)
+
+        cur = nxt3
 
     model.attn_erase = [sorted(erased_at[(li, 1)]) for li in range(n_layers)]
     model.ffn_erase = [sorted(erased_at[(li, 3)]) for li in range(n_layers)]
