@@ -678,6 +678,55 @@ payoff order:
   width are secondary but should combine with poll-loop-specific experts for
   the remaining ~1.3-1.5× to 60 fps.
 
+## 2026-07-08 rebuilt experts stage 1: the fold is real and receipted
+
+Not yet in jj (this session's working copy).
+
+What was built (`graph/fold.py`, `graph/eval.py`, `cpu6502/tests/test_fold.py`):
+- **`GraphFolder.fold(pins)`** graduates the moe_probe partial evaluator into
+  a graph transform that *materializes* a new `ProgramGraph`: pinned decode
+  gates become constants, gate=1 ReGLUs inline as exact linear maps (the
+  0.29x → 0.195x lever the in-place experts cannot reach), dead branches
+  prune by liveness, and folded-away readouts (e.g. `is_store` for JMP) come
+  back as named persists so step_specs always resolve by name.  Provenance
+  is kept for the engine: union lookup ids per new LookUp, `memory_group`
+  tags copied, and an **insert-side hazard check** (reachability from any
+  lookup's key/value expressions to a pinned gate — flagged, not assumed
+  safe; empty for all decode pins, which is the license to share the memory
+  structure and running-argmax registers across expert models).
+- **`ProgramEvaluator`** (`graph/eval.py`): a direct float64 evaluator for
+  any ProgramGraph — insert-then-query hardmax with the LATEST tie-break —
+  as an engine-free semantic oracle for graph transforms.
+
+Receipts (all in the fast suite, ~1 s total; 58 fast tests green, ruff clean):
+- Unpinned fold reproduces the union graph exactly: 71 layers, 29,136 terms,
+  op counts identical to the probe baseline.
+- Folded expert graphs shadow the union in lockstep: the union graph runs
+  the verify program through ProgramEvaluator, checked against the reference
+  oracle on the architectural fields every step; each expert (STA/LDA/BNE/
+  JMP/JSR/ADC-imm) replays the identical token stream and must reproduce
+  **all 22 runtime readouts exactly** on steps whose fetched opcode matches
+  its pin — the engine's routed-dispatch contract, engine-free.
+- Pipeline smoke: folded graphs go through `asap_schedule` + `build_model`
+  **unmodified** — JMP abs becomes a real 17-layer d_model=348 transformer
+  (union: 71 layers, d_model≈1550), LDA abs 22 layers / 350, memory heads
+  intact.
+- Correction to the probe: its per-opcode depths (9/13/22) were optimistic —
+  it kept original expressions over pruned dim sets, so dependencies through
+  inlined gate=1 folds were dropped as dangling edges.  True materialized
+  depths run ~1.4-1.7x deeper (JMP abs 17 vs 10) but still ~0.2-0.4x of the
+  union.  Terms (the load-bound cost) match the probe, which is what the CPU
+  path cares about; the depth correction matters for the batched/GPU story.
+
+Next (stage 2/3): schedule+build the 16 hot experts in the runner; rework
+`engine_gen.generate_source` to emit one TU with the union model plus
+per-expert *models* (each with its own slot layout and step_core — the st_*
+scalars, ram mirror, memory structure, and registers are the interface),
+mapping expert memory heads / registers onto the union's structures by
+lookup provenance, with loud guards where an expert's head classification
+disagrees with the union's.  Then the usual chain: codegen-vs-generic
+identity, nestest, Klaus 200K, full Klaus, SMB frame + fps.
+
 ## 2026-07-07 C++ run loop (KernelBus shape) — Python floor removed
 
 What was built (`model/engine_gen.py`, `cpu6502/weights_runner.py`,
