@@ -41,7 +41,6 @@ from transformer_vm.cpu6502 import reference
 from transformer_vm.cpu6502.interpreter import build as build_6502_graph
 from transformer_vm.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_vm.graph.core import (
-    CumSumDimension,
     InputDimension,
     LookUpDimension,
     PersistDimension,
@@ -167,12 +166,7 @@ class Cpu6502Runtime:
         }
 
         for dim in self.all_dims:
-            if isinstance(dim, CumSumDimension):
-                # The 6502 graph is stateless per step apart from attention;
-                # supporting running accumulators would complicate both the
-                # Python and C++ backends for no consumer.
-                raise NotImplementedError("the 6502 evaluator does not support CumSum dims")
-            elif isinstance(dim, ReGLUDimension):
+            if isinstance(dim, ReGLUDimension):
                 self._indexed_dim_ops[dim.id] = _OP_REGLU
                 self._indexed_dim_args[dim.id] = (
                     self._compile_expr(dim.a_expr),

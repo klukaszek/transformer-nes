@@ -1,38 +1,17 @@
 """Generated straight-line C++ engine for the analytic transformer weights.
 
-A generic CSR forward spends almost all its time on the dependent scalar
-gather -- loading indices[k]/data[k] and chasing them (~1.5-2 ns/nnz; the
-hulls are only ~8%).  This module applies the kernel.py trick to the weights:
-it emits one C++ translation unit specific to the built model, with column
-indices as immediates and +-1 coefficients as add/sub, so those loads
-disappear.
+A generic CSR forward spends almost all its time on the dependent scalar gather -- loading indices[k]/data[k] and chasing them (~1.5-2 ns/nnz; the hulls are only ~8%).  This module applies the kernel.py trick to the weights: it emits one C++ translation unit specific to the built model, with column indices as immediates and +-1 coefficients as add/sub, so those loads disappear.
 
 Three arithmetic modes:
 
 - ``arith="int32"`` (default): the residual stream is exact fixed-point
-  int32 at scale 2**F (F=1 covers the half-integer values the +-0.5
-  direct-map coefficients produce; every rescaling shift is guarded and
-  throws rather than round).  Every residual-feeding coefficient is an
-  integer, all lookup heads are LATEST tie-break so hull outputs return
-  the values that were inserted, and the STATE/HALT head rows are
-  integers -- the whole non-attention computation is exact integer
-  arithmetic.  Partial sums may wrap mod 2^32 (-fwrapv); every final
-  value fits, so results are exact.  Q/K/V and the position features
-  live in double, feeding the hulls directly (hulls always resolve in
-  double anyway), and clear_key-gated inserts (ky -= 1e30, provably
-  never a query winner) are skipped entirely.
+  int32 at scale 2**F (F=1 covers the half-integer values the +-0.5 direct-map coefficients produce; every rescaling shift is guarded and throws rather than round).  Every residual-feeding coefficient is an integer, all lookup heads are LATEST tie-break so hull outputs return the values that were inserted, and the STATE/HALT head rows are integers -- the whole non-attention computation is exact integer arithmetic.  Partial sums may wrap mod 2^32 (-fwrapv); every final value fits, so results are exact.  Q/K/V and the position features live in double, feeding the hulls directly (hulls always resolve in double anyway), and clear_key-gated inserts (ky -= 1e30, provably never a query winner) are skipped entirely.
 
-- ``arith="int64"``: the same emission at int64 width (no wrap argument
-  needed); measured slower than int32 -- the linear part is load-bound,
-  so value density wins.
+- ``arith="int64"``: the same emission at int64 width (no wrap argument needed); measured slower than int32 -- the linear part is load-bound, so value density wins.
 
-- ``arith="f32"``: float32 arithmetic (CSR column order, left-to-right
-  accumulation, float32 hexfloat literals); kept as a benchmarking
-  reference for the int paths.
+- ``arith="f32"``: float32 arithmetic (CSR column order, left-to-right accumulation, float32 hexfloat literals); kept as a benchmarking reference for the int paths.
 
-All modes generate the direct-WRITE key construction from graph.core's
-LATEST_ALPHA/KEY_OFFSET instead of hand-copying it, so the generated
-engine cannot silently desync from the graph.
+All modes generate the direct-WRITE key construction from graph.core's LATEST_ALPHA/KEY_OFFSET instead of hand-copying it, so the generated engine cannot silently desync from the graph.
 """
 
 from __future__ import annotations

@@ -95,14 +95,14 @@ class Cpu6502TransformerMachine:
         # size (~5M integer variables); critical-path scheduling costs some
         # d_model but no solver time.
         sched = asap_schedule(pg.input_tokens, pg.output_tokens, program_graph=pg)
-        self.model, all_tokens, tok_to_idx, shared = build_model(
+        self.model, _tokens, tok_to_idx, info = build_model(
             program_graph=pg, schedule=sched,
         )
         self.build_seconds = time.perf_counter() - build_start
-        self.n_layers = shared[3]
-        self._std_layers = shared[4]
-        self.slot_of = shared[6]
-        self.d_model = shared[9]
+        self.n_layers = info.n_layers
+        self._std_layers = info.std_layers
+        self.slot_of = info.slot_of
+        self.d_model = info.d_model
         self._state_row = tok_to_idx["STATE"]
         self._halt_row = tok_to_idx["HALT"]
         self._read_slots = {

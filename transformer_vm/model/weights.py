@@ -16,6 +16,7 @@ to compile that engine (torch.utils.cpp_extension), not as a tensor library.
 import logging
 import math
 from collections import defaultdict
+from typing import NamedTuple
 
 import numpy as np
 import yaml
@@ -23,6 +24,15 @@ import yaml
 logger = logging.getLogger(__name__)
 
 HARD_K = 1e10  # softmax temperature scaling to approximate hardmax (argmax) attention
+
+
+class BuildInfo(NamedTuple):
+    """The schedule/layout facts a caller needs alongside the weights."""
+
+    n_layers: int
+    std_layers: list
+    slot_of: dict
+    d_model: int
 
 
 def add_position_encoding(x, pos):
@@ -108,70 +118,15 @@ def _dump_allocation(
     logger.info("Wrote allocation to %s", alloc_path)
 
 
-def _load_plan(path, all_dims):
-    from transformer_vm.graph.core import LookUpDimension
-
-    with open(path) as f:
-        plan = yaml.safe_load(f)
-
-    name_to_dim = {d.name: d for d in all_dims}
-
-    def resolve(name):
-        d = name_to_dim.get(name)
-        if d is None:
-            raise KeyError(f"plan.yaml references unknown dim '{name}'")
-        return d
-
-    std_layers = []
-    alive_after = {}
-
-    for entry in plan["layers"]:
-        L = entry["layer"]
-
-        seen_hulls = {}
-        for dname in entry["attention"]:
-            d = resolve(dname)
-            assert isinstance(d, LookUpDimension), f"{dname} not a LookUpDimension"
-            lu = d.lookup
-            if lu.id not in seen_hulls:
-                seen_hulls[lu.id] = lu
-        attn = list(seen_hulls.values())
-
-        persist1 = [resolve(n) for n in entry["persist1"]]
-        ffn = [resolve(n) for n in entry["ffn"]]
-        persist2 = [resolve(n) for n in entry["persist2"]]
-        std_layers.append((attn, persist1, ffn, persist2))
-
-        if "after_persist1" in entry:
-            alive_after[4 * L + 1] = frozenset(resolve(n) for n in entry["after_persist1"]["dims"])
-        if "after_persist2" in entry:
-            alive_after[4 * L + 3] = frozenset(resolve(n) for n in entry["after_persist2"]["dims"])
-
-    return plan["summary"]["layers"], std_layers, alive_after
-
-
-def build_model(
-    use_erase=True,
-    _shared=None,
-    program_graph=None,
-    plan_path=None,
-    schedule=None,
-    max_layers=None,
-    no_reuse=False,
-    max_ffn=None,
-):
-    """Build transformer weights from a computation graph.
+def build_model(program_graph=None, schedule=None):
+    """Build transformer weight matrices from a computation graph.
 
     Args:
-        use_erase: whether to use erase-based slot reuse.
-        program_graph: optional ProgramGraph. If provided, uses its graph
-            data instead of importing machine.build().
-        plan_path: path to a schedule plan YAML file.
-        schedule: a precomputed schedule dict (milp_schedule/asap_schedule
-            output); skips the MILP.
-        max_layers: maximum number of transformer layers.
-        no_reuse: disable slot reuse in interval coloring.
-        max_ffn: maximum FFN neurons per layer.
+        program_graph: a ProgramGraph wrapping the input/output tokens.
+        schedule: a precomputed schedule dict (asap_schedule / milp_schedule).
+
+    Slots are reused across dead dims (interval coloring) and freed slots are
+    erased before reuse, so the represented computation is unchanged.
     """
     from transformer_vm.graph.core import (
         Expression,
@@ -181,169 +136,125 @@ def build_model(
         ReGLUDimension,
     )
 
-    if _shared is not None:
-        (
-            ALL_DIMS,
-            input_tokens,
-            output_tokens,
-            n_layers,
-            std_layers,
-            alive_after,
-            slot_of,
-            reused_at,
-            erased_at,
-            D,
-            internal_reglus,
-            internal_lookups,
-            internal_persists,
-            internal_dims,
-            one_expr,
-            pos_expr,
-            erase_q2d,
-            erase_k2d,
-            expr_to_tensor,
-            max_heads,
-            n_heads,
-            d_ffn,
-            max_ffn,
-            all_tokens,
-            tok_to_idx_map,
-            vocab_size,
-            input_dims,
-        ) = _shared
+    if program_graph is not None:
+        pg = program_graph
+        input_tokens = pg.input_tokens
+        output_tokens = pg.output_tokens
+        ALL_DIMS = pg.all_dims
+        _one = pg.one
+        _position = pg.position
+        _inv_log_pos = pg.inv_log_pos
+        _position_sq = pg.position_sq
     else:
-        if program_graph is not None:
-            pg = program_graph
-            input_tokens = pg.input_tokens
-            output_tokens = pg.output_tokens
-            ALL_DIMS = pg.all_dims
-            _one = pg.one
-            _position = pg.position
-            _inv_log_pos = pg.inv_log_pos
-            _position_sq = pg.position_sq
+        raise ValueError(
+            "build_model requires a program_graph (the default WASM "
+            "machine graph was removed; wrap your interpreter's "
+            "input/output tokens in a ProgramGraph)"
+        )
+
+    # ── Load schedule ─────────────────────────────────────────
+    if schedule is None:
+        raise ValueError(
+            "build_model requires a precomputed schedule "
+            "(asap_schedule or milp_schedule output)"
+        )
+    std_layers = schedule["std_layers"]
+    n_layers = schedule["num_layers"]
+    alive_after = schedule.get("alive_after", {})
+
+    # ── Slot assignment (interval coloring) ───────────────────
+    input_dims = [d for d in ALL_DIMS if isinstance(d, InputDimension)]
+    FIXED = {_position: 0, _inv_log_pos: 1, _position_sq: 2}
+    protected_slots = set(FIXED.values())
+    slot_of = dict(FIXED)
+    next_slot = 3
+    for d in input_dims:
+        if d not in slot_of:
+            slot_of[d] = next_slot
+            next_slot += 1
+
+    free_slots = []
+    pending_free = []  # freed this half-layer, available next
+    reused_at = {}  # (L, sp) -> slots written (already 0)
+    erased_at = {}  # (L, sp) -> slots being erased to 0
+
+    cur = frozenset(input_dims)
+    for L in range(n_layers):
+        for sp in (1, 3):
+            c = 4 * L + sp
+            nxt = alive_after.get(c, cur)
+            dying = cur - nxt
+            born = nxt - cur
+
+            free_slots.extend(pending_free)
+            free_slots.sort()
+            pending_free = []
+
+            erased = set()
+            for d in dying:
+                s = slot_of[d]
+                if s in protected_slots:
+                    continue
+                pending_free.append(s)
+                erased.add(s)
+
+            reused = set()
+            for d in sorted(born, key=lambda x: x.id):
+                if free_slots:
+                    s = free_slots.pop(0)
+                    slot_of[d] = s
+                    reused.add(s)
+                else:
+                    slot_of[d] = next_slot
+                    next_slot += 1
+
+            reused_at[(L, sp)] = reused
+            erased_at[(L, sp)] = erased
+            cur = nxt
+
+    # Assign slots to output-referenced dims not yet covered
+    output_dims_need = set()
+    for expr in output_tokens.values():
+        if isinstance(expr, Expression):
+            for d in expr.terms:
+                if d not in slot_of and d not in input_dims:
+                    output_dims_need.add(d)
+    for d in sorted(output_dims_need, key=lambda x: x.id):
+        if free_slots:
+            s = free_slots.pop(0)
+            slot_of[d] = s
         else:
-            raise ValueError(
-                "build_model requires a program_graph (the default WASM "
-                "machine graph was removed; wrap your interpreter's "
-                "input/output tokens in a ProgramGraph)"
-            )
+            slot_of[d] = next_slot
+            next_slot += 1
 
-        # ── Load schedule ─────────────────────────────────────────
-        if plan_path:
-            n_layers, std_layers, alive_after = _load_plan(plan_path, ALL_DIMS)
-        elif schedule is not None:
-            std_layers = schedule["std_layers"]
-            n_layers = schedule["num_layers"]
-            alive_after = schedule.get("alive_after", {})
-        else:
-            from transformer_vm.scheduler.milp import milp_schedule
+    D = next_slot
+    D += D % 2
 
-            sched = milp_schedule(
-                input_tokens,
-                output_tokens,
-                max_layers=max_layers,
-                max_ffn=max_ffn,
-                program_graph=program_graph,
-            )
-            std_layers = sched["std_layers"]
-            n_layers = sched["num_layers"]
-            alive_after = sched.get("alive_after", {})
+    # ── Internal dims (never in any alive set) ────────────────
+    all_ever_alive = set()
+    for s in alive_after.values():
+        all_ever_alive |= s
+    output_dims_set = set()
+    for expr in output_tokens.values():
+        if isinstance(expr, Expression):
+            output_dims_set |= set(expr.terms.keys())
+    non_internal = all_ever_alive | set(input_dims) | output_dims_set
+    internal_reglus = {
+        d for d in ALL_DIMS if isinstance(d, ReGLUDimension) and d not in non_internal
+    }
+    internal_lookups = {
+        d for d in ALL_DIMS if isinstance(d, LookUpDimension) and d not in non_internal
+    }
+    internal_persists = {
+        d for d in ALL_DIMS if isinstance(d, PersistDimension) and d not in non_internal
+    }
+    internal_dims = internal_reglus | internal_lookups | internal_persists
 
-        # ── Slot assignment (interval coloring) ───────────────────
-        input_dims = [d for d in ALL_DIMS if isinstance(d, InputDimension)]
-        FIXED = {_position: 0, _inv_log_pos: 1, _position_sq: 2}
-        protected_slots = set(FIXED.values())
-        slot_of = dict(FIXED)
-        next_slot = 3
-        for d in input_dims:
-            if d not in slot_of:
-                slot_of[d] = next_slot
-                next_slot += 1
-
-        free_slots = []
-        pending_free = []  # freed this half-layer, available next
-        reused_at = {}  # (L, sp) -> slots written (already 0)
-        erased_at = {}  # (L, sp) -> slots being erased to 0
-
-        cur = frozenset(input_dims)
-        for L in range(n_layers):
-            for sp in (1, 3):
-                c = 4 * L + sp
-                nxt = alive_after.get(c, cur)
-                dying = cur - nxt
-                born = nxt - cur
-
-                if not no_reuse:
-                    free_slots.extend(pending_free)
-                    free_slots.sort()
-                    pending_free = []
-
-                erased = set()
-                if not no_reuse:
-                    for d in dying:
-                        s = slot_of[d]
-                        if s in protected_slots:
-                            continue
-                        pending_free.append(s)
-                        erased.add(s)
-
-                reused = set()
-                for d in sorted(born, key=lambda x: x.id):
-                    if free_slots:
-                        s = free_slots.pop(0)
-                        slot_of[d] = s
-                        reused.add(s)
-                    else:
-                        slot_of[d] = next_slot
-                        next_slot += 1
-
-                reused_at[(L, sp)] = reused
-                erased_at[(L, sp)] = erased
-                cur = nxt
-
-        # Assign slots to output-referenced dims not yet covered
-        output_dims_need = set()
-        for expr in output_tokens.values():
-            if isinstance(expr, Expression):
-                for d in expr.terms:
-                    if d not in slot_of and d not in input_dims:
-                        output_dims_need.add(d)
-        for d in sorted(output_dims_need, key=lambda x: x.id):
-            if free_slots:
-                s = free_slots.pop(0)
-                slot_of[d] = s
-            else:
-                slot_of[d] = next_slot
-                next_slot += 1
-
-        D = next_slot
-        D += D % 2
-
-        # ── Internal dims (never in any alive set) ────────────────
-        all_ever_alive = set()
-        for s in alive_after.values():
-            all_ever_alive |= s
-        output_dims_set = set()
-        for expr in output_tokens.values():
-            if isinstance(expr, Expression):
-                output_dims_set |= set(expr.terms.keys())
-        non_internal = all_ever_alive | set(input_dims) | output_dims_set
-        internal_reglus = {
-            d for d in ALL_DIMS if isinstance(d, ReGLUDimension) and d not in non_internal
-        }
-        internal_lookups = {
-            d for d in ALL_DIMS if isinstance(d, LookUpDimension) and d not in non_internal
-        }
-        internal_persists = {
-            d for d in ALL_DIMS if isinstance(d, PersistDimension) and d not in non_internal
-        }
-        internal_dims = internal_reglus | internal_lookups | internal_persists
-
-        # ── Expressions for passthrough/erase Q/K ─────────────────
-        one_expr = Expression({_one: 1})
-        pos_expr = Expression({_position: 1})
-        erase_q2d = [pos_expr, one_expr]
-        erase_k2d = [pos_expr * 2, one_expr]
+    # ── Expressions for passthrough/erase Q/K ─────────────────
+    one_expr = Expression({_one: 1})
+    pos_expr = Expression({_position: 1})
+    erase_q2d = [pos_expr, one_expr]
+    erase_k2d = [pos_expr * 2, one_expr]
 
     def expr_to_tensor(expr):
         w = np.zeros(D, dtype=np.float64)
@@ -354,61 +265,60 @@ def build_model(
                 w[slot_of[dim]] += coeff
         return w
 
-    if _shared is None:
-        # ── Count resources (n_heads, d_ffn) ──────────────────────
-        max_heads = 0
-        max_ffn = 1
+    # ── Count resources (n_heads, d_ffn) ──────────────────────
+    max_heads = 0
+    max_ffn = 1
 
-        cur = frozenset(input_dims)
-        for L in range(n_layers):
-            attn, persist1, ffn, persist2 = std_layers[L]
+    cur = frozenset(input_dims)
+    for L in range(n_layers):
+        attn, persist1, ffn, persist2 = std_layers[L]
 
-            c1 = 4 * L + 1
-            nxt1 = alive_after.get(c1, cur)
-            erased1 = erased_at[(L, 1)]
+        c1 = 4 * L + 1
+        nxt1 = alive_after.get(c1, cur)
+        erased1 = erased_at[(L, 1)]
 
-            lookup_dims_set = set()
-            for lu in attn:
-                lookup_dims_set |= set(lu.dims)
-            n_lu_heads = sum((len(lu.value_exprs) + 1) // 2 for lu in attn)
+        lookup_dims_set = set()
+        for lu in attn:
+            lookup_dims_set |= set(lu.dims)
+        n_lu_heads = sum((len(lu.value_exprs) + 1) // 2 for lu in attn)
 
-            pt_srcs = set(erased1)
-            for pd in persist1:
-                for d in pd.expr.terms:
-                    if d not in slot_of or d in internal_dims:
-                        continue
-                    if not (isinstance(d, LookUpDimension) and d in lookup_dims_set):
-                        pt_srcs.add(slot_of[d])
+        pt_srcs = set(erased1)
+        for pd in persist1:
+            for d in pd.expr.terms:
+                if d not in slot_of or d in internal_dims:
+                    continue
+                if not (isinstance(d, LookUpDimension) and d in lookup_dims_set):
+                    pt_srcs.add(slot_of[d])
 
-            max_heads = max(max_heads, n_lu_heads + (len(pt_srcs) + 1) // 2)
-            cur = nxt1
+        max_heads = max(max_heads, n_lu_heads + (len(pt_srcs) + 1) // 2)
+        cur = nxt1
 
-            c3 = 4 * L + 3
-            nxt3 = alive_after.get(c3, cur)
-            erased3 = erased_at[(L, 3)]
+        c3 = 4 * L + 3
+        nxt3 = alive_after.get(c3, cur)
+        erased3 = erased_at[(L, 3)]
 
-            same_rg = set(ffn)
-            pt_srcs_ffn = set(erased3)
-            for pd in persist2:
-                for d in pd.expr.terms:
-                    if d not in slot_of or d in internal_dims:
-                        continue
-                    if d not in same_rg:
-                        pt_srcs_ffn.add(slot_of[d])
+        same_rg = set(ffn)
+        pt_srcs_ffn = set(erased3)
+        for pd in persist2:
+            for d in pd.expr.terms:
+                if d not in slot_of or d in internal_dims:
+                    continue
+                if d not in same_rg:
+                    pt_srcs_ffn.add(slot_of[d])
 
-            max_ffn = max(max_ffn, len(ffn) + len(pt_srcs_ffn))
-            cur = nxt3
+        max_ffn = max(max_ffn, len(ffn) + len(pt_srcs_ffn))
+        cur = nxt3
 
-        if 2 * max_heads > D:
-            D = 2 * max_heads
-            D += D % 2
-        n_heads = D // 2
-        d_ffn = max_ffn
+    if 2 * max_heads > D:
+        D = 2 * max_heads
+        D += D % 2
+    n_heads = D // 2
+    d_ffn = max_ffn
 
-        # ── Vocabulary ────────────────────────────────────────────
-        all_tokens = sorted(set(input_tokens.keys()) | set(output_tokens.keys()))
-        tok_to_idx_map = {t: i for i, t in enumerate(all_tokens)}
-        vocab_size = len(all_tokens)
+    # ── Vocabulary ────────────────────────────────────────────
+    all_tokens = sorted(set(input_tokens.keys()) | set(output_tokens.keys()))
+    tok_to_idx_map = {t: i for i, t in enumerate(all_tokens)}
+    vocab_size = len(all_tokens)
 
     # ── Create model ──────────────────────────────────────────────
     model = WeightModel(
@@ -531,9 +441,8 @@ def build_model(
                 elif d in slot_of:
                     pt[slot_of[d]][slot_of[pd]] += c
 
-        if use_erase:
-            for s in erased_at[(layer_idx, 1)]:
-                pt[s][s] -= 1.0
+        for s in erased_at[(layer_idx, 1)]:
+            pt[s][s] -= 1.0
 
         # 3) Pack passthroughs 2 per head (each reads one src_slot)
         pt_items = list(pt.items())
@@ -598,9 +507,8 @@ def build_model(
                 elif d in slot_of:
                     pt_ffn[slot_of[d]][slot_of[pd]] += c
 
-        if use_erase:
-            for s in erased_at[(layer_idx, 3)]:
-                pt_ffn[s][s] -= 1.0
+        for s in erased_at[(layer_idx, 3)]:
+            pt_ffn[s][s] -= 1.0
 
         # 3) One neuron per source slot
         for src, dsts in pt_ffn.items():
@@ -654,12 +562,11 @@ def build_model(
 
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
     logger.info(
-        "Built model: d_model=%d, n_layers=%d, n_heads=%d, d_ffn=%d, erase=%s",
+        "Built model: d_model=%d, n_layers=%d, n_heads=%d, d_ffn=%d",
         D,
         n_layers,
         n_heads,
         d_ffn,
-        use_erase,
     )
     logger.info(
         "  vocab=%d, hulls=%d, persist=%d, pt_h=%d, pt_g=%d",
@@ -672,35 +579,7 @@ def build_model(
 
     _dump_allocation(n_layers, std_layers, slot_of, head_map, internal_dims)
 
-    shared = (
-        ALL_DIMS,
-        input_tokens,
-        output_tokens,
-        n_layers,
-        std_layers,
-        alive_after,
-        slot_of,
-        reused_at,
-        erased_at,
-        D,
-        internal_reglus,
-        internal_lookups,
-        internal_persists,
-        internal_dims,
-        one_expr,
-        pos_expr,
-        erase_q2d,
-        erase_k2d,
-        expr_to_tensor,
-        max_heads,
-        n_heads,
-        d_ffn,
-        max_ffn,
-        all_tokens,
-        tok_to_idx_map,
-        vocab_size,
-        input_dims,
-    )
-
-    return model, all_tokens, tok_to_idx_map, shared
+    info = BuildInfo(n_layers=n_layers, std_layers=std_layers,
+                     slot_of=slot_of, d_model=D)
+    return model, all_tokens, tok_to_idx_map, info
 

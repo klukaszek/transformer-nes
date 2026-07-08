@@ -173,12 +173,6 @@ position_sq = InputDimension("position_sq")
 LATEST_ALPHA = 0.3  # tie-break weight favoring more recent tokens in hardmax attention
 
 
-class CumSumDimension(Dimension):
-    def __init__(self, value_expr, name=None):
-        super().__init__(name or f"cumsum_{Dimension._counter}", kind="cumsum")
-        self.value_expr = value_expr
-
-
 class PersistDimension(Dimension):
     """A dimension that stores a linear combination in a dedicated slot.
 
@@ -389,24 +383,6 @@ def auto_name(local_vars):
                         item.lookup.name = name
                 elif isinstance(item, Expression):
                     _name_expr_dims(f"{name}[{i}]", item)
-
-
-def fetch_sum(value_list):
-    """Cumulative sum via attention averaging: avg * position.
-
-    Position 0 (start token, one=0) is excluded from the average
-    because its ky=0 < 1, so the denominator is p (not p+1).
-    Multiplying by position recovers the exact cumulative sum.
-    """
-    if not isinstance(value_list, (list, tuple)):
-        value_list = [value_list]
-    key = Expression({one: KEY_OFFSET})
-    query = Expression({one: KEY_OFFSET})
-    avg_dims = fetch(value_list, query=query, key=key, tie_break="average")
-    if not isinstance(avg_dims, tuple):
-        avg_dims = (avg_dims,)
-    results = [reglu(_to_expr(d), _to_expr(position)) for d in avg_dims]
-    return tuple(results) if len(results) > 1 else results[0]
 
 
 # ── Graph lifecycle ──────────────────────────────────────────────────
