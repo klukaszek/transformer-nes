@@ -162,11 +162,30 @@ def run_weights(image: bytes, *, max_steps: int,
     mode = f"{machine.matmul}-{arith}" if arith else f"{machine.matmul}/{machine.dtype}"
     build_elapsed = time.perf_counter() - build_start
 
-    # Lockstep incrementally instead of materializing the whole trace:
-    # the full suite is 30.6M rows.
-    machine.boot_image(list(image), start_pc=START_PC)
     ref_cpu = Cpu6502(memory=bytearray(image))
     ref_cpu.pc = START_PC
+
+    if machine.supports_run_loop:
+        # The generated engine runs the whole stream in C++, pausing only at
+        # the jump-to-self success trap; lockstep each native chunk against
+        # the streaming reference (engine state is O(1), no checkpointing).
+        mode = f"{mode}-runloop"
+        run_start = time.perf_counter()
+        steps = 0
+        for out in machine.iter_run_arrays(list(image), start_pc=START_PC,
+                                           max_steps=max_steps, chunk=500_000,
+                                           stop_on_trap=True):
+            matched, n = lockstep_arrays_vs_reference(ref_cpu, out)
+            if not matched:
+                return False, steps + n, build_elapsed, time.perf_counter() - run_start, mode
+            steps += len(out["pc"])
+            if steps % 1_000_000 < 500_000:
+                elapsed = time.perf_counter() - run_start
+                logger.info("  %.1fM steps, %.0f steps/s", steps / 1e6, steps / elapsed)
+        return True, steps, build_elapsed, time.perf_counter() - run_start, mode
+
+    # Per-step fallback (generic CSR / sparse engines have no run loop).
+    machine.boot_image(list(image), start_pc=START_PC)
     run_start = time.perf_counter()
     steps = 0
     for i in range(max_steps):

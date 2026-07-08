@@ -341,6 +341,10 @@ class Cpu6502TransformerMachine:
     def set_nmi(self):
         """The interrupt sequence itself then runs inside the weights."""
         self._nmi_pending = True
+        # In the native run loop the pending-NMI flag lives in the engine
+        # (the per-step path passes it as an argument instead).
+        if self._cpp_step and getattr(self._engine, "has_run_loop", False):
+            self._engine.set_nmi()
 
     def inject_write(self, addr: int, value: int):
         self._insert_write(addr & 0xFFFF, value & 0xFF)
@@ -509,6 +513,132 @@ class Cpu6502TransformerMachine:
             if self.machine_halted:
                 break
         return trace
+
+    # ── C++ run loop (KernelBus shape) ──────────────────────────────
+    # The generated int/f32 engine can run the whole instruction stream
+    # natively, pausing back to Python only on halt / jump-to-self trap /
+    # watched device access / cycle budget (removes the per-step Python
+    # protocol floor).  These helpers expose it for the streaming Klaus /
+    # nestest harnesses; the NES console drives it through WeightsKernelBus.
+
+    @property
+    def supports_run_loop(self) -> bool:
+        return self._cpp_step and getattr(self._engine, "has_run_loop", False)
+
+    def _seed_run_state(self) -> None:
+        st = self._mstate
+        self._engine.set_run_state(
+            st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
+            st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"], st["halted"],
+        )
+
+    def _pull_run_state(self) -> None:
+        """Copy the engine's architectural state back into the Python mirror
+        (called after a native run so machine protocol / checkpointing see it)."""
+        s = self._engine.get_run_state()
+        self._mstate.update(
+            pc=int(s["pc"]), a=int(s["a"]), x=int(s["x"]), y=int(s["y"]),
+            s=int(s["s"]), p=int(s["p"]), ir=int(s["ir"]), oplo=int(s["oplo"]),
+            ophi=int(s["ophi"]), ea=int(s["ea"]), data=int(s["data"]),
+            halted=1 if s["halted"] else 0,
+        )
+        self.machine_halted = bool(s["halted"])
+        self.pos = int(s["pos"])
+
+    def run_image_arrays(self, memory_image, *, start_pc: int, max_steps: int,
+                         stop_on_trap: bool = False) -> dict:
+        """Boot and run up to max_steps entirely in the C++ run loop.
+
+        Returns the same result dict as the C++ kernel's run(): per-step
+        trace arrays (pc/a/x/y/s/p/ir/oplo/ophi/ea/data/halted), write arrays
+        (w_row 0-based within this call, w_addr, w_value), and the run's
+        "reason"/"cycles".  Materializes every step's arrays, so it is for
+        bounded runs (nestest, a Klaus prefix); use iter_run_arrays to stream
+        the full suite.
+        """
+        if not self.supports_run_loop:
+            raise RuntimeError("this engine has no C++ run loop")
+        self.boot_image(list(memory_image), start_pc=start_pc)
+        self._seed_run_state()
+        out = self._engine.run(max_steps, stop_on_trap, 0)
+        self._pull_run_state()
+        return out
+
+    def iter_run_arrays(self, memory_image, *, start_pc: int, max_steps: int,
+                        chunk: int = 200_000, stop_on_trap: bool = False):
+        """Stream the C++ run loop in fixed-size chunks (w_row rebased to 0
+        per chunk), so the full Klaus suite verifies without materializing a
+        30M-row trace.  Yields the kernel-shape result dict for each chunk.
+
+        Engine state is O(1) in the token log (memory on the exact
+        nearest-address structure, constant-query heads on running-argmax
+        registers), so streaming needs no checkpoint rebuild between chunks.
+        """
+        if not self.supports_run_loop:
+            raise RuntimeError("this engine has no C++ run loop")
+        self.boot_image(list(memory_image), start_pc=start_pc)
+        self._seed_run_state()
+        done = 0
+        while done < max_steps:
+            base = int(self._engine.get_run_state()["steps"])
+            out = self._engine.run(min(chunk, max_steps - done), stop_on_trap, 0)
+            n = len(out["pc"])
+            if n == 0:
+                break
+            # w_row is the engine's global step_index; rebase to this chunk.
+            out["w_row"] = out["w_row"] - base
+            done += n
+            yield out
+            if out["reason"] in ("halt", "trap"):
+                break
+        self._pull_run_state()
+
+    # ── Kernel-shape machine API (lets KernelBus drive the run loop) ─
+    # These mirror cpu6502.kernel.Cpu6502CppRuntime so the NES bus's
+    # KernelBus adapter drives the weights engine natively, pausing back to
+    # Python only for MMIO -- the same protocol as the C++ kernel.
+
+    def load_image(self, memory_image, *, start_pc: int) -> None:
+        self.boot_image(list(memory_image), start_pc=start_pc)
+        self._seed_run_state()
+
+    def run(self, max_steps: int, *, stop_on_trap: bool = False,
+            max_cycles: int = 0) -> dict:
+        """Resume the native run loop from the engine's persistent state
+        (no reboot), pausing on halt/trap/watch/cycle budget."""
+        out = self._engine.run(max_steps, stop_on_trap, max_cycles)
+        self._pull_run_state()
+        return out
+
+    def watch_read(self, lo: int, hi: int) -> None:
+        self._engine.watch_read(lo, hi)
+
+    def watch_write(self, lo: int, hi: int) -> None:
+        self._engine.watch_write(lo, hi)
+
+    def read_ram(self, addr: int) -> int:
+        return self._engine.read_ram(addr)
+
+    def dump_ram(self) -> bytes:
+        return self._engine.dump_ram()
+
+    def get_state(self) -> dict:
+        return dict(self._engine.get_run_state())
+
+    def set_state(self, state: dict) -> None:
+        """Restore architectural state after a snapshot rebuild (mirrors the
+        C++ kernel's set_state; the trace context fields carry over)."""
+        st = dict(self._mstate)
+        for k in st:
+            if k in state:
+                st[k] = int(state[k])
+        self._engine.set_run_state(
+            st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
+            st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"],
+            1 if state.get("halted") else 0,
+        )
+        self._mstate.update(st)
+        self.machine_halted = bool(state.get("halted", self.machine_halted))
 
 
 # ── Verification program (low addresses; see numerics caveat above) ──

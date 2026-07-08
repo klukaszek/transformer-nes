@@ -129,6 +129,7 @@ class Console:
         """Create the CPU machine + bus for a backend, optionally resuming
         from a snapshot (RAM image + architectural state)."""
         self.backend = backend
+        self._uses_kernel_bus = False
         if backend == "kernel":
             from transformer_vm.cpu6502.kernel import Cpu6502CppRuntime
 
@@ -137,6 +138,28 @@ class Console:
             if state is not None:
                 self._rt.set_state(state)
             self._read_cpu = self._rt.read_ram
+            self._uses_kernel_bus = True
+            return
+        if backend == "weights":
+            # The real transformer through its generated C++ run loop:
+            # KernelBus drives it natively (MMIO pauses back to Python), the
+            # same protocol as the kernel.  Falls back to the Python-stepped
+            # bus if the engine has no run loop (non-codegen diagnostics).
+            from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
+
+            machine = Cpu6502TransformerMachine(bcd=False, checkpoint_tokens=None)
+            if machine.supports_run_loop:
+                self._rt = machine
+                self.bus = KernelBus(machine, image, start_pc=start_pc)
+                if state is not None:
+                    machine.set_state(state)
+                self._read_cpu = machine.read_ram
+                self._uses_kernel_bus = True
+                return
+            machine.boot_image(list(image), start_pc=start_pc, state=state)
+            core = GraphCore(machine)
+            self.bus = Bus(core, image)
+            self._read_cpu = lambda addr: self.bus.ram[addr & 0xFFFF]
             return
         if backend == "reference":
             from transformer_vm.cpu6502.reference import Cpu6502
@@ -154,14 +177,6 @@ class Console:
             rt = Cpu6502Runtime(bcd=False)
             rt.boot_image(list(image), start_pc=start_pc, state=state)
             core = GraphCore(rt)
-        elif backend == "weights":
-            # The real transformer: same machine protocol as the graph
-            # evaluator, so the same bus adapter drives it.
-            from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
-
-            machine = Cpu6502TransformerMachine(bcd=False)
-            machine.boot_image(list(image), start_pc=start_pc, state=state)
-            core = GraphCore(machine)
         else:
             raise ValueError(f"unknown backend {backend!r}")
         self.bus = Bus(core, image)
@@ -173,7 +188,7 @@ class Console:
         self.bus.attach(self.controller, 0x4016, 0x4017)
 
     def _snapshot(self) -> tuple[bytes, dict]:
-        if self.backend == "kernel":
+        if self._uses_kernel_bus:
             return self._rt.dump_ram(), self._rt.get_state()
         ram = bytes(self.bus.ram)
         core = self.bus.core
@@ -203,7 +218,7 @@ class Console:
     # ── CPU driving ─────────────────────────────────────────────────
 
     def _set_nmi(self) -> None:
-        if self.backend == "kernel":
+        if self._uses_kernel_bus:
             self._rt.set_nmi()
         else:
             self.bus.set_nmi()
@@ -216,7 +231,7 @@ class Console:
         """Run the CPU until the console clock reaches target cycles."""
         if self.halted:
             return
-        if self.backend == "kernel":
+        if self._uses_kernel_bus:
             if target <= self.cycles:
                 return
             out = self.bus.run(

@@ -73,7 +73,7 @@ def _test_cart() -> Cartridge:
 
 
 def _ram(console: Console, addr: int) -> int:
-    if console.backend == "kernel":
+    if console._uses_kernel_bus:  # kernel or weights run loop: mirror in C++
         return console._rt.read_ram(addr)
     return console.bus.ram[addr]
 
@@ -159,6 +159,32 @@ def test_checkpoint_is_invisible_on_graph_backend():
         assert np.array_equal(a, b), f"frame {i} differs"
     assert ref.cycles == graph.cycles
     assert _ram(ref, 0x11) == _ram(graph, 0x11) == 2
+
+
+@pytest.mark.slow
+def test_weights_run_loop_console_matches_kernel():
+    """The real transformer driven by its generated C++ run loop (KernelBus
+    shape) must render the test cart -- OAM DMA, PPU registers, vblank NMI --
+    byte-for-byte and cycle-for-cycle like the kernel, both plainly and with
+    a snapshot-and-rebuild checkpoint every frame (which exercises the run
+    loop's dump_ram / load_image / set_state path)."""
+    kernel = Console(_test_cart(), backend="kernel", checkpoint_tokens=0)
+    kframes = [kernel.run_frame() for _ in range(6)]
+
+    weights = Console(_test_cart(), backend="weights", checkpoint_tokens=0)
+    assert weights._uses_kernel_bus  # the codegen engine has the run loop
+    wframes = [weights.run_frame() for _ in range(6)]
+    for i, (a, b) in enumerate(zip(kframes, wframes, strict=True)):
+        assert np.array_equal(a, b), f"frame {i} differs"
+    assert kernel.cycles == weights.cycles
+    assert bytes(kernel.ppu.oam) == bytes(weights.ppu.oam)
+
+    ck = Console(_test_cart(), backend="weights", checkpoint_tokens=1)
+    ckframes = [ck.run_frame() for _ in range(6)]
+    assert ck.checkpoint_count == 6
+    for i, (a, b) in enumerate(zip(kframes, ckframes, strict=True)):
+        assert np.array_equal(a, b), f"checkpointed frame {i} differs"
+    assert kernel.cycles == ck.cycles
 
 
 @pytest.mark.slow

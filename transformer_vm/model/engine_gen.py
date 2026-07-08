@@ -53,6 +53,54 @@ _ATTENTION_DIR = os.path.join(
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_engine_cache")
 
 
+def _read_mode_table() -> list[int]:
+    """Shadow-decode table for MMIO read watches, byte -> mode code.
+
+    0 when the instruction never reads a memory operand, else a code the
+    generated shadow_read_target() uses to compute the operand address from
+    (pc, x, y) and the RAM mirror.  Same construction as kernel.py's table
+    (shared source of truth: spec.OPCODES / READS_MEMORY); the C++ run loop
+    needs it to pause before a device read exactly as the kernel does.
+    """
+    from transformer_vm.cpu6502.spec import (
+        MODE_ABSOLUTE,
+        MODE_ABSOLUTE_X,
+        MODE_ABSOLUTE_Y,
+        MODE_INDIRECT_X,
+        MODE_INDIRECT_Y,
+        MODE_ZERO_PAGE,
+        MODE_ZERO_PAGE_X,
+        MODE_ZERO_PAGE_Y,
+        OPCODES,
+        READS_MEMORY,
+    )
+
+    code = {
+        MODE_ZERO_PAGE: 1, MODE_ZERO_PAGE_X: 2, MODE_ZERO_PAGE_Y: 3,
+        MODE_ABSOLUTE: 4, MODE_ABSOLUTE_X: 5, MODE_ABSOLUTE_Y: 6,
+        MODE_INDIRECT_X: 7, MODE_INDIRECT_Y: 8,
+    }
+    table = [0] * 256
+    for byte, op in OPCODES.items():
+        if op.operation in READS_MEMORY and op.mode in code:
+            table[byte] = code[op.mode]
+    return table
+
+
+def _cycles_table() -> list[int]:
+    """Base cycle count per opcode byte (0 for unknown bytes); NMI costs 7.
+
+    Base cycles only, no branch-taken or page-cross penalties -- identical to
+    kernel.py / nes.bus, so a run-loop cycle budget paces frames the same way.
+    """
+    from transformer_vm.cpu6502.spec import OPCODES
+
+    table = [0] * 256
+    for byte, op in OPCODES.items():
+        table[byte] = op.cycles
+    return table
+
+
 def _lit(value: float) -> str:
     """A float32 value as an exact C++ hexfloat literal."""
     f = float(np.float32(value))
@@ -517,6 +565,9 @@ def generate_source(model, step_spec: dict | None = None,
         body.extend(b)
 
     n_hulls = len(hull_tiebreak)
+    # The C++ run loop (KernelBus shape) needs the same memory-write path the
+    # machine_step uses, so it is emitted under the same condition.
+    has_run = step_spec is not None and n_memory_heads > 0
 
     emit(f"// Generated straight-line {arith} engine (model/engine_gen.py).")
     if is_int:
@@ -529,7 +580,10 @@ def generate_source(model, step_spec: dict | None = None,
     emit("#include <pybind11/pybind11.h>")
     emit("#include <pybind11/numpy.h>")
     emit("#include <cmath>")
+    emit("#include <cstring>")
     emit("#include <stdexcept>")
+    emit("#include <utility>")
+    emit("#include <vector>")
     emit('#include "hull2d_cht.h"')
     emit("")
     emit("namespace py = pybind11;")
@@ -627,6 +681,26 @@ def generate_source(model, step_spec: dict | None = None,
             emit(f"    double reg_s[{n_regs}];")
             emit(f"    {elem} reg_v0[{n_regs}], reg_v1[{n_regs}];")
             emit(f"    bool reg_any[{n_regs}];")
+    if has_run:
+        # Persistent-machine state for the C++ run loop, mirroring the C++
+        # kernel: a 64 KiB RAM mirror (for MMIO shadow decode), the
+        # architectural registers, pending-NMI/read-skip flags, counters,
+        # watch ranges, and the base-cycle / read-mode tables.
+        read_mode = ", ".join(str(v) for v in _read_mode_table())
+        cycles_tab = ", ".join(str(v) for v in _cycles_table())
+        emit("")
+        emit("    unsigned char ram[65536];  // mirror of the write log, for shadow decode")
+        emit("    int st_pc = 0, st_a = 0, st_x = 0, st_y = 0, st_s = 0xFD, st_p = 0x24;")
+        emit("    int st_ir = 0, st_oplo = 0, st_ophi = 0, st_ea = 0, st_data = 0;")
+        emit("    bool st_halted = false;")
+        emit("    bool nmi_pending = false;")
+        emit("    bool resume_read_skip = false;")
+        emit("    long step_index = 0;")
+        emit("    long cycles_total = 0;")
+        emit("    std::vector<std::pair<int,int>> rwatch, wwatch;")
+        emit(f"    static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};")
+        emit("    // Base cycles per opcode (no penalty cycles); NMI costs 7.")
+        emit(f"    static constexpr unsigned char CYCLES[256] = {{ {cycles_tab} }};")
     emit("")
     emit("    ENGINE_T() { reset(); }")
     emit("")
@@ -640,6 +714,13 @@ def generate_source(model, step_spec: dict | None = None,
         emit("            for (int w = 0; w < 64; ++w) mem_bits[g][w] = 0ULL;")
     if n_regs:
         emit(f"        for (int r = 0; r < {n_regs}; ++r) reg_any[r] = false;")
+    if has_run:
+        emit("        for (int i = 0; i < 65536; ++i) ram[i] = 0;")
+        emit("        st_pc = 0; st_a = st_x = st_y = 0; st_s = 0xFD; st_p = 0x24;")
+        emit("        st_ir = st_oplo = st_ophi = st_ea = st_data = 0;")
+        emit("        st_halted = false; nmi_pending = false; resume_read_skip = false;")
+        emit("        step_index = 0; cycles_total = 0;")
+        emit("        rwatch.clear(); wwatch.clear();")
     emit("        seq = -1;")
     emit("    }")
     emit("")
@@ -680,6 +761,8 @@ def generate_source(model, step_spec: dict | None = None,
     emit("        ++seq;")
     emit("        if (seq != pos)")
     emit('            throw std::runtime_error("direct WRITE position does not match engine sequence");')
+    if has_run:
+        emit("        ram[addr & 0xFFFF] = (unsigned char)(value & 0xFF);  // shadow-decode mirror")
     emit("        const int group = (addr >> 12) & 0xF;")
     if is_int:
         # Structure-served memory: a write is three stores; no key math.
@@ -717,9 +800,23 @@ def generate_source(model, step_spec: dict | None = None,
         def out_slot(name):
             return outs[name]
 
+        # Embedded values live on the fixed-point grid in int mode.
+        if is_int:
+            one_e, zero_l = "SCALE", "0"
+
+            def sc(v, e=elem):
+                return f"(({e})({v}) << F)"
+        else:
+            one_e, zero_l = "1.0f", "0.0f"
+
+            def sc(v):
+                return f"(float)({v})"
+
         emit("")
-        emit("    // One whole 6502 instruction: STATE embed -> layers ->")
-        emit("    // readout -> direct WRITE inserts -> halt logits.")
+        emit("    // One whole 6502 instruction from the persistent st_* state:")
+        emit("    // STATE embed -> layers -> readout -> direct WRITE inserts ->")
+        emit("    // halt logits.  Fills the 21-slot out buffer (trace row + next")
+        emit("    // state + writes) and advances st_* to the next instruction.")
         if not is_int:
             emit(f"    float xbuf[{d_model}];")
             emit("")
@@ -729,41 +826,28 @@ def generate_source(model, step_spec: dict | None = None,
             emit("        return (long long)std::nearbyint((double)v);")
             emit("    }")
         emit("")
-        emit("    void machine_step(int pc, int a, int xr, int yr, int sr,")
-        emit("                      int p, int ir, int oplo, int ophi,")
-        emit("                      int ea, int data, int halted, int nmi,")
-        emit("                      LArr out_arr) {")
-        emit('        if ((int)out_arr.size() != 21) throw std::runtime_error("step out buffer must have 21 slots");')
-        emit("        long long* out = out_arr.mutable_data();")
+        emit("    void step_core(long long* out) {")
         emit(f"        {elem}* x = xbuf;")
         emit(f"        for (int i = 0; i < {d_model}; ++i) x[i] = {zero};")
-        # Embedded values live on the fixed-point grid in int mode.
-        if is_int:
-            one, zero_l = "SCALE", "0"
-            def sc(v, e=elem):
-                return f"(({e})({v}) << F)"
-        else:
-            one, zero_l = "1.0f", "0.0f"
-            def sc(v):
-                return f"(float)({v})"
-        emit(f"        x[{model.one_slot}] = {one};")
-        emit(f"        x[{ins['is_state']}] = {one};")
-        emit(f"        x[{ins['pc_lo']}] = {sc('pc & 0xFF')};")
-        emit(f"        x[{ins['pc_hi']}] = {sc('(pc >> 8) & 0xFF')};")
-        emit(f"        x[{ins['a']}] = {sc('a')};")
-        emit(f"        x[{ins['x']}] = {sc('xr')};")
-        emit(f"        x[{ins['y']}] = {sc('yr')};")
-        emit(f"        x[{ins['s']}] = {sc('sr')};")
+        emit(f"        x[{model.one_slot}] = {one_e};")
+        emit(f"        x[{ins['is_state']}] = {one_e};")
+        emit(f"        x[{ins['pc_lo']}] = {sc('st_pc & 0xFF')};")
+        emit(f"        x[{ins['pc_hi']}] = {sc('(st_pc >> 8) & 0xFF')};")
+        emit(f"        x[{ins['a']}] = {sc('st_a')};")
+        emit(f"        x[{ins['x']}] = {sc('st_x')};")
+        emit(f"        x[{ins['y']}] = {sc('st_y')};")
+        emit(f"        x[{ins['s']}] = {sc('st_s')};")
         for slot, mask in step_spec["p_flags"]:
-            emit(f"        x[{slot}] = (p & {mask}) ? {one} : {zero_l};")
-        emit(f"        x[{ins['ir']}] = {sc('ir')};")
-        emit(f"        x[{ins['oplo']}] = {sc('oplo')};")
-        emit(f"        x[{ins['ophi']}] = {sc('ophi')};")
-        emit(f"        x[{ins['ea_lo']}] = {sc('ea & 0xFF')};")
-        emit(f"        x[{ins['ea_hi']}] = {sc('(ea >> 8) & 0xFF')};")
-        emit(f"        x[{ins['data']}] = {sc('data')};")
-        emit(f"        x[{ins['halted']}] = {sc('halted')};")
-        emit(f"        x[{ins['nmi']}] = {sc('nmi')};")
+            emit(f"        x[{slot}] = (st_p & {mask}) ? {one_e} : {zero_l};")
+        emit(f"        x[{ins['ir']}] = {sc('st_ir')};")
+        emit(f"        x[{ins['oplo']}] = {sc('st_oplo')};")
+        emit(f"        x[{ins['ophi']}] = {sc('st_ophi')};")
+        emit(f"        x[{ins['ea_lo']}] = {sc('st_ea & 0xFF')};")
+        emit(f"        x[{ins['ea_hi']}] = {sc('(st_ea >> 8) & 0xFF')};")
+        emit(f"        x[{ins['data']}] = {sc('st_data')};")
+        emit(f"        x[{ins['halted']}] = {sc('st_halted ? 1 : 0')};")
+        emit(f"        x[{ins['nmi']}] = {sc('nmi_pending ? 1 : 0')};")
+        emit("        nmi_pending = false;")
         emit("        const long long pos = seq + 1;")
         if is_int:
             emit("        const double pf[3] = {")
@@ -803,16 +887,166 @@ def generate_source(model, step_spec: dict | None = None,
         emit("        for (long long i = 0; i < n_writes; ++i)")
         emit("            insert_write_f32((int)out[15 + 2 * i], (int)out[16 + 2 * i], seq + 1);")
         hc, hv = step_spec["halt_head"]
-        sc, sv = step_spec["state_head"]
+        shc, shv = step_spec["state_head"]
         if is_int:
             emit(f"        const long long halt_logit = "
                  f"{_expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
             emit(f"        const long long state_logit = "
-                 f"{_expr_int(sc, sv, lambda i: f'x[{i}]', 'state head')};")
+                 f"{_expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
         else:
             emit(f"        const float halt_logit = {_expr(hc, hv, lambda i: f'x[{i}]')};")
-            emit(f"        const float state_logit = {_expr(sc, sv, lambda i: f'x[{i}]')};")
+            emit(f"        const float state_logit = {_expr(shc, shv, lambda i: f'x[{i}]')};")
         emit("        out[13] = halt_logit > state_logit ? 1 : 0;")
+        emit("        // Advance the architectural state (inputs are fully")
+        emit("        // consumed by the embed above before this update).")
+        emit("        st_pc = (int)out[12];")
+        emit("        st_a = (int)out[1]; st_x = (int)out[2]; st_y = (int)out[3];")
+        emit("        st_s = (int)out[4]; st_p = (int)out[5];")
+        emit("        st_ir = (int)out[6]; st_oplo = (int)out[7]; st_ophi = (int)out[8];")
+        emit("        st_ea = (int)out[9]; st_data = (int)out[10];")
+        emit("        st_halted = out[11] != 0;")
+        emit("    }")
+        emit("")
+        emit("    // Per-instruction entry point: seed st_* from arguments, run one")
+        emit("    // step.  Kept so the Python per-step path is byte-identical.")
+        emit("    void machine_step(int pc, int a, int xr, int yr, int sr,")
+        emit("                      int p, int ir, int oplo, int ophi,")
+        emit("                      int ea, int data, int halted, int nmi,")
+        emit("                      LArr out_arr) {")
+        emit('        if ((int)out_arr.size() != 21) throw std::runtime_error("step out buffer must have 21 slots");')
+        emit("        st_pc = pc & 0xFFFF; st_a = a & 0xFF; st_x = xr & 0xFF;")
+        emit("        st_y = yr & 0xFF; st_s = sr & 0xFF; st_p = p & 0xFF;")
+        emit("        st_ir = ir & 0xFF; st_oplo = oplo & 0xFF; st_ophi = ophi & 0xFF;")
+        emit("        st_ea = ea & 0xFFFF; st_data = data & 0xFF;")
+        emit("        st_halted = halted != 0; nmi_pending = nmi != 0;")
+        emit("        step_core(out_arr.mutable_data());")
+        emit("    }")
+
+        # ── C++ run loop (KernelBus shape) ───────────────────────────
+        emit("")
+        emit("    // Shadow-decode the instruction at st_pc; return the address it")
+        emit("    // will read, or -1 (mirrors nes/bus read_target and the kernel).")
+        emit("    int shadow_read_target() const {")
+        emit("        const int mode = READ_MODE[ram[st_pc]];")
+        emit("        if (mode == 0) return -1;")
+        emit("        const int lo = ram[(st_pc + 1) & 0xFFFF];")
+        emit("        const int hi = ram[(st_pc + 2) & 0xFFFF];")
+        emit("        switch (mode) {")
+        emit("            case 1: return lo;")
+        emit("            case 2: return (lo + st_x) & 0xFF;")
+        emit("            case 3: return (lo + st_y) & 0xFF;")
+        emit("            case 4: return lo | (hi << 8);")
+        emit("            case 5: return ((lo | (hi << 8)) + st_x) & 0xFFFF;")
+        emit("            case 6: return ((lo | (hi << 8)) + st_y) & 0xFFFF;")
+        emit("            case 7: { const int zp = (lo + st_x) & 0xFF;")
+        emit("                      return ram[zp] | (ram[(zp + 1) & 0xFF] << 8); }")
+        emit("            case 8: { const int base = ram[lo] | (ram[(lo + 1) & 0xFF] << 8);")
+        emit("                      return (base + st_y) & 0xFFFF; }")
+        emit("        }")
+        emit("        return -1;")
+        emit("    }")
+        emit("")
+        emit("    static bool in_ranges(const std::vector<std::pair<int,int>>& v, int addr) {")
+        emit("        for (const auto& r : v) if (addr >= r.first && addr <= r.second) return true;")
+        emit("        return false;")
+        emit("    }")
+        emit("")
+        emit("    // Run up to max_steps instructions natively, pausing back to")
+        emit("    // Python only on halt / jump-to-self trap / watched device")
+        emit("    // access / cycle budget -- the same protocol and result dict as")
+        emit("    // the C++ kernel's run(), so KernelBus can drive this engine.")
+        emit("    py::dict run(long max_steps, bool stop_on_trap, long max_cycles) {")
+        emit("        std::vector<int> t_pc, t_a, t_x, t_y, t_s, t_p, t_ir, t_oplo, t_ophi, t_ea, t_data, t_halted;")
+        emit("        std::vector<long> w_row; std::vector<int> w_addr, w_value;")
+        emit("        std::vector<int> hit_addr, hit_value;")
+        emit('        const char* reason = "budget";')
+        emit("        int read_addr = -1;")
+        emit("        long cycles_this = 0;")
+        emit("        long long o[21];")
+        emit("        for (long i = 0; i < max_steps; ++i) {")
+        emit('            if (st_halted) { reason = "halt"; break; }')
+        emit("            const bool skip = resume_read_skip;")
+        emit("            resume_read_skip = false;")
+        emit("            if (!nmi_pending && !skip && !rwatch.empty()) {")
+        emit("                const int target = shadow_read_target();")
+        emit("                if (target >= 0 && in_ranges(rwatch, target)) {")
+        emit('                    resume_read_skip = true; read_addr = target; reason = "watch_read"; break;')
+        emit("                }")
+        emit("            }")
+        emit("            const bool was_nmi = nmi_pending;")
+        emit("            const int prev_pc = st_pc;")
+        emit("            step_core(o);  // updates st_*, applies writes to ram + memory")
+        emit("            t_pc.push_back((int)o[0]); t_a.push_back((int)o[1]);")
+        emit("            t_x.push_back((int)o[2]); t_y.push_back((int)o[3]);")
+        emit("            t_s.push_back((int)o[4]); t_p.push_back((int)o[5]);")
+        emit("            t_ir.push_back((int)o[6]); t_oplo.push_back((int)o[7]);")
+        emit("            t_ophi.push_back((int)o[8]); t_ea.push_back((int)o[9]);")
+        emit("            t_data.push_back((int)o[10]);")
+        emit("            const bool halted = o[11] != 0;")
+        emit("            t_halted.push_back(halted ? 1 : 0);")
+        emit("            const int n_writes = (int)o[14];")
+        emit("            int n_hits = 0, sh_addr[3], sh_value[3];")
+        emit("            for (int w = 0; w < n_writes; ++w) {")
+        emit("                const int wa = (int)o[15 + 2 * w], wv = (int)o[16 + 2 * w];")
+        emit("                w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);")
+        emit("                if (!wwatch.empty() && in_ranges(wwatch, wa)) {")
+        emit("                    sh_addr[n_hits] = wa; sh_value[n_hits] = wv; ++n_hits;")
+        emit("                }")
+        emit("            }")
+        emit("            ++step_index;")
+        emit("            const long step_cycles = was_nmi ? 7 : (long)CYCLES[(unsigned char)o[6]];")
+        emit("            cycles_this += step_cycles; cycles_total += step_cycles;")
+        emit("            for (int k = 0; k < n_hits; ++k) { hit_addr.push_back(sh_addr[k]); hit_value.push_back(sh_value[k]); }")
+        emit('            if (halted) { st_halted = true; reason = "halt"; break; }')
+        emit('            if (o[13]) { st_halted = true; reason = "halt"; break; }')
+        emit('            if (stop_on_trap && (int)o[12] == prev_pc) { reason = "trap"; break; }')
+        emit('            if (n_hits > 0) { reason = "watch_write"; break; }')
+        emit('            if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }')
+        emit("        }")
+        emit("        py::dict out;")
+        emit("        auto arr = [](const std::vector<int>& src) {")
+        emit("            return py::array_t<int>((py::ssize_t)src.size(), src.data());")
+        emit("        };")
+        for field in ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi", "ea", "data", "halted"):
+            emit(f'        out["{field}"] = arr(t_{field});')
+        emit('        out["w_row"] = py::array_t<long>((py::ssize_t)w_row.size(), w_row.data());')
+        emit('        out["w_addr"] = arr(w_addr);')
+        emit('        out["w_value"] = arr(w_value);')
+        emit('        out["hit_addr"] = arr(hit_addr);')
+        emit('        out["hit_value"] = arr(hit_value);')
+        emit('        out["read_addr"] = read_addr;')
+        emit('        out["reason"] = reason;')
+        emit('        out["cycles"] = cycles_this;')
+        emit("        return out;")
+        emit("    }")
+        emit("")
+        emit("    // ── Machine API (mirrors the C++ kernel) ─────────────────")
+        emit("    void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }")
+        emit("    void watch_write(int lo, int hi) { wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }")
+        emit("    void clear_watches() { rwatch.clear(); wwatch.clear(); }")
+        emit("    void set_nmi() { nmi_pending = true; }")
+        emit("    void inject_write(int addr, int value) { insert_write_f32(addr & 0xFFFF, value & 0xFF, seq + 1); }")
+        emit("    int read_ram(int addr) { return ram[addr & 0xFFFF]; }")
+        emit("    py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }")
+        emit("")
+        emit("    void set_run_state(int pc, int a, int x, int y, int s, int p,")
+        emit("                       int ir, int oplo, int ophi, int ea, int data, int halted) {")
+        emit("        st_pc = pc & 0xFFFF; st_a = a & 0xFF; st_x = x & 0xFF; st_y = y & 0xFF;")
+        emit("        st_s = s & 0xFF; st_p = p & 0xFF;")
+        emit("        st_ir = ir & 0xFF; st_oplo = oplo & 0xFF; st_ophi = ophi & 0xFF;")
+        emit("        st_ea = ea & 0xFFFF; st_data = data & 0xFF;")
+        emit("        st_halted = halted != 0;")
+        emit("    }")
+        emit("")
+        emit("    py::dict get_run_state() {")
+        emit("        py::dict st;")
+        emit('        st["pc"] = st_pc; st["a"] = st_a; st["x"] = st_x; st["y"] = st_y;')
+        emit('        st["s"] = st_s; st["p"] = st_p; st["halted"] = st_halted;')
+        emit('        st["ir"] = st_ir; st["oplo"] = st_oplo; st["ophi"] = st_ophi;')
+        emit('        st["ea"] = st_ea; st["data"] = st_data;')
+        emit('        st["steps"] = step_index; st["cycles"] = cycles_total;')
+        emit('        st["pos"] = (long)(seq + 1);')
+        emit("        return st;")
         emit("    }")
 
     emit("};")
@@ -824,6 +1058,17 @@ def generate_source(model, step_spec: dict | None = None,
     emit("        .def(\"forward_f32\", &ENGINE_T::forward_f32)")
     if has_step:
         emit("        .def(\"machine_step\", &ENGINE_T::machine_step)")
+        emit('        .def("run", &ENGINE_T::run, py::arg("max_steps"),')
+        emit('             py::arg("stop_on_trap") = false, py::arg("max_cycles") = 0L)')
+        emit('        .def("watch_read", &ENGINE_T::watch_read)')
+        emit('        .def("watch_write", &ENGINE_T::watch_write)')
+        emit('        .def("clear_watches", &ENGINE_T::clear_watches)')
+        emit('        .def("set_nmi", &ENGINE_T::set_nmi)')
+        emit('        .def("inject_write", &ENGINE_T::inject_write)')
+        emit('        .def("read_ram", &ENGINE_T::read_ram)')
+        emit('        .def("dump_ram", &ENGINE_T::dump_ram)')
+        emit('        .def("set_run_state", &ENGINE_T::set_run_state)')
+        emit('        .def("get_run_state", &ENGINE_T::get_run_state)')
     emit("        .def(\"insert_write_f32\", &ENGINE_T::insert_write_f32);")
     emit("}")
 
@@ -869,10 +1114,22 @@ class GeneratedWeightsEngine:
         )
         self.compile_seconds = time.perf_counter() - build_start
         self._engine = module.Engine()
+        # The run loop is emitted under the same condition as machine_step.
+        self.has_run_loop = self.has_machine_step
         if self.has_machine_step:
-            # Bound method exposed directly: the runner's hot loop calls it
-            # once per instruction with no wrapper frame in between.
+            # Bound methods exposed directly: the hot loops call them with no
+            # wrapper frame in between.
             self.machine_step = self._engine.machine_step
+            self.run = self._engine.run
+            self.set_run_state = self._engine.set_run_state
+            self.get_run_state = self._engine.get_run_state
+            self.watch_read = self._engine.watch_read
+            self.watch_write = self._engine.watch_write
+            self.clear_watches = self._engine.clear_watches
+            self.set_nmi = self._engine.set_nmi
+            self.engine_inject_write = self._engine.inject_write
+            self.read_ram = self._engine.read_ram
+            self.dump_ram = self._engine.dump_ram
 
     def reset(self):
         self._engine.reset()

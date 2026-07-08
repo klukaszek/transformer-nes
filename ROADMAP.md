@@ -576,6 +576,67 @@ engineering gap.  Candidates, in expected payoff order:
 3. **Depth compaction**: fewer than 71 layers via graph restructuring
    (gadget fusion, wider per-layer FFN); bounded by the critical path.
 
+## 2026-07-07 C++ run loop (KernelBus shape) — Python floor removed
+
+What was built (`model/engine_gen.py`, `cpu6502/weights_runner.py`,
+`nes/console.py`; scouting recommendation #2 / the roadmap's next-step #2):
+- The generated engine's per-instruction work was refactored into a
+  `step_core()` that reads the persistent `st_*` registers, runs the whole
+  machine step, and advances `st_*`.  `machine_step(args, out)` now just
+  seeds `st_*` and calls it (byte-identical to before), and a new native
+  `run(max_steps, stop_on_trap, max_cycles)` loops `step_core` entirely in
+  C++ — a 64 KiB RAM mirror (updated in `insert_write_f32`), shadow-decode
+  read-watch (pause *before* a device read), write-watch (pause after),
+  base-cycle counting, and jump-to-self trap detection — returning the
+  exact same result dict as the C++ kernel's `run()`.  The `READ_MODE`/
+  `CYCLES` tables derive from `spec.OPCODES` (same source as kernel.py).
+- Because the engine now speaks the kernel's machine API (`run`,
+  `set_run_state`/`get_run_state`, `watch_read/write`, `set_nmi`,
+  `inject_write`, `read_ram`, `dump_ram`), `Cpu6502TransformerMachine`
+  exposes that API and **the existing `KernelBus` drives the weights engine
+  unchanged** — the console's `== "kernel"` branches became an
+  `_uses_kernel_bus` flag, and the weights backend now runs natively,
+  pausing to Python only for MMIO.  The Python-stepped `Bus`/`GraphCore`
+  path remains as the fallback for engines without a run loop.
+- Klaus/nestest stream through the loop: `run_image_arrays` (single native
+  call) + `iter_run_arrays` (fixed-size chunks, `w_row` rebased per chunk)
+  reuse `lockstep_arrays_vs_reference`.  Engine state is O(1), so streaming
+  needs no checkpoint rebuild.
+
+Receipts (all lockstep-exact / byte-identical; 47 fast + 8 console + 7
+weights tests green, ruff clean):
+- New `test_run_loop_matches_per_step`: the native run loop's trace
+  (states, writes, ir/ea/data) is identical to the verified per-step path,
+  single-call and chunked, and it detects the JMP-to-self trap.
+- New `test_weights_run_loop_console_matches_kernel`: the transformer
+  driven by the run loop renders the MMIO test cart (OAM DMA, PPU
+  registers, vblank NMI) byte- and cycle-identical to the kernel, plainly
+  and with a checkpoint every frame (exercises dump_ram/load_image/
+  set_state).
+- Full nestest MATCHED: **0.1 s, ~132K instr/s** (was ~98K per-step).
+- Klaus 200K decimal MATCHED: **1.7 s, ~119K instr/s** (was ~93K).
+- Synthetic step: **9.69 µs → 6.92 µs (1.40×)** — the pure C++ loop; the
+  removed cost was the ~1.2 µs Python glue plus the per-call pybind
+  marshalling of 13 int args + `tolist()`.
+- **SMB through the weights: ~73 ms/frame (~13.8 fps)** marginal, up from
+  ~90 ms (~11 fps); frame 61 byte-identical to the kernel, cycles exact
+  (1,816,641).
+- **Full Klaus through the run loop: MATCHED — 30,646,177 steps
+  (decimal mode) in 273 s (4.55 min, ~112K instr/s sustained incl. the
+  lockstep reference), throughput flat 24M→30M** (the chunked streaming
+  generator + `w_row` rebasing hold at scale; nothing grows).  Full-suite
+  run: 57 → 18.9 → 15.3 → 9.4 → 6.3 → 6.2 → **4.55 min** across the engine
+  generations.
+
+Where the remaining ~6.9 µs lives: it is now essentially all C++ compute
+(the load-bound linear gather at the M-series port floor + hull/mem +
+readout), with only a thin per-call boundary left.  The single-stream CPU
+construction is at its ceiling; the next real lever is the routed-MoE
+construction from the scouting probe below (depth 71→~13, terms ~0.19×),
+which the run loop is the natural host for — the expert dispatch reads
+`mem_val[pc]`/`ram[pc]` and jumps to the expert `step_core` before the
+forward.
+
 ## 2026-07-07 MoE routing scouting probe (measured, not guessed)
 
 No repo code changes; probe lives in `experiments/moe_probe/`

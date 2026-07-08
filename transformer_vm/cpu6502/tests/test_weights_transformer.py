@@ -142,6 +142,76 @@ def test_codegen_engine_matches_generic_engine():
 
 
 @pytest.mark.slow
+def test_run_loop_matches_per_step():
+    """The generated C++ run loop (KernelBus shape) must produce exactly the
+    trace the verified per-step machine_step path produces -- same states,
+    same writes -- and detect the jump-to-self trap.  Also checks the
+    chunked stream (w_row rebased per chunk) against the single native run."""
+    from collections import defaultdict
+
+    from transformer_vm.cpu6502.nestest import START_PC, load_image
+
+    image = load_image()
+    n = 120
+
+    # Verified reference: the per-step path (lockstep-exact vs the oracle).
+    per = Cpu6502TransformerMachine(bcd=False)
+    assert per.supports_run_loop
+    per.boot_image(list(image), start_pc=START_PC)
+    per_rows = [per.machine_step() for _ in range(n)]
+
+    def as_tuples(out):
+        wbr = defaultdict(set)
+        for r, a, v in zip(out["w_row"], out["w_addr"], out["w_value"], strict=True):
+            wbr[int(r)].add((int(a), int(v)))
+        return [
+            (
+                int(out["pc"][i]), int(out["a"][i]), int(out["x"][i]),
+                int(out["y"][i]), int(out["s"][i]), int(out["p"][i]),
+                int(out["ir"][i]), int(out["ea"][i]), int(out["data"][i]),
+                wbr.get(i, set()),
+            )
+            for i in range(len(out["pc"]))
+        ]
+
+    def per_tuple(row):
+        s = row.state
+        return (
+            s.pc, s.a, s.x, s.y, s.s, s.p, s.ir, s.ea, s.data,
+            {(w.addr, w.value) for w in row.writes},
+        )
+
+    single = Cpu6502TransformerMachine(bcd=False)
+    out = single.run_image_arrays(bytes(image), start_pc=START_PC, max_steps=n)
+    single_rows = as_tuples(out)
+    assert len(single_rows) == n
+    assert single_rows == [per_tuple(r) for r in per_rows]
+
+    # Chunked stream reconstructs the identical trace across chunk boundaries.
+    chunked = Cpu6502TransformerMachine(bcd=False)
+    streamed = []
+    for chunk in chunked.iter_run_arrays(bytes(image), start_pc=START_PC,
+                                         max_steps=n, chunk=17):
+        streamed.extend(as_tuples(chunk))
+    assert streamed == single_rows
+
+    # Trap detection: the verify program ends in JMP-to-self.  Every
+    # executed row must still lockstep the reference oracle.
+    trap = Cpu6502TransformerMachine(bcd=False)
+    tout = trap.run_image_arrays(
+        verify_program(), start_pc=VERIFY_START, max_steps=1000, stop_on_trap=True
+    )
+    assert tout["reason"] == "trap"
+    ref = reference.Cpu6502(memory=bytearray(verify_program()), bcd_enabled=False)
+    ref.pc = VERIFY_START
+    for i in range(len(tout["pc"])):
+        a = ref.step().state
+        got = (int(tout["pc"][i]), int(tout["a"][i]), int(tout["x"][i]),
+               int(tout["y"][i]), int(tout["s"][i]), int(tout["p"][i]))
+        assert (a.pc, a.a, a.x, a.y, a.s, a.p) == got, f"trap step {i}"
+
+
+@pytest.mark.slow
 def test_transformer_true_softmax_matches_reference():
     machine = Cpu6502TransformerMachine(bcd=False, cache="standard", matmul="sparse")
     image = verify_program()

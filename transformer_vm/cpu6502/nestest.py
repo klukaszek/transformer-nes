@@ -154,6 +154,18 @@ def run_weights(image: bytearray, *, max_steps: int,
     mode = f"{machine.matmul}-{arith}" if arith else f"{machine.matmul}/{machine.dtype}"
     build_elapsed = time.perf_counter() - build_start
 
+    if machine.supports_run_loop:
+        # Whole suite through the C++ run loop, then lockstep the arrays.
+        mode = f"{mode}-runloop"
+        run_start = time.perf_counter()
+        out = machine.run_image_arrays(bytes(image), start_pc=START_PC, max_steps=max_steps)
+        run_elapsed = time.perf_counter() - run_start
+        from transformer_vm.cpu6502.klaus import lockstep_arrays_vs_reference
+
+        ref = _new_cpu(image)
+        matched, n = lockstep_arrays_vs_reference(ref, out)
+        return matched, n, build_elapsed, run_elapsed, mode
+
     run_start = time.perf_counter()
     trace = machine.run_image(bytes(image), start_pc=START_PC, max_steps=max_steps)
     run_elapsed = time.perf_counter() - run_start
