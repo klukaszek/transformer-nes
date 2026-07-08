@@ -20,9 +20,9 @@ from transformer_vm.cpu6502.reference import Cpu6502
 
 logger = logging.getLogger(__name__)
 
-# The ROM asset lives with the other NES ROMs (data-only dependency; the
-# cpu6502 code itself never imports from transformer_vm.nes).
-NESTEST_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "nes", "examples")
+# nestest.nes is an NES ROM, so this harness lives in the nes package next to
+# its assets and depends downward on cpu6502 (the one-way nes -> cpu6502 rule).
+NESTEST_DIR = os.path.join(os.path.dirname(__file__), "examples")
 NESTEST_ROM = os.path.join(NESTEST_DIR, "nestest.nes")
 NESTEST_LOG = os.path.join(NESTEST_DIR, "nestest.log")
 START_PC = 0xC000
@@ -201,9 +201,9 @@ def main() -> None:
         help="instruction count for the graph run (default: the full log)",
     )
     parser.add_argument(
-        "--matmul", choices=["codegen", "engine", "sparse", "dense"], default="codegen",
-        help="weights runner: engine (generic CSR C++) or codegen "
-             "(generated straight-line C++); sparse/dense are diagnostics",
+        "--matmul", choices=["codegen", "engine"], default="codegen",
+        help="weights runner: codegen (generated straight-line C++, default) "
+             "or engine (generic CSR C++ cross-check)",
     )
     args = parser.parse_args()
 

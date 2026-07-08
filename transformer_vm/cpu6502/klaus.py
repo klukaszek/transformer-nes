@@ -247,9 +247,9 @@ def main() -> None:
     )
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument(
-        "--matmul", choices=["codegen", "engine", "sparse", "dense"], default="codegen",
-        help="weights runner: engine (generic CSR C++) or codegen "
-             "(generated straight-line C++); sparse/dense are diagnostics",
+        "--matmul", choices=["codegen", "engine"], default="codegen",
+        help="weights runner: codegen (generated straight-line C++, default) "
+             "or engine (generic CSR C++ cross-check)",
     )
     parser.add_argument(
         "--checkpoint-tokens", type=int, default=250_000,

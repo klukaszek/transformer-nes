@@ -21,8 +21,11 @@ one-way.
 | `evaluator.py` | Exact evaluator: compiles the graph's static schedule to one generated Python function |
 | `kernel.py` | C++ backend: emits the same schedule as a single C++ translation unit (hull heads, token inserts, run loop) |
 | `klaus.py` | Klaus Dormann functional-test harness (`6502-klaus`) |
-| `nestest.py` | nestest harness with Nintendulator golden-log comparison (`6502-nestest`) |
 | `trace.py` | Canonical trace format shared by every backend |
+
+The nestest harness (`6502-nestest`, Nintendulator golden-log comparison)
+lives in `transformer_vm/nes/nestest.py` — nestest.nes is an NES ROM, so it
+sits with its assets and depends downward on cpu6502.
 
 ## Execution model
 
@@ -54,7 +57,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `kernel.py` (generated C++) | ~450–600K | Same semantics at NES-relevant speed |
-| `weights_runner.py` (real transformer) | ~130K Klaus / ~305K routed SMB gameplay | The thesis: actual softmax-ReGLU transformer weights |
+| `weights_runner.py` (real transformer) | ~130K Klaus / ~305K routed SMB gameplay | The thesis: actual hull-attention + ReGLU transformer weights |
 
 The Python and C++ backends are **bit-identical**: same IEEE double
 operations in the same order, the same hull code (`hull2d_cht.h`), the same
@@ -67,11 +70,9 @@ premise: the graph is scheduled onto layers and compiled by
 `model/weights.py` into actual `VanillaTransformer` weights — d_model≈1550,
 71 layers, ~777 attention heads, constructed analytically, no
 training.  Execution is genuine transformer inference: per-position
-embeddings, Q/K/V projections, attention (hull hardmax, or **true
-softmax** via `--cache standard --matmul sparse`), ReGLU FFN, residual
+embeddings, Q/K/V projections, hull hardmax attention, ReGLU FFN, residual
 stream, output head.  The default path is the generated straight-line C++
-hull engine with an exact fixed-point int32 residual; true softmax is
-still a diagnostic path and does not implement latest-write tie-breaks.
+hull engine with an exact fixed-point int32 residual.
 
 Scheduling: the optimal-width MILP does not scale here — the blowup is
 the formulation (per-dim/per-boundary alive indicators → ~12M rows, ~5M
@@ -86,13 +87,11 @@ liveness-bound (~1550) under the grouped-memory lookup.
 
 Performance: the analytic weights are ~99.9% zeros, so inference runs the
 identical linear maps sparsely.  The generated straight-line engine is the
-production default; the generic CSR engine and the dense/scipy-sparse
-paths remain useful diagnostics:
+production default; the generic CSR engine remains as an independent
+cross-check:
 
 | `--matmul` | What runs | Speed (instr/s) |
 |------------|-----------|-----------------|
-| `dense` | dense torch matvecs, per-layer Python loop; float64 diagnostic | ~0.13 |
-| `sparse` | scipy CSR matvecs, per-layer Python loop | ~30–95 |
 | `engine` | `model/weights_engine.cpp`: generic CSR C++, whole stack per pybind call — float32 CSR matvecs, shared hull attention for lookup heads, direct WRITE-token insertion, structural fusion of passthrough/erase paths into direct CSR residual deltas | ~10-11K after boot |
 | `codegen` | `model/engine_gen.py`: model-specific generated C++ with the same arithmetic — column indices as immediates, ±1 coefficients as add/sub, coefficients as float32 hexfloat literals; compiled once per model digest (~5-10 s, cached); with a step_spec the whole machine_step (embed, readout, write inserts, halt logits) runs as one generated C++ call; default arith is an exact fixed-point int32 residual (guarded shifts, wrap-exact sums, cleared inserts skipped) and O(1) attention state: memory groups on an exact nearest-written-address structure, constant-query heads on running-argmax registers (zero hull2d calls in the forward; nothing grows with the token log), native run loop, and opcode-routed experts for hot paths; int64/f32-replica variants remain available | ~130K Klaus / ~305K routed SMB gameplay |
 
@@ -110,9 +109,7 @@ Precision: the original scalar 16-bit lookup needed float64 because
 now splits memory into 16 x 4 KiB lookup groups, so each local parabola is
 12-bit and K-side address scores stay below 2²⁴.  The default
 `dtype="float32"` engine matches high-address nestest end-to-end; hull
-sequence tie-breaks still resolve same-address rewrites.  True softmax
-remains separate because exact ties are averaged instead of resolved by
-sequence.
+sequence tie-breaks resolve same-address rewrites by latest write.
 
 Two departures from the WASM construction, both documented in the module:
 STATE tokens carry ~20 wide-domain fields, so the harness builds each

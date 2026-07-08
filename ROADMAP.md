@@ -647,6 +647,37 @@ payoff order:
    after single-game latency, not before.
    (Render/MMIO are ~5% — a later cleanup, not a real-time lever.)
 
+2026-07-08 follow-up investigation:
+- A local generated-engine prototype tried to fold only ReGLU neurons whose
+  gate becomes a positive constant under an opcode pin.  It was byte-identical
+  on the codegen-vs-generic test, but it found only ~5 folded-linear neurons per
+  hot expert.  That is not the missing 0.29× → 0.20× lever and the prototype was
+  reverted.
+- The missing work is broader partial evaluation through persist/mux chains:
+  e.g. the hot opcodes have hundreds of current-only ReGLUs that disappear from
+  the folded graph, while only a handful are locally constant-gate ReGLUs.  So
+  the real implementation is a rebuilt expert graph/model, not a small
+  post-build activation fold inside the union weights.
+- SMB histogram confirmation: top 4 opcodes cover 86.7% of gameplay, top 16
+  cover 93.7%, and the top-16 weighted folded-term ratio is ~0.195 of the union
+  (top 24 is still ~0.195).  Per-opcode rebuilt experts for the hot set are the
+  right granularity; widening coverage beyond the hot set mostly helps tail
+  correctness/perf smoothness, not the frame average.
+- Implementation shape to pursue: extract the partial evaluator from
+  `experiments/moe_probe/moe_probe.py` into reusable code that produces a
+  folded `ProgramGraph`/schedule per expert, then emit/build expert-specific
+  weights from that graph.  Keep the union body as fallback for NMI and cold
+  opcodes.  The hard part is preserving shared attention state across experts:
+  memory already has the global 16×4 KiB structure, but any non-memory latest
+  registers must keep the same insert/query semantics when a previous expert
+  pruned a register update.
+- Width/schedule compaction should be evaluated after rebuilt experts, not
+  before.  The union model is still 71 layers / D≈1550, while the folded
+  per-opcode probe is 9-22 layers and ~0.16-0.28 terms.  For the CPU codegen
+  path, fewer indexed loads matter most; fewer layer calls and smaller local
+  width are secondary but should combine with poll-loop-specific experts for
+  the remaining ~1.3-1.5× to 60 fps.
+
 ## 2026-07-07 C++ run loop (KernelBus shape) — Python floor removed
 
 What was built (`model/engine_gen.py`, `cpu6502/weights_runner.py`,

@@ -22,11 +22,9 @@ result dims are read back from the residual stream after the final layer
 appended as WRITE-token positions, and the next STATE embedding is built
 from the read-back state.
 
-Numerics caveat: the default hull/engine path is float32 and uses grouped
-4 KiB memory lookups so high-address reads survive Q/K rounding.  True
-softmax (`cache="standard"`) still averages exact ties instead of applying
-the hull sequence tie-break, so arbitrary high-address rewrite-heavy
-programs remain a separate standard-cache problem.
+Numerics caveat: the engine path is float32 (codegen) and uses grouped
+4 KiB memory lookups so high-address reads survive Q/K rounding; hull
+hardmax tie-breaks resolve same-address rewrites by latest write.
 """
 
 from __future__ import annotations
@@ -36,10 +34,7 @@ import logging
 import time
 
 import numpy as np
-import scipy.sparse as sp
-import torch
 
-from transformer_vm.attention import HullKVCache, StandardKVCache
 from transformer_vm.cpu6502 import reference
 from transformer_vm.cpu6502.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_vm.cpu6502.spec import OPCODES
@@ -73,7 +68,7 @@ DEFAULT_EXPERT_OPCODES = (
 class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
-    def __init__(self, *, bcd: bool = False, cache: str = "hull",
+    def __init__(self, *, bcd: bool = False,
                  matmul: str = "codegen", dtype: str = "float32",
                  codegen_arith: str = "int32",
                  checkpoint_tokens: int | None = None,
@@ -119,80 +114,44 @@ class Cpu6502TransformerMachine:
         }
         self._one_slot = self.slot_of[self.rt._one]
 
-        n_heads = self.model.attn[0].num_heads
-        # "engine" (generic CSR C++) and "codegen" (generated straight-line
-        # C++) share every runner code path; only the engine class differs.
-        self._cpp_stack = matmul in ("engine", "codegen")
-        if self._cpp_stack:
-            self.cache = None  # attention state lives inside the C++ engine
-        elif cache == "hull":
-            self.cache = HullKVCache(self.n_layers, n_heads)
-            for layer_idx in range(self.n_layers):
-                for h in range(n_heads):
-                    if self.model.head_tiebreak[layer_idx][h]:
-                        self.cache.set_tiebreak(layer_idx, h, True)
-        elif cache == "standard":
-            # True softmax over HARD_K-scaled scores; exact ties average,
-            # see the module docstring.
-            self.cache = StandardKVCache(self.n_layers, n_heads)
-        else:
-            raise ValueError(f"unknown cache {cache!r}")
-
-        # Precision experiment knob.  The grouped memory lookup keeps K-side
-        # address scores below 2^24, so float32 Q/K rounding can distinguish
-        # adjacent high addresses; hull tie-breaks still resolve rewrites.
+        # The whole layer stack -- hull attention plus the structural
+        # passthrough fusion -- runs inside C++.  "codegen" (default) compiles
+        # model-specific straight-line code (model/engine_gen.py); "engine"
+        # loads the generic CSR engine (model/weights_engine.cpp) as an
+        # independent cross-check.  There is no Python-stepped path anymore.
+        if matmul not in ("codegen", "engine"):
+            raise ValueError(
+                f"unknown matmul {matmul!r}; use 'codegen' (default) or "
+                "'engine' (generic CSR cross-check)"
+            )
+        # Precision knob.  The grouped memory lookup keeps K-side address
+        # scores below 2^24, so float32 Q/K rounding can distinguish adjacent
+        # high addresses; hull tie-breaks still resolve rewrites.  codegen is
+        # float32-only; the generic engine also supports float64.
         if dtype not in ("float64", "float32"):
             raise ValueError(f"unknown dtype {dtype!r}")
         self.dtype = dtype
         self.np_dtype = np.float32 if dtype == "float32" else np.float64
-        self.torch_dtype = torch.float32 if dtype == "float32" else torch.float64
         self._state_head_cols, self._state_head_vals = self._head_row(self._state_row)
         self._halt_head_cols, self._halt_head_vals = self._head_row(self._halt_row)
 
         self.matmul = matmul
-        self._direct_writes = False
-        self._cpp_step = False
-        if self._cpp_stack:
-            # Whole layer stack per pybind call; hull attention and
-            # structural passthrough fusion live in C++.  "engine" loads
-            # the generic CSR engine (model/weights_engine.cpp); "codegen"
-            # compiles model-specific straight-line code
-            # (model/engine_gen.py).
-            if cache != "hull":
-                raise ValueError(f"matmul={matmul!r} has hull attention built in")
-            if matmul == "codegen":
-                from transformer_vm.model.engine_gen import GeneratedWeightsEngine
+        if matmul == "codegen":
+            from transformer_vm.model.engine_gen import GeneratedWeightsEngine
 
-                experts = self._build_experts(expert_opcodes)
-                self._engine = GeneratedWeightsEngine(
-                    self.model, dtype=dtype, step_spec=self._step_spec(),
-                    arith=codegen_arith, experts=experts,
-                )
-            else:
-                from transformer_vm.model.engine import SparseWeightsEngine
-
-                self._engine = SparseWeightsEngine(self.model, dtype=dtype)
-            self._direct_writes = self._engine.supports_direct_writes
-            self._cpp_step = getattr(self._engine, "has_machine_step", False)
-            if self._cpp_step:
-                self._step_out = np.empty(21, dtype=np.int64)
-        elif matmul == "sparse":
-            # The analytic weights are ~99.9% zeros; CSR matvecs run the
-            # identical linear maps orders of magnitude faster.  This path
-            # remains useful for storage experiments and true-softmax checks;
-            # the C++ engine is the default production path.
-            self._layers = []
-            for layer_idx in range(self.n_layers):
-                ip = sp.csr_matrix(self.model.attn[layer_idx].in_proj_weight.numpy().astype(self.np_dtype))
-                opw = sp.csr_matrix(self.model.attn[layer_idx].out_proj.weight.numpy().astype(self.np_dtype))
-                fi = sp.csr_matrix(self.model.ff_in[layer_idx].weight.numpy().astype(self.np_dtype))
-                fo = sp.csr_matrix(self.model.ff_out[layer_idx].weight.numpy().astype(self.np_dtype))
-                self._layers.append((ip, opw, fi, fo))
-        elif matmul == "dense":
-            if dtype != "float64":
-                raise ValueError("matmul='dense' is a float64 diagnostic path")
+            experts = self._build_experts(expert_opcodes)
+            self._engine = GeneratedWeightsEngine(
+                self.model, dtype=dtype, step_spec=self._step_spec(),
+                arith=codegen_arith, experts=experts,
+            )
         else:
-            raise ValueError(f"unknown matmul {matmul!r}")
+            from transformer_vm.model.engine import SparseWeightsEngine
+
+            self._engine = SparseWeightsEngine(self.model, dtype=dtype)
+        self._direct_writes = self._engine.supports_direct_writes
+        self._cpp_step = getattr(self._engine, "has_machine_step", False)
+        if self._cpp_step:
+            self._step_out = np.empty(21, dtype=np.int64)
 
         self.pos = 0
         self._trace_len = 0
@@ -207,77 +166,26 @@ class Cpu6502TransformerMachine:
 
     # ── Transformer plumbing ────────────────────────────────────────
 
-    @torch.no_grad()
-    def _forward(self, x: torch.Tensor) -> torch.Tensor | np.ndarray:
-        """One genuine transformer position: attention + ReGLU per layer."""
-        add_position_encoding(x, self.pos)
-        self.pos += 1
-        if self._cpp_stack:
-            xv = x.numpy().astype(self.np_dtype, copy=False)
-            self._engine.forward(xv)  # in place, whole stack
-            return xv
-        if self.matmul == "sparse":
-            return self._forward_sparse(x)
-        model = self.model
-        for layer_idx, (attn, ff_in, ff_out) in enumerate(
-            zip(model.attn, model.ff_in, model.ff_out, strict=True)
-        ):
-            q, k, v = (attn.in_proj_weight @ x).chunk(3, dim=-1)
-            out = self.cache.layer_step(layer_idx, k, q, v)
-            x = x + attn.out_proj(out)
-            gate, val = ff_in(x).chunk(2, dim=-1)
-            x = x + ff_out(torch.nn.functional.relu(gate) * val)
-        return x
-
-    def _forward_sparse(self, x: torch.Tensor) -> torch.Tensor:
-        """The same layer stack through CSR matvecs."""
-        xv = x.numpy().astype(self.np_dtype, copy=False)
-        d = self.d_model
-        for layer_idx, (ip, opw, fi, fo) in enumerate(self._layers):
-            qkv = ip @ xv
-            # Scores are always computed in double inside the caches; in
-            # float32 mode the rounding damage to K/Q happened in the
-            # matvec above, which is exactly what the experiment measures.
-            out = self.cache.layer_step(
-                layer_idx,
-                torch.from_numpy(qkv[d:2 * d].astype(np.float64, copy=False)),
-                torch.from_numpy(qkv[:d].astype(np.float64, copy=False)),
-                torch.from_numpy(qkv[2 * d:].astype(np.float64, copy=False)),
-            )
-            xv = xv + opw @ out.numpy().astype(self.np_dtype, copy=False)
-            gv = fi @ xv
-            half = gv.shape[0] // 2
-            xv = xv + fo @ (np.maximum(gv[:half], 0.0) * gv[half:])
-        return torch.from_numpy(xv.astype(np.float64, copy=False))
-
     def _embed_array(self, values: dict) -> np.ndarray:
-        """Engine input embedding without constructing a torch tensor."""
+        """Engine input embedding: dim values at their residual slots.
+
+        Equivalent to a vocabulary embedding row for a token type that
+        enumerated exactly these values; the three position features (slots
+        0-2) are added by _forward_values.
+        """
         x = np.zeros(self.d_model, dtype=self.np_dtype)
         x[self._one_slot] = 1.0
         for dim, value in values.items():
             x[self.slot_of[dim]] = float(value)
         return x
 
-    def _forward_values(self, values: dict) -> torch.Tensor | np.ndarray:
-        if not self._cpp_stack:
-            return self._forward(self._embed(values))
+    def _forward_values(self, values: dict) -> np.ndarray:
+        """One genuine transformer position: embed, add position features,
+        and run the whole layer stack (hull attention + ReGLU) in C++."""
         x = self._embed_array(values)
         add_position_encoding(x, self.pos)
         self.pos += 1
-        self._engine.forward(x)
-        return x
-
-    def _embed(self, values: dict) -> torch.Tensor:
-        """Input embedding for one token: dim values at their slots.
-
-        Equivalent to a vocabulary embedding row for a token type that
-        enumerated exactly these values; position features are added by
-        _forward (slots 0-2 are reserved for them).
-        """
-        x = torch.zeros(self.d_model, dtype=self.torch_dtype)
-        x[self.slot_of[self.rt._one]] = 1.0
-        for dim, value in values.items():
-            x[self.slot_of[dim]] = float(value)
+        self._engine.forward(x)  # in place, whole stack
         return x
 
     def _build_experts(self, opcodes) -> list[dict]:
@@ -463,7 +371,7 @@ class Cpu6502TransformerMachine:
     def _head_logit(self, h: np.ndarray, cols: np.ndarray, vals: np.ndarray) -> float:
         return float(np.dot(h[cols], vals))
 
-    def _read(self, h: torch.Tensor | np.ndarray, name: str) -> float:
+    def _read(self, h: np.ndarray, name: str) -> float:
         slot = self._read_slots.get(name)
         if slot is None:
             slot = self.slot_of[self._dim_by_name[name]]
@@ -474,11 +382,9 @@ class Cpu6502TransformerMachine:
     # bus's GraphCore adapter can drive this machine unchanged) ──────
 
     def boot_image(self, memory_image, *, start_pc: int, state: dict | None = None):
-        # Fresh token log: clear attention state so a machine can be reused.
-        if self._cpp_stack:
-            self._engine.reset()
-        else:
-            self.cache.clear()
+        # Fresh token log: clear the engine's attention state so a machine
+        # instance can be reused for another program.
+        self._engine.reset()
         self.pos = 0
         self._trace_len = 0
         ram = bytearray(0x10000)
@@ -664,13 +570,8 @@ class Cpu6502TransformerMachine:
             ir=s.ir, oplo=s.operand_lo, ophi=s.operand_hi,
             ea=s.ea, data=s.data, halted=1 if s.halted else 0,
         )
-        if self._cpp_stack:
-            halt_logit = self._head_logit(h, self._halt_head_cols, self._halt_head_vals)
-            state_logit = self._head_logit(h, self._state_head_cols, self._state_head_vals)
-        else:
-            logits = self.model.head(h)
-            halt_logit = float(logits[self._halt_row])
-            state_logit = float(logits[self._state_row])
+        halt_logit = self._head_logit(h, self._halt_head_cols, self._halt_head_vals)
+        state_logit = self._head_logit(h, self._state_head_cols, self._state_head_vals)
         if halted or halt_logit > state_logit:
             self.machine_halted = True
         return row
@@ -852,11 +753,10 @@ def main() -> None:
         description="Verify the 6502 running as real transformer weights."
     )
     parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument("--cache", choices=["hull", "standard"], default="hull")
     parser.add_argument(
-        "--matmul", choices=["codegen", "engine", "sparse", "dense"], default="codegen",
+        "--matmul", choices=["codegen", "engine"], default="codegen",
         help="codegen is the production generated C++ engine; engine is the "
-             "generic CSR C++ cross-check; sparse/dense are diagnostics",
+             "generic CSR C++ cross-check",
     )
     parser.add_argument(
         "--codegen-arith", choices=["int32", "int64", "f32"], default="int32",
@@ -870,7 +770,7 @@ def main() -> None:
     args = parser.parse_args()
 
     machine = Cpu6502TransformerMachine(
-        bcd=False, cache=args.cache, matmul=args.matmul, dtype=args.dtype,
+        bcd=False, matmul=args.matmul, dtype=args.dtype,
         codegen_arith=args.codegen_arith,
         expert_opcodes=() if args.no_experts else DEFAULT_EXPERT_OPCODES,
     )

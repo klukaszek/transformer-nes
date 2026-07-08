@@ -143,23 +143,18 @@ class Console:
         if backend == "weights":
             # The real transformer through its generated C++ run loop:
             # KernelBus drives it natively (MMIO pauses back to Python), the
-            # same protocol as the kernel.  Falls back to the Python-stepped
-            # bus if the engine has no run loop (non-codegen diagnostics).
+            # same protocol as the kernel.
             from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
 
             machine = Cpu6502TransformerMachine(bcd=False, checkpoint_tokens=None)
-            if machine.supports_run_loop:
-                self._rt = machine
-                self.bus = KernelBus(machine, image, start_pc=start_pc)
-                if state is not None:
-                    machine.set_state(state)
-                self._read_cpu = machine.read_ram
-                self._uses_kernel_bus = True
-                return
-            machine.boot_image(list(image), start_pc=start_pc, state=state)
-            core = GraphCore(machine)
-            self.bus = Bus(core, image)
-            self._read_cpu = lambda addr: self.bus.ram[addr & 0xFFFF]
+            if not machine.supports_run_loop:
+                raise RuntimeError("the weights backend requires the codegen run loop")
+            self._rt = machine
+            self.bus = KernelBus(machine, image, start_pc=start_pc)
+            if state is not None:
+                machine.set_state(state)
+            self._read_cpu = machine.read_ram
+            self._uses_kernel_bus = True
             return
         if backend == "reference":
             from transformer_vm.cpu6502.reference import Cpu6502

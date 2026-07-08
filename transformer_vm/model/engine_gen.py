@@ -223,6 +223,256 @@ def _compose(outer: sp.csr_matrix, cols, inner_rows: sp.csr_matrix) -> sp.csr_ma
     return direct
 
 
+# ── Static C++ blocks ───────────────────────────────────────────────────
+# These sections do not depend on the built model (or depend only on the
+# integer element type, spliced in for "ELEM").  Keeping them as readable
+# C++ here, rather than hundreds of per-line emit() calls, is exact: the
+# generated source is `"\n".join(lines)`, so emitting one multi-line block is
+# byte-for-byte identical to emitting each of its lines.
+
+_INCLUDES = """\
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+#include "hull2d_cht.h"
+
+namespace py = pybind11;
+using FArr = py::array_t<float, py::array::c_style | py::array::forcecast>;
+using LArr = py::array_t<long long, py::array::c_style | py::array::forcecast>;"""
+
+# Fixed-point rescale/readout guards; ELEM is the int residual type.
+_FIXED_POINT_HELPERS = """\
+    static ELEM shr(ELEM v) {
+        // Rescale a product of two fixed-point values; the
+        // represented result must stay on the F-bit grid.
+        if (v & (SCALE - 1))
+            throw std::runtime_error("value finer than the fixed-point scale");
+        return v >> F;
+    }
+
+    static long long shr2(ELEM v) {
+        // Readout: trace-visible values are whole integers.
+        if (v & (SCALE - 1))
+            throw std::runtime_error("fractional readout value");
+        return (long long)(v >> F);
+    }
+
+    static ELEM half(ELEM v) {
+        // 0.5 coefficients in the fused direct maps: exact only
+        // on even operands, and the invariant says they always
+        // are -- fail loudly instead of rounding.
+        if (v & 1)
+            throw std::runtime_error("odd value under a 0.5 coefficient");
+        return v >> 1;
+    }"""
+
+# Exact nearest-written-address argmax over one 4 KiB memory group.
+_MEM_QUERY = """\
+    // Exact replacement for the memory-group hull argmax: the
+    // grouped parabola score -(q-a)^2 + q^2 + alpha*ilp(seq) is
+    // maximized by the nearest written address; recency breaks
+    // equidistant ties toward the later write, and below the
+    // double ulp the hull's LATEST tie-break agrees.  One shared
+    // structure per 4 KiB group serves every layer's heads (all
+    // per-layer memory hulls held identical data).
+    int mem_val[16][4096];
+    long long mem_seq[16][4096];
+    unsigned long long mem_bits[16][64];
+
+    void mem_query(const int g, const long long q, long long out[2]) const {
+        const unsigned long long* bits = mem_bits[g];
+        long long below = -1, above = -1;
+        if (q >= 0) {
+            const long long start = q < 4095 ? q : 4095;
+            int w = (int)(start >> 6);
+            unsigned long long m = bits[w] & (~0ULL >> (63 - (start & 63)));
+            while (true) {
+                if (m) { below = ((long long)w << 6) + (63 - __builtin_clzll(m)); break; }
+                if (--w < 0) break;
+                m = bits[w];
+            }
+        }
+        if (q <= 4095) {
+            const long long start = q > 0 ? q : 0;
+            int w = (int)(start >> 6);
+            unsigned long long m = bits[w] & (~0ULL << (start & 63));
+            while (true) {
+                if (m) { above = ((long long)w << 6) + __builtin_ctzll(m); break; }
+                if (++w > 63) break;
+                m = bits[w];
+            }
+        }
+        long long win;
+        if (below < 0 && above < 0) { out[0] = 0; out[1] = 0; return; }
+        else if (below < 0) win = above;
+        else if (above < 0) win = below;
+        else {
+            const long long db = q - below, da = above - q;
+            if (db < da) win = below;
+            else if (da < db) win = above;
+            else win = mem_seq[g][below] > mem_seq[g][above] ? below : above;
+        }
+        out[0] = mem_val[g][win];
+        out[1] = ((long long)g << 12) + win;
+    }"""
+
+# Shadow-decode + the native run loop (KernelBus shape) + machine API.
+_RUN_LOOP = """\
+    // Shadow-decode the instruction at st_pc; return the address it
+    // will read, or -1 (mirrors nes/bus read_target and the kernel).
+    int shadow_read_target() const {
+        const int mode = READ_MODE[ram[st_pc]];
+        if (mode == 0) return -1;
+        const int lo = ram[(st_pc + 1) & 0xFFFF];
+        const int hi = ram[(st_pc + 2) & 0xFFFF];
+        switch (mode) {
+            case 1: return lo;
+            case 2: return (lo + st_x) & 0xFF;
+            case 3: return (lo + st_y) & 0xFF;
+            case 4: return lo | (hi << 8);
+            case 5: return ((lo | (hi << 8)) + st_x) & 0xFFFF;
+            case 6: return ((lo | (hi << 8)) + st_y) & 0xFFFF;
+            case 7: { const int zp = (lo + st_x) & 0xFF;
+                      return ram[zp] | (ram[(zp + 1) & 0xFF] << 8); }
+            case 8: { const int base = ram[lo] | (ram[(lo + 1) & 0xFF] << 8);
+                      return (base + st_y) & 0xFFFF; }
+        }
+        return -1;
+    }
+
+    static bool in_ranges(const std::vector<std::pair<int,int>>& v, int addr) {
+        for (const auto& r : v) if (addr >= r.first && addr <= r.second) return true;
+        return false;
+    }
+
+    // Run up to max_steps instructions natively, pausing back to
+    // Python only on halt / jump-to-self trap / watched device
+    // access / cycle budget -- the same protocol and result dict as
+    // the C++ kernel's run(), so KernelBus can drive this engine.
+    py::dict run(long max_steps, bool stop_on_trap, long max_cycles) {
+        std::vector<int> t_pc, t_a, t_x, t_y, t_s, t_p, t_ir, t_oplo, t_ophi, t_ea, t_data, t_halted;
+        std::vector<long> w_row; std::vector<int> w_addr, w_value;
+        std::vector<int> hit_addr, hit_value;
+        const char* reason = "budget";
+        int read_addr = -1;
+        long cycles_this = 0;
+        long long o[21];
+        for (long i = 0; i < max_steps; ++i) {
+            if (st_halted) { reason = "halt"; break; }
+            const bool skip = resume_read_skip;
+            resume_read_skip = false;
+            if (!nmi_pending && !skip && !rwatch.empty()) {
+                const int target = shadow_read_target();
+                if (target >= 0 && in_ranges(rwatch, target)) {
+                    resume_read_skip = true; read_addr = target; reason = "watch_read"; break;
+                }
+            }
+            const bool was_nmi = nmi_pending;
+            const int prev_pc = st_pc;
+            step_core(o);  // updates st_*, applies writes to ram + memory
+            t_pc.push_back((int)o[0]); t_a.push_back((int)o[1]);
+            t_x.push_back((int)o[2]); t_y.push_back((int)o[3]);
+            t_s.push_back((int)o[4]); t_p.push_back((int)o[5]);
+            t_ir.push_back((int)o[6]); t_oplo.push_back((int)o[7]);
+            t_ophi.push_back((int)o[8]); t_ea.push_back((int)o[9]);
+            t_data.push_back((int)o[10]);
+            const bool halted = o[11] != 0;
+            t_halted.push_back(halted ? 1 : 0);
+            const int n_writes = (int)o[14];
+            int n_hits = 0, sh_addr[3], sh_value[3];
+            for (int w = 0; w < n_writes; ++w) {
+                const int wa = (int)o[15 + 2 * w], wv = (int)o[16 + 2 * w];
+                w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);
+                if (!wwatch.empty() && in_ranges(wwatch, wa)) {
+                    sh_addr[n_hits] = wa; sh_value[n_hits] = wv; ++n_hits;
+                }
+            }
+            ++step_index;
+            const long step_cycles = was_nmi ? 7 : (long)CYCLES[(unsigned char)o[6]];
+            cycles_this += step_cycles; cycles_total += step_cycles;
+            for (int k = 0; k < n_hits; ++k) { hit_addr.push_back(sh_addr[k]); hit_value.push_back(sh_value[k]); }
+            if (halted) { st_halted = true; reason = "halt"; break; }
+            if (o[13]) { st_halted = true; reason = "halt"; break; }
+            if (stop_on_trap && (int)o[12] == prev_pc) { reason = "trap"; break; }
+            if (n_hits > 0) { reason = "watch_write"; break; }
+            if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }
+        }
+        py::dict out;
+        auto arr = [](const std::vector<int>& src) {
+            return py::array_t<int>((py::ssize_t)src.size(), src.data());
+        };
+        out["pc"] = arr(t_pc);
+        out["a"] = arr(t_a);
+        out["x"] = arr(t_x);
+        out["y"] = arr(t_y);
+        out["s"] = arr(t_s);
+        out["p"] = arr(t_p);
+        out["ir"] = arr(t_ir);
+        out["oplo"] = arr(t_oplo);
+        out["ophi"] = arr(t_ophi);
+        out["ea"] = arr(t_ea);
+        out["data"] = arr(t_data);
+        out["halted"] = arr(t_halted);
+        out["w_row"] = py::array_t<long>((py::ssize_t)w_row.size(), w_row.data());
+        out["w_addr"] = arr(w_addr);
+        out["w_value"] = arr(w_value);
+        out["hit_addr"] = arr(hit_addr);
+        out["hit_value"] = arr(hit_value);
+        out["read_addr"] = read_addr;
+        out["reason"] = reason;
+        out["cycles"] = cycles_this;
+        return out;
+    }
+
+    // ── Machine API (mirrors the C++ kernel) ─────────────────
+    void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
+    void watch_write(int lo, int hi) { wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
+    void clear_watches() { rwatch.clear(); wwatch.clear(); }
+    void set_nmi() { nmi_pending = true; }
+    void inject_write(int addr, int value) { insert_write_f32(addr & 0xFFFF, value & 0xFF, seq + 1); }
+    int read_ram(int addr) { return ram[addr & 0xFFFF]; }
+    py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }
+
+    void set_run_state(int pc, int a, int x, int y, int s, int p,
+                       int ir, int oplo, int ophi, int ea, int data, int halted) {
+        st_pc = pc & 0xFFFF; st_a = a & 0xFF; st_x = x & 0xFF; st_y = y & 0xFF;
+        st_s = s & 0xFF; st_p = p & 0xFF;
+        st_ir = ir & 0xFF; st_oplo = oplo & 0xFF; st_ophi = ophi & 0xFF;
+        st_ea = ea & 0xFFFF; st_data = data & 0xFF;
+        st_halted = halted != 0;
+    }
+
+    py::dict get_run_state() {
+        py::dict st;
+        st["pc"] = st_pc; st["a"] = st_a; st["x"] = st_x; st["y"] = st_y;
+        st["s"] = st_s; st["p"] = st_p; st["halted"] = st_halted;
+        st["ir"] = st_ir; st["oplo"] = st_oplo; st["ophi"] = st_ophi;
+        st["ea"] = st_ea; st["data"] = st_data;
+        st["steps"] = step_index; st["cycles"] = cycles_total;
+        st["pos"] = (long)(seq + 1);
+        return st;
+    }"""
+
+# The pybind .def() lines gated on has_step (the machine_step + run-loop API).
+_PYBIND_STEP_METHODS = """\
+        .def("machine_step", &ENGINE_T::machine_step)
+        .def("run", &ENGINE_T::run, py::arg("max_steps"),
+             py::arg("stop_on_trap") = false, py::arg("max_cycles") = 0L)
+        .def("watch_read", &ENGINE_T::watch_read)
+        .def("watch_write", &ENGINE_T::watch_write)
+        .def("clear_watches", &ENGINE_T::clear_watches)
+        .def("set_nmi", &ENGINE_T::set_nmi)
+        .def("inject_write", &ENGINE_T::inject_write)
+        .def("read_ram", &ENGINE_T::read_ram)
+        .def("dump_ram", &ENGINE_T::dump_ram)
+        .def("set_run_state", &ENGINE_T::set_run_state)
+        .def("get_run_state", &ENGINE_T::get_run_state)"""
+
+
 def generate_source(model, step_spec: dict | None = None,
                     arith: str = "int64", experts=None) -> tuple[str, int, bool]:
     """Emit the C++ source; returns (source, n_memory_heads, has_step).
@@ -678,18 +928,7 @@ def generate_source(model, step_spec: dict | None = None,
     else:
         emit("// Arithmetic replicates weights_engine.cpp exactly: CSR column")
         emit("// order, left-to-right accumulation, float32 hexfloat literals.")
-    emit("#include <pybind11/pybind11.h>")
-    emit("#include <pybind11/numpy.h>")
-    emit("#include <cmath>")
-    emit("#include <cstring>")
-    emit("#include <stdexcept>")
-    emit("#include <utility>")
-    emit("#include <vector>")
-    emit('#include "hull2d_cht.h"')
-    emit("")
-    emit("namespace py = pybind11;")
-    emit("using FArr = py::array_t<float, py::array::c_style | py::array::forcecast>;")
-    emit("using LArr = py::array_t<long long, py::array::c_style | py::array::forcecast>;")
+    emit(_INCLUDES)
     emit("")
     emit("struct ENGINE_T {")
     emit(f"    static constexpr int D = {d_model};")
@@ -702,77 +941,9 @@ def generate_source(model, step_spec: dict | None = None,
         emit("    static constexpr double SCALE_D = (double)SCALE;")
         emit(f"    {elem} xbuf[D];")
         emit("")
-        emit(f"    static {elem} shr({elem} v) {{")
-        emit("        // Rescale a product of two fixed-point values; the")
-        emit("        // represented result must stay on the F-bit grid.")
-        emit("        if (v & (SCALE - 1))")
-        emit('            throw std::runtime_error("value finer than the fixed-point scale");')
-        emit("        return v >> F;")
-        emit("    }")
+        emit(_FIXED_POINT_HELPERS.replace("ELEM", elem))
         emit("")
-        emit(f"    static long long shr2({elem} v) {{")
-        emit("        // Readout: trace-visible values are whole integers.")
-        emit("        if (v & (SCALE - 1))")
-        emit('            throw std::runtime_error("fractional readout value");')
-        emit("        return (long long)(v >> F);")
-        emit("    }")
-        emit("")
-        emit(f"    static {elem} half({elem} v) {{")
-        emit("        // 0.5 coefficients in the fused direct maps: exact only")
-        emit("        // on even operands, and the invariant says they always")
-        emit("        // are -- fail loudly instead of rounding.")
-        emit("        if (v & 1)")
-        emit('            throw std::runtime_error("odd value under a 0.5 coefficient");')
-        emit("        return v >> 1;")
-        emit("    }")
-        emit("")
-        emit("    // Exact replacement for the memory-group hull argmax: the")
-        emit("    // grouped parabola score -(q-a)^2 + q^2 + alpha*ilp(seq) is")
-        emit("    // maximized by the nearest written address; recency breaks")
-        emit("    // equidistant ties toward the later write, and below the")
-        emit("    // double ulp the hull's LATEST tie-break agrees.  One shared")
-        emit("    // structure per 4 KiB group serves every layer's heads (all")
-        emit("    // per-layer memory hulls held identical data).")
-        emit("    int mem_val[16][4096];")
-        emit("    long long mem_seq[16][4096];")
-        emit("    unsigned long long mem_bits[16][64];")
-        emit("")
-        emit("    void mem_query(const int g, const long long q, long long out[2]) const {")
-        emit("        const unsigned long long* bits = mem_bits[g];")
-        emit("        long long below = -1, above = -1;")
-        emit("        if (q >= 0) {")
-        emit("            const long long start = q < 4095 ? q : 4095;")
-        emit("            int w = (int)(start >> 6);")
-        emit("            unsigned long long m = bits[w] & (~0ULL >> (63 - (start & 63)));")
-        emit("            while (true) {")
-        emit("                if (m) { below = ((long long)w << 6) + (63 - __builtin_clzll(m)); break; }")
-        emit("                if (--w < 0) break;")
-        emit("                m = bits[w];")
-        emit("            }")
-        emit("        }")
-        emit("        if (q <= 4095) {")
-        emit("            const long long start = q > 0 ? q : 0;")
-        emit("            int w = (int)(start >> 6);")
-        emit("            unsigned long long m = bits[w] & (~0ULL << (start & 63));")
-        emit("            while (true) {")
-        emit("                if (m) { above = ((long long)w << 6) + __builtin_ctzll(m); break; }")
-        emit("                if (++w > 63) break;")
-        emit("                m = bits[w];")
-        emit("            }")
-        emit("        }")
-        emit("        long long win;")
-        emit("        if (below < 0 && above < 0) { out[0] = 0; out[1] = 0; return; }")
-        emit("        else if (below < 0) win = above;")
-        emit("        else if (above < 0) win = below;")
-        emit("        else {")
-        emit("            const long long db = q - below, da = above - q;")
-        emit("            if (db < da) win = below;")
-        emit("            else if (da < db) win = above;")
-        emit("            else win = mem_seq[g][below] > mem_seq[g][above] ? below : above;")
-        emit("        }")
-        emit("        out[0] = mem_val[g][win];")
-        emit("        out[1] = ((long long)g << 12) + win;")
-        emit("    }")
+        emit(_MEM_QUERY)
         if n_regs:
             emit("")
             emit("    // Running-argmax registers for constant-query lookup")
@@ -1050,132 +1221,9 @@ def generate_source(model, step_spec: dict | None = None,
         emit("        step_core(out_arr.mutable_data());")
         emit("    }")
 
-        # ── C++ run loop (KernelBus shape) ───────────────────────────
+        # ── C++ run loop (KernelBus shape) and machine API ───────────
         emit("")
-        emit("    // Shadow-decode the instruction at st_pc; return the address it")
-        emit("    // will read, or -1 (mirrors nes/bus read_target and the kernel).")
-        emit("    int shadow_read_target() const {")
-        emit("        const int mode = READ_MODE[ram[st_pc]];")
-        emit("        if (mode == 0) return -1;")
-        emit("        const int lo = ram[(st_pc + 1) & 0xFFFF];")
-        emit("        const int hi = ram[(st_pc + 2) & 0xFFFF];")
-        emit("        switch (mode) {")
-        emit("            case 1: return lo;")
-        emit("            case 2: return (lo + st_x) & 0xFF;")
-        emit("            case 3: return (lo + st_y) & 0xFF;")
-        emit("            case 4: return lo | (hi << 8);")
-        emit("            case 5: return ((lo | (hi << 8)) + st_x) & 0xFFFF;")
-        emit("            case 6: return ((lo | (hi << 8)) + st_y) & 0xFFFF;")
-        emit("            case 7: { const int zp = (lo + st_x) & 0xFF;")
-        emit("                      return ram[zp] | (ram[(zp + 1) & 0xFF] << 8); }")
-        emit("            case 8: { const int base = ram[lo] | (ram[(lo + 1) & 0xFF] << 8);")
-        emit("                      return (base + st_y) & 0xFFFF; }")
-        emit("        }")
-        emit("        return -1;")
-        emit("    }")
-        emit("")
-        emit("    static bool in_ranges(const std::vector<std::pair<int,int>>& v, int addr) {")
-        emit("        for (const auto& r : v) if (addr >= r.first && addr <= r.second) return true;")
-        emit("        return false;")
-        emit("    }")
-        emit("")
-        emit("    // Run up to max_steps instructions natively, pausing back to")
-        emit("    // Python only on halt / jump-to-self trap / watched device")
-        emit("    // access / cycle budget -- the same protocol and result dict as")
-        emit("    // the C++ kernel's run(), so KernelBus can drive this engine.")
-        emit("    py::dict run(long max_steps, bool stop_on_trap, long max_cycles) {")
-        emit("        std::vector<int> t_pc, t_a, t_x, t_y, t_s, t_p, t_ir, t_oplo, t_ophi, t_ea, t_data, t_halted;")
-        emit("        std::vector<long> w_row; std::vector<int> w_addr, w_value;")
-        emit("        std::vector<int> hit_addr, hit_value;")
-        emit('        const char* reason = "budget";')
-        emit("        int read_addr = -1;")
-        emit("        long cycles_this = 0;")
-        emit("        long long o[21];")
-        emit("        for (long i = 0; i < max_steps; ++i) {")
-        emit('            if (st_halted) { reason = "halt"; break; }')
-        emit("            const bool skip = resume_read_skip;")
-        emit("            resume_read_skip = false;")
-        emit("            if (!nmi_pending && !skip && !rwatch.empty()) {")
-        emit("                const int target = shadow_read_target();")
-        emit("                if (target >= 0 && in_ranges(rwatch, target)) {")
-        emit('                    resume_read_skip = true; read_addr = target; reason = "watch_read"; break;')
-        emit("                }")
-        emit("            }")
-        emit("            const bool was_nmi = nmi_pending;")
-        emit("            const int prev_pc = st_pc;")
-        emit("            step_core(o);  // updates st_*, applies writes to ram + memory")
-        emit("            t_pc.push_back((int)o[0]); t_a.push_back((int)o[1]);")
-        emit("            t_x.push_back((int)o[2]); t_y.push_back((int)o[3]);")
-        emit("            t_s.push_back((int)o[4]); t_p.push_back((int)o[5]);")
-        emit("            t_ir.push_back((int)o[6]); t_oplo.push_back((int)o[7]);")
-        emit("            t_ophi.push_back((int)o[8]); t_ea.push_back((int)o[9]);")
-        emit("            t_data.push_back((int)o[10]);")
-        emit("            const bool halted = o[11] != 0;")
-        emit("            t_halted.push_back(halted ? 1 : 0);")
-        emit("            const int n_writes = (int)o[14];")
-        emit("            int n_hits = 0, sh_addr[3], sh_value[3];")
-        emit("            for (int w = 0; w < n_writes; ++w) {")
-        emit("                const int wa = (int)o[15 + 2 * w], wv = (int)o[16 + 2 * w];")
-        emit("                w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);")
-        emit("                if (!wwatch.empty() && in_ranges(wwatch, wa)) {")
-        emit("                    sh_addr[n_hits] = wa; sh_value[n_hits] = wv; ++n_hits;")
-        emit("                }")
-        emit("            }")
-        emit("            ++step_index;")
-        emit("            const long step_cycles = was_nmi ? 7 : (long)CYCLES[(unsigned char)o[6]];")
-        emit("            cycles_this += step_cycles; cycles_total += step_cycles;")
-        emit("            for (int k = 0; k < n_hits; ++k) { hit_addr.push_back(sh_addr[k]); hit_value.push_back(sh_value[k]); }")
-        emit('            if (halted) { st_halted = true; reason = "halt"; break; }')
-        emit('            if (o[13]) { st_halted = true; reason = "halt"; break; }')
-        emit('            if (stop_on_trap && (int)o[12] == prev_pc) { reason = "trap"; break; }')
-        emit('            if (n_hits > 0) { reason = "watch_write"; break; }')
-        emit('            if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }')
-        emit("        }")
-        emit("        py::dict out;")
-        emit("        auto arr = [](const std::vector<int>& src) {")
-        emit("            return py::array_t<int>((py::ssize_t)src.size(), src.data());")
-        emit("        };")
-        for field in ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi", "ea", "data", "halted"):
-            emit(f'        out["{field}"] = arr(t_{field});')
-        emit('        out["w_row"] = py::array_t<long>((py::ssize_t)w_row.size(), w_row.data());')
-        emit('        out["w_addr"] = arr(w_addr);')
-        emit('        out["w_value"] = arr(w_value);')
-        emit('        out["hit_addr"] = arr(hit_addr);')
-        emit('        out["hit_value"] = arr(hit_value);')
-        emit('        out["read_addr"] = read_addr;')
-        emit('        out["reason"] = reason;')
-        emit('        out["cycles"] = cycles_this;')
-        emit("        return out;")
-        emit("    }")
-        emit("")
-        emit("    // ── Machine API (mirrors the C++ kernel) ─────────────────")
-        emit("    void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }")
-        emit("    void watch_write(int lo, int hi) { wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }")
-        emit("    void clear_watches() { rwatch.clear(); wwatch.clear(); }")
-        emit("    void set_nmi() { nmi_pending = true; }")
-        emit("    void inject_write(int addr, int value) { insert_write_f32(addr & 0xFFFF, value & 0xFF, seq + 1); }")
-        emit("    int read_ram(int addr) { return ram[addr & 0xFFFF]; }")
-        emit("    py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }")
-        emit("")
-        emit("    void set_run_state(int pc, int a, int x, int y, int s, int p,")
-        emit("                       int ir, int oplo, int ophi, int ea, int data, int halted) {")
-        emit("        st_pc = pc & 0xFFFF; st_a = a & 0xFF; st_x = x & 0xFF; st_y = y & 0xFF;")
-        emit("        st_s = s & 0xFF; st_p = p & 0xFF;")
-        emit("        st_ir = ir & 0xFF; st_oplo = oplo & 0xFF; st_ophi = ophi & 0xFF;")
-        emit("        st_ea = ea & 0xFFFF; st_data = data & 0xFF;")
-        emit("        st_halted = halted != 0;")
-        emit("    }")
-        emit("")
-        emit("    py::dict get_run_state() {")
-        emit("        py::dict st;")
-        emit('        st["pc"] = st_pc; st["a"] = st_a; st["x"] = st_x; st["y"] = st_y;')
-        emit('        st["s"] = st_s; st["p"] = st_p; st["halted"] = st_halted;')
-        emit('        st["ir"] = st_ir; st["oplo"] = st_oplo; st["ophi"] = st_ophi;')
-        emit('        st["ea"] = st_ea; st["data"] = st_data;')
-        emit('        st["steps"] = step_index; st["cycles"] = cycles_total;')
-        emit('        st["pos"] = (long)(seq + 1);')
-        emit("        return st;")
-        emit("    }")
+        emit(_RUN_LOOP)
 
     emit("};")
     emit("")
@@ -1185,18 +1233,7 @@ def generate_source(model, step_spec: dict | None = None,
     emit("        .def(\"reset\", &ENGINE_T::reset)")
     emit("        .def(\"forward_f32\", &ENGINE_T::forward_f32)")
     if has_step:
-        emit("        .def(\"machine_step\", &ENGINE_T::machine_step)")
-        emit('        .def("run", &ENGINE_T::run, py::arg("max_steps"),')
-        emit('             py::arg("stop_on_trap") = false, py::arg("max_cycles") = 0L)')
-        emit('        .def("watch_read", &ENGINE_T::watch_read)')
-        emit('        .def("watch_write", &ENGINE_T::watch_write)')
-        emit('        .def("clear_watches", &ENGINE_T::clear_watches)')
-        emit('        .def("set_nmi", &ENGINE_T::set_nmi)')
-        emit('        .def("inject_write", &ENGINE_T::inject_write)')
-        emit('        .def("read_ram", &ENGINE_T::read_ram)')
-        emit('        .def("dump_ram", &ENGINE_T::dump_ram)')
-        emit('        .def("set_run_state", &ENGINE_T::set_run_state)')
-        emit('        .def("get_run_state", &ENGINE_T::get_run_state)')
+        emit(_PYBIND_STEP_METHODS)
     emit("        .def(\"insert_write_f32\", &ENGINE_T::insert_write_f32);")
     emit("}")
 

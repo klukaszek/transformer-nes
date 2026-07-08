@@ -34,7 +34,7 @@ dev = [
 6502-reference = "transformer_vm.cpu6502.reference:main"
 6502-eval = "transformer_vm.cpu6502.cli:main"
 6502-klaus = "transformer_vm.cpu6502.klaus:main"
-6502-nestest = "transformer_vm.cpu6502.nestest:main"
+6502-nestest = "transformer_vm.nes.nestest:main"
 6502-transformer = "transformer_vm.cpu6502.weights_runner:main"
 nes-run = "transformer_vm.nes.console:main"
 
