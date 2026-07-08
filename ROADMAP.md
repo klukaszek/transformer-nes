@@ -619,24 +619,33 @@ Receipts (all byte-identical; every expert swept by nestest + Klaus):
   expert set, so the aggregate gain understates the hot-path 2–2.7×).
 - **Hot-path win**: the JMP-to-self synthetic loop (pure expert path) went
   **7.80 → 2.90 µs/step (2.7×, 128K → 345K instr/s)**.  A real SMB *gameplay*
-  CPU stream (mixed hot opcodes, MMIO/render excluded) went **7.15 → 3.28
-  µs/step (2.18×, 140K → 305K instr/s)**.  Mean kept 1522/5308 ReGLU neurons
-  (0.29×) and 73/114 lookup heads (0.64×) — above the probe's 0.20× because the
-  in-place approach keeps the `gate=1` folded-linear neurons the union computes
-  (a rebuilt-expert model would reach 0.20× and is the thesis MoE artifact).
-- **Honest caveat**: the SMB *frame* time is unchanged (~34 ms) — it is bound
-  by the numpy PPU render plus the per-poll MMIO round-trips (each device read
-  pauses the native loop back to Python), not the CPU step.  Routing speeds up
-  CPU-bound streams (Klaus-hot, gameplay CPU); moving SMB *fps* now needs render
-  / MMIO-batching work, not more CPU throughput.
+  CPU stream (mixed hot opcodes) went **7.15 → 3.28 µs/step (2.18×, 140K → 305K
+  instr/s)**.  Mean kept 1522/5308 ReGLU neurons (0.29×) and 73/114 lookup heads
+  (0.64×) — above the probe's 0.20× because the in-place approach keeps the
+  `gate=1` folded-linear neurons the union computes (a rebuilt-expert model
+  would reach 0.20× and is the thesis MoE artifact).
+- **SMB gameplay fps nearly doubles: 14.65 → 28.24 fps (1.93×)** measured at
+  the frame level (drive to gameplay on the kernel, hand off to weights, hold
+  right).  A gameplay frame is **CPU-bound**: 9,870 instr/frame split ~33.5 ms
+  native CPU / **0.7 ms PPU render** / **1.0 ms Python glue** (MMIO pause
+  servicing, ~242 device reads/frame + discarded trace-array concat).  So the
+  numpy renderer and the per-poll MMIO round-trips are together only ~5% of the
+  frame — not the bottleneck; the CPU step is.  (An earlier note here claimed
+  the frame was render/MMIO-bound and unchanged by routing; that was a
+  benchmark bug — `expert_opcodes` is a def-time default, so monkeypatching the
+  module constant left both configs routed.  Corrected 2026-07-08.)
 
-Next, in payoff order:
+Path to real-time (SMB needs ~592K instr/s = 9,870 × 60): routed gameplay is
+~305K instr/s (~28 fps), so ~1.9× more CPU is the remaining gap.  Next, in
+payoff order:
 1. Rebuilt-expert weights model (inline the `gate=1` multiplies → the probe's
-   0.20× and a genuine Switch-style top-1 MoE for the write-up) and/or wider
-   expert coverage (per-family for cold opcodes) if a CPU-bound target needs it.
-2. The SMB frame is now render/MMIO-bound: batch device reads / speed the PPU
-   renderer to convert the CPU headroom into fps.
-3. Batched machines across cores (state is O(1) per machine).
+   0.20× vs the current 0.29×, ≈1.45×, and a genuine Switch-style top-1 MoE for
+   the write-up) and/or wider/per-family expert coverage.
+2. Width/schedule compaction and poll-loop expert micro-optimization for the
+   last stretch to 60 fps.
+3. Batched machines across cores for throughput (state is O(1) per machine) —
+   after single-game latency, not before.
+   (Render/MMIO are ~5% — a later cleanup, not a real-time lever.)
 
 ## 2026-07-07 C++ run loop (KernelBus shape) — Python floor removed
 

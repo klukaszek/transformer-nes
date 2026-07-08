@@ -853,12 +853,26 @@ def main() -> None:
     )
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--cache", choices=["hull", "standard"], default="hull")
-    parser.add_argument("--matmul", choices=["engine", "sparse", "dense"], default="engine")
+    parser.add_argument(
+        "--matmul", choices=["codegen", "engine", "sparse", "dense"], default="codegen",
+        help="codegen is the production generated C++ engine; engine is the "
+             "generic CSR C++ cross-check; sparse/dense are diagnostics",
+    )
+    parser.add_argument(
+        "--codegen-arith", choices=["int32", "int64", "f32"], default="int32",
+        help="arithmetic mode for --matmul codegen (default: int32)",
+    )
+    parser.add_argument(
+        "--no-experts", action="store_true",
+        help="disable opcode-routed generated experts and run the union model",
+    )
     parser.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     args = parser.parse_args()
 
     machine = Cpu6502TransformerMachine(
-        bcd=False, cache=args.cache, matmul=args.matmul, dtype=args.dtype
+        bcd=False, cache=args.cache, matmul=args.matmul, dtype=args.dtype,
+        codegen_arith=args.codegen_arith,
+        expert_opcodes=() if args.no_experts else DEFAULT_EXPERT_OPCODES,
     )
     logger.info(
         "transformer: d_model=%d n_layers=%d matmul=%s dtype=%s (%.1fs build)",
