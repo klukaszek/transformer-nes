@@ -4,6 +4,47 @@ Status snapshot and prioritized next steps.  Written 2026-07-06 as the
 handoff point for fresh working sessions; the design details live in
 [`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).
 
+## 2026-07-09 fetched-byte pin — the router predicate, fully spent
+
+What was built (`graph/fold.py` + tests; roadmap next-step #2 from the
+rebuilt-experts log): `opcode_pins(..., pin_fetched_byte=True)` (now the
+default) additionally pins the ``fetched_opcode`` persist to the routed
+byte.  The router dispatches on ``ram[pc] == byte``, which is strictly
+stronger than ``is_op = 1``, so the memory read at PC provably returns the
+byte -- the fold deletes that read (16 grouped lookup sites per expert) and
+the remaining decode residue.  Per expert: terms 0.82x, lookups 65 -> 49.
+The existing fold receipts re-verify the stronger pin unchanged (the
+expert-vs-union shadow lockstep runs on the default pin set); the probe
+comparison test pins pin_fetched_byte=False for apples-to-apples.
+
+Receipts (72 tests green; all lockstep-exact):
+- Full nestest MATCHED ~167K instr/s; Klaus 200K decimal MATCHED ~140K/s.
+- **JMP-to-self hot path: 1.75 -> 1.22 µs/step (817K instr/s)**.
+- **Frame-poll loop (LDA/AND/BEQ): 2.15 -> 1.54 µs/step (650K instr/s)** —
+  the hot loops are now individually past SMB real-time (~592K needed).
+- **SMB gameplay: 32.47 fps (top-16), 38.68 fps (top-48, 25.9 ms/frame)**
+  — from 28.24 at the start of the rebuilt-experts arc.
+- **Full Klaus re-validated: MATCHED — 30,646,177 steps (decimal) in
+  221.6 s (~138K instr/s incl. the lockstep reference), checkpoint-free**
+  (measured while a MILP solve shared the machine; within noise of the
+  previous 216.3 s).
+
+Remaining to 60 fps (~1.56x): busy-frame logic mix through the mid-size
+experts — per-expert width compaction, probed next.
+
+## 2026-07-09 per-expert MILP width probe
+
+At expert scale the exact-width MILP actually solves — the union blowup
+(2026-07-06: presolve alone exceeded an hour) was formulation-times-size,
+not the solver.  **CLC expert: 273K rows presolved to 74K / 33K binaries;
+optimal in 118 s; d_model 250 (balanced ASAP) → 154 (0.62x).**  HiGHS
+found a first incumbent in ~50 s and spent the rest proving.  The
+poll-loop-scale probe (LDA abs, 22 layers / ~1,700 ops) is next; if the
+width win holds there, the wiring question is schedule caching (a MILP
+solve per expert per machine build is unusable for tests — solutions must
+be cached by fold digest, or MILP experts become an opt-in performance
+configuration).
+
 ## Where things stand (all verified, all tests green)
 
 **Four backends, one 6502 semantics**, each lockstep-verified against the

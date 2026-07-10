@@ -375,11 +375,20 @@ class GraphFolder:
         )
 
 
-def opcode_pins(byte: int, opcodes) -> dict[str, float]:
+def opcode_pins(byte: int, opcodes, *, pin_fetched_byte: bool = True) -> dict[str, float]:
     """Pin every decode gate for a single-opcode expert: ``is_op_<byte>=1``,
     every other ``is_op_*=0``, ``is_nmi=0`` (an NMI overrides the fetched
-    instruction, so a routed step must not claim it)."""
+    instruction, so a routed step must not claim it).
+
+    With ``pin_fetched_byte`` (the default), the ``fetched_opcode`` persist
+    itself is pinned to the byte.  The router dispatches on
+    ``ram[pc] == byte``, which is strictly stronger than ``is_op = 1``, so
+    the memory read at PC provably returns the byte -- pinning it folds
+    that read (one of the three grouped fetch reads) and any remaining
+    decode residue out of the expert graph."""
     pins: dict[str, float] = {"is_nmi": 0.0}
     for op in opcodes.values():
         pins[f"is_op_{op.byte:02X}"] = 1.0 if op.byte == byte else 0.0
+    if pin_fetched_byte:
+        pins["fetched_opcode"] = float(byte)
     return pins

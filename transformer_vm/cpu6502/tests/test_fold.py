@@ -92,7 +92,10 @@ def test_unpinned_fold_reproduces_union(folder, probe_results):
 
 @pytest.mark.parametrize("byte", [0x4C, 0xAD, 0x29, 0xF0])
 def test_opcode_fold_matches_probe(folder, probe_results, byte):
-    r = folder.fold(opcode_pins(byte, OPCODES), label=f"{byte:02X}")
+    # pin_fetched_byte=False: the probe pinned only the decode one-hots,
+    # so that is the apples-to-apples configuration.
+    r = folder.fold(opcode_pins(byte, OPCODES, pin_fetched_byte=False),
+                    label=f"{byte:02X}")
     base = probe_results["union"]
     probe = probe_results["per_opcode"][f"{byte:02X}"]
     # The shared-state contract: decode pins never reach insert-side exprs.
@@ -108,6 +111,14 @@ def test_opcode_fold_matches_probe(folder, probe_results, byte):
     # True (materialized) depth; see the module docstring for why this runs
     # deeper than the probe's optimistic number.
     assert _depth(r) < base["depth"] * 0.5
+
+    # The default fold additionally pins the fetched byte (the router
+    # predicate ram[pc] == byte): the PC fetch read and decode residue fold
+    # away, so the graph must get strictly smaller, never larger.
+    rb = folder.fold(opcode_pins(byte, OPCODES), label=f"{byte:02X}+byte")
+    assert rb.insert_side_hazards == ()
+    assert rb.n_terms < r.n_terms
+    assert rb.n_lookups < r.n_lookups  # the PC read's group lookups died
 
 
 # ── Semantic shadow receipt ──────────────────────────────────────────
