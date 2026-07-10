@@ -382,6 +382,13 @@ _MEM_QUERY = """\
 
     void mem_query(const int g, const long long q, long long out[2]) const {
         const unsigned long long* bits = mem_bits[g];
+        // Written addresses answer for themselves: below == above == q,
+        // and the tie-break picks the same entry either way.
+        if (q >= 0 && q <= 4095 && (bits[q >> 6] >> (q & 63)) & 1ULL) {
+            out[0] = mem_val[g][q];
+            out[1] = ((long long)g << 12) + q;
+            return;
+        }
         long long below = -1, above = -1;
         if (q >= 0) {
             const long long start = q < 4095 ? q : 4095;

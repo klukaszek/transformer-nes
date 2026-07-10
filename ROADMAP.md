@@ -24,6 +24,35 @@ hull-log growth (optional cleanup), the Klaus harness cost (lockstep
 reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## 2026-07-10 generic loop scanner + written-bit fast path (any-ROM work)
+
+Two generality changes for arbitrary ROMs (SMB itself unchanged at
+~343 fps, frames byte-identical):
+
+- **scan_sequence_windows is now a generic closed-micro-loop finder**,
+  not a pattern list: decode forward from every address; a window closes
+  when its final control flow (conditional branch or JMP abs) targets
+  the head; cheap pre-filters (no writers, no mid-window branches,
+  only-first-reads), with `_build_sequence_expert`'s license checks as
+  the backstop — a rejected window is skipped with a log line, never a
+  crash.  JMP-closed loops still fold spin_repeat iterations.  On SMB it
+  finds **9 windows where the pattern list found 3**, including idioms
+  the list missed: the canonical `LDA $2002 / BPL` vblank waits, the
+  BNE-variant sprite-0 trio, a `DEY/BNE` delay, and two 4-instruction
+  timing loops (`SEC/SBC/DEY/BPL`, `INY/LSR/BCC`).  Any game's idle
+  idioms now qualify without anyone naming them.
+- **mem_query written-bit fast path**: if the queried address's own bit
+  is set, the nearest-written-address is the address itself — return
+  `latest[q]` directly (below == above == q collapses the tie-break).
+  Honest receipt: ~2% on a read-heavy loop — the scans were already
+  cheap on dense bitsets; kept because it is five exact lines that are
+  never slower.
+
+Receipts: 77 tests green (the sequence lockstep test now drives four
+idiom windows — abs trio, DEX/BNE delay, zero-page BPL poll, JMP spin —
+across two mid-run flag flips); SMB 343 fps, frames byte-identical
+120/120; full Klaus MATCHED 90.6 s; nestest MATCHED.
+
 ## 2026-07-10 hygiene-objective MILP — validated, kept as opt-in
 
 Approach #3, probed and closed.  `milp_schedule` gains

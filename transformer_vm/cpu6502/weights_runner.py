@@ -52,20 +52,59 @@ logger = logging.getLogger(__name__)
 DEFAULT_EXPERT_OPCODES = tuple(sorted(OPCODES))
 
 
+# Instructions that write memory (stores, RMW outside accumulator mode,
+# stack pushes) or leave the sequence license some other way -- the scanner's
+# cheap pre-filter; _build_sequence_expert's folded-constant checks remain
+# the backstop.
+_SEQ_WRITERS = frozenset({
+    "store_a", "store_x", "store_y", "sax", "pha", "php",
+    "jsr", "brk", "rti", "rts", "pla", "plp",
+})
+_SEQ_RMW = frozenset({
+    "asl", "lsr", "rol", "ror", "inc", "dec",
+    "slo", "rla", "sre", "rra", "dcp", "isb", "lax",
+})
+_SEQ_BRANCHES = frozenset({"bcc", "bcs", "beq", "bmi", "bne", "bpl", "bvc", "bvs"})
+_SEQ_MAX_INSTR = 4
+
+
 def scan_sequence_windows(image, *, spin_repeat: int = 4, limit: int = 16):
-    """Find sequence-expert windows by ISA pattern, not by workload: closed
-    LDA abs / AND imm / BEQ -7 poll loops and JMP-to-self spins.  The router
-    re-verifies every window byte at dispatch, so a stale match only costs
-    the fast path, never correctness."""
+    """Find sequence-expert windows generically: any closed micro-loop --
+    straight-line code whose final control flow (conditional branch or JMP
+    abs) targets the loop head.  This is an ISA-shape scan, not a workload
+    histogram: idle idioms of any game qualify (BIT $2002/BPL, LDA zp/BEQ,
+    DEX/BNE delays, JMP-to-self...).  Pre-filters here are cheap
+    necessities; the fold's license checks (write-free, non-halting,
+    straight-line, only-first-reads) arbitrate, and the router re-verifies
+    every window byte at dispatch, so a stale match only costs the fast
+    path, never correctness.  JMP-closed loops fold spin_repeat iterations
+    per forward; branch-closed loops fold one."""
     data = bytes(image)
     wins = []
-    for addr in range(len(data) - 6):
-        if (data[addr] == 0xAD and data[addr + 3] == 0x29
-                and data[addr + 5] == 0xF0 and data[addr + 6] == 0xF9):
-            wins.append((addr, data[addr:addr + 7], 1))
-    for addr in range(len(data) - 2):
-        if data[addr] == 0x4C and data[addr + 1] | (data[addr + 2] << 8) == addr:
-            wins.append((addr, data[addr:addr + 3], spin_repeat))
+    for head in range(len(data)):
+        pc = head
+        for n in range(_SEQ_MAX_INSTR):
+            op = OPCODES.get(data[pc]) if pc < len(data) - 2 else None
+            if op is None:
+                break
+            reads = op.operation in READS_MEMORY and op.mode not in (
+                "imp", "acc", "imm")
+            if (op.operation in _SEQ_WRITERS
+                    or (op.operation in _SEQ_RMW and op.mode != "acc")
+                    or (n > 0 and reads)):
+                break
+            nxt = pc + op.length
+            if op.operation in _SEQ_BRANCHES:
+                off = data[pc + 1]
+                target = (nxt + off - (256 if off & 0x80 else 0)) & 0xFFFF
+                if target == head and n > 0:
+                    wins.append((head, data[head:nxt], 1))
+                break
+            if op.operation == "jmp":
+                if op.mode == "abs" and data[pc + 1] | (data[pc + 2] << 8) == head:
+                    wins.append((head, data[head:nxt], spin_repeat))
+                break
+            pc = nxt
     return tuple(wins[:limit])
 
 
@@ -168,7 +207,13 @@ class Cpu6502TransformerMachine:
             experts = []
             if codegen_arith != "f32":
                 experts = self._build_expert_models(expert_opcodes)
-                experts += [self._build_sequence_expert(*w) for w in windows]
+                for w in windows:
+                    # The scanner proposes shapes; the fold's license checks
+                    # arbitrate.  A rejected window only loses its fast path.
+                    try:
+                        experts.append(self._build_sequence_expert(*w))
+                    except RuntimeError as e:
+                        logger.info("sequence window skipped: %s", e)
             elif expert_opcodes:
                 logger.info(
                     "opcode-routed experts disabled: f32 arith keeps every lookup "

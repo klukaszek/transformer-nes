@@ -173,15 +173,22 @@ def test_sequence_experts_match_per_step():
     from transformer_vm.cpu6502.weights_runner import scan_sequence_windows
 
     image = bytearray(0x10000)
-    image[0x0400:0x040B] = bytes([
-        0xAD, 0x00, 0x07,  # LDA $0700
-        0x29, 0x40,        # AND #$40
-        0xF0, 0xF9,        # BEQ $0400
-        0xEA,              # NOP
-        0x4C, 0x08, 0x04,  # JMP $0408 (self)
+    image[0x0400:0x0413] = bytes([
+        0xAD, 0x00, 0x07,  # 0400 LDA $0700   (abs poll trio)
+        0x29, 0x40,        # 0403 AND #$40
+        0xF0, 0xF9,        # 0405 BEQ $0400
+        0xEA,              # 0407 NOP
+        0xCA,              # 0408 DEX         (delay loop)
+        0xD0, 0xFD,        # 0409 BNE $0408
+        0xA5, 0x10,        # 040B LDA $10     (zero-page BPL poll)
+        0x10, 0xFC,        # 040D BPL $040B
+        0xEA,              # 040F NOP
+        0x4C, 0x10, 0x04,  # 0410 JMP $0410 (self)
     ])
     windows = scan_sequence_windows(image)
-    assert {(h, r) for h, _c, r in windows} == {(0x0400, 1), (0x0408, 4)}
+    assert {(h, r) for h, _c, r in windows} == {
+        (0x0400, 1), (0x0408, 1), (0x040B, 1), (0x0410, 4),
+    }
 
     fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
               "ea", "data", "halted")
@@ -190,22 +197,24 @@ def test_sequence_experts_match_per_step():
         m = Cpu6502TransformerMachine(bcd=False, sequence_windows=wins)
         m.load_image(bytes(image), start_pc=0x0400)
         chunks = []
-        done = 0
-        while done < 3000:  # polling: budget boundaries land mid-window
-            out = m.run(min(701, 3000 - done))
-            assert len(out["pc"]), out["reason"]
-            chunks.append(out)
-            done += len(out["pc"])
-        m.inject_write(0x0700, 0x40)  # flag up: fall through to the spin
-        done = 0
-        while done < 2000:
-            out = m.run(min(701, 2000 - done))
-            assert len(out["pc"]), out["reason"]
-            chunks.append(out)
-            done += len(out["pc"])
+
+        def drain(n, chunks=chunks, m=m):
+            done = 0
+            while done < n:  # odd chunks: budget boundaries land mid-window
+                out = m.run(min(701, n - done))
+                assert len(out["pc"]), out["reason"]
+                chunks.append(out)
+                done += len(out["pc"])
+
+        drain(3000)                    # abs poll trio spins
+        m.inject_write(0x0700, 0x40)   # flag up: through NOP + DEX/BNE delay
+        drain(1000)                    # ...into the zp BPL poll
+        m.inject_write(0x0010, 0x80)   # bit 7 up: fall through to the spin
+        drain(1000)
         traces.append({
             k: np.concatenate([c[k] for c in chunks]) for k in fields
         })
     for k in fields:
         assert np.array_equal(traces[0][k], traces[1][k]), f"{k} diverged"
-    assert 0x0408 in traces[0]["pc"], "never reached the spin"
+    for pc in (0x0408, 0x040B, 0x0410):
+        assert pc in traces[0]["pc"], f"never reached {pc:04X}"
