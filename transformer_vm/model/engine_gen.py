@@ -69,11 +69,11 @@ def _code_digest() -> str:
     return _code_digest_cache
 
 
-def engine_config_key(*, bcd: bool, arith: str, expert_bytes) -> str:
+def engine_config_key(*, bcd: bool, arith: str, expert_bytes, extra: str = "") -> str:
     """Cache key for a built engine, computable without folding or emitting:
     the config plus a digest of every source file that shapes the emission."""
     tag = ",".join(f"{int(b):02X}" for b in expert_bytes)
-    raw = f"{_code_digest()}|bcd={int(bcd)}|arith={arith}|experts={tag}"
+    raw = f"{_code_digest()}|bcd={int(bcd)}|arith={arith}|experts={tag}|{extra}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -471,6 +471,34 @@ _RUN_LOOP = """\
                     // Leased: serve the device read natively, exactly
                     // what the Python pause path would inject.
                     inject_write(target, lease_value);
+                }
+            }
+            // A routed sequence consumes a whole window in one forward;
+            // its guards (in seq_dispatch) keep this step-for-step
+            // equivalent to the per-instruction path below.
+            {
+                const int k_seq = seq_dispatch(i, max_steps, cycles_this,
+                                               max_cycles, stop_on_trap);
+                if (k_seq > 0) {
+                    for (int k = 0; k < k_seq; ++k) {
+                        const long long* ok = seq_out + 21 * k;
+                        t_pc.push_back((int)ok[0]); t_a.push_back((int)ok[1]);
+                        t_x.push_back((int)ok[2]); t_y.push_back((int)ok[3]);
+                        t_s.push_back((int)ok[4]); t_p.push_back((int)ok[5]);
+                        t_ir.push_back((int)ok[6]); t_oplo.push_back((int)ok[7]);
+                        t_ophi.push_back((int)ok[8]); t_ea.push_back((int)ok[9]);
+                        t_data.push_back((int)ok[10]);
+                        t_halted.push_back((int)ok[11]);
+                        ++step_index;
+                        const long step_cycles = (long)CYCLES[(unsigned char)ok[6]];
+                        cycles_this += step_cycles; cycles_total += step_cycles;
+                    }
+                    if (seq_out[21 * (k_seq - 1) + 13]) {
+                        st_halted = true; reason = "halt"; break;
+                    }
+                    i += k_seq - 1;
+                    if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }
+                    continue;
                 }
             }
             const bool was_nmi = nmi_pending;
@@ -1254,13 +1282,13 @@ def generate_source(model, step_spec: dict | None = None,
             # reads out through its own slot layout (spec); the persistent
             # st_* registers are the cross-model interface.
             ins = spec["inputs"]
-            outs = spec["outputs"]
+            # A sequence expert reads out K instructions from one forward
+            # (per-step slot maps under "step_outputs"); a plain expert is
+            # the K=1 case.
+            step_outs = spec.get("step_outputs") or [spec["outputs"]]
             hc, hv = spec["halt_head"]
             shc, shv = spec["state_head"]
             dm = mdl.tok.weight.shape[1]
-
-            def out_slot(name):
-                return outs[name]
 
             emit(f"    void {fn_name}(long long* out) {{")
             emit(f"        {elem}* x = xbuf;")
@@ -1299,28 +1327,37 @@ def generate_source(model, step_spec: dict | None = None,
             emit("        ++seq;")
             for li in range(len(mdl.attn)):
                 emit(f"        layer_{li}{layer_suffix}(x{', pf' if is_int else ''});")
-            for i, (name, mask) in enumerate((
-                ("current_pc", 0xFFFF), ("new_a", 0xFF), ("new_x", 0xFF),
-                ("new_y", 0xFF), ("new_s", 0xFF), ("new_p", 0xFF),
-                ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
-                ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF), ("data_out", 0xFF),
-                ("new_halted", 0xFF), ("next_pc", 0xFFFF),
-            )):
-                emit(f"        out[{i}] = {rdv(out_slot(name))} & 0x{mask:X};")
-            emit("        long long n_writes = 0;")
-            for store, addr, value in (
-                ("is_store", "write_addr_out", "write_value_out"),
-                ("is_store2", "write_addr2_out", "write_value2_out"),
-                ("is_store3", "write_addr3_out", "write_value3_out"),
-            ):
-                emit(f"        if (({rdv(out_slot(store))} & 0xFF) != 0) {{")
-                emit(f"            out[15 + 2 * n_writes] = {rdv(out_slot(addr))} & 0xFFFF;")
-                emit(f"            out[16 + 2 * n_writes] = {rdv(out_slot(value))} & 0xFF;")
-                emit("            ++n_writes;")
+            for k, outs in enumerate(step_outs):
+                off = 21 * k
+                for i, (name, mask) in enumerate((
+                    ("current_pc", 0xFFFF), ("new_a", 0xFF), ("new_x", 0xFF),
+                    ("new_y", 0xFF), ("new_s", 0xFF), ("new_p", 0xFF),
+                    ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
+                    ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF), ("data_out", 0xFF),
+                    ("new_halted", 0xFF), ("next_pc", 0xFFFF),
+                )):
+                    emit(f"        out[{off + i}] = {rdv(outs[name])} & 0x{mask:X};")
+                emit("        { long long n_writes = 0;")
+                for store, addr, value in (
+                    ("is_store", "write_addr_out", "write_value_out"),
+                    ("is_store2", "write_addr2_out", "write_value2_out"),
+                    ("is_store3", "write_addr3_out", "write_value3_out"),
+                ):
+                    emit(f"        if (({rdv(outs[store])} & 0xFF) != 0) {{")
+                    emit(f"            out[{off + 15} + 2 * n_writes] = {rdv(outs[addr])} & 0xFFFF;")
+                    emit(f"            out[{off + 16} + 2 * n_writes] = {rdv(outs[value])} & 0xFF;")
+                    emit("            ++n_writes;")
+                    emit("        }")
+                emit(f"        out[{off + 14}] = n_writes;")
+                emit("        for (long long i = 0; i < n_writes; ++i)")
+                emit(f"            insert_write_f32((int)out[{off + 15} + 2 * i], "
+                     f"(int)out[{off + 16} + 2 * i], seq + 1);")
                 emit("        }")
-            emit("        out[14] = n_writes;")
-            emit("        for (long long i = 0; i < n_writes; ++i)")
-            emit("            insert_write_f32((int)out[15 + 2 * i], (int)out[16 + 2 * i], seq + 1);")
+                if k + 1 < len(step_outs):
+                    # Non-final rows of a sequence are generation-verified
+                    # non-halting; only the final row competes STATE vs HALT.
+                    emit(f"        out[{off + 13}] = 0;")
+            last = 21 * (len(step_outs) - 1)
             if is_int:
                 emit(f"        const long long halt_logit = "
                      f"{_expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
@@ -1329,16 +1366,21 @@ def generate_source(model, step_spec: dict | None = None,
             else:
                 emit(f"        const float halt_logit = {_expr(hc, hv, lambda i: f'x[{i}]')};")
                 emit(f"        const float state_logit = {_expr(shc, shv, lambda i: f'x[{i}]')};")
-            emit("        out[13] = halt_logit > state_logit ? 1 : 0;")
+            emit(f"        out[{last + 13}] = halt_logit > state_logit ? 1 : 0;")
             emit("        // Advance the architectural state (inputs are fully")
             emit("        // consumed by the embed above before this update).")
-            emit("        st_pc = (int)out[12];")
-            emit("        st_a = (int)out[1]; st_x = (int)out[2]; st_y = (int)out[3];")
-            emit("        st_s = (int)out[4]; st_p = (int)out[5];")
-            emit("        st_ir = (int)out[6]; st_oplo = (int)out[7]; st_ophi = (int)out[8];")
-            emit("        st_ea = (int)out[9]; st_data = (int)out[10];")
-            emit("        st_halted = out[11] != 0;")
+            emit(f"        st_pc = (int)out[{last + 12}];")
+            emit(f"        st_a = (int)out[{last + 1}]; st_x = (int)out[{last + 2}]; "
+                 f"st_y = (int)out[{last + 3}];")
+            emit(f"        st_s = (int)out[{last + 4}]; st_p = (int)out[{last + 5}];")
+            emit(f"        st_ir = (int)out[{last + 6}]; st_oplo = (int)out[{last + 7}]; "
+                 f"st_ophi = (int)out[{last + 8}];")
+            emit(f"        st_ea = (int)out[{last + 9}]; st_data = (int)out[{last + 10}];")
+            emit(f"        st_halted = out[{last + 11}] != 0;")
             emit("    }")
+
+        op_experts = [e for e in experts if e.get("kind") != "seq"]
+        seq_experts = [e for e in experts if e.get("kind") == "seq"]
 
         emit_step_core("step_core_union", "", model, step_spec)
         for exp in experts:
@@ -1352,15 +1394,43 @@ def generate_source(model, step_spec: dict | None = None,
         # pending NMI overrides the instruction, so it takes the union step.
         emit("")
         emit("    void step_core(long long* out) {")
-        if experts:
+        if op_experts:
             emit("        if (!nmi_pending) {")
             emit("            switch (ram[st_pc]) {")
-            for exp in experts:
+            for exp in op_experts:
                 emit(f"                case 0x{exp['byte']:02X}: "
                      f"step_core__{exp['name']}(out); return;")
             emit("            }")
             emit("        }")
         emit("        step_core_union(out);")
+        emit("    }")
+
+        # Sequence dispatch (native run loop only): a whole pinned window as
+        # one forward.  The guards keep it step-for-step equivalent to the
+        # per-instruction path: pc at the head, every window byte matched, no
+        # pending NMI, and enough step/cycle budget that the per-step path
+        # would also have executed the full window before pausing.
+        max_k = max((e["n_steps"] for e in seq_experts), default=1)
+        emit("")
+        emit(f"    long long seq_out[{21 * max_k}];")
+        emit("    int seq_dispatch(long i, long max_steps, long cycles_this,")
+        emit("                     long max_cycles, bool stop_on_trap) {")
+        if seq_experts:
+            emit("        if (nmi_pending || stop_on_trap) return 0;")
+            for exp in seq_experts:
+                head, window = exp["head"], exp["window"]
+                k, prefix = exp["n_steps"], exp["cycles_prefix"]
+                match = " && ".join(
+                    f"ram[0x{(head + j) & 0xFFFF:04X}] == 0x{b:02X}"
+                    for j, b in enumerate(window)
+                )
+                emit(f"        if (st_pc == 0x{head:04X} && i + {k} <= max_steps")
+                emit(f"            && (max_cycles <= 0 || cycles_this + {prefix} < max_cycles)")
+                emit(f"            && {match}) {{")
+                emit(f"            step_core__{exp['name']}(seq_out);")
+                emit(f"            return {k};")
+                emit("        }")
+        emit("        return 0;")
         emit("    }")
         emit("")
         emit("    // Per-instruction entry point: seed st_* from arguments, run one")

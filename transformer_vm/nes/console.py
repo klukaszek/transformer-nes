@@ -144,9 +144,15 @@ class Console:
             # The real transformer through its generated C++ run loop:
             # KernelBus drives it natively (MMIO pauses back to Python), the
             # same protocol as the kernel.
-            from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
+            from transformer_vm.cpu6502.weights_runner import (
+                Cpu6502TransformerMachine,
+                scan_sequence_windows,
+            )
 
-            machine = Cpu6502TransformerMachine(bcd=False, checkpoint_tokens=None)
+            machine = Cpu6502TransformerMachine(
+                bcd=False, checkpoint_tokens=None,
+                sequence_windows=scan_sequence_windows(image),
+            )
             if not machine.supports_run_loop:
                 raise RuntimeError("the weights backend requires the codegen run loop")
             self._rt = machine

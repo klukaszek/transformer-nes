@@ -160,3 +160,52 @@ def test_run_loop_matches_per_step():
         got = (int(tout["pc"][i]), int(tout["a"][i]), int(tout["x"][i]),
                int(tout["y"][i]), int(tout["s"][i]), int(tout["p"][i]))
         assert (a.pc, a.a, a.x, a.y, a.s, a.p) == got, f"trap step {i}"
+
+
+@pytest.mark.slow
+def test_sequence_experts_match_per_step():
+    """Sequence dispatch (the poll trio and the JMP spin as one forward per
+    window) must leave the run-loop trace byte-identical to a machine with
+    no sequence windows, across the poll, a mid-run flag flip, the branch
+    fall-through, and the spin."""
+    import numpy as np
+
+    from transformer_vm.cpu6502.weights_runner import scan_sequence_windows
+
+    image = bytearray(0x10000)
+    image[0x0400:0x040B] = bytes([
+        0xAD, 0x00, 0x07,  # LDA $0700
+        0x29, 0x40,        # AND #$40
+        0xF0, 0xF9,        # BEQ $0400
+        0xEA,              # NOP
+        0x4C, 0x08, 0x04,  # JMP $0408 (self)
+    ])
+    windows = scan_sequence_windows(image)
+    assert {(h, r) for h, _c, r in windows} == {(0x0400, 1), (0x0408, 4)}
+
+    fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
+              "ea", "data", "halted")
+    traces = []
+    for wins in (windows, ()):
+        m = Cpu6502TransformerMachine(bcd=False, sequence_windows=wins)
+        m.load_image(bytes(image), start_pc=0x0400)
+        chunks = []
+        done = 0
+        while done < 3000:  # polling: budget boundaries land mid-window
+            out = m.run(min(701, 3000 - done))
+            assert len(out["pc"]), out["reason"]
+            chunks.append(out)
+            done += len(out["pc"])
+        m.inject_write(0x0700, 0x40)  # flag up: fall through to the spin
+        done = 0
+        while done < 2000:
+            out = m.run(min(701, 2000 - done))
+            assert len(out["pc"]), out["reason"]
+            chunks.append(out)
+            done += len(out["pc"])
+        traces.append({
+            k: np.concatenate([c[k] for c in chunks]) for k in fields
+        })
+    for k in fields:
+        assert np.array_equal(traces[0][k], traces[1][k]), f"{k} diverged"
+    assert 0x0408 in traces[0]["pc"], "never reached the spin"

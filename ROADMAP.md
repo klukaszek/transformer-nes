@@ -6,22 +6,68 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
-**START HERE (2026-07-10, 60 fps exceeded 3x):** SMB gameplay through
-the transformer weights runs at **182.4 fps (5.5 ms/frame)** — 3x past
-the 60 fps goal, 12x the C++ graph kernel in the same window.  The four
-levers, each with its own log below: the all-opcode MoE (227 rebuilt
-experts, no game-derived tuning set), the engine build cache
-(construction ~1 s, distributable compiled artifacts), the MMIO read
-lease ($2002 polls served natively instead of pausing to Python
-~1,420x/frame), and group-dispatch fusion (one memory query per read
-instead of 16).  Hot loops: JMP 0.37 µs/step (2.7M instr/s), poll trio
-0.39 µs.  Full Klaus (30,646,177 steps, decimal) MATCHED; 74 tests
-green; frames byte-identical across backends.  Remaining candidates:
-the poll-loop sequence expert (thesis artifact, approach #2 below), the
-MILP objective realignment probe (#3), the kernel backend's hull-log
-growth (optional cleanup), and the Klaus harness itself (now bound by
-the lockstep reference + trace marshalling, not the forwards).  The
+**START HERE (2026-07-10, 350 fps):** SMB gameplay through the
+transformer weights runs at **349.9 fps (2.9 ms/frame)** — nearly 6x the
+60 fps goal, 22x the C++ graph kernel in the same window.  The five
+levers of the two-day arc, each with its own log below: the all-opcode
+MoE (227 rebuilt experts, no game-derived tuning set), the engine build
+cache (construction ~1 s, distributable compiled artifacts), the MMIO
+read lease ($2002 polls served natively instead of pausing to Python
+~1,420x/frame), group-dispatch fusion (one memory query per read
+instead of 16), and **sequence experts** (a whole pinned instruction
+window as ONE forward: the poll trio at 0.07 µs/instr, the JMP spin at
+0.05 µs/instr — the roadmap's approach #2, landed).  Full Klaus
+(30,646,177 steps, decimal) MATCHED in 90.7 s; 76 tests green; frames
+byte-identical across backends.  Remaining candidates: the MILP
+objective realignment probe (#3, bounded), the kernel backend's
+hull-log growth (optional cleanup), the Klaus harness cost (lockstep
+reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
+
+## 2026-07-10 sequence experts — a pinned window is one forward
+
+Approach #2 from the 2026-07-09 handoff, landed as construction + engine:
+
+- **graph/fold.py `fold_sequence`**: folds a K-step composition of the
+  union graph into one materialized graph.  Per-step pins come from the
+  router (pc, every window byte, is_nmi=0), state chains through
+  `SEQUENCE_FEEDBACK` (expression feedback for A/flags/data; constants
+  propagate as pins; byte-split entries must fold constant), and each
+  step's roots materialize as `name__s<k>`.  Under sequence pins the
+  internal pc feedback is constant, so no byte-split gadgets are needed.
+- **Runner `_build_sequence_expert`**: the license is checked, not
+  assumed — every step write-free and non-halting (folded constants),
+  straight-line control flow inside the window (folded `next_pc__sk` ==
+  the next step's pinned pc), only the first instruction may read memory
+  (the shadow-watch check covers exactly one), no insert-side hazards.
+- **engine_gen**: `emit_step_core` generalizes to K out-buffers (a plain
+  expert is the K=1 case); a generated `seq_dispatch` matches pc == head
+  plus every window byte and requires the step/cycle budget that keeps
+  dispatch step-for-step equivalent to the per-instruction path (no
+  dispatch under stop_on_trap or a pending NMI); the run loop emits K
+  trace rows per forward.  machine_step never dispatches sequences.
+- **Windows come from an ISA pattern scan, not a workload**
+  (`scan_sequence_windows`): closed `LDA abs / AND imm / BEQ -7` poll
+  loops and `JMP`-to-self spins (folded 4 iterations per forward),
+  found in the boot image; the router re-verifies every byte at
+  dispatch, so self-modified code only loses the fast path.  The
+  console passes the scan of the cartridge image; the cache key covers
+  the windows.
+
+Receipts (76 tests green, ruff clean):
+- New fold shadow tests: one composed forward reproduces the union's K
+  consecutive readouts exactly (trio across taken/not-taken; 3-step
+  spin).  New run-loop lockstep test: traces byte-identical with and
+  without dispatch across poll, mid-run flag flip, fall-through, and
+  spin, including chunk boundaries that land mid-window (the budget
+  guard falls back to single steps).
+- **Poll trio 0.40 → 0.07 µs/instr; JMP spin 0.36 → 0.05 µs/instr.**
+- **SMB gameplay: 182.4 → 349.9 fps (2.9 ms/frame)**, frames
+  byte-identical kernel vs weights 120/120.  Fps arc: 28.24 → 29.68 →
+  32.47 → 43.51 → 47.65 → 123.5 → 182.4 → **349.9**.
+- Full Klaus re-validated MATCHED (90.7 s; the Klaus harness passes no
+  windows, so this re-verifies the shared emission changes); nestest
+  MATCHED.
 
 ## 2026-07-10 group-dispatch fusion — one memory query per read, not 16
 

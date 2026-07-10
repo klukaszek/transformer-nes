@@ -37,7 +37,7 @@ import numpy as np
 
 from transformer_vm.cpu6502 import reference
 from transformer_vm.cpu6502.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
-from transformer_vm.cpu6502.spec import OPCODES
+from transformer_vm.cpu6502.spec import OPCODES, READS_MEMORY
 from transformer_vm.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_vm.graph.core import ProgramGraph
 from transformer_vm.graph.fold import GraphFolder, opcode_pins
@@ -52,6 +52,23 @@ logger = logging.getLogger(__name__)
 DEFAULT_EXPERT_OPCODES = tuple(sorted(OPCODES))
 
 
+def scan_sequence_windows(image, *, spin_repeat: int = 4, limit: int = 16):
+    """Find sequence-expert windows by ISA pattern, not by workload: closed
+    LDA abs / AND imm / BEQ -7 poll loops and JMP-to-self spins.  The router
+    re-verifies every window byte at dispatch, so a stale match only costs
+    the fast path, never correctness."""
+    data = bytes(image)
+    wins = []
+    for addr in range(len(data) - 6):
+        if (data[addr] == 0xAD and data[addr + 3] == 0x29
+                and data[addr + 5] == 0xF0 and data[addr + 6] == 0xF9):
+            wins.append((addr, data[addr:addr + 7], 1))
+    for addr in range(len(data) - 2):
+        if data[addr] == 0x4C and data[addr + 1] | (data[addr + 2] << 8) == addr:
+            wins.append((addr, data[addr:addr + 3], spin_repeat))
+    return tuple(wins[:limit])
+
+
 class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
@@ -59,6 +76,7 @@ class Cpu6502TransformerMachine:
                  codegen_arith: str = "int32",
                  checkpoint_tokens: int | None = None,
                  expert_opcodes=DEFAULT_EXPERT_OPCODES,
+                 sequence_windows=(),
                  expert_schedule: str = "asap",
                  expert_milp_seconds: int = 900):
         # Build the graph (and keep the evaluator's dim handles; its Python
@@ -126,14 +144,22 @@ class Cpu6502TransformerMachine:
         # set), so a manifest hit skips the expert folds and the emission and
         # loads the compiled artifact directly.  MILP schedules are excluded:
         # their incumbents depend on solve time.
+        windows = [
+            (int(head) & 0xFFFF, bytes(code), int(repeat))
+            for head, code, repeat in (sequence_windows or ())
+        ] if codegen_arith != "f32" else []
         cache_key = None
         self._engine = None
         if expert_schedule == "asap":
             expert_bytes = [
                 int(b) for b in (expert_opcodes or ()) if int(b) in OPCODES
             ] if codegen_arith != "f32" else []
+            seq_tag = ",".join(
+                f"{head:04X}:{code.hex()}x{repeat}" for head, code, repeat in windows
+            )
             cache_key = engine_config_key(
                 bcd=bcd, arith=codegen_arith, expert_bytes=expert_bytes,
+                extra=seq_tag,
             )
             self._engine = GeneratedWeightsEngine.from_cache(cache_key)
             if self._engine is not None:
@@ -142,6 +168,7 @@ class Cpu6502TransformerMachine:
             experts = []
             if codegen_arith != "f32":
                 experts = self._build_expert_models(expert_opcodes)
+                experts += [self._build_sequence_expert(*w) for w in windows]
             elif expert_opcodes:
                 logger.info(
                     "opcode-routed experts disabled: f32 arith keeps every lookup "
@@ -290,6 +317,124 @@ class Cpu6502TransformerMachine:
                 (s("in_p_v"), reference.FLAG_V), (s("in_p_n"), reference.FLAG_N),
             ],
             "outputs": {name: s(name) for name in _RUNTIME_READ_DIMS},
+            "halt_head": head_row(tok_to_idx["HALT"]),
+            "state_head": head_row(tok_to_idx["STATE"]),
+        }
+
+    def _build_sequence_expert(self, head: int, code: bytes, repeat: int) -> dict:
+        """One sequence expert: a K-instruction window folded as ONE forward.
+
+        The router guarantees pc == head, the window's bytes, no pending NMI,
+        and a remaining step/cycle budget covering the whole window, so the
+        fold pins all of it.  The license is checked, not assumed: every step
+        must be write-free and non-halting (folded constants), control flow
+        inside the window must be straight-line (folded next_pc == the next
+        step's pinned pc), and only the first instruction may read memory
+        (the run loop's shadow-read watch check covers just that one).
+        """
+        from transformer_vm.graph.fold import SEQUENCE_FEEDBACK, sequence_pins
+
+        pin_list = sequence_pins(head, code, OPCODES) * repeat
+        n_steps = len(pin_list)
+        ops, off = [], 0
+        while off < len(code):
+            op = OPCODES[code[off]]
+            ops.append(op)
+            off += op.length
+        ops = ops * repeat
+        for op in ops[1:]:
+            if op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm"):
+                raise RuntimeError(
+                    f"sequence @{head:04X}: {op.mnemonic} reads memory past "
+                    "the shadow-watch check (only the first instruction may)"
+                )
+
+        folder = GraphFolder(self._pg, root_names=_RUNTIME_READ_DIMS)
+        label = f"seq_{head:04X}"
+        r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK, label=label)
+        if r.insert_side_hazards:
+            raise RuntimeError(
+                f"sequence @{head:04X}: pins reach insert-side expressions "
+                f"of {r.insert_side_hazards}"
+            )
+
+        one = r.program_graph.one
+
+        def const_root(name, k):
+            d = r.dim_of_name[f"{name}__s{k}"]
+            expr = getattr(d, "expr", None)
+            if expr is None or any(t is not one for t in expr.terms):
+                raise RuntimeError(
+                    f"sequence @{head:04X} step {k}: {name} did not fold "
+                    "to a constant"
+                )
+            return int(round(expr.terms.get(one, 0.0)))
+
+        for k in range(n_steps):
+            for store in ("is_store", "is_store2", "is_store3"):
+                if const_root(store, k) != 0:
+                    raise RuntimeError(
+                        f"sequence @{head:04X} step {k}: not write-free"
+                    )
+            if const_root("new_halted", k) != 0:
+                raise RuntimeError(f"sequence @{head:04X} step {k}: may halt")
+            if k + 1 < n_steps:
+                nxt = int(pin_list[k + 1]["current_pc_lo"]) | (
+                    int(pin_list[k + 1]["current_pc_hi"]) << 8
+                )
+                if const_root("next_pc", k) != nxt:
+                    raise RuntimeError(
+                        f"sequence @{head:04X} step {k}: control flow leaves "
+                        "the window (next_pc != the next step's pc)"
+                    )
+
+        fp = r.program_graph
+        sched = asap_schedule(fp.input_tokens, fp.output_tokens,
+                              program_graph=fp, log=logger.debug)
+        model, _tokens, tok_to_idx, info = build_model(
+            program_graph=fp, schedule=sched,
+        )
+        cycles = sum(op.cycles for op in ops)
+        return {
+            "kind": "seq", "name": label, "head": head, "window": bytes(code),
+            "n_steps": n_steps, "cycles": cycles,
+            "cycles_prefix": cycles - ops[-1].cycles, "model": model,
+            "step_spec": self._sequence_step_spec(r, model, tok_to_idx, info),
+            "union_lookup_of": r.union_lookup_of,
+            "_layers": info.n_layers, "_d": info.d_model,
+        }
+
+    def _sequence_step_spec(self, fold_result, model, tok_to_idx, info) -> dict:
+        """The _expert_step_spec shape, with one outputs map per step."""
+
+        def s(name):
+            return info.slot_of[fold_result.dim_of_name[name]]
+
+        def head_row(row):
+            w = model.head.weight[row]
+            cols = np.nonzero(w)[0]
+            return ([int(c) for c in cols], [float(w[c]) for c in cols])
+
+        return {
+            "inputs": {
+                "is_state": s("is_state"),
+                "pc_lo": s("in_pc_lo"), "pc_hi": s("in_pc_hi"),
+                "a": s("in_a"), "x": s("in_x"), "y": s("in_y"), "s": s("in_s"),
+                "ir": s("in_ir"), "oplo": s("in_oplo"), "ophi": s("in_ophi"),
+                "ea_lo": s("in_ea_lo"), "ea_hi": s("in_ea_hi"),
+                "data": s("in_data"), "halted": s("in_halted"),
+                "nmi": s("in_nmi"),
+            },
+            "p_flags": [
+                (s("in_p_c"), reference.FLAG_C), (s("in_p_z"), reference.FLAG_Z),
+                (s("in_p_i"), reference.FLAG_I), (s("in_p_d"), reference.FLAG_D),
+                (s("in_p_b"), reference.FLAG_B), (s("in_p_u"), reference.FLAG_U),
+                (s("in_p_v"), reference.FLAG_V), (s("in_p_n"), reference.FLAG_N),
+            ],
+            "step_outputs": [
+                {name: s(f"{name}__s{k}") for name in _RUNTIME_READ_DIMS}
+                for k in range(fold_result.n_steps)
+            ],
             "halt_head": head_row(tok_to_idx["HALT"]),
             "state_head": head_row(tok_to_idx["STATE"]),
         }
