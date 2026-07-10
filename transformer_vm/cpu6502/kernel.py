@@ -361,6 +361,9 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('    bool st_halted = false;')
     emit('    bool nmi_pending = false;')
     emit('    bool resume_read_skip = false;')
+    emit('    // Read lease: watched reads of this address are served natively')
+    emit('    // with this value (device semantics frozen until the bus clears it).')
+    emit('    int lease_addr = -1, lease_value = 0;')
     emit('    std::vector<std::pair<int,int>> rwatch, wwatch;')
     emit('')
     emit('    void load_image(py::bytes image_bytes, int start_pc) {')
@@ -379,10 +382,13 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        st_halted = false; nmi_pending = false; resume_read_skip = false;')
     emit('        cycles_total = 0;')
     emit('        rwatch.clear(); wwatch.clear();')
+    emit('        lease_addr = -1;')
     emit('    }')
     emit('')
     emit('    void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }')
     emit('    void watch_write(int lo, int hi) { wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }')
+    emit('    void set_read_lease(int addr, int value) { lease_addr = addr & 0xFFFF; lease_value = value & 0xFF; }')
+    emit('    void clear_read_lease() { lease_addr = -1; }')
     emit('    void set_nmi() { nmi_pending = true; }')
     emit('    int read_ram(int addr) { return ram[addr & 0xFFFF]; }')
     emit('    py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }')
@@ -463,10 +469,15 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('            if (!nmi_pending && !skip && !rwatch.empty()) {')
     emit('                const int target = shadow_read_target();')
     emit('                if (target >= 0 && in_ranges(rwatch, target)) {')
-    emit('                    resume_read_skip = true;')
-    emit('                    read_addr = target;')
-    emit('                    reason = "watch_read";')
-    emit('                    break;')
+    emit('                    if (target != lease_addr) {')
+    emit('                        resume_read_skip = true;')
+    emit('                        read_addr = target;')
+    emit('                        reason = "watch_read";')
+    emit('                        break;')
+    emit('                    }')
+    emit('                    // Leased: serve the device read natively, exactly')
+    emit('                    // what the Python pause path would inject.')
+    emit('                    inject_write(target, lease_value);')
     emit('                }')
     emit('            }')
     emit('            const bool nmi = nmi_pending;')
@@ -567,6 +578,8 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('             py::arg("max_cycles") = 0L)')
     emit('        .def("watch_read", &KERNEL_T::watch_read)')
     emit('        .def("watch_write", &KERNEL_T::watch_write)')
+    emit('        .def("set_read_lease", &KERNEL_T::set_read_lease)')
+    emit('        .def("clear_read_lease", &KERNEL_T::clear_read_lease)')
     emit('        .def("set_nmi", &KERNEL_T::set_nmi)')
     emit('        .def("inject_write", &KERNEL_T::inject_write)')
     emit('        .def("read_ram", &KERNEL_T::read_ram)')
@@ -637,6 +650,12 @@ class Cpu6502CppRuntime:
 
     def watch_write(self, lo: int, hi: int):
         self._kernel.watch_write(lo, hi)
+
+    def set_read_lease(self, addr: int, value: int):
+        self._kernel.set_read_lease(addr, value)
+
+    def clear_read_lease(self):
+        self._kernel.clear_read_lease()
 
     def set_nmi(self):
         self._kernel.set_nmi()

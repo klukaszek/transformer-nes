@@ -4,17 +4,57 @@ Status snapshot and prioritized next steps.  Written 2026-07-06 as the
 handoff point for fresh working sessions; the design details live in
 [`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).
 
-**START HERE (2026-07-09, all-opcode MoE):** the expert set is no longer
-a tuning knob — the default routes EVERY implemented opcode (227 rebuilt
-expert models, a total top-1 MoE over the ISA; see the log just below).
-Current receipts: SMB gameplay 47.65 fps (21.0 ms/frame), hot loops >1M
-instr/s (JMP 0.91 µs/step, poll loop 0.96 µs/step), full Klaus
-(30,646,177 steps, decimal) in 92.6 s (1.54 min, 331K instr/s), 74 tests
-green.  Remaining to 60 fps: ~1.26x — the poll-loop sequence expert
-(approach #2 in the three-approaches handoff below) is the next lever;
-MILP objective realignment (#3) stays the bounded fallback.  Approach #1
-(expert-set tuning + caching) is retired by the all-opcode default.  The
+**START HERE (2026-07-10, 60 fps exceeded):** SMB gameplay through the
+transformer weights runs at **123.5 fps (8.1 ms/frame)** — 2x past the
+60 fps goal, and 8x faster than the C++ graph kernel in the same window.
+The three levers that got here, each with its own log below: the
+all-opcode MoE (227 rebuilt experts, no game-derived tuning set), the
+engine build cache (construction ~1 s, distributable compiled
+artifacts), and the MMIO read lease ($2002 polls served natively in the
+run loop instead of pausing to Python ~1,420x/frame).  Full Klaus
+(30,646,177 steps, decimal) MATCHED in 91.5 s; 74 tests green; frames
+byte-identical across backends.  The poll-loop sequence expert
+(approach #2 below) is no longer needed for frame rate — it remains the
+next thesis artifact; the kernel backend's own slowness in poll-heavy
+windows (hull log growth) is a separate, optional cleanup.  The
 performance numbers in the older sections below are historical.
+
+## 2026-07-10 MMIO read lease — the frame was pause-bound, now it isn't
+
+Profiling the timed gameplay window overturned the plan: 78% of its
+instructions are the wait construct (JMP-to-self spin 35.1%, poll trio
+42.9%), the trio polls **$2002**, and every poll iteration paused the
+C++ run loop back to Python for the device read — 1,420 pauses/frame at
+~6-8.5 µs each ≈ 10 ms of the 21 ms frame, bigger than all transformer
+forwards combined.  (The "render/MMIO ~5%, not a lever" note from
+2026-07-08 predates all-opcode routing and a sprite-0-polling window;
+it was stale.)  The kernel backend was pause-bound the same way.
+
+The fix is a read lease, honoring the frame-level PPU's own model:
+during the visible span, $2002 can only change at the sprite-0 and
+vblank cycles the console already computes, and its read side effects
+(vblank flag clear, write-latch reset) are idempotent after the first
+read.  So when the bus services a $2002 pause it asks the device for a
+lease (`PPU.read_lease`); the run loop then serves further reads of the
+leased address natively — the same `inject_write` the Python path would
+do — without pausing.  Invalidation is conservative: any watched write
+clears it (bus), and the console clears at sprite-0 set, vblank begin,
+and vblank end.  Both generated run loops (kernel.py and engine_gen.py)
+carry the identical mechanism; devices that don't offer `read_lease`
+(controllers, the MMIO test devices) behave exactly as before.
+
+Receipts (74 tests green, ruff clean):
+- **SMB gameplay: 47.65 → 123.46 fps (8.1 ms/frame)** — pauses 1,420 →
+  ~32/frame; **frames byte-identical kernel vs weights, 120/120** in the
+  timed window.  Fps arc: 28.24 → 29.68 → 32.47 → 43.51 → 47.65 →
+  **123.5** — the 60 fps goal is exceeded 2x.
+- Kernel backend, same window A/B: 12.9 fps (lease off) → 15.5 fps
+  (lease on) — no regression; it is slow here because its hull token
+  log grows with the ~1,500 injected poll reads/frame (the weights
+  engine's O(1) memory structure is immune).  **The transformer weights
+  now run SMB 8x faster than the C++ graph kernel.**
+- Full Klaus re-validated (lease dormant — no watches): **MATCHED,
+  30,646,177 steps in 91.5 s (334.9K instr/s)**; nestest MATCHED.
 
 ## 2026-07-09 engine build cache — construction is ~1 s, artifacts ship
 

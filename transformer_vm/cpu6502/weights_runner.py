@@ -645,6 +645,12 @@ class Cpu6502TransformerMachine:
     def watch_write(self, lo: int, hi: int) -> None:
         self._engine.watch_write(lo, hi)
 
+    def set_read_lease(self, addr: int, value: int) -> None:
+        self._engine.set_read_lease(addr, value)
+
+    def clear_read_lease(self) -> None:
+        self._engine.clear_read_lease()
+
     def read_ram(self, addr: int) -> int:
         return self._engine.read_ram(addr)
 

@@ -289,6 +289,9 @@ class Bus:
             rows.append(self.step())
         return rows
 
+    def clear_read_lease(self) -> None:
+        pass  # per-step Python bus reads devices directly; nothing leased
+
 
 class KernelBus:
     """MMIO bus over the C++ kernel machine (kernel.Cpu6502CppRuntime).
@@ -314,6 +317,9 @@ class KernelBus:
             if lo <= addr <= hi:
                 return device
         return None
+
+    def clear_read_lease(self) -> None:
+        self.rt.clear_read_lease()
 
     @property
     def log_tokens(self) -> int:
@@ -369,6 +375,9 @@ class KernelBus:
             executed += len(out["pc"])
             cycles_done += int(out["cycles"])
             # CPU -> device: watched writes from the final step of this run.
+            if len(out["hit_addr"]):
+                # A device write may change what a leased register reads.
+                self.rt.clear_read_lease()
             for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
                 device = self._device_at(int(addr))
                 if device is not None:
@@ -382,6 +391,13 @@ class KernelBus:
                 if device is not None:
                     value = device.read(addr) & 0xFF
                     cycles_done += _drain_stall(device)
+                    # Registers whose value is frozen for the rest of the
+                    # span are served natively until the lease is cleared.
+                    lease = getattr(device, "read_lease", None)
+                    if lease is not None:
+                        leased = lease(addr)
+                        if leased is not None:
+                            self.rt.set_read_lease(addr, leased)
                 else:
                     value = self.rt.read_ram(addr)
                 self.rt.inject_write(addr, value)

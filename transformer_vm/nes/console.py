@@ -253,11 +253,14 @@ class Console:
         base = self._frame_base
 
         # Visible portion, split by the sprite-0 hit event when pending.
+        # Each PPU status transition invalidates any $2002 read lease.
         if self._sprite0_scanline is not None and self.ppu.rendering_enabled:
             hit_cycle = base + int((self._sprite0_scanline + 1) * CYCLES_PER_SCANLINE)
             self._run_until(min(hit_cycle, base + VBLANK_START_CYCLES))
+            self.bus.clear_read_lease()
             self.ppu.sprite0_hit = True
         self._run_until(base + VBLANK_START_CYCLES)
+        self.bus.clear_read_lease()
 
         frame = self.ppu.render_frame()
         self._sprite0_scanline = self.ppu.sprite0_scanline
@@ -266,6 +269,7 @@ class Console:
         if self.ppu.nmi_enabled:
             self._set_nmi()
         self._run_until(base + FRAME_CYCLES)
+        self.bus.clear_read_lease()
         self.ppu.end_vblank()
 
         self._frame_base += FRAME_CYCLES

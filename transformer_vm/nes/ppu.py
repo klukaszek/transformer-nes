@@ -98,6 +98,16 @@ class PPU:
             return value
         return 0  # write-only registers read as open bus; model as 0
 
+    def read_lease(self, addr: int) -> int | None:
+        """Value repeated $2002 reads return for the rest of the visible
+        span, or None.  Sound because status changes only at the sprite-0
+        and vblank cycles (the console clears the lease there) and the
+        read side effects (vblank flag, write latch) are already applied
+        by the granting read; PPU writes clear the lease at the bus."""
+        if (addr - 0x2000) & 7 != 2 or self.vblank:
+            return None
+        return 0x40 if self.sprite0_hit else 0
+
     def write(self, addr: int, value: int) -> None:
         reg = (addr - 0x2000) & 7
         value &= 0xFF

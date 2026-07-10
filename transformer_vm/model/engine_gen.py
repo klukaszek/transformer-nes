@@ -465,7 +465,12 @@ _RUN_LOOP = """\
             if (!nmi_pending && !skip && !rwatch.empty()) {
                 const int target = shadow_read_target();
                 if (target >= 0 && in_ranges(rwatch, target)) {
-                    resume_read_skip = true; read_addr = target; reason = "watch_read"; break;
+                    if (target != lease_addr) {
+                        resume_read_skip = true; read_addr = target; reason = "watch_read"; break;
+                    }
+                    // Leased: serve the device read natively, exactly
+                    // what the Python pause path would inject.
+                    inject_write(target, lease_value);
                 }
             }
             const bool was_nmi = nmi_pending;
@@ -529,6 +534,8 @@ _RUN_LOOP = """\
     void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
     void watch_write(int lo, int hi) { wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
     void clear_watches() { rwatch.clear(); wwatch.clear(); }
+    void set_read_lease(int addr, int value) { lease_addr = addr & 0xFFFF; lease_value = value & 0xFF; }
+    void clear_read_lease() { lease_addr = -1; }
     void set_nmi() { nmi_pending = true; }
     void inject_write(int addr, int value) { insert_write_f32(addr & 0xFFFF, value & 0xFF, seq + 1); }
     int read_ram(int addr) { return ram[addr & 0xFFFF]; }
@@ -562,6 +569,8 @@ _PYBIND_STEP_METHODS = """\
         .def("watch_read", &ENGINE_T::watch_read)
         .def("watch_write", &ENGINE_T::watch_write)
         .def("clear_watches", &ENGINE_T::clear_watches)
+        .def("set_read_lease", &ENGINE_T::set_read_lease)
+        .def("clear_read_lease", &ENGINE_T::clear_read_lease)
         .def("set_nmi", &ENGINE_T::set_nmi)
         .def("inject_write", &ENGINE_T::inject_write)
         .def("read_ram", &ENGINE_T::read_ram)
@@ -1102,6 +1111,9 @@ def generate_source(model, step_spec: dict | None = None,
         emit("    bool st_halted = false;")
         emit("    bool nmi_pending = false;")
         emit("    bool resume_read_skip = false;")
+        emit("    // Read lease: watched reads of this address are served natively")
+        emit("    // with this value (device semantics frozen until the bus clears it).")
+        emit("    int lease_addr = -1, lease_value = 0;")
         emit("    long step_index = 0;")
         emit("    long cycles_total = 0;")
         emit("    std::vector<std::pair<int,int>> rwatch, wwatch;")
@@ -1126,6 +1138,7 @@ def generate_source(model, step_spec: dict | None = None,
         emit("        st_pc = 0; st_a = st_x = st_y = 0; st_s = 0xFD; st_p = 0x24;")
         emit("        st_ir = st_oplo = st_ophi = st_ea = st_data = 0;")
         emit("        st_halted = false; nmi_pending = false; resume_read_skip = false;")
+        emit("        lease_addr = -1;")
         emit("        step_index = 0; cycles_total = 0;")
         emit("        rwatch.clear(); wwatch.clear();")
     emit("        seq = -1;")
@@ -1444,6 +1457,8 @@ class GeneratedWeightsEngine:
             self.watch_read = self._engine.watch_read
             self.watch_write = self._engine.watch_write
             self.clear_watches = self._engine.clear_watches
+            self.set_read_lease = self._engine.set_read_lease
+            self.clear_read_lease = self._engine.clear_read_lease
             self.set_nmi = self._engine.set_nmi
             self.engine_inject_write = self._engine.inject_write
             self.read_ram = self._engine.read_ram
