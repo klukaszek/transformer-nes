@@ -856,8 +856,13 @@ def generate_source(model, step_spec: dict | None = None,
                     b.append(f"                hull_seen[{hid}] = seq;")
                     b.append("            }")
                     b.append(f"            const long long qi = shr2({qi_expr});")
-                    b.append("            long long mo[2];")
-                    b.append(f"            mem_query({g}, qi, mo);")
+                    b.append("            long long mo[2] = {0, 0};")
+                    # Group dispatch: qi is the address minus this group's
+                    # base, so qi in [0, 4096) iff the address falls in this
+                    # group.  Other groups' contributions are gate-zeroed
+                    # downstream, and (0,0) is exactly the empty-group result.
+                    b.append("            if ((unsigned long long)qi >> 12 == 0)")
+                    b.append(f"                mem_query({g}, qi, mo);")
                     b.append(f"            ho{2 * h} = ({elem})(mo[0] << F);")
                     b.append(f"            ho{2 * h + 1} = ({elem})(mo[1] << F);")
                     b.append("        }")

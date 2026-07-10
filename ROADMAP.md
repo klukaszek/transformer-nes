@@ -2,22 +2,75 @@
 
 Status snapshot and prioritized next steps.  Written 2026-07-06 as the
 handoff point for fresh working sessions; the design details live in
-[`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).
+[`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md);
+the architecture-agnostic optimization catalog (for reuse on future
+targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
-**START HERE (2026-07-10, 60 fps exceeded):** SMB gameplay through the
-transformer weights runs at **123.5 fps (8.1 ms/frame)** — 2x past the
-60 fps goal, and 8x faster than the C++ graph kernel in the same window.
-The three levers that got here, each with its own log below: the
-all-opcode MoE (227 rebuilt experts, no game-derived tuning set), the
-engine build cache (construction ~1 s, distributable compiled
-artifacts), and the MMIO read lease ($2002 polls served natively in the
-run loop instead of pausing to Python ~1,420x/frame).  Full Klaus
-(30,646,177 steps, decimal) MATCHED in 91.5 s; 74 tests green; frames
-byte-identical across backends.  The poll-loop sequence expert
-(approach #2 below) is no longer needed for frame rate — it remains the
-next thesis artifact; the kernel backend's own slowness in poll-heavy
-windows (hull log growth) is a separate, optional cleanup.  The
+**START HERE (2026-07-10, 60 fps exceeded 3x):** SMB gameplay through
+the transformer weights runs at **182.4 fps (5.5 ms/frame)** — 3x past
+the 60 fps goal, 12x the C++ graph kernel in the same window.  The four
+levers, each with its own log below: the all-opcode MoE (227 rebuilt
+experts, no game-derived tuning set), the engine build cache
+(construction ~1 s, distributable compiled artifacts), the MMIO read
+lease ($2002 polls served natively instead of pausing to Python
+~1,420x/frame), and group-dispatch fusion (one memory query per read
+instead of 16).  Hot loops: JMP 0.37 µs/step (2.7M instr/s), poll trio
+0.39 µs.  Full Klaus (30,646,177 steps, decimal) MATCHED; 74 tests
+green; frames byte-identical across backends.  Remaining candidates:
+the poll-loop sequence expert (thesis artifact, approach #2 below), the
+MILP objective realignment probe (#3), the kernel backend's hull-log
+growth (optional cleanup), and the Klaus harness itself (now bound by
+the lockstep reference + trace marshalling, not the forwards).  The
 performance numbers in the older sections below are historical.
+
+## 2026-07-10 group-dispatch fusion — one memory query per read, not 16
+
+The step-anatomy finding, fixed.  Each memory-head site's query is
+already the *local* address for its group (`qi = address − 4096·g` by
+construction — the structure-eligibility check verifies the query row is
+a positive scalar multiple of `[address − lo, 1]`), so the dispatch is
+purely local: serve `mem_query` only when `qi` lands in `[0, 4096)`
+(one unsigned compare), else substitute `(0, 0)` — exactly the
+empty-group result, a value every consumer already handles for real
+(the documented masked-by-zero-multiplication case; contributions of
+non-matching groups are killed by the exact-zero `query_in_group` gate).
+No family detection, no emission reordering: a four-line change at the
+query site in engine_gen.py, identical for union and expert bodies.
+
+Receipts (74 tests green incl. the codegen-vs-generic identity test —
+the substitution never reaches a readout; ruff clean):
+- **JMP hot path 0.87 → 0.37 µs/step (2.7M instr/s); poll trio 0.88 →
+  0.39; LDA abs ~1.27 → ~0.49** — a read now costs ~0.1 µs, down from
+  ~0.4.
+- **SMB gameplay: 123.5 → 182.4 fps (5.5 ms/frame)**, frames
+  byte-identical kernel vs weights 120/120.  Fps arc: 28.24 → 29.68 →
+  32.47 → 43.51 → 47.65 → 123.5 → **182.4**.
+- Full Klaus MATCHED (92.1 s, ~333K instr/s) and nestest MATCHED —
+  Klaus wall time is now harness-bound (lockstep reference + 30M-row
+  trace marshalling), so step-level gains no longer move it.
+
+## 2026-07-10 step-anatomy probe — the forward is ~90% grouped-lookup queries
+
+Self-contained loop benches through the all-opcode machine decompose the
+expert step: CLC/INY steps cost **~0.05 µs** (the per-forward fixed cost
+is nearly nothing, and chunk length / trace vectors don't matter), while
+cost tracks memory reads at **~0.4 µs per architectural read** — JMP abs
+(2 operand reads) 0.87 µs, LDA abs (3 reads) ~1.27 µs.  The cause, read
+off the emitted source: a read whose address group isn't statically
+known emits **all 16** 4 KiB-group `mem_query` calls, with one-hot gates
+zeroing 15 results downstream (~25 ns per query — there are just 16x too
+many).  Next lever (user-confirmed priority, ahead of the sequence
+expert): **group-dispatch fusion** — verify per read family at
+generation that `qi_g == qi_0 - g*4096` as a linear-form identity, then
+emit `group_sel = addr >> 12` and a single query.  Same construction
+principle as the opcode router, applied per read; helps every workload.
+Open design question to resolve first: where the group-selection
+arithmetic lives downstream (gated products vs ungated out_proj — the
+int32 wrap-masking argument leans on exact zero gates), so the fusion
+can be guarded generation-time.  Probe scripts in the session scratchpad
+(probe_step_anatomy.py; note its first version hung on a bare
+`boot_image` + a zero-step-blind bench loop — `load_image` seeds the run
+state, and `iter_run_arrays`' `if n == 0: break` guard is mandatory).
 
 ## 2026-07-10 MMIO read lease — the frame was pause-bound, now it isn't
 
