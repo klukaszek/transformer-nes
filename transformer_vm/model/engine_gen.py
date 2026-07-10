@@ -187,6 +187,49 @@ def _load_engine_module(digest: str, arith: str) -> tuple[object, float]:
     return module, time.perf_counter() - build_start
 
 
+def seqmod_config_key(*, core_digest: str, bcd: bool, arith: str, windows) -> str:
+    """Cache key for a per-ROM sequence module.  The core digest covers the
+    header the module compiles against; the code digest covers fold/emission
+    changes that alter the module without altering the core's source."""
+    tag = ",".join(f"{h:04X}:{bytes(c).hex()}x{r}" for h, c, r in windows)
+    raw = (f"{_code_digest()}|core={core_digest}|bcd={int(bcd)}"
+           f"|arith={arith}|seq={tag}")
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+def _load_seqmod_module(digest: str, arith: str) -> tuple[object, float]:
+    """Import a compiled sequence module (single small TU), preferring the
+    cached .so exactly like _load_engine_module."""
+    name = f"seqmod_gen_{digest}"
+    if name in sys.modules:
+        return sys.modules[name], 0.0
+    build_dir = os.path.join(_CACHE_DIR, f"build_{digest}")
+    so_path = os.path.join(build_dir, f"{name}.so")
+    if os.path.exists(so_path):
+        spec = importlib.util.spec_from_file_location(name, so_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules[name] = module
+        return module, 0.0
+
+    from torch.utils.cpp_extension import load
+
+    build_start = time.perf_counter()
+    cflags = ["-O2", "-std=c++17"]
+    if arith == "int32":
+        cflags.append("-fwrapv")
+    os.makedirs(build_dir, exist_ok=True)
+    module = load(
+        name=name,
+        sources=[os.path.join(_CACHE_DIR, f"seqmod_{digest}.cpp")],
+        extra_cflags=cflags,
+        extra_include_paths=[_ATTENTION_DIR, _CACHE_DIR],
+        build_directory=build_dir,
+        verbose=False,
+    )
+    return module, time.perf_counter() - build_start
+
+
 def _read_mode_table() -> list[int]:
     """Shadow-decode table for MMIO read watches, byte -> mode code.
 
@@ -387,6 +430,7 @@ _INCLUDES = """\
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -479,6 +523,27 @@ _MEM_QUERY = """\
         out[0] = mem_val[g][win];
         out[1] = ((long long)g << 12) + win;
     }"""
+
+# Per-ROM sequence-module hook: a separately compiled window module attaches
+# its dispatch through a raw function pointer, so a new ROM's window set never
+# recompiles this TU.  The module fills seq_out with K trace rows per forward.
+_SEQ_HOOK = """\
+    typedef int (*SeqFn)(void*, void*, long, long, long, long, int);
+    SeqFn seq_fn = nullptr;
+    void* seq_ctx = nullptr;
+    static constexpr int SEQ_MAX_K = 32;
+    long long seq_out[21 * SEQ_MAX_K];
+
+    int seq_dispatch(long i, long max_steps, long cycles_this,
+                     long max_cycles, bool stop_on_trap) {
+        return seq_fn ? seq_fn(seq_ctx, this, i, max_steps, cycles_this,
+                               max_cycles, stop_on_trap ? 1 : 0) : 0;
+    }
+
+    void attach_seq(std::uintptr_t fn, std::uintptr_t ctx) {
+        seq_fn = (SeqFn)fn; seq_ctx = (void*)ctx;
+    }
+    void detach_seq() { seq_fn = nullptr; seq_ctx = nullptr; }"""
 
 # Shadow-decode + the native run loop (KernelBus shape) + machine API.
 _RUN_LOOP = """\
@@ -667,11 +732,104 @@ _PYBIND_STEP_METHODS = """\
         .def("read_ram", &ENGINE_T::read_ram)
         .def("dump_ram", &ENGINE_T::dump_ram)
         .def("set_run_state", &ENGINE_T::set_run_state)
-        .def("get_run_state", &ENGINE_T::get_run_state)"""
+        .def("get_run_state", &ENGINE_T::get_run_state)
+        .def("attach_seq", &ENGINE_T::attach_seq)
+        .def("detach_seq", &ENGINE_T::detach_seq)"""
+
+
+# Core-side seq_out capacity; keep in sync with SEQ_MAX_K in _SEQ_HOOK.
+_SEQ_MAX_K = 32
+
+
+def _assemble_seq_module(lines, body, experts, core_digest, elem,
+                         n_seen, emit_step_core) -> tuple[str, int, bool]:
+    """Assemble the per-ROM sequence-module TU from the emitted expert
+    bodies: a SEQMOD_T struct compiled against the core's generated header,
+    exporting its dispatch as a raw function pointer for attach_seq()."""
+    emit = lines.append
+    core_name = f"Engine_{core_digest}"
+    mod_xbuf = max(e["model"].tok.weight.shape[1] for e in experts)
+    max_k = max(e["n_steps"] for e in experts)
+    if max_k > _SEQ_MAX_K:
+        raise RuntimeError(
+            f"sequence window of {max_k} steps exceeds the core's "
+            f"seq_out capacity ({_SEQ_MAX_K})"
+        )
+    emit("// Generated per-ROM sequence module (model/engine_gen.py): folded")
+    emit("// window experts + dispatch, compiled against the core engine's")
+    emit("// generated header and attached at runtime via attach_seq().  All")
+    emit("// shared machine state is reached through the typed reference E;")
+    emit("// only scratch (xbuf, the hull_seen guards) lives in the module.")
+    emit(f'#include "engine_{core_digest}.hpp"')
+    emit("")
+    emit("struct SEQMOD_T {")
+    emit(f"    using Eng = {core_name};")
+    emit("    static constexpr int F = Eng::F;")
+    emit(f"    static constexpr {elem} SCALE = Eng::SCALE;")
+    emit("    static constexpr double SCALE_D = Eng::SCALE_D;")
+    emit(f"    static {elem} shr({elem} v) {{ return Eng::shr(v); }}")
+    emit(f"    static long long shr2({elem} v) {{ return Eng::shr2(v); }}")
+    emit(f"    static {elem} half({elem} v) {{ return Eng::half(v); }}")
+    emit(f"    {elem} xbuf[{mod_xbuf}];")
+    emit("    // Guard state only: module memory heads never hold hull data")
+    emit("    // (ids are shared with the discarded union planning pass, so")
+    emit("    // the array is sparse -- a few hundred longs, not worth rebasing).")
+    emit(f"    long hull_seen[{max(n_seen, 1)}];")
+    emit(f"    SEQMOD_T() {{ for (int i = 0; i < {max(n_seen, 1)}; ++i) "
+         "hull_seen[i] = -1; }")
+    emit("")
+    lines.extend(body)
+    for exp in experts:
+        emit("")
+        emit_step_core(f"step_core__{exp['name']}", f"__{exp['name']}",
+                       exp["model"], exp["step_spec"])
+    # Window dispatch: same guards as the per-instruction path needs for
+    # step-for-step equivalence -- pc at the head, every window byte
+    # matched, no pending NMI, enough step/cycle budget for the window.
+    emit("")
+    emit("    int dispatch(Eng& E, long i, long max_steps, long cycles_this,")
+    emit("                 long max_cycles, bool stop_on_trap) {")
+    emit("        if (E.nmi_pending || stop_on_trap) return 0;")
+    for exp in experts:
+        head, window = exp["head"], exp["window"]
+        k, prefix = exp["n_steps"], exp["cycles_prefix"]
+        match = " && ".join(
+            f"E.ram[0x{(head + j) & 0xFFFF:04X}] == 0x{b:02X}"
+            for j, b in enumerate(window)
+        )
+        emit(f"        if (E.st_pc == 0x{head:04X} && i + {k} <= max_steps")
+        emit(f"            && (max_cycles <= 0 || cycles_this + {prefix} < max_cycles)")
+        emit(f"            && {match}) {{")
+        emit(f"            step_core__{exp['name']}(E, E.seq_out);")
+        emit(f"            return {k};")
+        emit("        }")
+    emit("        return 0;")
+    emit("    }")
+    emit("")
+    emit("    static int dispatch_tramp(void* ctx, void* eng, long i,")
+    emit("                              long max_steps, long cycles_this,")
+    emit("                              long max_cycles, int stop_on_trap) {")
+    emit("        return ((SEQMOD_T*)ctx)->dispatch(*(Eng*)eng, i, max_steps,")
+    emit("                                          cycles_this, max_cycles,")
+    emit("                                          stop_on_trap != 0);")
+    emit("    }")
+    emit("};")
+    emit("")
+    emit("PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {")
+    emit('    py::class_<SEQMOD_T>(m, "SeqModule", py::module_local())')
+    emit("        .def(py::init<>())")
+    emit('        .def("ctx_ptr", [](SEQMOD_T& s) { return (std::uintptr_t)&s; })')
+    emit('        .def_static("fn_ptr", []() { '
+         "return (std::uintptr_t)&SEQMOD_T::dispatch_tramp; });")
+    emit(f'    m.attr("core_name") = "{core_name}";')
+    emit(f'    m.attr("max_k") = {max_k};')
+    emit("}")
+    return "\n".join(lines) + "\n", 0, False
 
 
 def generate_source(model, step_spec: dict | None = None,
-                    arith: str = "int64", experts=None) -> tuple[str, int, bool]:
+                    arith: str = "int64", experts=None,
+                    seq_module_core: str | None = None) -> tuple[str, int, bool]:
     """Emit the C++ source; returns (source, n_memory_heads, has_step).
 
     step_spec, if given, additionally emits a machine_step member that runs
@@ -700,8 +858,20 @@ def generate_source(model, step_spec: dict | None = None,
     divergent history across routed steps.  The run loop / machine_step
     dispatch on ``ram[st_pc]`` (== the fetched opcode; the fold's pin) and
     fall back to the union step for cold opcodes and pending NMIs.
+
+    seq_module_core, if given, is the digest of an already-emitted core
+    engine: instead of a full engine, emit a tiny per-ROM *sequence module*
+    -- the given kind="seq" experts compiled against the core's generated
+    header, reaching all shared machine state (st_* registers, RAM mirror,
+    memory structure, running-argmax registers) through a typed engine
+    reference, and exporting its window dispatch as a raw function pointer
+    for the core's attach_seq() hook.  ``model`` must be the same union
+    model the core was emitted from: the union planning pass runs here only
+    to reproduce the core's shared-state allocation (register indices) so
+    the module folds into the same registers.
     """
     experts = experts or []
+    seq_mode = seq_module_core is not None
     if KEY_OFFSET != 0:
         raise RuntimeError(
             "generated engine assumes KEY_OFFSET == 0 in the lookup key "
@@ -710,6 +880,15 @@ def generate_source(model, step_spec: dict | None = None,
     if arith not in ("int64", "int32", "f32"):
         raise ValueError(f"unknown arith {arith!r}")
     is_int = arith in ("int64", "int32")
+    if not seq_mode and any(e.get("kind") == "seq" for e in experts):
+        raise RuntimeError(
+            "sequence experts are compiled per-ROM (SequenceModule) and "
+            "attached at runtime, not emitted into the core engine"
+        )
+    if seq_mode and (
+        not experts or any(e.get("kind") != "seq" for e in experts)
+    ):
+        raise RuntimeError("a sequence module takes kind='seq' experts only")
     if experts:
         if not is_int:
             raise RuntimeError(
@@ -719,6 +898,11 @@ def generate_source(model, step_spec: dict | None = None,
             )
         if step_spec is None:
             raise RuntimeError("opcode-routed expert models require a step_spec")
+
+    # Shared-state prefix: "" emitting the engine itself (its own members),
+    # "E." emitting a sequence module (a typed reference to the core engine).
+    # Module-private scratch (xbuf, the hull_seen guards) stays unprefixed.
+    E = "E." if seq_mode else ""
 
     d_model = model.tok.weight.shape[1]
     n_layers = len(model.attn)
@@ -785,6 +969,8 @@ def generate_source(model, step_spec: dict | None = None,
             return _expr(indices, data, ref)
 
     layer_sig = f"{elem}* x, const double* pf" if is_int else "float* x"
+    if seq_mode:
+        layer_sig = f"Eng& E, {layer_sig}"
 
     def plan_model(mdl, label, union_lookup_of=None):
         """Per-layer emission plans for one model.
@@ -939,12 +1125,12 @@ def generate_source(model, step_spec: dict | None = None,
                     k1 = _expr_dbl(*_row(ip, dm + 2 * h + 1), dref)
                     b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
                     b.append("        {")
-                    b.append(f"            if (hull_seen[{hid}] != seq) {{")
+                    b.append(f"            if (hull_seen[{hid}] != {E}seq) {{")
                     b.append(f"                const double kyg = {k1};")
                     b.append("                if (kyg > -1.0e29)")
                     b.append('                    throw std::runtime_error('
                              '"live forward insert into a memory-group hull");')
-                    b.append(f"                hull_seen[{hid}] = seq;")
+                    b.append(f"                hull_seen[{hid}] = {E}seq;")
                     b.append("            }")
                     b.append(f"            const long long qi = shr2({qi_expr});")
                     b.append("            long long mo[2] = {0, 0};")
@@ -953,7 +1139,7 @@ def generate_source(model, step_spec: dict | None = None,
                     # group.  Other groups' contributions are gate-zeroed
                     # downstream, and (0,0) is exactly the empty-group result.
                     b.append("            if ((unsigned long long)qi >> 12 == 0)")
-                    b.append(f"                mem_query({g}, qi, mo);")
+                    b.append(f"                {E}mem_query({g}, qi, mo);")
                     b.append(f"            ho{2 * h} = ({elem})(mo[0] << F);")
                     b.append(f"            ho{2 * h + 1} = ({elem})(mo[1] << F);")
                     b.append("        }")
@@ -985,15 +1171,15 @@ def generate_source(model, step_spec: dict | None = None,
                     b.append(f"            const double kyv = {k1};")
                     b.append("            if (kyv > -1.0e29) {  // live: fold into the running argmax")
                     b.append(f"                const double s = {_lit_d(qx)}*({k0}) + {_lit_d(qy)}*kyv;")
-                    b.append(f"                if (!reg_any[{r}] || s >= reg_s[{r}]) {{")
-                    b.append(f"                    reg_any[{r}] = true;")
-                    b.append(f"                    reg_s[{r}] = s;")
-                    b.append(f"                    reg_v0[{r}] = {v0_i};")
-                    b.append(f"                    reg_v1[{r}] = {v1_i};")
+                    b.append(f"                if (!{E}reg_any[{r}] || s >= {E}reg_s[{r}]) {{")
+                    b.append(f"                    {E}reg_any[{r}] = true;")
+                    b.append(f"                    {E}reg_s[{r}] = s;")
+                    b.append(f"                    {E}reg_v0[{r}] = {v0_i};")
+                    b.append(f"                    {E}reg_v1[{r}] = {v1_i};")
                     b.append("                }")
                     b.append("            }")
-                    b.append(f"            ho{2 * h} = reg_any[{r}] ? reg_v0[{r}] : 0;")
-                    b.append(f"            ho{2 * h + 1} = reg_any[{r}] ? reg_v1[{r}] : 0;")
+                    b.append(f"            ho{2 * h} = {E}reg_any[{r}] ? {E}reg_v0[{r}] : 0;")
+                    b.append(f"            ho{2 * h + 1} = {E}reg_any[{r}] ? {E}reg_v1[{r}] : 0;")
                     b.append("        }")
                 elif is_int:
                     if not is_union:
@@ -1149,11 +1335,140 @@ def generate_source(model, step_spec: dict | None = None,
         out.append("    }")
         return out
 
-    for plan in layer_plans:
-        body.extend(emit_layer_fn(plan, ""))
+    # In seq mode the union plans exist only to reproduce the core's
+    # shared-state allocation; the module emits expert bodies alone.
+    if not seq_mode:
+        for plan in layer_plans:
+            body.extend(emit_layer_fn(plan, ""))
     for exp, plans in expert_plans:
         for plan in plans:
             body.extend(emit_layer_fn(plan, f"__{exp['name']}"))
+
+    # ── Step-core emission helpers, shared by the core engine and the
+    # per-ROM sequence module ────────────────────────────────────────
+    if is_int:
+        one_e, zero_l = "SCALE", "0"
+
+        def sc(v, e=elem):
+            return f"(({e})({v}) << F)"
+    else:
+        one_e, zero_l = "1.0f", "0.0f"
+
+        def sc(v):
+            return f"(float)({v})"
+
+    rdv = (lambda s: f"shr2(x[{s}])") if is_int else (lambda s: f"rd(x[{s}])")
+
+    def emit_step_core(fn_name, layer_suffix, mdl, spec):
+        # One whole instruction, sharing the embed/readout/write/halt
+        # protocol; layer_suffix selects the union stack ("") or a routed
+        # expert's own rebuilt stack ("__<name>").  Each model embeds and
+        # reads out through its own slot layout (spec); the persistent
+        # st_* registers are the cross-model interface.
+        ins = spec["inputs"]
+        # A sequence expert reads out K instructions from one forward
+        # (per-step slot maps under "step_outputs"); a plain expert is
+        # the K=1 case.
+        step_outs = spec.get("step_outputs") or [spec["outputs"]]
+        hc, hv = spec["halt_head"]
+        shc, shv = spec["state_head"]
+        dm = mdl.tok.weight.shape[1]
+
+        emit(f"    void {fn_name}({'Eng& E, ' if seq_mode else ''}long long* out) {{")
+        emit(f"        {elem}* x = xbuf;")
+        emit(f"        for (int i = 0; i < {dm}; ++i) x[i] = {zero};")
+        emit(f"        x[{mdl.one_slot}] = {one_e};")
+        emit(f"        x[{ins['is_state']}] = {one_e};")
+        emit(f"        x[{ins['pc_lo']}] = {sc(f'{E}st_pc & 0xFF')};")
+        emit(f"        x[{ins['pc_hi']}] = {sc(f'({E}st_pc >> 8) & 0xFF')};")
+        emit(f"        x[{ins['a']}] = {sc(f'{E}st_a')};")
+        emit(f"        x[{ins['x']}] = {sc(f'{E}st_x')};")
+        emit(f"        x[{ins['y']}] = {sc(f'{E}st_y')};")
+        emit(f"        x[{ins['s']}] = {sc(f'{E}st_s')};")
+        for slot, mask in spec["p_flags"]:
+            emit(f"        x[{slot}] = ({E}st_p & {mask}) ? {one_e} : {zero_l};")
+        emit(f"        x[{ins['ir']}] = {sc(f'{E}st_ir')};")
+        emit(f"        x[{ins['oplo']}] = {sc(f'{E}st_oplo')};")
+        emit(f"        x[{ins['ophi']}] = {sc(f'{E}st_ophi')};")
+        emit(f"        x[{ins['ea_lo']}] = {sc(f'{E}st_ea & 0xFF')};")
+        emit(f"        x[{ins['ea_hi']}] = {sc(f'({E}st_ea >> 8) & 0xFF')};")
+        emit(f"        x[{ins['data']}] = {sc(f'{E}st_data')};")
+        emit(f"        x[{ins['halted']}] = {sc(f'{E}st_halted ? 1 : 0')};")
+        emit(f"        x[{ins['nmi']}] = {sc(f'{E}nmi_pending ? 1 : 0')};")
+        emit(f"        {E}nmi_pending = false;")
+        emit(f"        const long long pos = {E}seq + 1;")
+        if is_int:
+            emit("        const double pf[3] = {")
+            emit("            (double)pos,")
+            emit("            1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0),")
+            emit("            (double)pos * (double)pos,")
+            emit("        };")
+        else:
+            emit("        x[0] += (float)pos;")
+            emit("        x[1] += (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
+            emit("        // integer square converted once, like NumPy's int -> float32")
+            emit("        x[2] += (float)((unsigned long long)pos * (unsigned long long)pos);")
+        emit(f"        ++{E}seq;")
+        for li in range(len(mdl.attn)):
+            emit(f"        layer_{li}{layer_suffix}("
+                 f"{'E, ' if seq_mode else ''}x{', pf' if is_int else ''});")
+        for k, outs in enumerate(step_outs):
+            off = 21 * k
+            for i, (name, mask) in enumerate((
+                ("current_pc", 0xFFFF), ("new_a", 0xFF), ("new_x", 0xFF),
+                ("new_y", 0xFF), ("new_s", 0xFF), ("new_p", 0xFF),
+                ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
+                ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF), ("data_out", 0xFF),
+                ("new_halted", 0xFF), ("next_pc", 0xFFFF),
+            )):
+                emit(f"        out[{off + i}] = {rdv(outs[name])} & 0x{mask:X};")
+            emit("        { long long n_writes = 0;")
+            for store, addr, value in (
+                ("is_store", "write_addr_out", "write_value_out"),
+                ("is_store2", "write_addr2_out", "write_value2_out"),
+                ("is_store3", "write_addr3_out", "write_value3_out"),
+            ):
+                emit(f"        if (({rdv(outs[store])} & 0xFF) != 0) {{")
+                emit(f"            out[{off + 15} + 2 * n_writes] = {rdv(outs[addr])} & 0xFFFF;")
+                emit(f"            out[{off + 16} + 2 * n_writes] = {rdv(outs[value])} & 0xFF;")
+                emit("            ++n_writes;")
+                emit("        }")
+            emit(f"        out[{off + 14}] = n_writes;")
+            emit("        for (long long i = 0; i < n_writes; ++i)")
+            emit(f"            {E}insert_write_f32((int)out[{off + 15} + 2 * i], "
+                 f"(int)out[{off + 16} + 2 * i], {E}seq + 1);")
+            emit("        }")
+            if k + 1 < len(step_outs):
+                # Non-final rows of a sequence are generation-verified
+                # non-halting; only the final row competes STATE vs HALT.
+                emit(f"        out[{off + 13}] = 0;")
+        last = 21 * (len(step_outs) - 1)
+        if is_int:
+            emit(f"        const long long halt_logit = "
+                 f"{_expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
+            emit(f"        const long long state_logit = "
+                 f"{_expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
+        else:
+            emit(f"        const float halt_logit = {_expr(hc, hv, lambda i: f'x[{i}]')};")
+            emit(f"        const float state_logit = {_expr(shc, shv, lambda i: f'x[{i}]')};")
+        emit(f"        out[{last + 13}] = halt_logit > state_logit ? 1 : 0;")
+        emit("        // Advance the architectural state (inputs are fully")
+        emit("        // consumed by the embed above before this update).")
+        emit(f"        {E}st_pc = (int)out[{last + 12}];")
+        emit(f"        {E}st_a = (int)out[{last + 1}]; {E}st_x = (int)out[{last + 2}]; "
+             f"{E}st_y = (int)out[{last + 3}];")
+        emit(f"        {E}st_s = (int)out[{last + 4}]; {E}st_p = (int)out[{last + 5}];")
+        emit(f"        {E}st_ir = (int)out[{last + 6}]; {E}st_oplo = (int)out[{last + 7}]; "
+             f"{E}st_ophi = (int)out[{last + 8}];")
+        emit(f"        {E}st_ea = (int)out[{last + 9}]; {E}st_data = (int)out[{last + 10}];")
+        emit(f"        {E}st_halted = out[{last + 11}] != 0;")
+        emit("    }")
+
+    if seq_mode:
+        return _assemble_seq_module(
+            lines, body, experts, seq_module_core, elem,
+            len(hull_tiebreak), emit_step_core,
+        )
 
     n_hulls = len(hull_tiebreak)
     # The C++ run loop (KernelBus shape) needs the same memory-write path the
@@ -1310,18 +1625,6 @@ def generate_source(model, step_spec: dict | None = None,
 
     has_step = step_spec is not None and bool(flat)
     if has_step:
-        # Embedded values live on the fixed-point grid in int mode.
-        if is_int:
-            one_e, zero_l = "SCALE", "0"
-
-            def sc(v, e=elem):
-                return f"(({e})({v}) << F)"
-        else:
-            one_e, zero_l = "1.0f", "0.0f"
-
-            def sc(v):
-                return f"(float)({v})"
-
         emit("")
         emit("    // One whole 6502 instruction from the persistent st_* state:")
         emit("    // STATE embed -> layers -> readout -> direct WRITE inserts ->")
@@ -1336,115 +1639,6 @@ def generate_source(model, step_spec: dict | None = None,
             emit("        return (long long)std::nearbyint((double)v);")
             emit("    }")
         emit("")
-        rdv = (lambda s: f"shr2(x[{s}])") if is_int else (lambda s: f"rd(x[{s}])")
-
-        def emit_step_core(fn_name, layer_suffix, mdl, spec):
-            # One whole instruction, sharing the embed/readout/write/halt
-            # protocol; layer_suffix selects the union stack ("") or a routed
-            # expert's own rebuilt stack ("__<name>").  Each model embeds and
-            # reads out through its own slot layout (spec); the persistent
-            # st_* registers are the cross-model interface.
-            ins = spec["inputs"]
-            # A sequence expert reads out K instructions from one forward
-            # (per-step slot maps under "step_outputs"); a plain expert is
-            # the K=1 case.
-            step_outs = spec.get("step_outputs") or [spec["outputs"]]
-            hc, hv = spec["halt_head"]
-            shc, shv = spec["state_head"]
-            dm = mdl.tok.weight.shape[1]
-
-            emit(f"    void {fn_name}(long long* out) {{")
-            emit(f"        {elem}* x = xbuf;")
-            emit(f"        for (int i = 0; i < {dm}; ++i) x[i] = {zero};")
-            emit(f"        x[{mdl.one_slot}] = {one_e};")
-            emit(f"        x[{ins['is_state']}] = {one_e};")
-            emit(f"        x[{ins['pc_lo']}] = {sc('st_pc & 0xFF')};")
-            emit(f"        x[{ins['pc_hi']}] = {sc('(st_pc >> 8) & 0xFF')};")
-            emit(f"        x[{ins['a']}] = {sc('st_a')};")
-            emit(f"        x[{ins['x']}] = {sc('st_x')};")
-            emit(f"        x[{ins['y']}] = {sc('st_y')};")
-            emit(f"        x[{ins['s']}] = {sc('st_s')};")
-            for slot, mask in spec["p_flags"]:
-                emit(f"        x[{slot}] = (st_p & {mask}) ? {one_e} : {zero_l};")
-            emit(f"        x[{ins['ir']}] = {sc('st_ir')};")
-            emit(f"        x[{ins['oplo']}] = {sc('st_oplo')};")
-            emit(f"        x[{ins['ophi']}] = {sc('st_ophi')};")
-            emit(f"        x[{ins['ea_lo']}] = {sc('st_ea & 0xFF')};")
-            emit(f"        x[{ins['ea_hi']}] = {sc('(st_ea >> 8) & 0xFF')};")
-            emit(f"        x[{ins['data']}] = {sc('st_data')};")
-            emit(f"        x[{ins['halted']}] = {sc('st_halted ? 1 : 0')};")
-            emit(f"        x[{ins['nmi']}] = {sc('nmi_pending ? 1 : 0')};")
-            emit("        nmi_pending = false;")
-            emit("        const long long pos = seq + 1;")
-            if is_int:
-                emit("        const double pf[3] = {")
-                emit("            (double)pos,")
-                emit("            1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0),")
-                emit("            (double)pos * (double)pos,")
-                emit("        };")
-            else:
-                emit("        x[0] += (float)pos;")
-                emit("        x[1] += (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
-                emit("        // integer square converted once, like NumPy's int -> float32")
-                emit("        x[2] += (float)((unsigned long long)pos * (unsigned long long)pos);")
-            emit("        ++seq;")
-            for li in range(len(mdl.attn)):
-                emit(f"        layer_{li}{layer_suffix}(x{', pf' if is_int else ''});")
-            for k, outs in enumerate(step_outs):
-                off = 21 * k
-                for i, (name, mask) in enumerate((
-                    ("current_pc", 0xFFFF), ("new_a", 0xFF), ("new_x", 0xFF),
-                    ("new_y", 0xFF), ("new_s", 0xFF), ("new_p", 0xFF),
-                    ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
-                    ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF), ("data_out", 0xFF),
-                    ("new_halted", 0xFF), ("next_pc", 0xFFFF),
-                )):
-                    emit(f"        out[{off + i}] = {rdv(outs[name])} & 0x{mask:X};")
-                emit("        { long long n_writes = 0;")
-                for store, addr, value in (
-                    ("is_store", "write_addr_out", "write_value_out"),
-                    ("is_store2", "write_addr2_out", "write_value2_out"),
-                    ("is_store3", "write_addr3_out", "write_value3_out"),
-                ):
-                    emit(f"        if (({rdv(outs[store])} & 0xFF) != 0) {{")
-                    emit(f"            out[{off + 15} + 2 * n_writes] = {rdv(outs[addr])} & 0xFFFF;")
-                    emit(f"            out[{off + 16} + 2 * n_writes] = {rdv(outs[value])} & 0xFF;")
-                    emit("            ++n_writes;")
-                    emit("        }")
-                emit(f"        out[{off + 14}] = n_writes;")
-                emit("        for (long long i = 0; i < n_writes; ++i)")
-                emit(f"            insert_write_f32((int)out[{off + 15} + 2 * i], "
-                     f"(int)out[{off + 16} + 2 * i], seq + 1);")
-                emit("        }")
-                if k + 1 < len(step_outs):
-                    # Non-final rows of a sequence are generation-verified
-                    # non-halting; only the final row competes STATE vs HALT.
-                    emit(f"        out[{off + 13}] = 0;")
-            last = 21 * (len(step_outs) - 1)
-            if is_int:
-                emit(f"        const long long halt_logit = "
-                     f"{_expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
-                emit(f"        const long long state_logit = "
-                     f"{_expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
-            else:
-                emit(f"        const float halt_logit = {_expr(hc, hv, lambda i: f'x[{i}]')};")
-                emit(f"        const float state_logit = {_expr(shc, shv, lambda i: f'x[{i}]')};")
-            emit(f"        out[{last + 13}] = halt_logit > state_logit ? 1 : 0;")
-            emit("        // Advance the architectural state (inputs are fully")
-            emit("        // consumed by the embed above before this update).")
-            emit(f"        st_pc = (int)out[{last + 12}];")
-            emit(f"        st_a = (int)out[{last + 1}]; st_x = (int)out[{last + 2}]; "
-                 f"st_y = (int)out[{last + 3}];")
-            emit(f"        st_s = (int)out[{last + 4}]; st_p = (int)out[{last + 5}];")
-            emit(f"        st_ir = (int)out[{last + 6}]; st_oplo = (int)out[{last + 7}]; "
-                 f"st_ophi = (int)out[{last + 8}];")
-            emit(f"        st_ea = (int)out[{last + 9}]; st_data = (int)out[{last + 10}];")
-            emit(f"        st_halted = out[{last + 11}] != 0;")
-            emit("    }")
-
-        op_experts = [e for e in experts if e.get("kind") != "seq"]
-        seq_experts = [e for e in experts if e.get("kind") == "seq"]
-
         emit_step_core("step_core_union", "", model, step_spec)
         for exp in experts:
             emit("")
@@ -1457,10 +1651,10 @@ def generate_source(model, step_spec: dict | None = None,
         # pending NMI overrides the instruction, so it takes the union step.
         emit("")
         emit("    void step_core(long long* out) {")
-        if op_experts:
+        if experts:
             emit("        if (!nmi_pending) {")
             emit("            switch (ram[st_pc]) {")
-            for exp in op_experts:
+            for exp in experts:
                 emit(f"                case 0x{exp['byte']:02X}: "
                      f"step_core__{exp['name']}(out); return;")
             emit("            }")
@@ -1469,32 +1663,10 @@ def generate_source(model, step_spec: dict | None = None,
         emit("    }")
 
         # Sequence dispatch (native run loop only): a whole pinned window as
-        # one forward.  The guards keep it step-for-step equivalent to the
-        # per-instruction path: pc at the head, every window byte matched, no
-        # pending NMI, and enough step/cycle budget that the per-step path
-        # would also have executed the full window before pausing.
-        max_k = max((e["n_steps"] for e in seq_experts), default=1)
+        # one forward, compiled per-ROM into a separate module that attaches
+        # through the function-pointer hook -- no core recompile per ROM.
         emit("")
-        emit(f"    long long seq_out[{21 * max_k}];")
-        emit("    int seq_dispatch(long i, long max_steps, long cycles_this,")
-        emit("                     long max_cycles, bool stop_on_trap) {")
-        if seq_experts:
-            emit("        if (nmi_pending || stop_on_trap) return 0;")
-            for exp in seq_experts:
-                head, window = exp["head"], exp["window"]
-                k, prefix = exp["n_steps"], exp["cycles_prefix"]
-                match = " && ".join(
-                    f"ram[0x{(head + j) & 0xFFFF:04X}] == 0x{b:02X}"
-                    for j, b in enumerate(window)
-                )
-                emit(f"        if (st_pc == 0x{head:04X} && i + {k} <= max_steps")
-                emit(f"            && (max_cycles <= 0 || cycles_this + {prefix} < max_cycles)")
-                emit(f"            && {match}) {{")
-                emit(f"            step_core__{exp['name']}(seq_out);")
-                emit(f"            return {k};")
-                emit("        }")
-        emit("        return 0;")
-        emit("    }")
+        emit(_SEQ_HOOK)
         emit("")
         emit("    // Per-instruction entry point: seed st_* from arguments, run one")
         emit("    // step.  Kept so the Python per-step path is byte-identical.")
@@ -1543,6 +1715,7 @@ class GeneratedWeightsEngine:
             model, step_spec, arith, experts=experts
         )
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+        self.digest = digest
         source = source.replace("ENGINE_T", f"Engine_{digest}")
         os.makedirs(_CACHE_DIR, exist_ok=True)
         hpp_path = os.path.join(_CACHE_DIR, f"engine_{digest}.hpp")
@@ -1578,6 +1751,7 @@ class GeneratedWeightsEngine:
         self = cls.__new__(cls)
         self.dtype = "float32"
         self.arith = entry["arith"]
+        self.digest = entry["digest"]
         self.n_experts = entry["n_experts"]
         self.n_memory_heads = entry["n_memory_heads"]
         self.has_machine_step = entry["has_machine_step"]
@@ -1607,6 +1781,8 @@ class GeneratedWeightsEngine:
             self.engine_inject_write = self._engine.inject_write
             self.read_ram = self._engine.read_ram
             self.dump_ram = self._engine.dump_ram
+            self.attach_seq = self._engine.attach_seq
+            self.detach_seq = self._engine.detach_seq
 
     def reset(self):
         self._engine.reset()
@@ -1625,3 +1801,68 @@ class GeneratedWeightsEngine:
                 "be silently lost -- use a full WRITE-token forward instead"
             )
         self._engine.insert_write_f32(addr, value, pos)
+
+
+class SequenceModule:
+    """Per-ROM sequence-window module: the folded window experts compiled
+    against a core engine's generated header (a single small TU, seconds to
+    build, cached by digest), exporting its dispatch as a raw function
+    pointer for the core's attach_seq() hook.  The holder must keep this
+    object alive while it is attached."""
+
+    def __init__(self, model, step_spec, experts, *, core_digest: str,
+                 arith: str, cache_key: str | None = None):
+        source, _, _ = generate_source(
+            model, step_spec, arith, experts=experts,
+            seq_module_core=core_digest,
+        )
+        digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+        source = source.replace("SEQMOD_T", f"SeqMod_{digest}")
+        self.core_digest = core_digest
+        self.digest = digest
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        path = os.path.join(_CACHE_DIR, f"seqmod_{digest}.cpp")
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write(source)
+        module, self.compile_seconds = _load_seqmod_module(digest, arith)
+        if cache_key is not None:
+            _manifest_put(cache_key, {
+                "kind": "seqmod", "digest": digest, "arith": arith,
+                "core": core_digest, "n_windows": len(experts),
+            })
+        self._bind(module)
+
+    @classmethod
+    def from_cache(cls, cache_key: str, *, core_digest: str) -> SequenceModule | None:
+        """Load a module by config key alone, skipping the sequence folds
+        and the emission entirely; None on any miss."""
+        entry = _manifest_read().get(cache_key)
+        if (
+            entry is None
+            or entry.get("kind") != "seqmod"
+            or entry["core"] != core_digest
+            or not os.path.exists(
+                os.path.join(_CACHE_DIR, f"seqmod_{entry['digest']}.cpp")
+            )
+        ):
+            return None
+        self = cls.__new__(cls)
+        self.core_digest = core_digest
+        self.digest = entry["digest"]
+        module, self.compile_seconds = _load_seqmod_module(
+            entry["digest"], entry["arith"]
+        )
+        self._bind(module)
+        return self
+
+    def _bind(self, module) -> None:
+        if module.core_name != f"Engine_{self.core_digest}":
+            raise RuntimeError(
+                f"sequence module was compiled against {module.core_name}, "
+                f"not Engine_{self.core_digest}"
+            )
+        self.max_k = int(module.max_k)
+        self._mod = module.SeqModule()
+        self.fn_ptr = int(module.SeqModule.fn_ptr())
+        self.ctx_ptr = int(self._mod.ctx_ptr())

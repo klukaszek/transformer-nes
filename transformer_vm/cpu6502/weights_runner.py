@@ -179,10 +179,12 @@ class Cpu6502TransformerMachine:
             raise ValueError(f"unknown expert_schedule {expert_schedule!r}")
         self._expert_schedule = expert_schedule
         self._expert_milp_seconds = expert_milp_seconds
-        # The engine is fully determined by (source code, bcd, arith, expert
-        # set), so a manifest hit skips the expert folds and the emission and
-        # loads the compiled artifact directly.  MILP schedules are excluded:
-        # their incumbents depend on solve time.
+        # The core engine is fully determined by (source code, bcd, arith,
+        # expert set) -- deliberately NOT the ROM's sequence windows -- so it
+        # compiles once per code digest and every ROM shares it; a manifest
+        # hit skips the expert folds and the emission and loads the compiled
+        # artifact directly.  MILP schedules are excluded: their incumbents
+        # depend on solve time.
         windows = [
             (int(head) & 0xFFFF, bytes(code), int(repeat))
             for head, code, repeat in (sequence_windows or ())
@@ -193,12 +195,8 @@ class Cpu6502TransformerMachine:
             expert_bytes = [
                 int(b) for b in (expert_opcodes or ()) if int(b) in OPCODES
             ] if codegen_arith != "f32" else []
-            seq_tag = ",".join(
-                f"{head:04X}:{code.hex()}x{repeat}" for head, code, repeat in windows
-            )
             cache_key = engine_config_key(
                 bcd=bcd, arith=codegen_arith, expert_bytes=expert_bytes,
-                extra=seq_tag,
             )
             self._engine = GeneratedWeightsEngine.from_cache(cache_key)
             if self._engine is not None:
@@ -207,13 +205,6 @@ class Cpu6502TransformerMachine:
             experts = []
             if codegen_arith != "f32":
                 experts = self._build_expert_models(expert_opcodes)
-                for w in windows:
-                    # The scanner proposes shapes; the fold's license checks
-                    # arbitrate.  A rejected window only loses its fast path.
-                    try:
-                        experts.append(self._build_sequence_expert(*w))
-                    except RuntimeError as e:
-                        logger.info("sequence window skipped: %s", e)
             elif expert_opcodes:
                 logger.info(
                     "opcode-routed experts disabled: f32 arith keeps every lookup "
@@ -223,6 +214,11 @@ class Cpu6502TransformerMachine:
                 self.model, step_spec=self._step_spec(),
                 arith=codegen_arith, experts=experts, cache_key=cache_key,
             )
+        # The ROM's windows land in a tiny per-ROM module attached through
+        # the core's function-pointer hook (no core recompile per ROM).
+        self._seq_module = None
+        if windows and getattr(self._engine, "has_machine_step", False):
+            self._attach_sequence_module(windows, bcd=bcd, arith=codegen_arith)
         self._direct_writes = self._engine.supports_direct_writes
         self._cpp_step = getattr(self._engine, "has_machine_step", False)
         if self._cpp_step:
@@ -373,6 +369,38 @@ class Cpu6502TransformerMachine:
             "halt_head": head_row(tok_to_idx["HALT"]),
             "state_head": head_row(tok_to_idx["STATE"]),
         }
+
+    def _attach_sequence_module(self, windows, *, bcd: bool, arith: str) -> None:
+        """Compile-or-load the per-ROM sequence module and attach its window
+        dispatch to the core engine.  A new ROM's window set costs one small
+        TU (cached by digest); the 43 MB core is never re-emitted for it."""
+        from transformer_vm.model.engine_gen import (
+            SequenceModule,
+            seqmod_config_key,
+        )
+
+        key = seqmod_config_key(core_digest=self._engine.digest, bcd=bcd,
+                                arith=arith, windows=windows)
+        mod = SequenceModule.from_cache(key, core_digest=self._engine.digest)
+        if mod is None:
+            experts = []
+            for w in windows:
+                # The scanner proposes shapes; the fold's license checks
+                # arbitrate.  A rejected window only loses its fast path.
+                try:
+                    experts.append(self._build_sequence_expert(*w))
+                except RuntimeError as e:
+                    logger.info("sequence window skipped: %s", e)
+            if not experts:
+                return
+            mod = SequenceModule(
+                self.model, self._step_spec(), experts,
+                core_digest=self._engine.digest, arith=arith, cache_key=key,
+            )
+        else:
+            logger.info("sequence module cache hit (max window %d steps)", mod.max_k)
+        self._seq_module = mod
+        self._engine.attach_seq(mod.fn_ptr, mod.ctx_ptr)
 
     def _build_sequence_expert(self, head: int, code: bytes, repeat: int) -> dict:
         """One sequence expert: a K-instruction window folded as ONE forward.

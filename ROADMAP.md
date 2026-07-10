@@ -6,23 +6,62 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
-**START HERE (2026-07-10, 350 fps):** SMB gameplay through the
-transformer weights runs at **349.9 fps (2.9 ms/frame)** — nearly 6x the
-60 fps goal, 22x the C++ graph kernel in the same window.  The five
-levers of the two-day arc, each with its own log below: the all-opcode
+**START HERE (2026-07-10, 350 fps + per-ROM skirt):** SMB gameplay
+through the transformer weights runs at **~332-350 fps (~3 ms/frame)** —
+nearly 6x the 60 fps goal, ~20x the C++ graph kernel in the same window.
+The levers of the arc, each with its own log below: the all-opcode
 MoE (227 rebuilt experts, no game-derived tuning set), the engine build
 cache (construction ~1 s, distributable compiled artifacts), the MMIO
 read lease ($2002 polls served natively instead of pausing to Python
 ~1,420x/frame), group-dispatch fusion (one memory query per read
-instead of 16), and **sequence experts** (a whole pinned instruction
+instead of 16), **sequence experts** (a whole pinned instruction
 window as ONE forward: the poll trio at 0.07 µs/instr, the JMP spin at
-0.05 µs/instr — the roadmap's approach #2, landed).  Full Klaus
-(30,646,177 steps, decimal) MATCHED in 90.7 s; 76 tests green; frames
-byte-identical across backends.  Remaining candidates: the MILP
-objective realignment probe (#3, bounded), the kernel backend's
-hull-log growth (optional cleanup), the Klaus harness cost (lockstep
-reference + trace marshalling, no longer the forwards).  The
+0.05 µs/instr), and the **per-ROM sequence module** (the compile skirt:
+the core compiles once per code digest, a new ROM costs a ~160 KB TU —
+cold ~7 s, warm ~1 s).  Full Klaus (30,646,177 steps, decimal) MATCHED
+in 90.0 s; 77 tests green; frames byte-identical across backends.
+Remaining candidates: profile-guided JIT window discovery (the module
+hook is its substrate, see the recorded idea below), the kernel
+backend's hull-log growth (optional cleanup), the Klaus harness cost
+(lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
+
+## 2026-07-10 per-ROM sequence module — the compile skirt, landed
+
+The recorded path (a), built: sequence experts no longer compile into
+the engine TU.  The **core engine** (union + 227 opcode experts) is
+emitted with a sequence-dispatch *hook* — a raw function pointer + a
+`seq_out[21*32]` buffer + `attach_seq`/`detach_seq` — and its cache key
+deliberately excludes the windows, so it compiles once per code digest
+and every ROM shares the dlopen fast path.  A ROM's windows become a
+**per-ROM module** (`SequenceModule`): the folded window experts
+emitted as a tiny TU that `#include`s the core's generated header and
+reaches all shared machine state (st_* registers, RAM mirror, 16x4KiB
+memory structure, running-argmax registers, seq) through a typed
+`Engine_<digest>&` — public data members and in-header inline methods
+only, so there is no cross-dylib symbol dependency and the digest-named
+struct keeps ODR honest.  Module-private state is scratch only (xbuf,
+the hull_seen guards).  The union planning pass re-runs at module
+emission purely to reproduce the core's register allocation
+(deterministic given the model); a mismatched core digest refuses to
+attach.  The seq-module cache key covers (code digest, core digest,
+bcd, arith, window set).
+
+Receipts: 77 tests green, ruff clean; sequence lockstep test
+byte-identical through the module path; full nestest MATCHED 0.1 s;
+Klaus 200K decimal prefix MATCHED; **full Klaus MATCHED 30,646,177
+steps in 90.0 s**; SMB frames byte-identical kernel vs weights 120/120
+at **332.3 fps (3.0 ms/frame)** — the function-pointer indirection is
+within run-to-run noise.  **Per-ROM cost: novel window set ~7.1 s
+(sequence folds + one ~160 KB TU compile), cached ~0.95 s** — vs the
+full ~45-60 s core re-emission + recompile it replaces.  Gotcha for
+fps probes: the console handoff constructs the weights machine inside
+the timed window, so a ROM's *first* run pays the module build there
+(observed 30.8 "fps" cold vs 78.2 warm on the same nes-run command,
+both dominated by kernel warmup frames); per-frame numbers need a
+frame-level probe with the module cache warm.  This is the JIT
+substrate: hot-swapping a window set is now build-module + attach, no
+core recompile.
 
 ## 2026-07-10 sharded engine compile — 107 s → 17 s, per-ROM included
 
@@ -43,15 +82,13 @@ guard counts per-phase ops, not boundary width) while narrowing the hot
 top-end experts 1696 → 1584 — harmless, the union is cold under
 all-opcode routing.
 
-Recorded (not started): the complete per-ROM compile skirt.  Two paths,
-both real but not low-hanging: (a) a stable core module (union + opcode
-experts, compiled once per code digest) plus a tiny per-ROM sequence
-module talking to it through a state-pointer ABI — per-ROM cost becomes
-a ~1 MB TU, a few seconds, and it is the natural substrate for the JIT
-idea below; (b) canonical shape experts with symbolic pc (zero per-ROM
-compile), which needs byte-split feedback gadgets fold_sequence
-currently requires to be constant.  Beware the cross-dylib ODR trap
-(digest-named structs exist because of it) when designing (a).
+Recorded (landed same day, see the per-ROM sequence module log above):
+the complete per-ROM compile skirt, path (a) — a stable core module
+(union + opcode experts, compiled once per code digest) plus a tiny
+per-ROM sequence module attached through a function-pointer hook.
+Path (b) — canonical shape experts with symbolic pc (zero per-ROM
+compile) — remains open; it needs byte-split feedback gadgets
+fold_sequence currently requires to be constant.
 
 ## 2026-07-10 greedy hygiene scheduling — the MILP's win at zero solver cost
 
