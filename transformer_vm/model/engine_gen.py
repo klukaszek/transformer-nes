@@ -17,7 +17,10 @@ All modes generate the direct-WRITE key construction from graph.core's LATEST_AL
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import json
 import os
+import sys
 import time
 
 import numpy as np
@@ -29,6 +32,103 @@ _ATTENTION_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "attention"
 )
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_engine_cache")
+_MANIFEST_PATH = os.path.join(_CACHE_DIR, "manifest.json")
+
+# Everything whose content can change the emitted engine, hashed into the
+# config key so any edit is a cache miss (over-inclusion is safe).
+_CODE_DIRS = ("graph", "scheduler", "model", "attention")
+_CODE_FILES = (
+    "cpu6502/spec.py",
+    "cpu6502/evaluator.py",
+    "cpu6502/reference.py",
+    "cpu6502/weights_runner.py",
+)
+_code_digest_cache: str | None = None
+
+
+def _code_digest() -> str:
+    global _code_digest_cache
+    if _code_digest_cache is not None:
+        return _code_digest_cache
+    pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    paths = []
+    for d in _CODE_DIRS:
+        for root, dirs, files in os.walk(os.path.join(pkg, d)):
+            dirs[:] = [x for x in dirs if x not in ("__pycache__", "_engine_cache")]
+            paths.extend(
+                os.path.join(root, f) for f in files
+                if f.endswith((".py", ".h", ".hpp", ".cpp"))
+            )
+    paths.extend(os.path.join(pkg, *f.split("/")) for f in _CODE_FILES)
+    h = hashlib.sha256()
+    for p in sorted(paths, key=lambda p: os.path.relpath(p, pkg)):
+        h.update(os.path.relpath(p, pkg).encode())
+        with open(p, "rb") as fh:
+            h.update(fh.read())
+    _code_digest_cache = h.hexdigest()
+    return _code_digest_cache
+
+
+def engine_config_key(*, bcd: bool, arith: str, expert_bytes) -> str:
+    """Cache key for a built engine, computable without folding or emitting:
+    the config plus a digest of every source file that shapes the emission."""
+    tag = ",".join(f"{int(b):02X}" for b in expert_bytes)
+    raw = f"{_code_digest()}|bcd={int(bcd)}|arith={arith}|experts={tag}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+def _manifest_read() -> dict:
+    try:
+        with open(_MANIFEST_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _manifest_put(key: str, entry: dict) -> None:
+    manifest = _manifest_read()
+    manifest[key] = entry
+    os.makedirs(_CACHE_DIR, exist_ok=True)
+    tmp = _MANIFEST_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f, indent=1, sort_keys=True)
+    os.replace(tmp, _MANIFEST_PATH)
+
+
+def _load_engine_module(digest: str, arith: str) -> tuple[object, float]:
+    """Import the compiled engine, preferring the .so cached next to the
+    source (a direct dlopen, no ninja/clang -- the distributable path);
+    compile from the cached source only when the .so is absent."""
+    name = f"weights_gen_{digest}"
+    if name in sys.modules:
+        return sys.modules[name], 0.0
+    build_dir = os.path.join(_CACHE_DIR, f"build_{digest}")
+    so_path = os.path.join(build_dir, f"{name}.so")
+    if os.path.exists(so_path):
+        spec = importlib.util.spec_from_file_location(name, so_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules[name] = module
+        return module, 0.0
+
+    from torch.utils.cpp_extension import load
+
+    build_start = time.perf_counter()
+    cflags = ["-O2", "-std=c++17"]
+    if arith == "int32":
+        # int32 exactness argument is mod-2^32: partial sums may wrap,
+        # every final value fits.  Wrap must be defined behavior.
+        cflags.append("-fwrapv")
+    os.makedirs(build_dir, exist_ok=True)
+    module = load(
+        name=name,
+        sources=[os.path.join(_CACHE_DIR, f"engine_{digest}.cpp")],
+        extra_cflags=cflags,
+        extra_include_paths=[_ATTENTION_DIR],
+        build_directory=build_dir,
+        verbose=False,
+    )
+    return module, time.perf_counter() - build_start
 
 
 def _read_mode_table() -> list[int]:
@@ -1284,7 +1384,7 @@ class GeneratedWeightsEngine:
     """The 6502 transformer as generated C++; exact int32 residual by default."""
 
     def __init__(self, model, *, step_spec: dict | None = None,
-                 arith: str = "int32", experts=None):
+                 arith: str = "int32", experts=None, cache_key: str | None = None):
         self.dtype = "float32"
         self.arith = arith
         self.n_experts = len(experts or [])
@@ -1298,23 +1398,39 @@ class GeneratedWeightsEngine:
         if not os.path.exists(src_path):
             with open(src_path, "w") as f:
                 f.write(source)
+        module, self.compile_seconds = _load_engine_module(digest, arith)
+        if cache_key is not None:
+            _manifest_put(cache_key, {
+                "digest": digest, "arith": arith, "n_experts": self.n_experts,
+                "n_memory_heads": self.n_memory_heads,
+                "has_machine_step": self.has_machine_step,
+            })
+        self._bind(module)
 
-        from torch.utils.cpp_extension import load
-
-        build_start = time.perf_counter()
-        cflags = ["-O2", "-std=c++17"]
-        if arith == "int32":
-            # int32 exactness argument is mod-2^32: partial sums may wrap,
-            # every final value fits.  Wrap must be defined behavior.
-            cflags.append("-fwrapv")
-        module = load(
-            name=f"weights_gen_{digest}",
-            sources=[src_path],
-            extra_cflags=cflags,
-            extra_include_paths=[_ATTENTION_DIR],
-            verbose=False,
+    @classmethod
+    def from_cache(cls, cache_key: str) -> GeneratedWeightsEngine | None:
+        """Load an engine by config key alone, skipping the expert folds and
+        the source emission entirely; None on any miss."""
+        entry = _manifest_read().get(cache_key)
+        if entry is None:
+            return None
+        if not os.path.exists(
+            os.path.join(_CACHE_DIR, f"engine_{entry['digest']}.cpp")
+        ):
+            return None
+        self = cls.__new__(cls)
+        self.dtype = "float32"
+        self.arith = entry["arith"]
+        self.n_experts = entry["n_experts"]
+        self.n_memory_heads = entry["n_memory_heads"]
+        self.has_machine_step = entry["has_machine_step"]
+        module, self.compile_seconds = _load_engine_module(
+            entry["digest"], entry["arith"]
         )
-        self.compile_seconds = time.perf_counter() - build_start
+        self._bind(module)
+        return self
+
+    def _bind(self, module) -> None:
         self._engine = module.Engine()
         # The run loop is emitted under the same condition as machine_step.
         self.has_run_loop = self.has_machine_step

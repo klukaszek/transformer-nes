@@ -16,6 +16,31 @@ MILP objective realignment (#3) stays the bounded fallback.  Approach #1
 (expert-set tuning + caching) is retired by the all-opcode default.  The
 performance numbers in the older sections below are historical.
 
+## 2026-07-09 engine build cache — construction is ~1 s, artifacts ship
+
+The all-opcode default made warm machine construction ~30 s (227 folds +
+43 MB emission), all of it reproducing a source file already sitting in
+`model/_engine_cache/`.  Now cached at the config level: the key is
+sha256 of (every source file that shapes the emission: graph/, scheduler/,
+model/, attention/, plus spec/evaluator/reference/weights_runner) with
+(bcd, arith, expert set) — computable without folding anything — and
+`_engine_cache/manifest.json` maps it to the emitted-source digest plus
+the engine metadata.  On a hit the runner skips `_build_expert_models`
+and `generate_source` entirely and `GeneratedWeightsEngine.from_cache`
+dlopens the compiled `.so` directly (no ninja/clang on the hit path).
+Compiles now land in `_engine_cache/build_<digest>/` instead of torch's
+home-dir extension cache, so the cache directory is a self-contained
+distributable bundle: same-platform users load with zero compiles, other
+platforms rebuild from the shipped `.cpp` automatically.  Any edit to a
+generator-relevant source file changes the key — over-invalidation is
+the safety argument.  MILP expert schedules are excluded (incumbents
+depend on solve time).
+
+Receipts: construction 30 s → **0.99 s** (hit), console handoff to
+weights 29.3 s → **0.4 s**, slow test suite 303 s → **26.7 s** (11x);
+74 tests green, ruff clean; SMB gameplay 47.28 fps (unchanged, as it
+must be — the loaded engine is byte-identical).
+
 ## 2026-07-09 all-opcode experts — the expert set stops being a knob
 
 Per explicit user decision ("default expert opcodes is game dependent...
@@ -35,7 +60,9 @@ the compile.  What the wider default really costs: emission 16.3 s, a
 ~30 s per machine.  If the 30 s starts to hurt (tests, console handoff),
 the fold-digest artifact cache from the old approach-#1 note is the
 known fix — cache the per-expert schedule/model arrays keyed by a
-content digest of the folded graph.
+content digest of the folded graph.  (Done same day: see the engine
+build cache log above — cached at the whole-engine config level
+instead, which also skips emission.)
 
 One generator fix made it possible: the step_core variants share one
 residual buffer, previously sized to the union's d_model with a hard

@@ -113,24 +113,44 @@ class Cpu6502TransformerMachine:
         self._state_head_cols, self._state_head_vals = self._head_row(self._state_row)
         self._halt_head_cols, self._halt_head_vals = self._head_row(self._halt_row)
 
-        from transformer_vm.model.engine_gen import GeneratedWeightsEngine
+        from transformer_vm.model.engine_gen import (
+            GeneratedWeightsEngine,
+            engine_config_key,
+        )
 
         if expert_schedule not in ("asap", "milp"):
             raise ValueError(f"unknown expert_schedule {expert_schedule!r}")
         self._expert_schedule = expert_schedule
         self._expert_milp_seconds = expert_milp_seconds
-        experts = []
-        if codegen_arith != "f32":
-            experts = self._build_expert_models(expert_opcodes)
-        elif expert_opcodes:
-            logger.info(
-                "opcode-routed experts disabled: f32 arith keeps every lookup "
-                "head on a real hull, which cannot be shared across models"
+        # The engine is fully determined by (source code, bcd, arith, expert
+        # set), so a manifest hit skips the expert folds and the emission and
+        # loads the compiled artifact directly.  MILP schedules are excluded:
+        # their incumbents depend on solve time.
+        cache_key = None
+        self._engine = None
+        if expert_schedule == "asap":
+            expert_bytes = [
+                int(b) for b in (expert_opcodes or ()) if int(b) in OPCODES
+            ] if codegen_arith != "f32" else []
+            cache_key = engine_config_key(
+                bcd=bcd, arith=codegen_arith, expert_bytes=expert_bytes,
             )
-        self._engine = GeneratedWeightsEngine(
-            self.model, step_spec=self._step_spec(),
-            arith=codegen_arith, experts=experts,
-        )
+            self._engine = GeneratedWeightsEngine.from_cache(cache_key)
+            if self._engine is not None:
+                logger.info("engine cache hit (%d experts)", self._engine.n_experts)
+        if self._engine is None:
+            experts = []
+            if codegen_arith != "f32":
+                experts = self._build_expert_models(expert_opcodes)
+            elif expert_opcodes:
+                logger.info(
+                    "opcode-routed experts disabled: f32 arith keeps every lookup "
+                    "head on a real hull, which cannot be shared across models"
+                )
+            self._engine = GeneratedWeightsEngine(
+                self.model, step_spec=self._step_spec(),
+                arith=codegen_arith, experts=experts, cache_key=cache_key,
+            )
         self._direct_writes = self._engine.supports_direct_writes
         self._cpp_step = getattr(self._engine, "has_machine_step", False)
         if self._cpp_step:
