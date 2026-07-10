@@ -340,8 +340,11 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     fetched_operand_hi = _memory_at(_wrap16(current_pc + 2), "fetched_operand_hi_raw")
 
     fetched_opcode = persist(fetched_opcode, name="fetched_opcode")
-    fetched_operand_lo = persist(fetched_operand_lo, name="fetched_operand_lo")
-    fetched_operand_hi = persist(fetched_operand_hi, name="fetched_operand_hi")
+    # Raw operand bytes, used by the addressing machinery below.  The trace
+    # *reports* them gated by instruction length (reference convention), so
+    # the readout dims named fetched_operand_lo/hi are built near data_out.
+    fetched_operand_lo = persist(fetched_operand_lo, name="fetched_operand_lo_all")
+    fetched_operand_hi = persist(fetched_operand_hi, name="fetched_operand_hi_all")
 
     # ── Per-opcode gates ────────────────────────────────────────────
     opcode_gates: dict[int, Expression] = {}
@@ -1101,8 +1104,54 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     write_addr3 = persist(0x0100 + _wrap8(current_s - 2), name="write_addr3_out")
     write_value3 = persist(_mux(is_nmi, nmi_push_p, php_push_value), name="write_value3_out")
 
-    # ── Data bus output for tracing ───────────────────────────────
-    data_out = _mux(is_nmi, 0, operand)
+    # ── Trace-context outputs (reference-aligned, 2026-07-09) ────────
+    # The trace reports exactly what reference.py reports, field for field:
+    # operands only when the instruction fetches them (raw on an NMI step,
+    # which reports the not-executed instruction bytes), and data as the
+    # operation's *primary result* -- the value a load loads, a store
+    # stores, an RMW writes, a compare computes -- 0 for pure control
+    # flow.  Previously these reported the raw pc+1/pc+2/[ea] reads, which
+    # kept those memory lookups alive in every routed expert even when the
+    # instruction never used them.
+    has_operand_lo = length - 1  # 0 for 1-byte instructions, else >= 1
+    has_operand_hi = is_abs + is_abx + is_aby + is_ind
+    report_operand_lo = stepglu(fetched_operand_lo, has_operand_lo + is_nmi - 1)
+    report_operand_lo = persist(report_operand_lo, name="fetched_operand_lo")
+    report_operand_hi = stepglu(fetched_operand_hi, has_operand_hi + is_nmi - 1)
+    report_operand_hi = persist(report_operand_hi, name="fetched_operand_hi")
+
+    # The operation-family gates are a mutually exclusive one-hot, so data
+    # is a *parallel* gated sum (depth 2), not a mux chain.  Families with
+    # data == 0 (jmp/jsr/rts/rti/brk, branches, flag ops, nop) are simply
+    # absent.  Shift families report the shift result in both accumulator
+    # and memory modes, exactly as the reference handlers return it.
+    data_ref = (
+        _multiply(op_store_a + op_pha, current_a)
+        + _multiply(op_store_x, current_x)
+        + _multiply(op_store_y, current_y)
+        + _multiply(op_php, current_p)
+        + _multiply(op_inc + op_isb, inc_result)
+        + _multiply(op_dec + op_dcp, dec_result)
+        + _multiply(op_asl + op_slo, asl_result)
+        + _multiply(op_lsr + op_sre, lsr_result)
+        + _multiply(op_rol + op_rla, rol_result)
+        + _multiply(op_ror + op_rra, ror_result)
+        + _multiply(op_sax, sax_result)
+        + _multiply(
+            op_load_a + op_lax + op_adc + op_sbc + op_and + op_ora + op_eor
+            + op_pla + op_txa + op_tya,
+            new_a,
+        )
+        + _multiply(op_load_x + op_inx + op_dex + op_tax + op_tsx, new_x)
+        + _multiply(op_load_y + op_iny + op_dey + op_tay, new_y)
+        + _multiply(op_txs, new_s)
+        + _multiply(op_plp, new_p)
+        + _multiply(op_cmp, cmp_result)
+        + _multiply(op_cpx, cpx_result)
+        + _multiply(op_cpy, cpy_result)
+        + _multiply(op_bit, operand)
+    )
+    data_out = _mux(is_nmi, 0, data_ref)
     data_out = persist(data_out, name="data_out")
 
     # ── Halt ────────────────────────────────────────────────────────

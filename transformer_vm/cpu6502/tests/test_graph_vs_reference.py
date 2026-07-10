@@ -24,18 +24,10 @@ def _traces_equal(ref_trace, graph_trace):
         return False
     for r1, r2 in zip(ref_trace.rows, graph_trace.rows, strict=True):
         s1, s2 = r1.state, r2.state
-        # Compare architectural state only (pc, registers, flags, halt).
-        # Internal fetch/execute fields (ir, operand_lo, operand_hi, ea, data)
-        # may differ between implementations.
-        if (
-            s1.pc != s2.pc
-            or s1.a != s2.a
-            or s1.x != s2.x
-            or s1.y != s2.y
-            or s1.s != s2.s
-            or s1.p != s2.p
-            or s1.halted != s2.halted
-        ):
+        # Full-state comparison: since 2026-07-09 the graph reports trace
+        # context (ir, operands, ea, data) with the reference's exact
+        # conventions, so every field must match.
+        if s1 != s2:
             return False
         if r1.writes != r2.writes:
             return False

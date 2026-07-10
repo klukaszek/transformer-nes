@@ -209,6 +209,12 @@ def union_run(union_pg):
                reads["new_x"] & 0xFF, reads["new_y"] & 0xFF,
                reads["new_s"] & 0xFF, reads["new_p"] & 0xFF)
         assert got == (s.pc, s.a, s.x, s.y, s.s, s.p)
+        # Trace context follows the reference convention exactly (2026-07-09).
+        context = (reads["fetched_opcode"] & 0xFF,
+                   reads["fetched_operand_lo"] & 0xFF,
+                   reads["fetched_operand_hi"] & 0xFF,
+                   reads["ea"] & 0xFFFF, reads["data_out"] & 0xFF)
+        assert context == (s.ir, s.operand_lo, s.operand_hi, s.ea, s.data)
         assert writes == {(w.addr, w.value) for w in row.writes}
         assert state_expr.evaluate(v) > halt_expr.evaluate(v)
 

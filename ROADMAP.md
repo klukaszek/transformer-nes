@@ -4,6 +4,58 @@ Status snapshot and prioritized next steps.  Written 2026-07-06 as the
 handoff point for fresh working sessions; the design details live in
 [`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).
 
+## 2026-07-09 reference-aligned trace convention — the million-instruction mark
+
+Per explicit decision (option: "align with reference"), the graph's trace-
+context fields now follow reference.py's conventions *exactly*, field for
+field: operands gated by instruction length (raw on an NMI step, which
+reports the not-executed instruction bytes), ea already matched everywhere
+(measured first: 0 mismatches over nestest before any change), and data as
+the operation's primary result — loads report the loaded value, stores/RMW
+the written byte (write_value already equals it for every writing family),
+compares the wrapped difference, PHP live P, pure control flow 0, built as
+a parallel gated sum over the mutually exclusive family one-hots (depth 2,
+not a mux chain).  Previously these fields reported the raw pc+1/pc+2/[ea]
+reads, which kept those memory lookups alive in every routed expert even
+when the instruction never used them.
+
+Union cost: terms 29,136 → 29,704 (+2%), depth 71 → 74 (the data sum
+hangs off new_p, the critical-path tail); union fallback ~8.3 → ~8.9 µs.
+Expert payoff: the fold now kills the operand reads and the operand-memory
+read wherever the instruction doesn't use them.
+
+The verification story got *stronger*, not weaker: the old caveat
+("internal fetch/execute fields may differ between implementations") is
+retired — test_graph_vs_reference now compares full states, and a new
+test_trace_convention checks kernel-vs-reference on ALL trace fields over
+full nestest and a 200K Klaus decimal prefix, instruction by instruction.
+Measured before/after with a field-by-field differ: 15,177 mismatches in
+331 (field, op, mode) classes before; **0 after**.  moe_probe results
+regenerated against the new graph (baseline 74 layers / 29,704 terms;
+checked-in JSONs updated).
+
+Receipts (74 tests green, ruff clean; all lockstep-exact):
+- Full nestest MATCHED ~177K instr/s; Klaus 200K decimal MATCHED ~137K/s.
+- **Full Klaus re-validated: MATCHED — 30,646,177 steps (decimal) in
+  208.7 s (3.48 min, ~147K instr/s sustained incl. the lockstep
+  reference), checkpoint-free.**  Full-suite arc across the engine
+  generations: 57 → 18.9 → 15.3 → 9.4 → 6.3 → 6.2 → 4.55 → 3.83 → 3.60 →
+  **3.48 min**.
+- **JMP-to-self hot path: 1.22 → 0.99 µs/step — 1.01M instr/s, the first
+  million-instruction-per-second receipt through genuine 71-layer-model
+  transformer inference.**
+- **Frame-poll loop: 1.54 → 1.03 µs/step (973K instr/s).**
+- **SMB gameplay: 33.33 fps (top-16), 43.51 fps (top-48, 23.0 ms/frame)**
+  — the arc so far: 28.24 → 29.68 → 32.47 → 43.51.  Remaining to 60 fps:
+  ~1.39x, still busy-frame logic through the mid-size experts.
+
+Next, in payoff order:
+1. Widen/tune the expert set for the gameplay logic mix (top-48 is now
+   clearly worth its build cost for play; consider caching expert builds).
+2. Poll-loop sequence expert (LDA/AND/BEQ as one folded step).
+3. MILP objective realignment (minimize slot-hygiene nnz under a width
+   bound) — bounded ~1.2-1.3x, after the above.
+
 ## 2026-07-09 fetched-byte pin — the router predicate, fully spent
 
 What was built (`graph/fold.py` + tests; roadmap next-step #2 from the
