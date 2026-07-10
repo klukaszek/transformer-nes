@@ -24,6 +24,35 @@ hull-log growth (optional cleanup), the Klaus harness cost (lockstep
 reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## 2026-07-10 sharded engine compile — 107 s → 17 s, per-ROM included
+
+The 43 MB engine TU compiled single-threaded while nine cores idled.
+The emission is now post-processed into a header (struct, state, small
+inline methods, declarations) plus ~10 content-balanced .cpp shards with
+out-of-class `layer_*`/`step_core*` definitions, compiled in parallel by
+ninja (the split is deterministic text processing; the digest still
+covers the original single source, and the dlopen fast path is
+unchanged).  Receipts: **fresh compile 106.9 → 16.7 s (6.4x)**; a full
+bcd=True machine build (folds + emission + compile) now fits in 30 s;
+step times hold or improve (no cross-shard inlining loss measured); 77
+tests green; SMB ~337 fps byte-identical 120/120; full Klaus MATCHED
+90.8 s.  `-O1` was measured and rejected: ~12% compile win (parse/
+codegen dominates, not optimization) for unquantified step-time risk.
+Note: the hygiene sweep widened the *union* d_model 1564 → 1766 (its
+guard counts per-phase ops, not boundary width) while narrowing the hot
+top-end experts 1696 → 1584 — harmless, the union is cold under
+all-opcode routing.
+
+Recorded (not started): the complete per-ROM compile skirt.  Two paths,
+both real but not low-hanging: (a) a stable core module (union + opcode
+experts, compiled once per code digest) plus a tiny per-ROM sequence
+module talking to it through a state-pointer ABI — per-ROM cost becomes
+a ~1 MB TU, a few seconds, and it is the natural substrate for the JIT
+idea below; (b) canonical shape experts with symbolic pc (zero per-ROM
+compile), which needs byte-split feedback gadgets fold_sequence
+currently requires to be constant.  Beware the cross-dylib ODR trap
+(digest-named structs exist because of it) when designing (a).
+
 ## 2026-07-10 greedy hygiene scheduling — the MILP's win at zero solver cost
 
 `asap_schedule` gains a hygiene sweep (default on): after the balance

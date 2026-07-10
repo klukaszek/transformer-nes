@@ -20,6 +20,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import time
 
@@ -95,10 +96,61 @@ def _manifest_put(key: str, entry: dict) -> None:
     os.replace(tmp, _MANIFEST_PATH)
 
 
+_FUNC_RE = re.compile(r"^    void ((?:layer_|step_core)\w*)\((.*)\) \{$")
+
+
+def _shard_source(source: str, struct_name: str, n_shards: int) -> tuple[str, list[str]]:
+    """Split the single-TU engine into a header + n_shards bodies so ninja
+    compiles them in parallel.  The heavy member functions (layer_*,
+    step_core*) become out-of-class definitions, greedily balanced by line
+    count; everything else stays in-class (implicitly inline) in the header.
+    The PYBIND module block lands in shard 0.  Purely a deterministic
+    post-processing of the emitted text -- the digest covers the original."""
+    lines = source.split("\n")
+    header: list[str] = ["#pragma once"]
+    chunks: list[list[str]] = []
+    pybind: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = _FUNC_RE.match(line)
+        if m is not None:
+            depth = line.count("{") - line.count("}")
+            chunk = [f"void {struct_name}::{m.group(1)}({m.group(2)}) {{"]
+            i += 1
+            while depth > 0:
+                depth += lines[i].count("{") - lines[i].count("}")
+                chunk.append(lines[i])
+                i += 1
+            header.append(f"    void {m.group(1)}({m.group(2)});")
+            chunks.append(chunk)
+            continue
+        if line.startswith("PYBIND11_MODULE("):
+            depth = line.count("{") - line.count("}")
+            pybind.append(line)
+            i += 1
+            while depth > 0:
+                depth += lines[i].count("{") - lines[i].count("}")
+                pybind.append(lines[i])
+                i += 1
+            continue
+        header.append(line)
+        i += 1
+
+    shards = [[] for _ in range(max(1, n_shards))]
+    sizes = [0] * len(shards)
+    for chunk in sorted(chunks, key=len, reverse=True):
+        k = sizes.index(min(sizes))
+        shards[k].extend(chunk + [""])
+        sizes[k] += len(chunk)
+    shards[0] = pybind + [""] + shards[0]
+    return "\n".join(header) + "\n", ["\n".join(s) + "\n" for s in shards]
+
+
 def _load_engine_module(digest: str, arith: str) -> tuple[object, float]:
     """Import the compiled engine, preferring the .so cached next to the
     source (a direct dlopen, no ninja/clang -- the distributable path);
-    compile from the cached source only when the .so is absent."""
+    compile from the cached source shards only when the .so is absent."""
     name = f"weights_gen_{digest}"
     if name in sys.modules:
         return sys.modules[name], 0.0
@@ -120,11 +172,15 @@ def _load_engine_module(digest: str, arith: str) -> tuple[object, float]:
         # every final value fits.  Wrap must be defined behavior.
         cflags.append("-fwrapv")
     os.makedirs(build_dir, exist_ok=True)
+    shard_glob = sorted(
+        f for f in os.listdir(_CACHE_DIR)
+        if f.startswith(f"engine_{digest}_s") and f.endswith(".cpp")
+    )
     module = load(
         name=name,
-        sources=[os.path.join(_CACHE_DIR, f"engine_{digest}.cpp")],
+        sources=[os.path.join(_CACHE_DIR, f) for f in shard_glob],
         extra_cflags=cflags,
-        extra_include_paths=[_ATTENTION_DIR],
+        extra_include_paths=[_ATTENTION_DIR, _CACHE_DIR],
         build_directory=build_dir,
         verbose=False,
     )
@@ -1489,10 +1545,16 @@ class GeneratedWeightsEngine:
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         source = source.replace("ENGINE_T", f"Engine_{digest}")
         os.makedirs(_CACHE_DIR, exist_ok=True)
-        src_path = os.path.join(_CACHE_DIR, f"engine_{digest}.cpp")
-        if not os.path.exists(src_path):
-            with open(src_path, "w") as f:
-                f.write(source)
+        hpp_path = os.path.join(_CACHE_DIR, f"engine_{digest}.hpp")
+        if not os.path.exists(hpp_path):
+            n_shards = max(1, min((os.cpu_count() or 4) - 2, 12))
+            header, shards = _shard_source(source, f"Engine_{digest}", n_shards)
+            for k, body in enumerate(shards):
+                with open(os.path.join(_CACHE_DIR, f"engine_{digest}_s{k}.cpp"),
+                          "w") as f:
+                    f.write(f'#include "engine_{digest}.hpp"\n\n{body}')
+            with open(hpp_path, "w") as f:
+                f.write(header)
         module, self.compile_seconds = _load_engine_module(digest, arith)
         if cache_key is not None:
             _manifest_put(cache_key, {
@@ -1510,7 +1572,7 @@ class GeneratedWeightsEngine:
         if entry is None:
             return None
         if not os.path.exists(
-            os.path.join(_CACHE_DIR, f"engine_{entry['digest']}.cpp")
+            os.path.join(_CACHE_DIR, f"engine_{entry['digest']}.hpp")
         ):
             return None
         self = cls.__new__(cls)
