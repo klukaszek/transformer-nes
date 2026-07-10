@@ -32,18 +32,47 @@ Receipts (72 tests green; all lockstep-exact):
 Remaining to 60 fps (~1.56x): busy-frame logic mix through the mid-size
 experts — per-expert width compaction, probed next.
 
-## 2026-07-09 per-expert MILP width probe
+## 2026-07-09 per-expert MILP: solves now, but width is the wrong objective
 
 At expert scale the exact-width MILP actually solves — the union blowup
 (2026-07-06: presolve alone exceeded an hour) was formulation-times-size,
-not the solver.  **CLC expert: 273K rows presolved to 74K / 33K binaries;
-optimal in 118 s; d_model 250 (balanced ASAP) → 154 (0.62x).**  HiGHS
-found a first incumbent in ~50 s and spent the rest proving.  The
-poll-loop-scale probe (LDA abs, 22 layers / ~1,700 ops) is next; if the
-width win holds there, the wiring question is schedule caching (a MILP
-solve per expert per machine build is unusable for tests — solutions must
-be cached by fold digest, or MILP experts become an opt-in performance
-configuration).
+not the solver:
+- **CLC expert: 273K rows presolved to 74K / 33K binaries; optimal in
+  118 s; d_model 250 → 154 (0.62x)** (260 → 162 with the byte pin).
+- **LDA abs (22 layers / ~1,700 ops): 881K rows presolved to 456K;
+  incumbents 152 @ 4 min → 105 @ 8 min → 98 @ 22 min vs ASAP 272**
+  (bound 91, gap 7.2% when stopped) — usable incumbents come early,
+  proofs are slow.
+
+**But width does not buy step time**: the CLC expert at 0.62x width runs
+only ~7% faster (CLC*30+JMP loop: 1.26 → 1.19 µs/step avg; extracted
+CLC step ~1.03 → 0.95 µs).  The codegen engine is load-bound on *nnz*
+(plus the lookup structures), and minimizing max width neither reduces
+nnz nor the slot-hygiene work — tighter slot reuse can even add erase
+churn.  Wiring landed anyway (`milp_schedule(time_limit=...)`,
+`Cpu6502TransformerMachine(expert_schedule="milp", expert_milp_seconds=...)`)
+as an experimental option; default stays ASAP.
+
+Implication: if the MILP is to earn real step time, the *objective* must
+be realigned to the engine's cost model — minimize total passthrough/
+erase bookkeeping (the `pd_var`/dying indicators the formulation already
+builds), subject to width ≤ the balanced-ASAP width, rather than
+minimizing width itself.  Slot-hygiene work is ~20-30% of an expert's
+nnz, so the honest ceiling of that realignment is ~1.2-1.3x — worth one
+probe, not a research arc.
+
+The bigger measured lever for busy-frame logic cost is the **trace-
+context fetch reads**: fetched_operand_lo/hi and operand_mem/data_out
+stay live in every expert only because the trace convention reports the
+*raw* pc+1/pc+2/[ea] reads even for instructions that never use them
+(1-2-byte opcodes, non-memory ops).  The reference core's convention is
+already "0 when not fetched/used"; aligning the graph's trace fields
+with it would let the fold kill up to two more grouped reads per expert
+(the byte pin killed one such read for 1.75 → 1.22 µs on JMP).  This is
+a semantics/verification-story decision — it changes trace-context
+fields that have been byte-identical across every engine generation
+(architectural lockstep fields and writes are untouched) — so it needs
+an explicit call, not a silent redefinition.
 
 ## Where things stand (all verified, all tests green)
 

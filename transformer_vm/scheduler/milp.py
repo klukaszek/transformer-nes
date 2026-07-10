@@ -345,7 +345,8 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None, bal
 
 
 def milp_schedule(
-    input_tokens, output_tokens, max_layers=None, max_ffn=None, log=None, program_graph=None
+    input_tokens, output_tokens, max_layers=None, max_ffn=None, log=None,
+    program_graph=None, time_limit=3600,
 ):
     """Optimal schedule minimizing dependency width at persist boundaries.
 
@@ -355,6 +356,8 @@ def milp_schedule(
         log: logging callable (defaults to logger.info).
         program_graph: optional ProgramGraph; if provided, uses its dims/lookups
             and positional dimensions instead of module-level globals.
+        time_limit: solver budget in seconds; at the limit HiGHS returns its
+            best incumbent (the schedule is feasible, just not proven optimal).
     """
     _log = log or print
 
@@ -626,11 +629,11 @@ def milp_schedule(
     try:
         from pulp import HiGHS
 
-        solver = HiGHS(timeLimit=3600)
+        solver = HiGHS(timeLimit=time_limit)
     except Exception:
         from pulp import PULP_CBC_CMD
 
-        solver = PULP_CBC_CMD(msg=0, timeLimit=3600)
+        solver = PULP_CBC_CMD(msg=0, timeLimit=time_limit)
     prob.solve(solver)
 
     if prob.status != 1:

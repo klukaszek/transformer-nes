@@ -64,7 +64,9 @@ class Cpu6502TransformerMachine:
     def __init__(self, *, bcd: bool = False,
                  codegen_arith: str = "int32",
                  checkpoint_tokens: int | None = None,
-                 expert_opcodes=DEFAULT_EXPERT_OPCODES):
+                 expert_opcodes=DEFAULT_EXPERT_OPCODES,
+                 expert_schedule: str = "asap",
+                 expert_milp_seconds: int = 900):
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
         self.rt = Cpu6502Runtime(bcd=bcd)
@@ -119,6 +121,10 @@ class Cpu6502TransformerMachine:
 
         from transformer_vm.model.engine_gen import GeneratedWeightsEngine
 
+        if expert_schedule not in ("asap", "milp"):
+            raise ValueError(f"unknown expert_schedule {expert_schedule!r}")
+        self._expert_schedule = expert_schedule
+        self._expert_milp_seconds = expert_milp_seconds
         experts = []
         if codegen_arith != "f32":
             experts = self._build_expert_models(expert_opcodes)
@@ -206,8 +212,21 @@ class Cpu6502TransformerMachine:
                     "state would diverge"
                 )
             fp = r.program_graph
-            sched = asap_schedule(fp.input_tokens, fp.output_tokens,
-                                  program_graph=fp, log=logger.debug)
+            if self._expert_schedule == "milp":
+                # Exact-width schedule: tractable at expert scale (the union
+                # formulation blowup was size-driven); at the time limit the
+                # solver's best incumbent is used -- feasible, just unproven.
+                from transformer_vm.scheduler.milp import milp_schedule
+
+                t0 = time.perf_counter()
+                sched = milp_schedule(fp.input_tokens, fp.output_tokens,
+                                      program_graph=fp, log=logger.debug,
+                                      time_limit=self._expert_milp_seconds)
+                logger.info("expert %02X: MILP schedule in %.0fs",
+                            byte, time.perf_counter() - t0)
+            else:
+                sched = asap_schedule(fp.input_tokens, fp.output_tokens,
+                                      program_graph=fp, log=logger.debug)
             model, _tokens, tok_to_idx, info = build_model(
                 program_graph=fp, schedule=sched,
             )
