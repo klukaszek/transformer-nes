@@ -244,7 +244,8 @@ def _legal_phases(lo, hi, op):
     return range(start, hi + 1, step)
 
 
-def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None, balance=True):
+def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
+                  balance=True, hygiene=True):
     """Critical-path (ASAP) schedule, optionally load-balanced.
 
     Same output shape as milp_schedule but no solver: layer count equals
@@ -319,6 +320,52 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None, bal
             best = min(candidates, key=lambda p: (load[p], -p))
             pa[op] = best
             load[best] += 1
+
+    if balance and hygiene:
+        # Hygiene sweep (the greedy half of the hygiene-MILP receipt): the
+        # engine is nnz-bound and the schedule-variable hygiene cost is
+        # persist-1 passthrough persistence.  Move each persist within its
+        # exact dependency window to (a) prefer persist-2 slots (no
+        # attention passthrough) and (b) co-locate persist-1 consumers of
+        # the same deps, guarded so no phase exceeds the current max load.
+        # Deterministic: topo order, tuple-key min over ordered candidates.
+        persists = [op for op in topo_order if isinstance(op, PersistDimension)]
+        max_load = max(load.values(), default=0)
+        p1_layers = defaultdict(lambda: defaultdict(int))  # dep -> layer -> uses
+        for p in persists:
+            if pa[p] % 4 == 1:
+                for d in op_deps[p]:
+                    p1_layers[d][pa[p] // 4] += 1
+        for _ in range(2):  # a second sweep settles moves the first enabled
+            for p in persists:
+                cur = pa[p]
+                load[cur] -= 1
+                if cur % 4 == 1:
+                    for d in op_deps[p]:
+                        p1_layers[d][cur // 4] -= 1
+                lo = max((pa[d] for d in op_deps[p] if d in pa), default=-1) + 1
+                kids = [pa[c] for c in children.get(p, ()) if c in pa]
+                hi = (min(kids) - 1) if kids else max_phase
+                candidates = list(_legal_phases(lo, max(hi, lo), p)) or [cur]
+
+                def hygiene_cost(ph, p=p):
+                    if ph % 4 != 1:
+                        return 0  # persist-2: FFN side, no attention passthrough
+                    L = ph // 4
+                    return sum(
+                        1 for d in op_deps[p]
+                        if p1_layers[d][L] == 0
+                        and not (isinstance(d, LookUp) and pa.get(d) == 4 * L)
+                    )
+
+                best = min(candidates, key=lambda ph: (
+                    load[ph] >= max_load, hygiene_cost(ph), load[ph], -ph,
+                ))
+                pa[p] = best
+                load[best] += 1
+                if best % 4 == 1:
+                    for d in op_deps[p]:
+                        p1_layers[d][best // 4] += 1
 
     (num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after) = (
         _layers_and_liveness(

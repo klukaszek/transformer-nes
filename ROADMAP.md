@@ -24,6 +24,42 @@ hull-log growth (optional cleanup), the Klaus harness cost (lockstep
 reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## 2026-07-10 greedy hygiene scheduling — the MILP's win at zero solver cost
+
+`asap_schedule` gains a hygiene sweep (default on): after the balance
+pass, a deterministic two-round local search moves each persist within
+its exact dependency window minimizing (over-width, new-passthrough-
+layers, load, -phase) — preferring persist-2 slots (no attention
+passthrough) and co-locating persist-1 consumers of shared deps, with
+the same-layer-lookup exemption the MILP's pd_var has and a width guard
+so no phase exceeds the balanced max load.
+
+Receipts: **LDA abs;JMP 0.422 → 0.377 µs/step (1.12x), JSR;RTS 0.380 →
+0.327 (1.16x)** — the greedy captures essentially the whole hygiene-MILP
+result (0.375 at 632 s of solver) in milliseconds, so the MILP opt-in is
+now purely a certificate.  SMB 350.6 fps, frames byte-identical 120/120;
+full Klaus MATCHED 91.4 s; nestest MATCHED; 77 tests green.  Probe
+gotcha for the record: monkeypatch-A/B configs must salt the engine
+cache key — `functools.partial(key, extra=...)` is silently overridden
+by the call site's `extra=` kwarg, and the collision surfaces as an
+"x size != d_model" mismatch against the cached artifact.
+
+## Recorded idea: profile-guided JIT window discovery (not started)
+
+The general successor to the boot-time loop scanner: the run loop counts
+dispatch-fallback pcs (one array increment where the opcode switch runs
+today); the runner periodically takes the hottest pcs, decodes candidate
+windows around them (straight-line bodies included — shapes the closed-
+loop scanner cannot see), folds the ones that pass the sequence license,
+and hot-swaps the engine (the build cache makes rebuilds ~1 s plus a
+one-time compile per new window set; state carries over exactly like a
+console handoff: st_* registers + RAM mirror + memstruct + running-
+argmax registers).  Workload-independent by construction — it discovers
+any ROM's hot idioms at runtime — and the self-profiling MoE that grows
+its own experts is a thesis chapter on its own.  Prerequisites are all
+landed: sequence experts, license checks, config-key caching, cheap
+construction.
+
 ## 2026-07-10 generic loop scanner + written-bit fast path (any-ROM work)
 
 Two generality changes for arbitrary ROMs (SMB itself unchanged at
