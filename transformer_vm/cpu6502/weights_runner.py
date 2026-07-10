@@ -260,10 +260,18 @@ class Cpu6502TransformerMachine:
                 from transformer_vm.scheduler.milp import milp_schedule
 
                 t0 = time.perf_counter()
+                # The engine is nnz-bound, so the objective is the schedule's
+                # hygiene cost (passthrough persistence), capped at the
+                # balanced-ASAP width the default path would have used.
+                asap = asap_schedule(fp.input_tokens, fp.output_tokens,
+                                     program_graph=fp, log=logger.debug)
+                _m, _t, _ti, ainfo = build_model(program_graph=fp, schedule=asap)
                 sched = milp_schedule(fp.input_tokens, fp.output_tokens,
                                       program_graph=fp, log=logger.debug,
-                                      time_limit=self._expert_milp_seconds)
-                logger.info("expert %02X: MILP schedule in %.0fs",
+                                      time_limit=self._expert_milp_seconds,
+                                      objective="hygiene",
+                                      width_bound=ainfo.d_model)
+                logger.info("expert %02X: hygiene MILP in %.0fs",
                             byte, time.perf_counter() - t0)
             else:
                 sched = asap_schedule(fp.input_tokens, fp.output_tokens,

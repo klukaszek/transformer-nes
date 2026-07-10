@@ -24,6 +24,23 @@ hull-log growth (optional cleanup), the Klaus harness cost (lockstep
 reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## 2026-07-10 hygiene-objective MILP — validated, kept as opt-in
+
+Approach #3, probed and closed.  `milp_schedule` gains
+`objective="hygiene"` (minimize the passthrough-persistence indicator
+sum — total dying is schedule-invariant, so passthrough co-scheduling
+and the persist1/persist2 choice are the schedule-variable hygiene
+cost) plus `width_bound` (cap d_model at the balanced-ASAP width);
+`expert_schedule="milp"` now uses it.  Receipts: the LDA abs;JMP loop
+runs 0.429 (ASAP) → **0.375 µs/step (1.14x)** — the realignment works
+where the width objective bought only ~7% — but costs 632 s of solver
+per two experts (vs 12 s ASAP), incumbents don't appear at all inside
+120 s for the bigger experts (JSR: 884K rows), and at 227 experts it is
+~19 h per machine config.  Verdict: correct objective, wrong price for
+a default — kept as the opt-in it already was, for maximum-performance
+builds of chosen experts.  At 350 fps the logic tail it targets is
+~0.1 ms/frame, so it is a thesis receipt, not a frame-rate lever.
+
 ## 2026-07-10 sequence experts — a pinned window is one forward
 
 Approach #2 from the 2026-07-09 handoff, landed as construction + engine:

@@ -347,6 +347,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None, bal
 def milp_schedule(
     input_tokens, output_tokens, max_layers=None, max_ffn=None, log=None,
     program_graph=None, time_limit=3600,
+    objective="width", width_bound=None,
 ):
     """Optimal schedule minimizing dependency width at persist boundaries.
 
@@ -358,6 +359,11 @@ def milp_schedule(
             and positional dimensions instead of module-level globals.
         time_limit: solver budget in seconds; at the limit HiGHS returns its
             best incumbent (the schedule is feasible, just not proven optimal).
+        objective: "width" minimizes d_model; "hygiene" minimizes the
+            passthrough-persistence indicator sum (the engine is nnz-bound,
+            and slot hygiene -- not width -- is the schedule-variable part),
+            usually with width_bound set to the balanced-ASAP d_model.
+        width_bound: optional cap on d_model (2 * D_half <= width_bound).
     """
     _log = log or print
 
@@ -623,6 +629,19 @@ def milp_schedule(
         dying_L = prev_alive - cur_alive + born_L
 
         prob += 2 * D_half >= 2 * n_lu_L + dying_L + pt_L
+
+    # ── Objective / width bound ───────────────────────────────────
+    if width_bound is not None:
+        prob += 2 * D_half <= int(width_bound)
+    if objective == "hygiene":
+        # Realigned to the engine's cost model: total dying is
+        # schedule-invariant (every dim dies once), but the passthrough
+        # persistence sum varies with persist co-scheduling and the
+        # persist1/persist2 choice.  D_half enters as a small tie-break so
+        # incumbents do not wander wide under the bound.
+        prob.setObjective(lpSum(pd_var.values()) + 0.001 * D_half)
+    elif objective != "width":
+        raise ValueError(f"unknown objective {objective!r}")
 
     # ── Solve ─────────────────────────────────────────────────────
     _log("Solving MILP...")

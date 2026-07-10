@@ -95,11 +95,17 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
    unselected branches, and the substitute equals a state the arithmetic
    already handles for real.
 
-10. **Multi-instruction sequence experts** (pending, thesis artifact).
-   Fold a K-step composition of the union graph under a sequence pin
-   (write-free sequences first — no intermediate-write semantics), route
-   on the full pinned byte window.  No longer needed for frame rate here;
-   kept as the next construction.
+10. **Multi-instruction sequence experts** (~2x frame time here; the
+   trio runs at 0.07 µs/instr, 5.7x its per-instruction cost).  Fold a
+   K-step composition of the union graph under router pins (pc + every
+   window byte); state chains through a feedback map, and everything
+   the router verifies becomes a pin (lever 6 again).  License checked
+   per window at generation: write-free, non-halting, straight-line,
+   only the first instruction reads memory.  Find windows by ISA
+   pattern (closed poll loops, self-jump spins), never by workload —
+   and re-verify the window bytes at dispatch so self-modifying code
+   only loses the fast path.  Budget guards keep dispatch step-for-step
+   equivalent to the per-instruction path.
 
 ## Dead ends (kept so they stay dead)
 
