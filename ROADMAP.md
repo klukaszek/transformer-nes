@@ -4,6 +4,60 @@ Status snapshot and prioritized next steps.  Written 2026-07-06 as the
 handoff point for fresh working sessions; the design details live in
 [`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).
 
+**START HERE (2026-07-09, all-opcode MoE):** the expert set is no longer
+a tuning knob — the default routes EVERY implemented opcode (227 rebuilt
+expert models, a total top-1 MoE over the ISA; see the log just below).
+Current receipts: SMB gameplay 47.65 fps (21.0 ms/frame), hot loops >1M
+instr/s (JMP 0.91 µs/step, poll loop 0.96 µs/step), full Klaus
+(30,646,177 steps, decimal) in 92.6 s (1.54 min, 331K instr/s), 74 tests
+green.  Remaining to 60 fps: ~1.26x — the poll-loop sequence expert
+(approach #2 in the three-approaches handoff below) is the next lever;
+MILP objective realignment (#3) stays the bounded fallback.  Approach #1
+(expert-set tuning + caching) is retired by the all-opcode default.  The
+performance numbers in the older sections below are historical.
+
+## 2026-07-09 all-opcode experts — the expert set stops being a knob
+
+Per explicit user decision ("default expert opcodes is game dependent...
+when we try other games, this will probably fall apart"), the
+game-derived default expert set is gone: `DEFAULT_EXPERT_OPCODES` is now
+every opcode in `spec.OPCODES` (227, documented + implemented
+undocumented) — one rebuilt expert model per opcode, NMI still falling
+back to the exact union step.  Routing is workload-independent; nothing
+about the default is derived from SMB (or any game) anymore.
+
+The premise that made a subset necessary was stale: measured this
+session, fold+asap+build_model is ~0.05 s per expert (all 227 fold with
+zero insert-side hazards in 10.8 s), and the roadmap's "~25 s" top-48
+build was actually ~7.4 s warm — the C++ digest cache already absorbed
+the compile.  What the wider default really costs: emission 16.3 s, a
+43 MB TU, one-time compile ~107 s (digest-cached), warm construction
+~30 s per machine.  If the 30 s starts to hurt (tests, console handoff),
+the fold-digest artifact cache from the old approach-#1 note is the
+known fix — cache the per-expert schedule/model arrays keyed by a
+content digest of the folded graph.
+
+One generator fix made it possible: the step_core variants share one
+residual buffer, previously sized to the union's d_model with a hard
+error if an expert exceeded it — and PLP's rebuilt model does (d_model
+1696 vs union 1564; the `_low_bit` 256-way-gadget outlier).  The buffer
+is now sized to the widest model and the guard is retired.
+
+Receipts (74 tests green, ruff clean; all lockstep-exact):
+- Full nestest MATCHED (~148K instr/s); every opcode swept through its
+  expert by nestest + Klaus as before.
+- **Full Klaus: MATCHED — 30,646,177 steps (decimal) in 92.6 s
+  (1.54 min, 331K instr/s sustained incl. the lockstep reference),
+  checkpoint-free — 2.25x over the 3.48 min record**, because the
+  decimal ALU and the whole opcode tail now route.  Full-suite arc:
+  57 → 18.9 → 15.3 → 9.4 → 6.3 → 6.2 → 4.55 → 3.83 → 3.60 → 3.48 →
+  **1.54 min**.
+- JMP-to-self 0.91 µs/step (1.10M instr/s); frame-poll loop 0.96 µs/step
+  (1.04M instr/s).
+- **SMB gameplay: 47.65 fps (21.0 ms/frame)** — arc: 28.24 → 29.68 →
+  32.47 → 43.51 → **47.65**.  Remaining to 60 fps: ~1.26x, busy-frame
+  logic through the mid-size experts.
+
 ## 2026-07-09 reference-aligned trace convention — the million-instruction mark
 
 Per explicit decision (option: "align with reference"), the graph's trace-
@@ -49,12 +103,60 @@ Receipts (74 tests green, ruff clean; all lockstep-exact):
   — the arc so far: 28.24 → 29.68 → 32.47 → 43.51.  Remaining to 60 fps:
   ~1.39x, still busy-frame logic through the mid-size experts.
 
-Next, in payoff order:
-1. Widen/tune the expert set for the gameplay logic mix (top-48 is now
-   clearly worth its build cost for play; consider caching expert builds).
-2. Poll-loop sequence expert (LDA/AND/BEQ as one folded step).
-3. MILP objective realignment (minimize slot-hygiene nnz under a width
-   bound) — bounded ~1.2-1.3x, after the above.
+### Next steps (handoff, written 2026-07-09): the three approaches to 60 fps
+
+Current state: hot loops >1M instr/s; SMB gameplay 43.51 fps top-48 /
+33.33 fps top-16 (default); the gap is ~1.39x, concentrated in busy-frame
+logic through the mid-size experts plus the expert-set build cost.
+
+**1. Expert-set tuning + build caching (engineering, do first).**
+Top-48 (99.1% gameplay coverage, from the checked-in
+`experiments/moe_probe/smb_opcode_hist_gameplay.json`) is clearly worth it
+for play but costs ~25 s of fold+schedule+build per machine construction,
+which is why the default stays top-16.  Fix by caching, then flip the
+default: cache per-expert artifacts keyed by a content digest of the
+folded graph (deterministic given bcd + opcode + pin set) — either the
+solved schedule as {dim id -> phase} (rebuild via `_layers_and_liveness`;
+ids are deterministic because fold materializes in id order) or the built
+WeightModel arrays.  `model/_engine_cache/` is the pattern to follow.
+Also reconsider the expert set itself: gameplay-weighted, per-opcode for
+the hot ~16, and check whether the 9,870-instr busy-frame mix (broader
+than the idle-frame poll mix) wants different members — measure with the
+histogram before choosing.  Expected: top-48 for free at machine build,
++~10 fps over top-16 today.
+
+**2. Poll-loop sequence expert (the interesting construction).**
+Fold a multi-instruction pin vector: the SMB frame-wait loop
+`LDA abs / AND imm / BEQ rel` (plus the `JMP abs` idle spin) as ONE step
+— one forward consumes three instructions.  The fold machinery is ready
+(pins are just names -> constants; pin all three opcodes' bytes and the
+operand bytes, which the router verifies); the graph construction needs a
+3-step composition of the union graph before folding (state chained
+through, one token emitted).  Router: pc equals the loop head AND the
+next ~7 RAM bytes match the pinned sequence AND no NMI pending; bail to
+per-instruction steps otherwise.  The poll loop writes nothing, which
+sidesteps intermediate-write semantics entirely (a general sequence
+expert must not defer writes past a step that could observe them — keep
+to write-free sequences first).  Trace rows must still be emitted per
+instruction (three rows from one forward; the readout needs all three
+states, or relax to emitting the last row only inside the native run loop
+where no watch fires — decide with receipts).  Payoff: the ~87% idle-poll
+fraction collapses ~3x; busy frames gain less, so measure at the frame
+level.  Verification: the fold shadow receipt generalizes (replay the
+union token stream, compare the 3-step composition), then the usual
+lockstep chain.  This is also a genuinely novel artifact for the write-up
+(trace-routed super-instruction expert).
+
+**3. MILP objective realignment (bounded, do last).**
+The exact solve is tractable at expert scale but the width objective buys
+~7% (see the 2026-07-09 probe log).  Realign the objective to the
+engine's cost model: minimize the passthrough/erase indicator sum (the
+`pd_var`/dying terms `milp_schedule` already builds) subject to
+`D_half <=` the balanced-ASAP width, per expert, with `time_limit` and
+incumbent acceptance (both already wired:
+`expert_schedule="milp"` / `expert_milp_seconds`).  Slot-hygiene work is
+~20-30% of an expert's nnz, so the honest ceiling is ~1.2-1.3x on expert
+steps.  One probe on the poll-loop experts decides it.
 
 ## 2026-07-09 fetched-byte pin — the router predicate, fully spent
 

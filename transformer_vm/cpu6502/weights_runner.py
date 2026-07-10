@@ -46,16 +46,10 @@ from transformer_vm.scheduler.milp import asap_schedule
 
 logger = logging.getLogger(__name__)
 
-# Opcode-routed experts, on by default for the generated int engine.  These
-# are the hot opcodes of the SMB gameplay histogram (experiments/moe_probe):
-# the frame-wait poll loop (LDA abs / AND imm / BEQ) plus the idle JMP spin
-# dominate (~87%), and the top ~16 cover ~94%.  Every other opcode (and every
-# NMI) falls back to the exact union step, so correctness is workload-agnostic;
-# the set only decides which opcodes get the faster pruned step.
-DEFAULT_EXPERT_OPCODES = (
-    0xF0, 0xAD, 0x29, 0x4C, 0xC8, 0xD0, 0x85, 0xC9,
-    0x4A, 0x99, 0xA5, 0xBD, 0x20, 0x60, 0x90, 0x18,
-)
+# Opcode-routed experts, on by default: one expert per documented opcode, so
+# routing is workload-independent (no game-derived tuning set).  NMI steps and
+# any opcode outside a narrowed set fall back to the exact union step.
+DEFAULT_EXPERT_OPCODES = tuple(sorted(OPCODES))
 
 
 class Cpu6502TransformerMachine:

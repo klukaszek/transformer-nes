@@ -522,6 +522,9 @@ def generate_source(model, step_spec: dict | None = None,
 
     d_model = model.tok.weight.shape[1]
     n_layers = len(model.attn)
+    # The step_core variants share one residual buffer; an expert model may
+    # schedule wider than the union (e.g. PLP), so size it for the widest.
+    xbuf_size = max([d_model] + [e["model"].tok.weight.shape[1] for e in experts])
 
     lines: list[str] = []
     emit = lines.append
@@ -599,10 +602,6 @@ def generate_source(model, step_spec: dict | None = None,
         is_union = union_lookup_of is None
         dm = mdl.tok.weight.shape[1]
         nh = mdl.attn[0].num_heads
-        if dm > d_model:
-            raise RuntimeError(
-                f"{label}: d_model {dm} exceeds the union's {d_model}"
-            )
         plans: list[dict] = []
         for li in range(len(mdl.attn)):
             _check_ffn_kinds(mdl, li)
@@ -975,7 +974,7 @@ def generate_source(model, step_spec: dict | None = None,
         emit(f"    static constexpr int F = {f_bits};")
         emit(f"    static constexpr {elem} SCALE = 1 << F;")
         emit("    static constexpr double SCALE_D = (double)SCALE;")
-        emit(f"    {elem} xbuf[D];")
+        emit(f"    {elem} xbuf[{xbuf_size}];")
         emit("")
         emit(_FIXED_POINT_HELPERS.replace("ELEM", elem))
         emit("")
