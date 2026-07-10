@@ -41,6 +41,7 @@ from transformer_vm.graph.fold import (
     GraphFolder,
     opcode_pins,
     sequence_pins,
+    sequence_shape_pins,
 )
 from transformer_vm.scheduler.milp import _build_graph, _min_layers
 
@@ -416,3 +417,158 @@ def test_folded_expert_shadows_union(folder, union_run, byte):
         assert state_expr.evaluate(v) > halt_expr.evaluate(v)
         matched += 1
     assert matched > 0, f"opcode {byte:02X} never executed in the prefix"
+
+
+# ── Canonical shape fold: symbolic pc + operands, one fold per SHAPE ──
+
+SHAPE_HEADS = {
+    "dex-bne": (0x0480, 0x04FF),   # the second window crosses a page
+    "poll-trio": (0x0400, 0x0520),  # different poll address AND mask
+}
+
+
+def _shape_program():
+    """Two instantiations of each shape: the DEX/BNE delay at an in-page
+    head and at $04FF (its BNE sits at $0500 -- the pc carry gadget fires),
+    then two poll trios with different operands."""
+    image = bytearray(0x10000)
+    image[0x047E:0x0483] = bytes([0xA2, 0x03,          # LDX #$03
+                                  0xCA, 0xD0, 0xFD])   # DEX / BNE -3
+    image[0x0483:0x0488] = bytes([0xA2, 0x02,          # LDX #$02
+                                  0x4C, 0xFF, 0x04])   # JMP $04FF
+    image[0x04FF:0x0505] = bytes([0xCA, 0xD0, 0xFD,    # DEX / BNE -3 (cross)
+                                  0x4C, 0x00, 0x04])   # JMP $0400
+    image[0x0400:0x040A] = bytes([0xAD, 0x00, 0x07,    # LDA $0700
+                                  0x29, 0x40,          # AND #$40
+                                  0xF0, 0xF9,          # BEQ -7
+                                  0x4C, 0x20, 0x05])   # JMP $0520
+    image[0x0520:0x052A] = bytes([0xAD, 0x03, 0x07,    # LDA $0703
+                                  0x29, 0x80,          # AND #$80
+                                  0xF0, 0xF9,          # BEQ -7
+                                  0x4C, 0x27, 0x05])   # JMP self
+    return image
+
+
+@pytest.fixture(scope="module")
+def shape_run(union_pg):
+    """Union walk over the shape program: both delay loops (taken + exit),
+    both polls (three spins, a flag flip, the fall-through)."""
+    ev = ProgramEvaluator(union_pg)
+    image = _shape_program()
+    start = 0x047E
+    tokens = [("boot", {"start_pc_lo": start & 0xFF, "start_pc_hi": start >> 8,
+                        "is_start": 1})]
+    for addr, b in enumerate(image):
+        if b:
+            tokens.append(("boot", {"is_memory_write": 1, "byte_value": b,
+                                    "addr_lo": addr & 0xFF, "addr_hi": addr >> 8}))
+    for _, inputs in tokens:
+        ev.step(inputs)
+
+    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+    ref.pc = start
+    st = {"pc": start, "a": 0, "x": 0, "y": 0, "s": 0xFD,
+          "p": reference.FLAG_U | reference.FLAG_I,
+          "ir": 0, "oplo": 0, "ophi": 0, "ea": 0, "data": 0}
+    steps = []
+    for i in range(52):
+        for flip_i, addr, value in ((23, 0x0700, 0x40), (37, 0x0703, 0x80)):
+            if i == flip_i:
+                w = {"is_memory_write": 1, "byte_value": value,
+                     "addr_lo": addr & 0xFF, "addr_hi": addr >> 8}
+                ev.step(w)
+                tokens.append(("boot", w))
+                ref.memory[addr] = value
+        p = st["p"]
+        inputs = {
+            "is_state": 1,
+            "in_pc_lo": st["pc"] & 0xFF, "in_pc_hi": (st["pc"] >> 8) & 0xFF,
+            "in_a": st["a"], "in_x": st["x"], "in_y": st["y"], "in_s": st["s"],
+            "in_p_c": 1 if p & reference.FLAG_C else 0,
+            "in_p_z": 1 if p & reference.FLAG_Z else 0,
+            "in_p_i": 1 if p & reference.FLAG_I else 0,
+            "in_p_d": 1 if p & reference.FLAG_D else 0,
+            "in_p_b": 1 if p & reference.FLAG_B else 0,
+            "in_p_u": 1 if p & reference.FLAG_U else 0,
+            "in_p_v": 1 if p & reference.FLAG_V else 0,
+            "in_p_n": 1 if p & reference.FLAG_N else 0,
+            "in_ir": st["ir"], "in_oplo": st["oplo"], "in_ophi": st["ophi"],
+            "in_ea_lo": st["ea"] & 0xFF, "in_ea_hi": (st["ea"] >> 8) & 0xFF,
+            "in_data": st["data"], "in_halted": 0, "in_nmi": 0,
+        }
+        v = ev.step(inputs)
+        reads = _read_all(ev, v)
+        row = ref.step()
+        s = row.state
+        got = (reads["current_pc"] & 0xFFFF, reads["new_a"] & 0xFF,
+               reads["new_x"] & 0xFF, reads["new_p"] & 0xFF)
+        assert got == (s.pc, s.a, s.x, s.p), f"union vs oracle at step {i}"
+        tokens.append(("state", inputs))
+        steps.append({"reads": reads, "pc": st["pc"]})
+        st.update(pc=reads["next_pc"] & 0xFFFF, a=reads["new_a"] & 0xFF,
+                  x=reads["new_x"] & 0xFF, y=reads["new_y"] & 0xFF,
+                  s=reads["new_s"] & 0xFF, p=reads["new_p"] & 0xFF,
+                  ir=reads["fetched_opcode"] & 0xFF,
+                  oplo=reads["fetched_operand_lo"] & 0xFF,
+                  ophi=reads["fetched_operand_hi"] & 0xFF,
+                  ea=reads["ea"] & 0xFFFF, data=reads["data_out"] & 0xFF)
+    for heads in SHAPE_HEADS.values():
+        for head in heads:
+            assert sum(s["pc"] == head for s in steps) >= 2, hex(head)
+    return {"tokens": tokens, "steps": steps}
+
+
+@pytest.mark.parametrize(
+    ("shape_id", "code"),
+    [
+        ("dex-bne", bytes([0xCA, 0xD0, 0xFD])),
+        ("poll-trio", bytes([0xAD, 0, 0, 0x29, 0, 0xF0, 0])),
+    ],
+    ids=["dex-bne", "poll-trio"],
+)
+def test_shape_fold_shadows_union(folder, shape_run, shape_id, code):
+    """ONE fold of a canonical shape (pc and every operand byte symbolic --
+    only the opcode bytes are pinned) must reproduce the union's K-step
+    readouts at BOTH instantiations, page-cross and both branch outcomes
+    included.  This is the zero-per-ROM-compile contract: the same weights
+    serve every (head, operands) the router matches."""
+    heads = SHAPE_HEADS[shape_id]
+    pin_list, offsets = sequence_shape_pins(code, OPCODES)
+    n_steps = len(pin_list)
+    r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
+                             label=f"shape_{shape_id}", pc_offsets=offsets)
+    assert r.n_steps == n_steps
+    assert not r.insert_side_hazards
+    ev = ProgramEvaluator(r.program_graph)
+
+    steps = shape_run["steps"]
+    idx = 0
+    skip = 0
+    dispatched = dict.fromkeys(heads, 0)
+    for kind, inputs in shape_run["tokens"]:
+        if kind != "state":
+            ev.step(inputs)
+            continue
+        if skip:
+            skip -= 1
+            idx += 1
+            continue
+        pc = inputs["in_pc_lo"] | (inputs["in_pc_hi"] << 8)
+        if pc not in dispatched or idx + n_steps > len(steps):
+            ev.step(inputs)
+            idx += 1
+            continue
+        v = ev.step(inputs)
+        for k in range(n_steps):
+            expected = steps[idx + k]["reads"]
+            for name in _RUNTIME_READ_DIMS:
+                mask = 0xFFFF if name in ("current_pc", "next_pc", "ea") else 0xFF
+                got = int(round(ev.read(v, f"{name}__s{k}"))) & mask
+                assert got == expected[name] & mask, (
+                    f"head {pc:04X} step {k} ({name}) diverged"
+                )
+        dispatched[pc] += 1
+        skip = n_steps - 1
+        idx += 1
+    for head, n in dispatched.items():
+        assert n >= 2, f"head {head:04X} never dispatched twice"

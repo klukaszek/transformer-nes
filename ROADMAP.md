@@ -26,6 +26,46 @@ backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## 2026-07-10 canonical shape folds — symbolic pc/operands, probed GREEN
+
+Path (b)'s recorded blocker is broken.  `fold_sequence` gains
+`pc_offsets`: a window folded as a *shape* pins only the opcode bytes —
+pc and every operand byte stay symbolic.  Step k's pc derives from the
+symbolic head as head + offset with ONE stepglu carry per step (exact
+on integer bytes; license: no $FFFF wrap), so the general 16→8+8
+byte-split gadget the roadmap feared is never needed.  A non-constant
+byte-split feedback source (ea with a symbolic address) now leaves the
+input *unbound* instead of erroring: dead under the fold is fine, a
+live reference fails loudly in tr().  `sequence_shape_pins(code)`
+builds the pin list + offsets.
+
+Receipts (test_shape_fold_shadows_union, 79 tests green): ONE fold of
+the DEX/BNE shape reproduces the union byte-identically at two heads
+including a page-crossing window (DEX@$04FF/BNE@$0500 — the carry
+fires), loop iterations and exit both; ONE fold of the poll-trio shape
+(LDA abs / AND imm / BEQ rel — poll address, mask, and rel all
+symbolic) matches at two instantiations ($0700/#$40 and $0703/#$80),
+spin and fall-through.  Shape sizes: DEX/BNE 2,436 terms; poll trio
+10,414 terms / 97 lookups (symbolic addresses keep the fetch reads
+live — a shape forward will cost more than a pinned window's but far
+less than per-instruction routing).
+
+Why this matters: a *fixed library* of shape experts compiles once into
+the core — zero per-ROM compile, any ROM including homebrew — and the
+runtime dispatch table (head, shape) is data.  JIT "discovery" becomes:
+count dispatch-fallback pcs, decode candidate windows, match against
+the shape library, add a table entry.  The per-ROM pinned module
+remains the opt-in turbo tier (0.07 µs/instr vs an estimated
+~0.2 µs/instr for shapes).  Still to build (next session): engine-side
+shape experts + runtime window table (`add_window(shape_id, head)`
+after Python-side license checks: opcode bytes at offsets, write-free
+ops, watch-range exclusion, no $FFFF wrap, intermediate next_pc ==
+head+offset — the last is exhaustively checkable over all 64K heads
+since the folded expression's support is pc-only for non-branch steps);
+JMP-spin shapes additionally need an operand==head router check (the
+self-target is a dispatch property, not a fold property); then the
+fallback-pc profiling counter and the scan-at-boot table population.
+
 ## 2026-07-10 per-ROM sequence module — the compile skirt, landed
 
 The recorded path (a), built: sequence experts no longer compile into

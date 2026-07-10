@@ -385,18 +385,29 @@ class GraphFolder:
     # ── Sequence fold: K chained steps as one graph ───────────────────
 
     def fold_sequence(self, pin_list, feedback, label: str = "",
-                      keep_alive_token: str = "READOUT") -> FoldResult:
+                      keep_alive_token: str = "READOUT",
+                      pc_offsets=None) -> FoldResult:
         """Fold a K-step composition of the union graph into ONE graph.
 
         pin_list[k] pins step k (the router supplies them: pc, instruction
         bytes, is_nmi=0).  feedback maps a step's state-input persist name to
         the previous step's output name -- either "out_name" (bound as an
         expression, or as a pin when the previous fold made it constant) or
-        ("out_name", "lo"|"hi") (byte split; the source must fold constant).
+        ("out_name", "lo"|"hi") (byte split; a non-constant source leaves
+        the input UNBOUND -- fine when the fold proves it dead, a loud
+        KeyError when anything live still reads it).
         Every step's root dims are materialized with a ``__s<k>`` suffix and
         kept alive through ``keep_alive_token``; the other output tokens are
         substituted through the FINAL step, and step 0's input dims keep
         their canonical names (the composed graph embeds one state token).
+
+        pc_offsets, if given, folds a canonical *shape*: step k's pc is not
+        pinned but derived as head + pc_offsets[k], where head is step 0's
+        symbolic (input-bound) pc.  The byte split is one stepglu carry per
+        step -- exact for integer bytes -- so a single fold serves every
+        head the router matches.  License (checked by the caller): the
+        window must not wrap $FFFF, and intermediate control flow must
+        actually be pc + offset (verify folded next_pc__sk).
         """
         pg = self.pg
         one = pg.one
@@ -432,9 +443,15 @@ class GraphFolder:
         fb_const: dict[str, float] = {}
         new_outputs = None
 
+        pc_names = ("current_pc_lo", "current_pc_hi")
+        pc_exprs = None  # step-0 (head) pc byte expressions, new-graph space
+
         for k in range(n_steps):
             pins = dict(pin_list[k])
             frozen: set[str] = set()
+            unbound: set[str] = set()
+            if pc_offsets is not None and k > 0:
+                frozen |= set(pc_names)
             if k > 0:
                 for in_name, out in feedback.items():
                     if in_name in pins:  # explicit pins beat feedback
@@ -446,10 +463,12 @@ class GraphFolder:
                         out_name, part = out
                         c = fb_const.get(out_name)
                         if c is None:
-                            raise RuntimeError(
-                                f"fold_sequence({label}) step {k}: {out_name} "
-                                f"must fold constant for the {part} byte split"
-                            )
+                            # Non-constant byte-split source: leave the
+                            # input unbound.  Dead under the fold -> fine;
+                            # a live reference fails loudly in tr().
+                            frozen.add(in_name)
+                            unbound.add(in_name)
+                            continue
                         v = int(round(c))
                         pins[in_name] = float(v & 0xFF if part == "lo" else (v >> 8) & 0xFF)
                     elif (c := fb_const.get(out)) is not None:
@@ -521,7 +540,25 @@ class GraphFolder:
             # previous step's already-materialized output expressions.
             sub = dict(base_sub)
             for in_name in frozen:
+                if in_name in unbound or in_name in pc_names:
+                    continue
                 sub[self._by_name[in_name]] = fb_expr[feedback[in_name]]
+            if pc_offsets is not None and k > 0:
+                # Shape fold: pc(k) = head + offset, byte-split with one
+                # stepglu carry (exact on integer bytes).  No $FFFF wrap by
+                # the caller's license.
+                from transformer_vm.graph.core import stepglu
+
+                off = int(pc_offsets[k])
+                lo0, hi0 = pc_exprs
+                if off == 0:
+                    lo_e, hi_e = lo0, hi0
+                else:
+                    carry = stepglu(1, lo0 + Expression({_graph.one: off - 256}))
+                    lo_e = lo0 + Expression({_graph.one: float(off)}) + carry * -256.0
+                    hi_e = hi0 + carry
+                sub[self._by_name["current_pc_lo"]] = lo_e
+                sub[self._by_name["current_pc_hi"]] = hi_e
 
             def tr(expr: Expression, *, sub=sub, val=val, k=k) -> Expression:
                 out = Expression()
@@ -592,6 +629,11 @@ class GraphFolder:
                     n_persists += 1
                     n_terms += len(nd.expr.terms)
                 keep_alive = keep_alive + 1e-6 * sub[d]
+
+            if pc_offsets is not None and k == 0:
+                pc_exprs = tuple(
+                    tr(Expression({self._by_name[n]: 1})) for n in pc_names
+                )
 
             fb_const, fb_expr = {}, {}
             for out in set(feedback.values()):
@@ -678,6 +720,30 @@ SEQUENCE_FEEDBACK = {
     "current_ea_lo": ("ea", "lo"), "current_ea_hi": ("ea", "hi"),
     "current_data": "data_out",
 }
+
+
+def sequence_shape_pins(code: bytes, opcodes) -> tuple[list[dict[str, float]], list[int]]:
+    """Per-step pins for a canonical window SHAPE: opcode one-hots and the
+    fetched opcode byte only -- pc and operand bytes stay symbolic, so one
+    fold serves every (head, operands) instantiation.  The router verifies
+    the opcode byte at each returned offset; operand bytes need no check
+    (the expert reads them through the live memory structure).  Returns
+    (pin_list, pc_offsets) for fold_sequence(..., pc_offsets=...)."""
+    pin_list: list[dict[str, float]] = []
+    offsets: list[int] = []
+    off = 0
+    while off < len(code):
+        op = opcodes.get(code[off])
+        if op is None:
+            raise ValueError(f"byte {code[off]:02X} at +{off} is not an opcode")
+        pins = opcode_pins(op.byte, opcodes)
+        pins["current_halted"] = 0.0
+        pin_list.append(pins)
+        offsets.append(off)
+        off += op.length
+    if off != len(code):
+        raise ValueError("window does not end on an instruction boundary")
+    return pin_list, offsets
 
 
 def sequence_pins(head_pc: int, code: bytes, opcodes) -> list[dict[str, float]]:
