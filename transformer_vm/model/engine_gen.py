@@ -527,6 +527,8 @@ _MEM_QUERY = """\
 # Per-ROM sequence-module hook: a separately compiled window module attaches
 # its dispatch through a raw function pointer, so a new ROM's window set never
 # recompiles this TU.  The module fills seq_out with K trace rows per forward.
+# A pinned module window outranks the canonical shape table (it folded the
+# operands too, so its forward is cheaper); both fall back to per-step.
 _SEQ_HOOK = """\
     typedef int (*SeqFn)(void*, void*, long, long, long, long, int);
     SeqFn seq_fn = nullptr;
@@ -536,8 +538,13 @@ _SEQ_HOOK = """\
 
     int seq_dispatch(long i, long max_steps, long cycles_this,
                      long max_cycles, bool stop_on_trap) {
-        return seq_fn ? seq_fn(seq_ctx, this, i, max_steps, cycles_this,
-                               max_cycles, stop_on_trap ? 1 : 0) : 0;
+        if (seq_fn) {
+            const int k = seq_fn(seq_ctx, this, i, max_steps, cycles_this,
+                                 max_cycles, stop_on_trap ? 1 : 0);
+            if (k) return k;
+        }
+        return shape_dispatch(i, max_steps, cycles_this, max_cycles,
+                              stop_on_trap);
     }
 
     void attach_seq(std::uintptr_t fn, std::uintptr_t ctx) {
@@ -734,7 +741,9 @@ _PYBIND_STEP_METHODS = """\
         .def("set_run_state", &ENGINE_T::set_run_state)
         .def("get_run_state", &ENGINE_T::get_run_state)
         .def("attach_seq", &ENGINE_T::attach_seq)
-        .def("detach_seq", &ENGINE_T::detach_seq)"""
+        .def("detach_seq", &ENGINE_T::detach_seq)
+        .def("add_window", &ENGINE_T::add_window)
+        .def("clear_windows", &ENGINE_T::clear_windows)"""
 
 
 # Core-side seq_out capacity; keep in sync with SEQ_MAX_K in _SEQ_HOOK.
@@ -1546,6 +1555,7 @@ def generate_source(model, step_spec: dict | None = None,
         emit(f"        for (int r = 0; r < {n_regs}; ++r) reg_any[r] = false;")
     if has_run:
         emit("        for (int i = 0; i < 65536; ++i) ram[i] = 0;")
+        emit("        std::memset(shape_of_pc, 0, sizeof(shape_of_pc));")
         emit("        st_pc = 0; st_a = st_x = st_y = 0; st_s = 0xFD; st_p = 0x24;")
         emit("        st_ir = st_oplo = st_ophi = st_ea = st_data = 0;")
         emit("        st_halted = false; nmi_pending = false; resume_read_skip = false;")
@@ -1649,17 +1659,73 @@ def generate_source(model, step_spec: dict | None = None,
         # ram[st_pc] (== the graph's memory read at pc), so an expert built by
         # pinning is_op_<byte> runs exactly when that byte is fetched.  A
         # pending NMI overrides the instruction, so it takes the union step.
+        op_experts = [e for e in experts if e.get("kind") is None]
+        shape_experts = [e for e in experts if e.get("kind") == "shape"]
         emit("")
         emit("    void step_core(long long* out) {")
-        if experts:
+        if op_experts:
             emit("        if (!nmi_pending) {")
             emit("            switch (ram[st_pc]) {")
-            for exp in experts:
+            for exp in op_experts:
                 emit(f"                case 0x{exp['byte']:02X}: "
                      f"step_core__{exp['name']}(out); return;")
             emit("            }")
             emit("        }")
         emit("        step_core_union(out);")
+        emit("    }")
+
+        # Canonical shape windows (native run loop only): compiled once into
+        # this core with pc and operands symbolic, dispatched through a
+        # runtime table -- zero per-ROM compile.  add_window() entries come
+        # from the boot-time image scan; dispatch re-verifies the shape's
+        # opcode bytes (and the JMP self-target) against live RAM, so a
+        # stale entry only loses the fast path, never correctness.
+        emit("")
+        emit("    unsigned char shape_of_pc[65536];")
+        n_shapes = len(shape_experts)
+        if n_shapes:
+            lens = ", ".join(str(e["length"]) for e in shape_experts)
+            emit(f"    static constexpr int SHAPE_LEN[{n_shapes}] = {{ {lens} }};")
+        emit("    void add_window(int shape, int head) {")
+        if n_shapes:
+            emit(f"        if (shape < 0 || shape >= {n_shapes})")
+            emit('            throw std::runtime_error("unknown shape id");')
+            emit("        if (head < 0 || head + SHAPE_LEN[shape] > 0x10000)")
+            emit('            throw std::runtime_error("shape window would wrap $FFFF");')
+            emit("        shape_of_pc[head] = (unsigned char)(shape + 1);")
+        else:
+            emit("        (void)shape; (void)head;")
+            emit('        throw std::runtime_error("engine has no shape experts");')
+        emit("    }")
+        emit("    void clear_windows() { std::memset(shape_of_pc, 0, sizeof(shape_of_pc)); }")
+        emit("")
+        emit("    int shape_dispatch(long i, long max_steps, long cycles_this,")
+        emit("                       long max_cycles, bool stop_on_trap) {")
+        if n_shapes:
+            emit("        const int sid = shape_of_pc[st_pc];")
+            emit("        if (!sid || nmi_pending || stop_on_trap) return 0;")
+            emit("        switch (sid) {")
+            for j, exp in enumerate(shape_experts):
+                # add_window guarantees head + length <= 0x10000: no wrap.
+                checks = " && ".join(
+                    f"ram[st_pc + {off}] == 0x{b:02X}" if off
+                    else f"ram[st_pc] == 0x{b:02X}"
+                    for off, b in exp["opcode_checks"]
+                )
+                if exp.get("self_target"):
+                    checks += (" && ram[st_pc + 1] == (st_pc & 0xFF)"
+                               " && ram[st_pc + 2] == ((st_pc >> 8) & 0xFF)")
+                emit(f"        case {j + 1}:  // {exp['name']}")
+                emit(f"            if (i + {exp['n_steps']} <= max_steps")
+                emit(f"                && (max_cycles <= 0 || cycles_this + "
+                     f"{exp['cycles_prefix']} < max_cycles)")
+                emit(f"                && {checks}) {{")
+                emit(f"                step_core__{exp['name']}(seq_out);")
+                emit(f"                return {exp['n_steps']};")
+                emit("            }")
+                emit("            return 0;")
+            emit("        }")
+        emit("        return 0;")
         emit("    }")
 
         # Sequence dispatch (native run loop only): a whole pinned window as
@@ -1707,10 +1773,14 @@ class GeneratedWeightsEngine:
     """The 6502 transformer as generated C++; exact int32 residual by default."""
 
     def __init__(self, model, *, step_spec: dict | None = None,
-                 arith: str = "int32", experts=None, cache_key: str | None = None):
+                 arith: str = "int32", experts=None, cache_key: str | None = None,
+                 shapes_meta=None):
         self.dtype = "float32"
         self.arith = arith
         self.n_experts = len(experts or [])
+        # Shape-window scan metadata (id/signature/length/close rule) so a
+        # cache-hit load can populate the runtime table without refolding.
+        self.shapes_meta = list(shapes_meta or [])
         source, self.n_memory_heads, self.has_machine_step = generate_source(
             model, step_spec, arith, experts=experts
         )
@@ -1734,6 +1804,7 @@ class GeneratedWeightsEngine:
                 "digest": digest, "arith": arith, "n_experts": self.n_experts,
                 "n_memory_heads": self.n_memory_heads,
                 "has_machine_step": self.has_machine_step,
+                "shapes": self.shapes_meta,
             })
         self._bind(module)
 
@@ -1755,6 +1826,7 @@ class GeneratedWeightsEngine:
         self.n_experts = entry["n_experts"]
         self.n_memory_heads = entry["n_memory_heads"]
         self.has_machine_step = entry["has_machine_step"]
+        self.shapes_meta = entry.get("shapes") or []
         module, self.compile_seconds = _load_engine_module(
             entry["digest"], entry["arith"]
         )
@@ -1783,6 +1855,8 @@ class GeneratedWeightsEngine:
             self.dump_ram = self._engine.dump_ram
             self.attach_seq = self._engine.attach_seq
             self.detach_seq = self._engine.detach_seq
+            self.add_window = self._engine.add_window
+            self.clear_windows = self._engine.clear_windows
 
     def reset(self):
         self._engine.reset()

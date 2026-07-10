@@ -6,25 +6,76 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
-**START HERE (2026-07-10, 350 fps + per-ROM skirt):** SMB gameplay
-through the transformer weights runs at **~332-350 fps (~3 ms/frame)** —
-nearly 6x the 60 fps goal, ~20x the C++ graph kernel in the same window.
-The levers of the arc, each with its own log below: the all-opcode
-MoE (227 rebuilt experts, no game-derived tuning set), the engine build
-cache (construction ~1 s, distributable compiled artifacts), the MMIO
-read lease ($2002 polls served natively instead of pausing to Python
+**START HERE (2026-07-10, 350 fps + universal shapes):** SMB gameplay
+through the transformer weights runs at **~333 fps (3.0 ms/frame)**
+with its per-ROM pinned module, and at **155 fps with ZERO
+ROM-specific compilation** — the shape-expert tier serves any ROM,
+homebrew included, from the shipped core alone.  The levers of the
+arc, each with its own log below: the all-opcode MoE (227 rebuilt
+experts, no game-derived tuning set), the engine build cache
+(construction ~1 s, distributable compiled artifacts), the MMIO read
+lease ($2002 polls served natively instead of pausing to Python
 ~1,420x/frame), group-dispatch fusion (one memory query per read
 instead of 16), **sequence experts** (a whole pinned instruction
-window as ONE forward: the poll trio at 0.07 µs/instr, the JMP spin at
-0.05 µs/instr), and the **per-ROM sequence module** (the compile skirt:
-the core compiles once per code digest, a new ROM costs a ~160 KB TU —
-cold ~7 s, warm ~1 s).  Full Klaus (30,646,177 steps, decimal) MATCHED
-in 90.0 s; 77 tests green; frames byte-identical across backends.
-Remaining candidates: profile-guided JIT window discovery (the module
-hook is its substrate, see the recorded idea below), the kernel
+window as ONE forward: the poll trio at 0.07 µs/instr), the **per-ROM
+sequence module** (the compile skirt: the core compiles once per code
+digest, a new ROM's pinned windows cost a ~160 KB TU — cold ~7 s, warm
+~1 s), and **canonical shape experts** (15 idiom shapes folded with pc
+and operands symbolic, dispatched via a runtime window table the
+machine populates from its own image at boot).  Full Klaus (30,646,177
+steps, decimal) MATCHED in 94.8 s; 79 tests green; frames
+byte-identical across backends and dispatch tiers.  Remaining
+candidates: the profile-guided JIT counter (runtime window discovery;
+both dispatch substrates are landed), shape-library growth, the kernel
 backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
+
+## 2026-07-10 shape-expert engine — any ROM, zero per-ROM compile, landed
+
+The canonical shape folds (below) are now in the engine.  A curated
+**15-shape library** (`weights_runner.SHAPE_LIBRARY`: JMP self-spin,
+counter/branch pairs, zp and abs load-polls, BIT $2002 idioms, the
+LDA/AND/BEQ+BNE trios) compiles ONCE into the core — the shapes are
+code, covered by the code digest — and dispatches through a **runtime
+window table**: `shape_of_pc[65536]` + generated per-shape checks that
+re-verify the opcode bytes (and the JMP self-target) against live RAM
+at dispatch, so a stale entry only loses the fast path.  The machine
+populates the table itself at every boot/reseed by scanning its own
+image (`match_shape_windows`; closure to head is a profitability
+filter, not a correctness one — the fold licenses any operands).
+Dispatch precedence: pinned per-ROM module first (cheaper forward),
+then the shape table, then per-instruction.
+
+Licenses are checked, not assumed (`_build_shape_experts`, hard errors
+— the library is code): only the first instruction may read memory
+(spec), every step write-free + non-halting (folded constants), and
+each interior step's next_pc == head + offset verified **exhaustively
+over every head the window fits at** (`_eval_over_heads`, vectorized;
+possible exactly because the folded next_pc may depend on nothing but
+the step-0 pc persists — the evaluation cuts where the head enters via
+the state-attention lookup).  The JMP spin's closure is a dispatch
+check instead (operand bytes == head), sound because the window is
+write-free and dispatch-verified.
+
+Receipts: 79 tests green, ruff clean; the three-tier lockstep test
+(pinned module / shape table / per-instruction) byte-identical across
+polls, flag flips, fall-throughs, spin, and mid-window chunk
+boundaries — all four idioms in its program match library shapes; full
+nestest MATCHED 0.1 s; **full Klaus MATCHED 30,646,177 steps in
+94.8 s**; SMB frames byte-identical kernel vs weights **120/120 on
+both tiers**; pinned+shapes **~333 fps** (unchanged — the table costs
+nothing when the module wins); **shapes-only: 154.8 fps (6.5 ms/frame)
+with ZERO ROM-specific compilation** — any NES ROM, homebrew included,
+gets this tier from the shipped core alone.  Micro: DEX/BNE through
+its shape expert 0.23 µs/instr vs 5.8 through the union step.  Full
+core build (227 opcode + 15 shape experts) 52 s, one-time, cached.
+
+Next: the profile-guided JIT counter (count dispatch-fallback pcs in
+the run loop, propose windows at runtime, match shapes / build pinned
+modules in the background); shape-library growth (4-instr timing
+loops, LDX/LDY polls, INC zp delays) — each addition is a one-time
+core rebuild shared by every ROM.
 
 ## 2026-07-10 canonical shape folds — symbolic pc/operands, probed GREEN
 

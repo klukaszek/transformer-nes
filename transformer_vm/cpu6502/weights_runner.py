@@ -67,6 +67,110 @@ _SEQ_RMW = frozenset({
 _SEQ_BRANCHES = frozenset({"bcc", "bcs", "beq", "bmi", "bne", "bpl", "bvc", "bvs"})
 _SEQ_MAX_INSTR = 4
 
+# Canonical window shapes compiled ONCE into the core engine with pc and
+# every operand byte symbolic (graph/fold.py pc_offsets): any ROM's matching
+# idiom dispatches into the same shipped weights -- zero per-ROM compile.
+# Entries are (name, template, spin_repeat); operand bytes in a template are
+# placeholders (the fold never reads them), opcode bytes are the shape.
+SHAPE_LIBRARY: tuple[tuple[str, bytes, int], ...] = (
+    ("jmp_self", bytes([0x4C, 0, 0]), 4),
+    ("dex_bne", bytes([0xCA, 0xD0, 0]), 1),
+    ("dey_bne", bytes([0x88, 0xD0, 0]), 1),
+    ("inx_bne", bytes([0xE8, 0xD0, 0]), 1),
+    ("iny_bne", bytes([0xC8, 0xD0, 0]), 1),
+    ("lda_zp_bpl", bytes([0xA5, 0, 0x10, 0]), 1),
+    ("lda_zp_bmi", bytes([0xA5, 0, 0x30, 0]), 1),
+    ("lda_zp_beq", bytes([0xA5, 0, 0xF0, 0]), 1),
+    ("lda_zp_bne", bytes([0xA5, 0, 0xD0, 0]), 1),
+    ("lda_abs_bpl", bytes([0xAD, 0, 0, 0x10, 0]), 1),
+    ("lda_abs_bmi", bytes([0xAD, 0, 0, 0x30, 0]), 1),
+    ("bit_abs_bpl", bytes([0x2C, 0, 0, 0x10, 0]), 1),
+    ("bit_abs_bvc", bytes([0x2C, 0, 0, 0x50, 0]), 1),
+    ("lda_abs_and_beq", bytes([0xAD, 0, 0, 0x29, 0, 0xF0, 0]), 1),
+    ("lda_abs_and_bne", bytes([0xAD, 0, 0, 0x29, 0, 0xD0, 0]), 1),
+)
+
+
+def match_shape_windows(image, shapes_meta, *, limit: int = 512):
+    """Runtime shape-table population: every head whose opcode bytes match a
+    shape signature and whose closing op targets the head.  Closure is a
+    profitability filter, not a correctness one -- the fold licenses any
+    operand values, and dispatch re-verifies the opcode bytes live."""
+    data = bytes(image)
+    n = len(data)
+    out = []
+    for m in shapes_meta:
+        sig = [(int(o), int(b)) for o, b in m["sig"]]
+        length = int(m["length"])
+        first = bytes([sig[0][1]])
+        start = 0
+        while len(out) < limit:
+            head = data.find(first, start, n - length + 1)
+            if head < 0:
+                break
+            start = head + 1
+            if any(data[head + off] != b for off, b in sig[1:]):
+                continue
+            if m["close"] == "jmp":
+                if data[head + 1] | (data[head + 2] << 8) != head:
+                    continue
+            else:  # closing branch is the window's last instruction
+                rel = data[head + length - 1]
+                target = (head + length + rel - (256 if rel & 0x80 else 0)) & 0xFFFF
+                if target != head:
+                    continue
+            out.append((int(m["id"]), head))
+    return out
+
+
+def _eval_over_heads(fold_result, dim, length):
+    """Evaluate a folded dim as a function of the symbolic head pc, for every
+    head where the window fits without wrapping $FFFF.  The head enters the
+    graph through the step-0 pc persists (state arrives via attention, so
+    raw inputs never carry it); evaluation cuts there and raises if the
+    value depends on anything else -- the straight-line license needs
+    next_pc to be a pure function of pc."""
+    from transformer_vm.graph.core import (
+        InputDimension,
+        LookUpDimension,
+        PersistDimension,
+        ReGLUDimension,
+    )
+
+    heads = np.arange(0x10000 - length + 1, dtype=np.float64)
+    memo: dict = {
+        fold_result.dim_of_name["current_pc_lo__s0"]: heads % 256.0,
+        fold_result.dim_of_name["current_pc_hi__s0"]: heads // 256.0,
+    }
+
+    def ev(d):
+        r = memo.get(d)
+        if r is not None:
+            return r
+        if isinstance(d, InputDimension):
+            if d.name != "one":
+                raise RuntimeError(f"depends on input {d.name!r}")
+            r = np.float64(1.0)
+        elif isinstance(d, ReGLUDimension):
+            a, b = np.asarray(evx(d.a_expr)), np.asarray(evx(d.b_expr))
+            r = np.where(b > 0.0, a * b, 0.0)
+        elif isinstance(d, PersistDimension):
+            r = evx(d.expr)
+        elif isinstance(d, LookUpDimension):
+            raise RuntimeError("depends on a memory lookup")
+        else:
+            raise RuntimeError(f"unsupported dim {d.name!r}")
+        memo[d] = r
+        return r
+
+    def evx(e):
+        acc = np.float64(0.0)
+        for d, c in e.terms.items():
+            acc = acc + ev(d) * c
+        return acc
+
+    return heads, np.asarray(ev(dim))
+
 
 def scan_sequence_windows(image, *, spin_repeat: int = 4, limit: int = 16):
     """Find sequence-expert windows generically: any closed micro-loop --
@@ -116,6 +220,7 @@ class Cpu6502TransformerMachine:
                  checkpoint_tokens: int | None = None,
                  expert_opcodes=DEFAULT_EXPERT_OPCODES,
                  sequence_windows=(),
+                 shape_library=SHAPE_LIBRARY,
                  expert_schedule: str = "asap",
                  expert_milp_seconds: int = 900):
         # Build the graph (and keep the evaluator's dim handles; its Python
@@ -189,22 +294,31 @@ class Cpu6502TransformerMachine:
             (int(head) & 0xFFFF, bytes(code), int(repeat))
             for head, code, repeat in (sequence_windows or ())
         ] if codegen_arith != "f32" else []
+        shapes = tuple(shape_library or ()) if codegen_arith != "f32" else ()
         cache_key = None
         self._engine = None
         if expert_schedule == "asap":
             expert_bytes = [
                 int(b) for b in (expert_opcodes or ()) if int(b) in OPCODES
             ] if codegen_arith != "f32" else []
+            shape_tag = ",".join(
+                f"{name}:{bytes(t).hex()}x{r}" for name, t, r in shapes
+            )
             cache_key = engine_config_key(
                 bcd=bcd, arith=codegen_arith, expert_bytes=expert_bytes,
+                extra=f"shapes={shape_tag}",
             )
             self._engine = GeneratedWeightsEngine.from_cache(cache_key)
             if self._engine is not None:
                 logger.info("engine cache hit (%d experts)", self._engine.n_experts)
         if self._engine is None:
             experts = []
+            shapes_meta: list[dict] = []
             if codegen_arith != "f32":
                 experts = self._build_expert_models(expert_opcodes)
+                if shapes:
+                    shape_experts, shapes_meta = self._build_shape_experts(shapes)
+                    experts.extend(shape_experts)
             elif expert_opcodes:
                 logger.info(
                     "opcode-routed experts disabled: f32 arith keeps every lookup "
@@ -213,6 +327,7 @@ class Cpu6502TransformerMachine:
             self._engine = GeneratedWeightsEngine(
                 self.model, step_spec=self._step_spec(),
                 arith=codegen_arith, experts=experts, cache_key=cache_key,
+                shapes_meta=shapes_meta,
             )
         # The ROM's windows land in a tiny per-ROM module attached through
         # the core's function-pointer hook (no core recompile per ROM).
@@ -485,6 +600,131 @@ class Cpu6502TransformerMachine:
             "_layers": info.n_layers, "_d": info.d_model,
         }
 
+    def _build_shape_experts(self, shapes) -> tuple[list[dict], list[dict]]:
+        """Canonical shape experts for the runtime window table.
+
+        Each shape folds ONCE with pc and every operand byte symbolic
+        (fold_sequence pc_offsets); the license is checked, not assumed:
+        only the first instruction may read memory (spec), every step is
+        write-free and non-halting (folded constants), and each interior
+        step's next_pc equals head + offset -- verified EXHAUSTIVELY over
+        every head the window fits at, which is possible exactly because
+        the folded expression may depend on nothing but the pc bytes.
+        The JMP self-spin's closure is a dispatch property instead (the
+        router compares the operand bytes to the head).  A library shape
+        that fails its license is a hard error: the library is code.
+        """
+        from transformer_vm.graph.fold import (
+            SEQUENCE_FEEDBACK,
+            sequence_shape_pins,
+        )
+
+        folder = GraphFolder(self._pg, root_names=_RUNTIME_READ_DIMS)
+        experts: list[dict] = []
+        meta: list[dict] = []
+        for sid, (name, template, repeat) in enumerate(shapes):
+            ops, checks, off = [], [], 0
+            while off < len(template):
+                op = OPCODES[template[off]]
+                ops.append(op)
+                checks.append((off, op.byte))
+                off += op.length
+            for op in ops[1:]:
+                if op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm"):
+                    raise RuntimeError(
+                        f"shape {name}: {op.mnemonic} reads memory past the "
+                        "shadow-watch check (only the first instruction may)"
+                    )
+            self_target = (
+                len(ops) == 1 and ops[0].operation == "jmp" and ops[0].mode == "abs"
+            )
+            if repeat > 1 and not self_target:
+                raise RuntimeError(f"shape {name}: only a JMP self-spin may repeat")
+            if not self_target and ops[-1].operation not in _SEQ_BRANCHES:
+                raise RuntimeError(f"shape {name}: window must close via its last op")
+
+            pins, offsets = sequence_shape_pins(template, OPCODES)
+            pin_list = pins * repeat
+            pc_offsets = offsets * repeat
+            n_steps = len(pin_list)
+            r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
+                                     label=f"shape_{name}", pc_offsets=pc_offsets)
+            if r.insert_side_hazards:
+                raise RuntimeError(
+                    f"shape {name}: pins reach insert-side expressions "
+                    f"of {r.insert_side_hazards}"
+                )
+
+            one = r.program_graph.one
+
+            def const_root(root, k, *, r=r, one=one, name=name):
+                d = r.dim_of_name[f"{root}__s{k}"]
+                expr = getattr(d, "expr", None)
+                if expr is None or any(t is not one for t in expr.terms):
+                    raise RuntimeError(
+                        f"shape {name} step {k}: {root} did not fold constant"
+                    )
+                return int(round(expr.terms.get(one, 0.0)))
+
+            for k in range(n_steps):
+                for store in ("is_store", "is_store2", "is_store3"):
+                    if const_root(store, k) != 0:
+                        raise RuntimeError(f"shape {name} step {k}: not write-free")
+                if const_root("new_halted", k) != 0:
+                    raise RuntimeError(f"shape {name} step {k}: may halt")
+                if k + 1 < n_steps and not self_target:
+                    heads, got = _eval_over_heads(
+                        r, r.dim_of_name[f"next_pc__s{k}"], len(template)
+                    )
+                    if not np.array_equal(got, heads + pc_offsets[k + 1]):
+                        raise RuntimeError(
+                            f"shape {name} step {k}: interior next_pc is not "
+                            "head + offset for every head"
+                        )
+
+            fp = r.program_graph
+            sched = asap_schedule(fp.input_tokens, fp.output_tokens,
+                                  program_graph=fp, log=logger.debug)
+            model, _tokens, tok_to_idx, info = build_model(
+                program_graph=fp, schedule=sched,
+            )
+            ops_full = ops * repeat
+            cycles = sum(op.cycles for op in ops_full)
+            experts.append({
+                "kind": "shape", "name": f"shape_{name}", "shape_id": sid,
+                "opcode_checks": checks, "length": len(template),
+                "self_target": self_target, "n_steps": n_steps,
+                "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
+                "step_spec": self._sequence_step_spec(r, model, tok_to_idx, info),
+                "union_lookup_of": r.union_lookup_of,
+                "_layers": info.n_layers, "_d": info.d_model,
+            })
+            meta.append({
+                "id": sid, "name": name, "sig": [[o, b] for o, b in checks],
+                "length": len(template), "repeat": repeat,
+                "close": "jmp" if self_target else "branch",
+            })
+        if experts:
+            logger.info(
+                "shape experts: %d folded, %d-%d layers, d_model %d-%d",
+                len(experts),
+                min(e["_layers"] for e in experts), max(e["_layers"] for e in experts),
+                min(e["_d"] for e in experts), max(e["_d"] for e in experts),
+            )
+        return experts, meta
+
+    def _populate_shape_windows(self) -> None:
+        """Fill the engine's runtime window table from the current RAM image
+        (called at every boot/reseed; dispatch re-verifies bytes live, so a
+        stale entry is only a missed fast path)."""
+        meta = getattr(self._engine, "shapes_meta", None) or []
+        if not (meta and self._cpp_step
+                and getattr(self._engine, "has_run_loop", False)):
+            return
+        self._engine.clear_windows()
+        for sid, head in match_shape_windows(self._ram, meta):
+            self._engine.add_window(sid, head)
+
     def _sequence_step_spec(self, fold_result, model, tok_to_idx, info) -> dict:
         """The _expert_step_spec shape, with one outputs map per step."""
 
@@ -593,6 +833,7 @@ class Cpu6502TransformerMachine:
             self._mstate.update({k: int(state[k]) for k in self._mstate if k in state})
         self._nmi_pending = False
         self.machine_halted = False
+        self._populate_shape_windows()
 
     @property
     def machine_state(self) -> dict:

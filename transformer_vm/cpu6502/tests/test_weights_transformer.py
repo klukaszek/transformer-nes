@@ -164,13 +164,17 @@ def test_run_loop_matches_per_step():
 
 @pytest.mark.slow
 def test_sequence_experts_match_per_step():
-    """Sequence dispatch (the poll trio and the JMP spin as one forward per
-    window) must leave the run-loop trace byte-identical to a machine with
-    no sequence windows, across the poll, a mid-run flag flip, the branch
-    fall-through, and the spin."""
+    """All three dispatch tiers must produce byte-identical run-loop traces:
+    the per-ROM pinned module, the canonical shape table (zero per-ROM
+    compile -- every idiom below matches a library shape), and the pure
+    per-instruction path, across polls, mid-run flag flips, the branch
+    fall-through, the spin, and chunk boundaries landing mid-window."""
     import numpy as np
 
-    from transformer_vm.cpu6502.weights_runner import scan_sequence_windows
+    from transformer_vm.cpu6502.weights_runner import (
+        match_shape_windows,
+        scan_sequence_windows,
+    )
 
     image = bytearray(0x10000)
     image[0x0400:0x0413] = bytes([
@@ -192,10 +196,18 @@ def test_sequence_experts_match_per_step():
 
     fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
               "ea", "data", "halted")
+    configs = (
+        {"sequence_windows": windows},           # pinned module + shape table
+        {},                                      # shape table only
+        {"shape_library": ()},                   # pure per-instruction
+    )
     traces = []
-    for wins in (windows, ()):
-        m = Cpu6502TransformerMachine(bcd=False, sequence_windows=wins)
+    for cfg in configs:
+        m = Cpu6502TransformerMachine(bcd=False, **cfg)
         m.load_image(bytes(image), start_pc=0x0400)
+        if "shape_library" not in cfg:
+            # Every idiom in the program must be covered by a library shape.
+            assert len(match_shape_windows(image, m._engine.shapes_meta)) == 4
         chunks = []
 
         def drain(n, chunks=chunks, m=m):
@@ -214,7 +226,8 @@ def test_sequence_experts_match_per_step():
         traces.append({
             k: np.concatenate([c[k] for c in chunks]) for k in fields
         })
-    for k in fields:
-        assert np.array_equal(traces[0][k], traces[1][k]), f"{k} diverged"
+    for t in traces[1:]:
+        for k in fields:
+            assert np.array_equal(traces[0][k], t[k]), f"{k} diverged"
     for pc in (0x0408, 0x040B, 0x0410):
         assert pc in traces[0]["pc"], f"never reached {pc:04X}"
