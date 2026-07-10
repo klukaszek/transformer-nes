@@ -36,7 +36,12 @@ from transformer_vm.cpu6502.spec import OPCODES
 from transformer_vm.cpu6502.weights_runner import VERIFY_START, verify_program
 from transformer_vm.graph.core import ProgramGraph, reset_graph
 from transformer_vm.graph.eval import ProgramEvaluator
-from transformer_vm.graph.fold import GraphFolder, opcode_pins
+from transformer_vm.graph.fold import (
+    SEQUENCE_FEEDBACK,
+    GraphFolder,
+    opcode_pins,
+    sequence_pins,
+)
 from transformer_vm.scheduler.milp import _build_graph, _min_layers
 
 _PROBE_JSON = (
@@ -238,6 +243,153 @@ def union_run(union_pg):
             ea=reads["ea"] & 0xFFFF, data=reads["data_out"] & 0xFF,
         )
     return {"tokens": tokens, "steps": steps}
+
+
+# ── Sequence fold: the poll trio and the JMP spin as one step ────────
+
+POLL_HEAD = 0x0400
+SPIN_HEAD = 0x0408
+
+
+def _poll_program():
+    """LDA $0700 / AND #$40 / BEQ -7 poll loop, then NOP and a JMP spin."""
+    image = bytearray(0x10000)
+    image[POLL_HEAD:POLL_HEAD + 11] = bytes([
+        0xAD, 0x00, 0x07,  # LDA $0700
+        0x29, 0x40,        # AND #$40
+        0xF0, 0xF9,        # BEQ $0400
+        0xEA,              # NOP
+        0x4C, 0x08, 0x04,  # JMP $0408 (self)
+    ])
+    return image
+
+
+@pytest.fixture(scope="module")
+def poll_run(union_pg):
+    """Drive the union over the poll program (three loop iterations, a flag
+    write flipping the poll, then the fall-through into the JMP spin)."""
+    ev = ProgramEvaluator(union_pg)
+    image = _poll_program()
+    tokens = [("boot", {
+        "start_pc_lo": POLL_HEAD & 0xFF, "start_pc_hi": POLL_HEAD >> 8,
+        "is_start": 1,
+    })]
+    for addr, b in enumerate(image):
+        if b:
+            tokens.append(("boot", {
+                "is_memory_write": 1, "byte_value": b,
+                "addr_lo": addr & 0xFF, "addr_hi": (addr >> 8) & 0xFF,
+            }))
+    for _, inputs in tokens:
+        ev.step(inputs)
+
+    st = {
+        "pc": POLL_HEAD, "a": 0, "x": 0, "y": 0, "s": 0xFD,
+        "p": reference.FLAG_U | reference.FLAG_I,
+        "ir": 0, "oplo": 0, "ophi": 0, "ea": 0, "data": 0,
+    }
+    steps = []
+    for i in range(24):
+        if i == 9:  # after three full loop iterations: raise the flag
+            wtok = {"is_memory_write": 1, "byte_value": 0x40,
+                    "addr_lo": 0x00, "addr_hi": 0x07}
+            ev.step(wtok)
+            tokens.append(("boot", wtok))
+        p = st["p"]
+        inputs = {
+            "is_state": 1,
+            "in_pc_lo": st["pc"] & 0xFF, "in_pc_hi": (st["pc"] >> 8) & 0xFF,
+            "in_a": st["a"], "in_x": st["x"], "in_y": st["y"], "in_s": st["s"],
+            "in_p_c": 1 if p & reference.FLAG_C else 0,
+            "in_p_z": 1 if p & reference.FLAG_Z else 0,
+            "in_p_i": 1 if p & reference.FLAG_I else 0,
+            "in_p_d": 1 if p & reference.FLAG_D else 0,
+            "in_p_b": 1 if p & reference.FLAG_B else 0,
+            "in_p_u": 1 if p & reference.FLAG_U else 0,
+            "in_p_v": 1 if p & reference.FLAG_V else 0,
+            "in_p_n": 1 if p & reference.FLAG_N else 0,
+            "in_ir": st["ir"], "in_oplo": st["oplo"], "in_ophi": st["ophi"],
+            "in_ea_lo": st["ea"] & 0xFF, "in_ea_hi": (st["ea"] >> 8) & 0xFF,
+            "in_data": st["data"], "in_halted": 0, "in_nmi": 0,
+        }
+        v = ev.step(inputs)
+        reads = _read_all(ev, v)
+        assert not _writes_of(reads), "the poll program must be write-free"
+        tokens.append(("state", inputs))
+        steps.append({"reads": reads, "pc": st["pc"]})
+        st.update(
+            pc=reads["next_pc"] & 0xFFFF, a=reads["new_a"] & 0xFF,
+            x=reads["new_x"] & 0xFF, y=reads["new_y"] & 0xFF,
+            s=reads["new_s"] & 0xFF, p=reads["new_p"] & 0xFF,
+            ir=reads["fetched_opcode"] & 0xFF,
+            oplo=reads["fetched_operand_lo"] & 0xFF,
+            ophi=reads["fetched_operand_hi"] & 0xFF,
+            ea=reads["ea"] & 0xFFFF, data=reads["data_out"] & 0xFF,
+        )
+    # The stream must contain poll iterations, the fall-through, and spins.
+    assert sum(s["pc"] == POLL_HEAD for s in steps) == 4
+    assert sum(s["pc"] == SPIN_HEAD for s in steps) >= 3
+    return {"tokens": tokens, "steps": steps}
+
+
+@pytest.mark.parametrize(
+    ("head", "code", "repeat"),
+    [
+        (POLL_HEAD, bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9]), 1),
+        (SPIN_HEAD, bytes([0x4C, 0x08, 0x04]), 3),
+    ],
+    ids=["poll-trio", "jmp-spin-x3"],
+)
+def test_sequence_fold_shadows_union(folder, poll_run, head, code, repeat):
+    """One sequence forward must reproduce the union's K consecutive step
+    readouts exactly whenever the router would dispatch it (pc == head; the
+    window bytes are pinned).  Intermediate STATE tokens are not fed to the
+    sequence graph -- exactly the engine's one-forward-per-window contract."""
+    pin_list = sequence_pins(head, code, OPCODES) * repeat
+    n_steps = len(pin_list)
+    r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
+                             label=f"seq@{head:04X}")
+    assert r.n_steps == n_steps
+    assert not r.insert_side_hazards
+    ev = ProgramEvaluator(r.program_graph)
+    state_expr = r.program_graph.output_tokens["STATE"]
+    halt_expr = r.program_graph.output_tokens["HALT"]
+
+    steps = poll_run["steps"]
+    idx = 0  # union step index for state tokens
+    skip = 0
+    windows = 0
+    for kind, inputs in poll_run["tokens"]:
+        if kind != "state":
+            ev.step(inputs)
+            continue
+        if skip:
+            skip -= 1
+            idx += 1
+            continue
+        pc = inputs["in_pc_lo"] | (inputs["in_pc_hi"] << 8)
+        dispatch = pc == head and idx + n_steps <= len(steps)
+        if not dispatch:
+            ev.step(inputs)
+            idx += 1
+            continue
+        v = ev.step(inputs)
+        for k in range(n_steps):
+            expected = steps[idx + k]["reads"]
+            got = {
+                name: int(round(ev.read(v, f"{name}__s{k}")))
+                for name in _RUNTIME_READ_DIMS
+            }
+            for name in _RUNTIME_READ_DIMS:
+                mask = 0xFFFF if name in ("current_pc", "next_pc", "ea") else 0xFF
+                assert got[name] & mask == expected[name] & mask, (
+                    f"step {k} ({name}) diverged at union step {idx + k}"
+                )
+        assert state_expr.evaluate(v) > halt_expr.evaluate(v)
+        windows += 1
+        skip = n_steps - 1
+        idx += 1
+    assert windows >= 2, "the stream never dispatched the sequence"
 
 
 @pytest.mark.parametrize("byte", SHADOW_OPCODES)

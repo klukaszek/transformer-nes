@@ -83,7 +83,19 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
    safety argument.  Ship the cache directory: same platform loads with
    zero compiles, others rebuild from the shipped source.
 
-9. **Multi-instruction sequence experts** (pending, thesis artifact).
+9. **Hoist runtime one-hots into hard branches at every scale**
+   (~2x step time here).  The opcode router (lever 5) is one instance of
+   a general move: wherever the model computes an exact 0/1 selector and
+   gates parallel branches with it, the generated code can evaluate the
+   selector natively and run only the selected branch — substituting the
+   provably-masked branches' already-exercised "empty" value.  Applied
+   per memory read (16 grouped lookups → 1, since the group one-hot is
+   `addr >> 12`), it took the hot loops from 0.87 to 0.37 µs/step.  The
+   soundness argument is always the same: the gate is exactly zero for
+   unselected branches, and the substitute equals a state the arithmetic
+   already handles for real.
+
+10. **Multi-instruction sequence experts** (pending, thesis artifact).
    Fold a K-step composition of the union graph under a sequence pin
    (write-free sequences first — no intermediate-write semantics), route
    on the full pinned byte window.  No longer needed for frame rate here;

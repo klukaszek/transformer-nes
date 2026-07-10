@@ -102,6 +102,9 @@ class FoldResult:
     n_terms: int = 0
     # Root names that folded away and were re-materialized as persists.
     folded_roots: tuple[str, ...] = field(default=())
+    # Sequence folds: number of composed steps (root/readout names carry a
+    # __s<k> suffix per step; step-0 input dims keep their canonical names).
+    n_steps: int = 1
 
 
 class GraphFolder:
@@ -125,12 +128,16 @@ class GraphFolder:
 
     # ── Partial evaluation (the probe's rules, verbatim) ─────────────
 
-    def _partial_eval(self, pins: dict[str, float]):
+    def _partial_eval(self, pins: dict[str, float], frozen: frozenset = frozenset()):
         pg = self.pg
         one = pg.one
         val: dict = {one: Expression({one: 1.0})}
         folded: dict = {}
         for d in pg.all_dims:
+            if isinstance(d, PersistDimension) and d.name in frozen:
+                # Opaque leaf: bound to another step's output at
+                # materialization (fold_sequence), never folded through.
+                continue
             if isinstance(d, PersistDimension) and d.name in pins:
                 val[d] = Expression({one: float(pins[d.name])})
                 continue
@@ -375,6 +382,266 @@ class GraphFolder:
         )
 
 
+    # ── Sequence fold: K chained steps as one graph ───────────────────
+
+    def fold_sequence(self, pin_list, feedback, label: str = "",
+                      keep_alive_token: str = "READOUT") -> FoldResult:
+        """Fold a K-step composition of the union graph into ONE graph.
+
+        pin_list[k] pins step k (the router supplies them: pc, instruction
+        bytes, is_nmi=0).  feedback maps a step's state-input persist name to
+        the previous step's output name -- either "out_name" (bound as an
+        expression, or as a pin when the previous fold made it constant) or
+        ("out_name", "lo"|"hi") (byte split; the source must fold constant).
+        Every step's root dims are materialized with a ``__s<k>`` suffix and
+        kept alive through ``keep_alive_token``; the other output tokens are
+        substituted through the FINAL step, and step 0's input dims keep
+        their canonical names (the composed graph embeds one state token).
+        """
+        pg = self.pg
+        one = pg.one
+        n_steps = len(pin_list)
+        root_dims = [self._by_name[n] for n in self.root_names]
+        feedback = dict(feedback)
+        for out in feedback.values():
+            if isinstance(out, (int, float)):
+                continue  # constant feedback (e.g. the always-1 U flag)
+            out_name = out[0] if isinstance(out, tuple) else out
+            if out_name not in self._by_name:
+                raise KeyError(f"feedback output {out_name!r} not in the graph")
+
+        reset_graph()
+        base_sub: dict = {
+            pg.one: Expression({_graph.one: 1}),
+            pg.position: Expression({_graph.position: 1}),
+            pg.inv_log_pos: Expression({_graph.inv_log_pos: 1}),
+            pg.position_sq: Expression({_graph.position_sq: 1}),
+        }
+        for d in pg.all_dims:
+            if isinstance(d, InputDimension) and d not in base_sub:
+                base_sub[d] = Expression({InputDimension(d.name): 1})
+
+        all_pins: dict[str, float] = {}
+        union_lookup_of: dict[int, int] = {}
+        lookup_of_union: dict[int, LookUp] = {}
+        insert_side_hazards: set[str] = set()
+        folded_roots: list[str] = []
+        keep_alive = Expression()
+        n_reglus = n_persists = n_lookups = n_terms = 0
+        fb_expr: dict[str, Expression] = {}  # prev step's outputs, new-graph space
+        fb_const: dict[str, float] = {}
+        new_outputs = None
+
+        for k in range(n_steps):
+            pins = dict(pin_list[k])
+            frozen: set[str] = set()
+            if k > 0:
+                for in_name, out in feedback.items():
+                    if in_name in pins:  # explicit pins beat feedback
+                        continue
+                    if isinstance(out, (int, float)):
+                        pins[in_name] = float(out)
+                        continue
+                    if isinstance(out, tuple):
+                        out_name, part = out
+                        c = fb_const.get(out_name)
+                        if c is None:
+                            raise RuntimeError(
+                                f"fold_sequence({label}) step {k}: {out_name} "
+                                f"must fold constant for the {part} byte split"
+                            )
+                        v = int(round(c))
+                        pins[in_name] = float(v & 0xFF if part == "lo" else (v >> 8) & 0xFF)
+                    elif (c := fb_const.get(out)) is not None:
+                        pins[in_name] = c
+                    else:
+                        frozen.add(in_name)
+            for name, v in pins.items():
+                all_pins[f"s{k}:{name}"] = v
+
+            val, folded, lookup_exprs = self._partial_eval(pins, frozenset(frozen))
+            insert_side_hazards |= {
+                lu.name or f"lookup_{lu.id}"
+                for lu in self._insert_hazards(frozenset(pins))
+            }
+
+            # Liveness seeds: this step's roots, the outputs the next step
+            # feeds on, and (final step) the graph's output tokens.
+            fb_dims = [
+                self._by_name[o[0] if isinstance(o, tuple) else o]
+                for o in feedback.values() if not isinstance(o, (int, float))
+            ] if k + 1 < n_steps else []
+            fout = {}
+            if k + 1 == n_steps:
+                val_out = {d: v for d, v in val.items() if d not in set(root_dims)}
+                fout = {
+                    name: _subst(expr, val_out)
+                    for name, expr in pg.output_tokens.items()
+                    if isinstance(expr, Expression)
+                }
+            seeds: set = set()
+            for e in fout.values():
+                seeds |= set(e.terms)
+            for d in root_dims + fb_dims:
+                seeds |= set(val[d].terms) if d in val else {d}
+
+            def is_leaf(d, *, frozen=frozen):
+                return (
+                    isinstance(d, InputDimension)
+                    or (isinstance(d, PersistDimension) and d.name in frozen)
+                )
+
+            live: set = set()
+            stack = [d for d in seeds if d not in val and not is_leaf(d)]
+            while stack:
+                d = stack.pop()
+                if d in live:
+                    continue
+                live.add(d)
+                deps: set = set()
+                if isinstance(d, ReGLUDimension):
+                    a, b = folded[d]
+                    deps = set(a.terms) | set(b.terms)
+                elif isinstance(d, PersistDimension):
+                    (e,) = folded[d]
+                    deps = set(e.terms)
+                elif isinstance(d, LookUpDimension):
+                    fx = lookup_exprs[d.lookup]
+                    for e in fx["query"] + fx["key"] + fx["values"]:
+                        deps |= set(e.terms)
+                    for sib in d.lookup.dims:
+                        if sib not in live and sib not in val:
+                            live.add(sib)
+                for dep in deps:
+                    if dep not in val and not is_leaf(dep) and dep not in live:
+                        stack.append(dep)
+
+            # Materialize this step (fresh sub: the same union dim holds a
+            # different value per step); frozen persists resolve to the
+            # previous step's already-materialized output expressions.
+            sub = dict(base_sub)
+            for in_name in frozen:
+                sub[self._by_name[in_name]] = fb_expr[feedback[in_name]]
+
+            def tr(expr: Expression, *, sub=sub, val=val, k=k) -> Expression:
+                out = Expression()
+                for d, c in expr.terms.items():
+                    s = sub.get(d)
+                    if s is None:
+                        if d in val:
+                            s = sub[d] = tr(val[d])
+                        else:
+                            raise KeyError(
+                                f"fold_sequence({label}) s{k}: {d!r} neither "
+                                "live nor folded"
+                            )
+                    out = out + s * c
+                return out
+
+            def sname(name, *, k=k):
+                return f"{name}__s{k}" if name else None
+
+            made = set()
+            for d in pg.all_dims:
+                if d in val or d not in live or is_leaf(d):
+                    continue
+                if isinstance(d, ReGLUDimension):
+                    a, b = folded[d]
+                    nd = ReGLUDimension(tr(a), tr(b), name=sname(d.name))
+                    sub[d] = Expression({nd: 1})
+                    n_reglus += 1
+                    n_terms += len(nd.a_expr.terms) + len(nd.b_expr.terms)
+                elif isinstance(d, PersistDimension):
+                    (e,) = folded[d]
+                    nd = PersistDimension(tr(e), name=sname(d.name))
+                    sub[d] = Expression({nd: 1})
+                    n_persists += 1
+                    n_terms += len(nd.expr.terms)
+                elif isinstance(d, LookUpDimension):
+                    lu = d.lookup
+                    if lu in made:
+                        continue
+                    made.add(lu)
+                    fx = lookup_exprs[lu]
+                    nlu = LookUp(
+                        [tr(e) for e in fx["values"]],
+                        [tr(e) for e in fx["query"]],
+                        [tr(e) for e in fx["key"]],
+                        tie_break=lu.tie_break,
+                    )
+                    nlu.name = sname(lu.name)
+                    mg = getattr(lu, "memory_group", None)
+                    if mg is not None:
+                        nlu.memory_group = mg
+                    union_lookup_of[nlu.id] = lu.id
+                    lookup_of_union[lu.id] = nlu  # last step wins; ids share state
+                    for ud, ndim in zip(lu.dims, nlu.dims, strict=True):
+                        ndim.name = sname(ud.name)
+                        sub[ud] = Expression({ndim: 1})
+                    n_lookups += 1
+                    for e in nlu.query_exprs_2d + nlu.key_exprs_2d + nlu.value_exprs:
+                        n_terms += len(e.terms)
+
+            # Roots: every step's readout set, suffixed; folded-away roots
+            # come back as named persists (same contract as fold()).
+            for d in root_dims:
+                if d in val:
+                    nd = PersistDimension(tr(val[d]), name=sname(d.name))
+                    sub[d] = Expression({nd: 1})
+                    folded_roots.append(nd.name)
+                    n_persists += 1
+                    n_terms += len(nd.expr.terms)
+                keep_alive = keep_alive + 1e-6 * sub[d]
+
+            fb_const, fb_expr = {}, {}
+            for out in set(feedback.values()):
+                if isinstance(out, (int, float)):
+                    continue
+                out_name = out[0] if isinstance(out, tuple) else out
+                d = self._by_name[out_name]
+                src = val.get(d, Expression({d: 1}))
+                c = _const_of(src, one)
+                if c is not None:
+                    fb_const[out_name] = c
+                else:
+                    fb_expr[out_name] = tr(src)
+
+            if k + 1 == n_steps:
+                new_inputs = {
+                    name: tr(expr) if isinstance(expr, Expression) else expr
+                    for name, expr in pg.input_tokens.items()
+                }
+                new_outputs = {
+                    name: tr(fout[name]) if name in fout else expr
+                    for name, expr in pg.output_tokens.items()
+                }
+
+        prev = new_outputs.get(keep_alive_token)
+        prev = prev if isinstance(prev, Expression) else Expression()
+        new_outputs[keep_alive_token] = prev + keep_alive
+        new_pg = ProgramGraph(new_inputs, new_outputs)
+
+        dim_of_name: dict[str, Dimension] = {}
+        for d in new_pg.all_dims:
+            dim_of_name.setdefault(d.name, d)
+
+        return FoldResult(
+            label=label,
+            pins=all_pins,
+            program_graph=new_pg,
+            dim_of_name=dim_of_name,
+            union_lookup_of=union_lookup_of,
+            lookup_of_union=lookup_of_union,
+            insert_side_hazards=tuple(sorted(insert_side_hazards)),
+            n_reglus=n_reglus,
+            n_persists=n_persists,
+            n_lookups=n_lookups,
+            n_terms=n_terms,
+            folded_roots=tuple(folded_roots),
+            n_steps=n_steps,
+        )
+
+
 def opcode_pins(byte: int, opcodes, *, pin_fetched_byte: bool = True) -> dict[str, float]:
     """Pin every decode gate for a single-opcode expert: ``is_op_<byte>=1``,
     every other ``is_op_*=0``, ``is_nmi=0`` (an NMI overrides the fetched
@@ -392,3 +659,54 @@ def opcode_pins(byte: int, opcodes, *, pin_fetched_byte: bool = True) -> dict[st
     if pin_fetched_byte:
         pins["fetched_opcode"] = float(byte)
     return pins
+
+
+# State-input persist -> previous step's output, for fold_sequence over the
+# 6502 graph.  pc and the trace-context bytes are pinned per step instead
+# (sequence_pins knows them); ea feeds back as a byte split, so it must fold
+# constant -- true for the write-free poll/spin windows this is built for.
+SEQUENCE_FEEDBACK = {
+    "current_a": "new_a", "current_x": "new_x", "current_y": "new_y",
+    "current_s": "new_s", "current_halted": "new_halted",
+    "current_p_c": "new_p_c_final", "current_p_z": "new_p_z_final",
+    "current_p_i": "new_p_i_final", "current_p_d": "new_p_d_final",
+    "current_p_b": "new_p_b_final", "current_p_u": 1.0,  # U reads 1 always
+    "current_p_v": "new_p_v_final", "current_p_n": "new_p_n_final",
+    "current_ir": "fetched_opcode",
+    "current_oplo": "fetched_operand_lo",
+    "current_ophi": "fetched_operand_hi",
+    "current_ea_lo": ("ea", "lo"), "current_ea_hi": ("ea", "hi"),
+    "current_data": "data_out",
+}
+
+
+def sequence_pins(head_pc: int, code: bytes, opcodes) -> list[dict[str, float]]:
+    """Per-step pins for a K-instruction window: the bytes at head_pc.
+
+    Each step gets its opcode pins plus its pc and every in-window operand
+    byte pinned (the router verifies pc == head_pc and the whole window's
+    bytes, so all of it is router-guaranteed).  current_halted is pinned 0:
+    the run loop never dispatches a halted machine, and the runner checks
+    each step's folded new_halted is constant 0.
+    """
+    pin_list = []
+    pc = head_pc
+    off = 0
+    while off < len(code):
+        op = opcodes.get(code[off])
+        if op is None:
+            raise ValueError(f"byte {code[off]:02X} at +{off} is not an opcode")
+        pins = opcode_pins(op.byte, opcodes)
+        pins["current_pc_lo"] = float(pc & 0xFF)
+        pins["current_pc_hi"] = float((pc >> 8) & 0xFF)
+        pins["current_halted"] = 0.0
+        if off + 1 < len(code):
+            pins["fetched_operand_lo_all"] = float(code[off + 1])
+        if off + 2 < len(code):
+            pins["fetched_operand_hi_all"] = float(code[off + 2])
+        pin_list.append(pins)
+        pc += op.length
+        off += op.length
+    if off != len(code):
+        raise ValueError("window does not end on an instruction boundary")
+    return pin_list
