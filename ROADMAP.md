@@ -31,6 +31,48 @@ backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## The refactor plan (written 2026-07-10 after the dead-code excision)
+
+Same-day excisions already landed: LATEST_ALPHA + the recency machinery,
+KEY_OFFSET, the average tie-break constructor, the vestigial
+matmul/dtype/np_dtype attrs (jj lylmpmvy).  What remains is structural,
+in priority order — the lockstep chain is the safety net for all of it:
+
+1. **One classification module.**  The mem-structure / running-argmax /
+   hull-fallback eligibility logic now exists TWICE: engine_gen's
+   plan_model (matrix-level) and kernel._KernelSpec (graph-expr level).
+   Divergence here is the project's biggest latent hazard.  Extract to
+   `model/classify.py` with both consumers driving it.
+2. **Split weights_runner.**  Cpu6502TransformerMachine has accreted:
+   machine protocol + engine cache orchestration + THREE expert builders
+   + scanner + shape matcher + JIT + license checks + CLI.  Carve into
+   `experts.py` (builders + licenses incl. _eval_over_heads),
+   `windows.py` (SHAPE_LIBRARY, scanner, matcher, JIT policy), and the
+   machine core.  The engine cache/manifest logic moves next to
+   engine_gen.
+3. **Drop diagnostic arith modes (needs a user call).**  f32 mode is the
+   sole consumer of the real-hull emission path and forbids
+   experts/shapes; int64 is recorded slower.  Removing both shrinks
+   generate_source by roughly a third and kills the dual-flavor
+   emission closures.  The exact evaluator remains the semantics
+   diagnostic.  Same sweep: verify the Python per-step branch of
+   machine_step is unreachable (has_machine_step is always true for
+   built engines) and excise it.
+4. **One C++ run loop.**  kernel.py and engine_gen emit two
+   near-identical run loops (watch/lease/trace/budget protocol).
+   Template it once; the KernelBus contract is the spec.
+5. **Integer register scores** (finishes the f64 retirement in the
+   runtime): keys are integer-valued now, so reg_s goes i64 and the
+   position features leave the hot path; the score-form license moves
+   into classify.py.
+6. **Docs pass.**  README/docstrings still reference retired things
+   (weights_engine.cpp, dense/sparse paths, f64 caveats, the recency
+   term).  Rewrite around the artifact boundary: graph -> schedule ->
+   weights (the model) vs engines (execution strategies) vs
+   console/frontends.
+7. **PPU to C++** — unlocks the native SDL/Sokol app; do it as the
+   console layer's part of the refactor, not before.
+
 ## Recorded decision: retire f64 (not started; early refactor items)
 
 Per explicit user call: runtime f64 is vestigial.  The last hot-path
