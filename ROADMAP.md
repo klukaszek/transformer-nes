@@ -31,6 +31,14 @@ backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+**Refactor receipt (2026-07-10):** generated runtime is exact-int32 only;
+the unreachable Python step/write paths and duplicated run-protocol tables
+are gone. Full automated suite: 85 passed. Full nestest matched 8,991 steps
+through reference/graph/kernel/weights. Full Klaus passed 30,646,177 steps
+through the kernel (40.60 s) and weights (91.3 s, 336K steps/s). Scripted SMB
+matched kernel⇔weights for 180/180 frames plus RAM, cycles, PPU state, and CPU
+registers; measured 70.1 fps kernel and 257.9 fps weights in the final run.
+
 ## The refactor plan (written 2026-07-10 after the dead-code excision)
 
 Same-day excisions already landed: LATEST_ALPHA + the recency machinery,
@@ -1825,8 +1833,8 @@ uv run pytest                                  # + kernel/weights/console suites
 uv run 6502-klaus --runner cpp-full            # full Klaus, ~48 s, exact step count
 uv run 6502-nestest --runner both              # golden log: reference + graph + kernel
 uv run 6502-nestest --runner weights           # full nestest through the generated int32 engine, ~0.1 s
-uv run 6502-klaus --runner weights --graph-steps 200000
-uv run 6502-transformer --steps 30 --cache standard --matmul sparse   # true softmax diagnostic
+uv run 6502-klaus --runner weights --graph-steps 30646177  # full weights receipt
+uv run 6502-transformer --steps 30
 uv run nes-run transformer_vm/nes/examples/smb.nes --frames 61 \
     --warmup-frames 60 --backend weights --out frame.ppm
 ```

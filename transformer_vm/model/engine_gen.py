@@ -1,9 +1,9 @@
 """Emit model-specific C++ for analytic transformer weights.
 
 Sparse indices and coefficients become C++ expressions, removing CSR gather
-overhead. ``int32`` is the exact fixed-point production path; ``int64`` and
-``f32`` remain diagnostic modes. Attention uses exact memory structures,
-running argmax registers, or hulls according to :mod:`model.classify`.
+overhead. The residual uses exact fixed-point int32. Attention uses exact
+memory structures, running argmax registers, or hulls according to
+:mod:`model.classify`.
 """
 
 from __future__ import annotations
@@ -232,7 +232,7 @@ def _expr_dbl(indices, data, ref) -> str:
 
 
 def _expr_int(indices, data, ref, where: str) -> str:
-    """One CSR row as an exact int64 expression.
+    """One CSR row as an exact fixed-point integer expression.
 
     Integer coefficients only, except +-0.5 (four fused direct-map
     coefficients) which become guarded halvings; anything else means the

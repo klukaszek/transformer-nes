@@ -63,7 +63,7 @@ def test_transformer_int32_engine_matches_high_address_nestest_prefix():
 
 @pytest.mark.slow
 def test_checkpoint_rebuild_is_invisible():
-    """Snapshot-and-rebuild mid-run: the hull logs reseed from the RAM
+    """Snapshot-and-rebuild mid-run: attention reseeds from the RAM
     mirror without perturbing the executed trace.  Uses the nestest prefix
     so high-address reads cross checkpoint boundaries."""
     from transformer_vm.nes.nestest import START_PC, load_image

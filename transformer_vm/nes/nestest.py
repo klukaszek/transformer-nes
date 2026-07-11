@@ -149,7 +149,7 @@ def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, 
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(bcd=False)
-    mode = f"codegen-{machine._engine.arith}"
+    mode = "codegen-exact-int32"
     build_elapsed = time.perf_counter() - build_start
 
     if machine.supports_run_loop:

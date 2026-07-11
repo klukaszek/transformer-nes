@@ -216,10 +216,7 @@ class Cpu6502TransformerMachine:
 
         self.pos = 0
         self._trace_len = 0
-        # RAM mirror for snapshot-and-rebuild checkpointing (KernelBus
-        # keeps the same mirror for the C++ kernel).  checkpoint_tokens, if
-        # set, rebuilds automatically once the token log grows past it, so
-        # long runs do not grow unbounded hull logs.
+        # RAM mirror for optional snapshot/reseed checkpoints.
         self._ram = bytearray(0x10000)
         self._checkpoint_tokens = checkpoint_tokens
         self._seed_pos = 0
@@ -806,11 +803,11 @@ class Cpu6502TransformerMachine:
         return row
 
     def checkpoint(self) -> bool:
-        """Snapshot-and-rebuild the token log from the RAM mirror.
+        """Snapshot and reseed attention state from the RAM mirror.
 
         Mirrors KernelBus.checkpoint: captures the architectural state,
-        reseeds the attention state (hull logs) with a fresh WRITE-token
-        prefix from the mirror, and restores the state.  Semantically
+        reseeds attention with a fresh WRITE-token prefix from the mirror,
+        and restores the state. Semantically
         invisible: unwritten and zero bytes both read as 0 through the
         exact-address mask, so dropping the history and reseeding only the
         nonzero RAM bytes preserves every future read.

@@ -158,7 +158,7 @@ def run_weights(image: bytes, *, max_steps: int,
     machine = Cpu6502TransformerMachine(
         bcd=True, checkpoint_tokens=checkpoint_tokens,
     )
-    mode = f"codegen-{machine._engine.arith}"
+    mode = "codegen-exact-int32"
     build_elapsed = time.perf_counter() - build_start
 
     ref_cpu = Cpu6502(memory=bytearray(image))
@@ -246,11 +246,9 @@ def main() -> None:
     )
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument(
-        "--checkpoint-tokens", type=int, default=250_000,
-        help="weights runner: snapshot-and-rebuild the hull logs every N "
-             "token positions (0 disables; default 250000 -- every forward "
-             "inserts into all shared hulls, so the window bounds memory at "
-             "roughly 100 bytes/token/hull-insert)",
+        "--checkpoint-tokens", type=int, default=0,
+        help="weights runner: snapshot and reseed every N token positions "
+             "(default 0: disabled; generated attention state is O(1))",
     )
     args = parser.parse_args()
 
