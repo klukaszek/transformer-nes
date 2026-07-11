@@ -24,18 +24,7 @@ from transformer_vm.cpu6502.evaluator import (
     _RUNTIME_READ_DIMS,
     Cpu6502Runtime,
 )
-from transformer_vm.cpu6502.spec import (
-    MODE_ABSOLUTE,
-    MODE_ABSOLUTE_X,
-    MODE_ABSOLUTE_Y,
-    MODE_INDIRECT_X,
-    MODE_INDIRECT_Y,
-    MODE_ZERO_PAGE,
-    MODE_ZERO_PAGE_X,
-    MODE_ZERO_PAGE_Y,
-    OPCODES,
-    READS_MEMORY,
-)
+from transformer_vm.cpu6502.run_protocol import cycle_table, read_mode_table
 from transformer_vm.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_vm.graph.core import PersistDimension
 from transformer_vm.model.classify import memory_query, register_query
@@ -50,36 +39,6 @@ _STATE_FIELDS = (
     "in_ir", "in_oplo", "in_ophi", "in_ea_lo", "in_ea_hi", "in_data", "in_halted",
     "in_nmi",
 )
-
-# Shadow-decode table for MMIO read watches: READ_MODE[opcode] is 0 when the
-# instruction's execution never reads a memory operand, else a code for how
-# to compute the operand address from (pc, x, y) and the RAM mirror.
-_READ_MODE_CODE = {
-    MODE_ZERO_PAGE: 1, MODE_ZERO_PAGE_X: 2, MODE_ZERO_PAGE_Y: 3,
-    MODE_ABSOLUTE: 4, MODE_ABSOLUTE_X: 5, MODE_ABSOLUTE_Y: 6,
-    MODE_INDIRECT_X: 7, MODE_INDIRECT_Y: 8,
-}
-
-
-def _read_mode_table() -> list[int]:
-    table = [0] * 256
-    for byte, op in OPCODES.items():
-        if op.operation in READS_MEMORY and op.mode in _READ_MODE_CODE:
-            table[byte] = _READ_MODE_CODE[op.mode]
-    return table
-
-
-def _cycles_table() -> list[int]:
-    """Base cycle count per opcode byte (0 for unknown bytes).
-
-    Approximation shared with nes/bus.py: base cycles only, no branch-taken
-    or page-cross penalties.  An NMI step costs 7 cycles.
-    """
-    table = [0] * 256
-    for byte, op in OPCODES.items():
-        table[byte] = op.cycles
-    return table
-
 
 def _c_num(coeff) -> str:
     if isinstance(coeff, int):
@@ -279,11 +238,8 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('    double g[NDIMS] = {0};')
     emit('    std::vector<int> g_set;')
     emit('')
-    emit('    // Exact nearest-written-address structure serving the memory')
-    emit('    // lookups (identical to the weights engine: the grouped parabola')
-    emit('    // score is maximized by the nearest written address, recency')
-    emit('    // breaking equidistant ties toward the later write).  O(1) in')
-    emit('    // the token log; insert_write is three stores, not hull inserts.')
+    emit('    // Exact memory-head argmax: nearest address wins; equal-distance')
+    emit('    // ties use the latest write. State is O(1) in the token log.')
     emit('    int mem_val[16][4096];')
     emit('    long long mem_seq[16][4096];')
     emit('    unsigned long long mem_bits[16][64];')
@@ -523,8 +479,8 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     # can inject the register value as a WRITE token; device writes pause
     # after the writing step.  set_nmi() flags the next STATE token; the
     # interrupt sequence itself is graph logic.
-    read_mode = ", ".join(str(v) for v in _read_mode_table())
-    cycles_tab = ", ".join(str(v) for v in _cycles_table())
+    read_mode = ", ".join(str(v) for v in read_mode_table())
+    cycles_tab = ", ".join(str(v) for v in cycle_table())
     emit('')
     emit(f'    static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};')
     emit('    // Base cycles per opcode (no penalty cycles); NMI costs 7.')

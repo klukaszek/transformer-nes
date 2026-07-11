@@ -1,30 +1,8 @@
-"""Run the 6502 through the real weights-based transformer.
+"""Construct and run the 6502 analytic transformer weights backend.
 
-This is the end of the verification chain: the same computation graph that
-the exact evaluator and the C++ kernel execute is scheduled onto transformer
-layers and compiled into actual transformer weights (analytically -- no
-training).  Execution is then genuine transformer inference: per-position
-embeddings, Q/K/V projections, hardmax (hull) attention, ReGLU FFN,
-residual stream, and
-an output head that decides STATE vs HALT.
-
-One departure from the WASM construction: WASM tokens formed a finite
-vocabulary (each token type's values were baked into its embedding row).
-A 6502 STATE token carries ~20 wide-domain fields, so token *values*
-cannot be enumerated; instead the harness builds each position's input
-embedding directly -- the value of every input dim placed at its residual
-slot, exactly what an enumerated vocabulary row would have contained.
-The transformer layers themselves are untouched.
-
-The run loop is the same protocol as the exact evaluator: the machine's
-result dims are read back from the residual stream after the final layer
-(kept alive to the end via a synthetic READOUT output token), writes are
-appended as WRITE-token positions, and the next STATE embedding is built
-from the read-back state.
-
-Numerics caveat: the engine path is float32 (codegen) and uses grouped
-4 KiB memory lookups so high-address reads survive Q/K rounding; hull
-hardmax tie-breaks resolve same-address rewrites by latest write.
+The graph is scheduled, converted to weights, and executed by generated C++.
+Python owns construction, cache orchestration, and the public machine API;
+the native engine owns instruction execution and attention state.
 """
 
 from __future__ import annotations
@@ -225,12 +203,13 @@ class Cpu6502TransformerMachine:
         # The ROM's windows land in a tiny per-ROM module attached through
         # the core's function-pointer hook (no core recompile per ROM).
         self._seq_module = None
-        if windows and getattr(self._engine, "has_machine_step", False):
+        if not self._engine.has_machine_step:
+            raise RuntimeError("generated 6502 engine is missing machine_step")
+        if not self._engine.supports_direct_writes:
+            raise RuntimeError("generated 6502 engine is missing direct memory writes")
+        if windows:
             self._attach_sequence_module(windows, bcd=bcd, arith=codegen_arith)
-        self._direct_writes = self._engine.supports_direct_writes
-        self._cpp_step = getattr(self._engine, "has_machine_step", False)
-        if self._cpp_step:
-            self._step_out = np.empty(21, dtype=np.int64)
+        self._step_out = np.empty(21, dtype=np.int64)
 
         # Profile-guided JIT: every jit_interval native run() returns, pcs
         # with >= jit_min_count fallback steps since the last poll are
@@ -623,8 +602,7 @@ class Cpu6502TransformerMachine:
         self._jit_calls = 0
         self._jit_rejected.clear()
         meta = getattr(self._engine, "shapes_meta", None) or []
-        if not (meta and self._cpp_step
-                and getattr(self._engine, "has_run_loop", False)):
+        if not (meta and self._engine.has_run_loop):
             return
         self._engine.clear_windows()
         for sid, head in match_shape_windows(self._ram, meta):
@@ -737,16 +715,6 @@ class Cpu6502TransformerMachine:
         cols = np.nonzero(w)[0].astype(np.int32)
         return cols, w[cols].astype(np.float32, copy=False)
 
-    def _head_logit(self, h: np.ndarray, cols: np.ndarray, vals: np.ndarray) -> float:
-        return float(np.dot(h[cols], vals))
-
-    def _read(self, h: np.ndarray, name: str) -> float:
-        slot = self._read_slots.get(name)
-        if slot is None:
-            slot = self.slot_of[self._dim_by_name[name]]
-            self._read_slots[name] = slot
-        return float(h[slot])
-
     # ── Machine protocol (mirrors evaluator.Cpu6502Runtime, so the NES
     # bus's GraphCore adapter can drive this machine unchanged) ──────
 
@@ -789,7 +757,7 @@ class Cpu6502TransformerMachine:
         self._nmi_pending = True
         # In the native run loop the pending-NMI flag lives in the engine
         # (the per-step path passes it as an argument instead).
-        if self._cpp_step and getattr(self._engine, "has_run_loop", False):
+        if self._engine.has_run_loop:
             self._engine.set_nmi()
 
     def inject_write(self, addr: int, value: int):
@@ -799,17 +767,8 @@ class Cpu6502TransformerMachine:
         addr &= 0xFFFF
         value &= 0xFF
         self._ram[addr] = value
-        if self._direct_writes:
-            self._engine.insert_write(addr, value, self.pos)
-            self.pos += 1
-            return
-        rt = self.rt
-        self._forward_values({
-            rt.byte_value: value & 0xFF,
-            rt.is_memory_write: 1,
-            rt.addr_lo: addr & 0xFF,
-            rt.addr_hi: (addr >> 8) & 0xFF,
-        })
+        self._engine.insert_write(addr, value, self.pos)
+        self.pos += 1
 
     def _machine_step_cpp(self) -> TraceRow:
         """One instruction entirely in generated C++ (embed, layers,
@@ -879,72 +838,7 @@ class Cpu6502TransformerMachine:
             and self.pos - self._seed_pos >= self._checkpoint_tokens
         ):
             self.checkpoint()
-        if self._cpp_step:
-            return self._machine_step_cpp()
-        rt = self.rt
-        st = self._mstate
-        p = st["p"]
-        nmi = 1 if self._nmi_pending else 0
-        self._nmi_pending = False
-        flag = Cpu6502Runtime._flag_bit
-        h = self._forward_values({
-            rt.is_state: 1,
-            rt.in_pc_lo: st["pc"] & 0xFF,
-            rt.in_pc_hi: (st["pc"] >> 8) & 0xFF,
-            rt.in_a: st["a"], rt.in_x: st["x"], rt.in_y: st["y"], rt.in_s: st["s"],
-            rt.in_p_c: flag(p, reference.FLAG_C), rt.in_p_z: flag(p, reference.FLAG_Z),
-            rt.in_p_i: flag(p, reference.FLAG_I), rt.in_p_d: flag(p, reference.FLAG_D),
-            rt.in_p_b: flag(p, reference.FLAG_B), rt.in_p_u: flag(p, reference.FLAG_U),
-            rt.in_p_v: flag(p, reference.FLAG_V), rt.in_p_n: flag(p, reference.FLAG_N),
-            rt.in_ir: st["ir"], rt.in_oplo: st["oplo"], rt.in_ophi: st["ophi"],
-            rt.in_ea_lo: st["ea"] & 0xFF, rt.in_ea_hi: (st["ea"] >> 8) & 0xFF,
-            rt.in_data: st["data"], rt.in_halted: st["halted"],
-            rt.in_nmi: nmi,
-        })
-
-        def read(name, mask):
-            return int(round(self._read(h, name))) & mask
-
-        writes = []
-        for store, addr, value in (
-            ("is_store", "write_addr_out", "write_value_out"),
-            ("is_store2", "write_addr2_out", "write_value2_out"),
-            ("is_store3", "write_addr3_out", "write_value3_out"),
-        ):
-            if read(store, 0xFF):
-                writes.append(MemWrite(self._trace_len, read(addr, 0xFFFF), read(value, 0xFF)))
-
-        halted = read("new_halted", 0xFF) != 0
-        row = TraceRow(
-            step=self._trace_len,
-            state=Cpu6502State(
-                pc=read("current_pc", 0xFFFF),
-                a=read("new_a", 0xFF), x=read("new_x", 0xFF), y=read("new_y", 0xFF),
-                s=read("new_s", 0xFF), p=read("new_p", 0xFF),
-                ir=read("fetched_opcode", 0xFF),
-                operand_lo=read("fetched_operand_lo", 0xFF),
-                operand_hi=read("fetched_operand_hi", 0xFF),
-                ea=read("ea", 0xFFFF), data=read("data_out", 0xFF),
-                halted=halted,
-            ),
-            writes=tuple(writes),
-        )
-        self._trace_len += 1
-
-        for w in row.writes:
-            self._insert_write(w.addr, w.value)
-
-        s = row.state
-        st.update(
-            pc=read("next_pc", 0xFFFF), a=s.a, x=s.x, y=s.y, s=s.s, p=s.p,
-            ir=s.ir, oplo=s.operand_lo, ophi=s.operand_hi,
-            ea=s.ea, data=s.data, halted=1 if s.halted else 0,
-        )
-        halt_logit = self._head_logit(h, self._halt_head_cols, self._halt_head_vals)
-        state_logit = self._head_logit(h, self._state_head_cols, self._state_head_vals)
-        if halted or halt_logit > state_logit:
-            self.machine_halted = True
-        return row
+        return self._machine_step_cpp()
 
     def run_image(self, memory_image, *, start_pc: int, max_steps: int) -> Trace:
         self.boot_image(list(memory_image), start_pc=start_pc)
@@ -956,15 +850,11 @@ class Cpu6502TransformerMachine:
         return trace
 
     # ── C++ run loop (KernelBus shape) ──────────────────────────────
-    # The generated int/f32 engine can run the whole instruction stream
-    # natively, pausing back to Python only on halt / jump-to-self trap /
-    # watched device access / cycle budget (removes the per-step Python
-    # protocol floor).  These helpers expose it for the streaming Klaus /
-    # nestest harnesses; the NES console drives it through WeightsKernelBus.
+    # Native streaming API used by Klaus, nestest, and KernelBus.
 
     @property
     def supports_run_loop(self) -> bool:
-        return self._cpp_step and getattr(self._engine, "has_run_loop", False)
+        return self._engine.has_run_loop
 
     def _seed_run_state(self) -> None:
         st = self._mstate

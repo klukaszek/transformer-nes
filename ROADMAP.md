@@ -68,9 +68,14 @@ in priority order — the lockstep chain is the safety net for all of it:
    diagnostic.  Same sweep: verify the Python per-step branch of
    machine_step is unreachable (has_machine_step is always true for
    built engines) and excise it.
+   **Partial:** the unreachable Python `machine_step` and WRITE-token fallback
+   are gone. Engine construction now rejects missing native step/direct-write
+   support. Diagnostic arithmetic modes remain pending an explicit decision.
 4. **One C++ run loop.**  kernel.py and engine_gen emit two
    near-identical run loops (watch/lease/trace/budget protocol).
    Template it once; the KernelBus contract is the spec.
+   **Partial:** opcode read-mode and cycle tables now come from
+   `cpu6502/run_protocol.py`, removing the first duplicated protocol logic.
 5. **Integer register scores** (finishes the f64 retirement in the
    runtime): keys are integer-valued now, so reg_s goes i64 and the
    position features leave the hot path; the score-form license moves

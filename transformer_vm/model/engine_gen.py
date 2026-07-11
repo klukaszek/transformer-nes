@@ -1,17 +1,9 @@
-"""Generated straight-line C++ engine for the analytic transformer weights.
+"""Emit model-specific C++ for analytic transformer weights.
 
-A generic CSR forward spends almost all its time on the dependent scalar gather -- loading indices[k]/data[k] and chasing them (~1.5-2 ns/nnz; the hulls are only ~8%).  This module applies the kernel.py trick to the weights: it emits one C++ translation unit specific to the built model, with column indices as immediates and +-1 coefficients as add/sub, so those loads disappear.
-
-Three arithmetic modes:
-
-- ``arith="int32"`` (default): the residual stream is exact fixed-point
-  int32 at scale 2**F (F=1 covers the half-integer values the +-0.5 direct-map coefficients produce; every rescaling shift is guarded and throws rather than round).  Every residual-feeding coefficient is an integer, all lookup heads are LATEST tie-break so hull outputs return the values that were inserted, and the STATE/HALT head rows are integers -- the whole non-attention computation is exact integer arithmetic.  Partial sums may wrap mod 2^32 (-fwrapv); every final value fits, so results are exact.  Q/K/V and the position features live in double, feeding the hulls directly (hulls always resolve in double anyway), and clear_key-gated inserts (ky -= 1e30, provably never a query winner) are skipped entirely.
-
-- ``arith="int64"``: the same emission at int64 width (no wrap argument needed); measured slower than int32 -- the linear part is load-bound, so value density wins.
-
-- ``arith="f32"``: float32 arithmetic (CSR column order, left-to-right accumulation, float32 hexfloat literals); kept as a benchmarking reference for the int paths.
-
-The direct-WRITE key construction mirrors graph.core's `_to_2d_key` (kx = 2*local, ky = -local^2, exact ties resolved by the LATEST tie-break).
+Sparse indices and coefficients become C++ expressions, removing CSR gather
+overhead. ``int32`` is the exact fixed-point production path; ``int64`` and
+``f32`` remain diagnostic modes. Attention uses exact memory structures,
+running argmax registers, or hulls according to :mod:`model.classify`.
 """
 
 from __future__ import annotations
@@ -27,6 +19,7 @@ import time
 import numpy as np
 import scipy.sparse as sp
 
+from transformer_vm.cpu6502.run_protocol import cycle_table, read_mode_table
 from transformer_vm.model.classify import memory_query, register_query
 
 _ATTENTION_DIR = os.path.join(
@@ -42,6 +35,7 @@ _CODE_FILES = (
     "cpu6502/spec.py",
     "cpu6502/evaluator.py",
     "cpu6502/reference.py",
+    "cpu6502/run_protocol.py",
     "cpu6502/windows.py",
     "cpu6502/weights_runner.py",
 )
@@ -229,54 +223,6 @@ def _load_seqmod_module(digest: str, arith: str) -> tuple[object, float]:
         verbose=False,
     )
     return module, time.perf_counter() - build_start
-
-
-def _read_mode_table() -> list[int]:
-    """Shadow-decode table for MMIO read watches, byte -> mode code.
-
-    0 when the instruction never reads a memory operand, else a code the
-    generated shadow_read_target() uses to compute the operand address from
-    (pc, x, y) and the RAM mirror.  Same construction as kernel.py's table
-    (shared source of truth: spec.OPCODES / READS_MEMORY); the C++ run loop
-    needs it to pause before a device read exactly as the kernel does.
-    """
-    from transformer_vm.cpu6502.spec import (
-        MODE_ABSOLUTE,
-        MODE_ABSOLUTE_X,
-        MODE_ABSOLUTE_Y,
-        MODE_INDIRECT_X,
-        MODE_INDIRECT_Y,
-        MODE_ZERO_PAGE,
-        MODE_ZERO_PAGE_X,
-        MODE_ZERO_PAGE_Y,
-        OPCODES,
-        READS_MEMORY,
-    )
-
-    code = {
-        MODE_ZERO_PAGE: 1, MODE_ZERO_PAGE_X: 2, MODE_ZERO_PAGE_Y: 3,
-        MODE_ABSOLUTE: 4, MODE_ABSOLUTE_X: 5, MODE_ABSOLUTE_Y: 6,
-        MODE_INDIRECT_X: 7, MODE_INDIRECT_Y: 8,
-    }
-    table = [0] * 256
-    for byte, op in OPCODES.items():
-        if op.operation in READS_MEMORY and op.mode in code:
-            table[byte] = code[op.mode]
-    return table
-
-
-def _cycles_table() -> list[int]:
-    """Base cycle count per opcode byte (0 for unknown bytes); NMI costs 7.
-
-    Base cycles only, no branch-taken or page-cross penalties -- identical to
-    kernel.py / nes.bus, so a run-loop cycle budget paces frames the same way.
-    """
-    from transformer_vm.cpu6502.spec import OPCODES
-
-    table = [0] * 256
-    for byte, op in OPCODES.items():
-        table[byte] = op.cycles
-    return table
 
 
 def _lit(value: float) -> str:
@@ -470,13 +416,8 @@ _FIXED_POINT_HELPERS = """\
 
 # Exact nearest-written-address argmax over one 4 KiB memory group.
 _MEM_QUERY = """\
-    // Exact replacement for the memory-group hull argmax: the
-    // grouped parabola score -(q-a)^2 + q^2 + alpha*ilp(seq) is
-    // maximized by the nearest written address; recency breaks
-    // equidistant ties toward the later write, and below the
-    // double ulp the hull's LATEST tie-break agrees.  One shared
-    // structure per 4 KiB group serves every layer's heads (all
-    // per-layer memory hulls held identical data).
+    // Exact memory-head argmax: nearest address wins; equal-distance
+    // ties use the latest write. One structure serves each 4 KiB group.
     int mem_val[16][4096];
     long long mem_seq[16][4096];
     unsigned long long mem_bits[16][64];
@@ -860,47 +801,14 @@ def _assemble_seq_module(lines, body, experts, core_digest, elem,
 
 
 def generate_source(model, step_spec: dict | None = None,
-                    arith: str = "int64", experts=None,
+                    arith: str = "int32", experts=None,
                     seq_module_core: str | None = None) -> tuple[str, int, bool]:
-    """Emit the C++ source; returns (source, n_memory_heads, has_step).
+    """Return ``(source, memory_head_count, has_machine_step)``.
 
-    step_spec, if given, additionally emits a machine_step member that runs
-    one whole 6502 instruction in C++ -- STATE-token embedding, position
-    features, the layer stack, readout, write extraction with direct hull
-    inserts, and the STATE/HALT head logits -- writing results into a
-    caller-provided int64 buffer.  Layout: {"inputs": {name: slot},
-    "p_flags": [(slot, mask)], "outputs": {name: slot},
-    "halt_head"/"state_head": (cols, vals)}.
-
-    experts, if given, is a list of opcode-routed *rebuilt expert models*
-    (a genuine top-1 hard-routed MoE).  Each is a dict ``{"name": "4C",
-    "byte": 0x4C, "model": WeightModel, "step_spec": dict,
-    "union_lookup_of": {expert_lu_id: union_lu_id}}`` -- a full transformer
-    built from the union graph partially evaluated under the pinned decode
-    one-hot (graph/fold.py), scheduled and weight-compiled independently, so
-    a gate=1 mux fold really disappears instead of surviving as a union
-    neuron.  Expert residual layouts are private; the interface between
-    experts is the persistent machine state: the ``st_*`` registers, the RAM
-    mirror, the 16x4KiB memory structure, and the running-argmax registers,
-    which are keyed by (union lookup id, value pair) and resolved through
-    the fold's provenance.  An expert head whose classification disagrees
-    with the union's (a memory head failing structure eligibility, a
-    constant-query head with no union register, or a head needing a real
-    hull) is a hard generation error: a per-expert hull would accumulate
-    divergent history across routed steps.  The run loop / machine_step
-    dispatch on ``ram[st_pc]`` (== the fetched opcode; the fold's pin) and
-    fall back to the union step for cold opcodes and pending NMIs.
-
-    seq_module_core, if given, is the digest of an already-emitted core
-    engine: instead of a full engine, emit a tiny per-ROM *sequence module*
-    -- the given kind="seq" experts compiled against the core's generated
-    header, reaching all shared machine state (st_* registers, RAM mirror,
-    memory structure, running-argmax registers) through a typed engine
-    reference, and exporting its window dispatch as a raw function pointer
-    for the core's attach_seq() hook.  ``model`` must be the same union
-    model the core was emitted from: the union planning pass runs here only
-    to reproduce the core's shared-state allocation (register indices) so
-    the module folds into the same registers.
+    ``step_spec`` enables the native machine protocol. ``experts`` contains
+    independently folded opcode or sequence models whose attention state is
+    resolved through union lookup provenance. ``seq_module_core`` switches
+    emission from the core engine to a per-ROM module attached to that core.
     """
     experts = experts or []
     seq_mode = seq_module_core is not None
@@ -1125,12 +1033,8 @@ def generate_source(model, step_spec: dict | None = None,
 
                 if mem_ok:
                     # Memory-group lookup served by the exact nearest-address
-                    # structure: with qy == 1, the parabola score makes the
-                    # argmax the nearest written address, recency breaking
-                    # equidistant ties toward the later write (below the
-                    # double ulp the hull's LATEST tie-break picks the same
-                    # winner).  Writes arrive only via insert_write; the hull
-                    # stays empty and its guard makes that contract loud.
+                    # structure. Nearest address wins and equal-distance ties
+                    # use the latest write. The hull remains empty by design.
                     g = mem_groups[h]
                     qi_expr = _expr_int([i for _c, i in mem_terms],
                                         [c for c, _i in mem_terms],
@@ -1525,8 +1429,8 @@ def generate_source(model, step_spec: dict | None = None,
         # kernel: a 64 KiB RAM mirror (for MMIO shadow decode), the
         # architectural registers, pending-NMI/read-skip flags, counters,
         # watch ranges, and the base-cycle / read-mode tables.
-        read_mode = ", ".join(str(v) for v in _read_mode_table())
-        cycles_tab = ", ".join(str(v) for v in _cycles_table())
+        read_mode = ", ".join(str(v) for v in read_mode_table())
+        cycles_tab = ", ".join(str(v) for v in cycle_table())
         emit("")
         emit("    unsigned char ram[65536];  // mirror of the write log, for shadow decode")
         emit("    int st_pc = 0, st_a = 0, st_x = 0, st_y = 0, st_s = 0xFD, st_p = 0x24;")
@@ -1737,8 +1641,7 @@ def generate_source(model, step_spec: dict | None = None,
         emit("")
         emit(_SEQ_HOOK)
         emit("")
-        emit("    // Per-instruction entry point: seed st_* from arguments, run one")
-        emit("    // step.  Kept so the Python per-step path is byte-identical.")
+        emit("    // Per-instruction entry point used by machine_step().")
         emit("    void machine_step(int pc, int a, int xr, int yr, int sr,")
         emit("                      int p, int ir, int oplo, int ophi,")
         emit("                      int ea, int data, int halted, int nmi,")
