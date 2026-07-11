@@ -27,7 +27,11 @@ from transformer_vm.cpu6502.run_protocol import (
     run_loop_cpp,
     run_state_members_cpp,
 )
-from transformer_vm.model.classify import memory_query, register_query
+from transformer_vm.model.classify import (
+    integer_score_terms,
+    memory_query,
+    register_query,
+)
 
 _ATTENTION_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "attention"
@@ -678,10 +682,13 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     # order, expert passes resolve through the fold's lookup provenance.
     reg_of: dict[tuple[int, int], int] = {}
 
-    # Position features stay double and never enter integer residual rows.
+    # Position features stay double and never enter integer residual rows;
+    # they reach the emission only through hull-path fallbacks, so a model
+    # with no such head drops them (and their per-forward log()) entirely.
     elem = "int"
     f_bits = 1
     inv_scale = f"0x1p-{f_bits}"
+    uses_pf: set[bool] = set()
 
     def xref(i):
         if i <= 2:
@@ -696,10 +703,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
 
     def row_raw(indices, data, ref, where):
         return _expr_int(indices, data, ref, where)
-
-    layer_sig = f"{elem}* x, const double* pf"
-    if seq_mode:
-        layer_sig = f"Eng& E, {layer_sig}"
 
     def plan_model(mdl, label, union_lookup_of=None):
         """Per-layer emission plans for one model.
@@ -809,11 +812,27 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     )
 
                 reg_q = None
+                reg_score = None
                 v0_i = v1_i = None
                 if not mem_ok:
                     reg_q = register_query(qx_terms, qy_terms,
                                            one_id=mdl.one_slot,
                                            latest=bool(tiebreak[h]))
+                    if reg_q is not None:
+                        # The integer score form is part of the register
+                        # license: qx == qy > 0 makes the score a positive
+                        # multiple of kx + ky, and the clear gate an exact
+                        # zero test -- no f64 in the fold or the compare.
+                        k0_idx, k0_dat = _row(ip, dm + 2 * h)
+                        k1_idx, k1_dat = _row(ip, dm + 2 * h + 1)
+                        reg_score = integer_score_terms(
+                            reg_q[0], reg_q[1],
+                            list(zip(k0_dat, k0_idx, strict=True)),
+                            list(zip(k1_dat, k1_idx, strict=True)),
+                            banned_ids=(0, 1, 2),
+                        )
+                        if reg_score is None:
+                            reg_q = None
                     if reg_q is not None:
                         try:
                             v0_i = _expr_int(*_row(ip, 2 * dm + 2 * h),
@@ -832,12 +851,28 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     qi_expr = _expr_int([i for _c, i in mem_terms],
                                         [c for c, _i in mem_terms],
                                         xref, f"{label} L{li} mem query")
-                    k1 = _expr_dbl(*_row(ip, dm + 2 * h + 1), dref)
+                    k1_idx, k1_dat = _row(ip, dm + 2 * h + 1)
+                    guard = integer_score_terms(
+                        1.0, 1.0, [],
+                        list(zip(k1_dat, k1_idx, strict=True)),
+                        banned_ids=(0, 1, 2),
+                    )
                     b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
                     b.append("        {")
                     b.append(f"            if (hull_seen[{hid}] != {E}seq) {{")
-                    b.append(f"                const double kyg = {k1};")
-                    b.append("                if (kyg > -1.0e29)")
+                    if guard is not None:
+                        # A live (unrescinded) K row means the model would
+                        # insert into a memory hull, which this engine cannot
+                        # do; the clear gate is an exact zero test.
+                        live_cond = " && ".join(
+                            f"x[{g_id}] == 0" for g_id in guard[1]
+                        ) or "true"
+                        b.append(f"                if ({live_cond})")
+                    else:
+                        uses_pf.add(True)
+                        k1 = _expr_dbl(*_row(ip, dm + 2 * h + 1), dref)
+                        b.append(f"                const double kyg = {k1};")
+                        b.append("                if (kyg > -1.0e29)")
                     b.append('                    throw std::runtime_error('
                              '"live forward insert into a memory-group hull");')
                     b.append(f"                hull_seen[{hid}] = {E}seq;")
@@ -872,14 +907,19 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                                 f"{label} L{li} head {h}: constant-query head "
                                 f"has no union register (lookup {lu_id} pair {pair})"
                             )
-                    qx, qy = reg_q
-                    k0 = _expr_dbl(*_row(ip, dm + 2 * h), dref)
-                    k1 = _expr_dbl(*_row(ip, dm + 2 * h + 1), dref)
+                    score_terms, gate_ids = reg_score
+                    s_expr = _expr_int(
+                        [i for _c, i in score_terms],
+                        [c for c, _i in score_terms],
+                        xref, f"{label} L{li} reg score",
+                    )
+                    live_cond = " && ".join(
+                        f"x[{g_id}] == 0" for g_id in gate_ids
+                    ) or "true"
                     b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
                     b.append("        {")
-                    b.append(f"            const double kyv = {k1};")
-                    b.append("            if (kyv > -1.0e29) {  // live: fold into the running argmax")
-                    b.append(f"                const double s = {_lit_d(qx)}*({k0}) + {_lit_d(qy)}*kyv;")
+                    b.append(f"            if ({live_cond}) {{  // live: fold into the running argmax")
+                    b.append(f"                const long long s = {s_expr};")
                     b.append(f"                if (!{E}reg_any[{r}] || s >= {E}reg_s[{r}]) {{")
                     b.append(f"                    {E}reg_any[{r}] = true;")
                     b.append(f"                    {E}reg_s[{r}] = s;")
@@ -898,6 +938,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                             "the union's across routed steps)"
                         )
                     n_hull_heads += 1
+                    uses_pf.add(True)
                     if mem_groups[h] >= 0:
                         mem_fallback_hulls.append(hid)
                     # Q/K/V straight to double: the hull resolves in double
@@ -991,6 +1032,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         for exp in experts
     ]
     n_regs = len(reg_of)
+    use_pf = bool(uses_pf)
+    layer_sig = f"{elem}* x" + (", const double* pf" if use_pf else "")
+    if seq_mode:
+        layer_sig = f"Eng& E, {layer_sig}"
 
     # ── Emit the layer functions: one body per model -- the union stack
     # plus each rebuilt expert's own (smaller) stack.  Expert bodies are
@@ -1072,16 +1117,17 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit(f"        x[{ins['halted']}] = {sc(f'{E}st_halted ? 1 : 0')};")
         emit(f"        x[{ins['nmi']}] = {sc(f'{E}nmi_pending ? 1 : 0')};")
         emit(f"        {E}nmi_pending = false;")
-        emit(f"        const long long pos = {E}seq + 1;")
-        emit("        const double pf[3] = {")
-        emit("            (double)pos,")
-        emit("            1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0),")
-        emit("            (double)pos * (double)pos,")
-        emit("        };")
+        if use_pf:
+            emit(f"        const long long pos = {E}seq + 1;")
+            emit("        const double pf[3] = {")
+            emit("            (double)pos,")
+            emit("            1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0),")
+            emit("            (double)pos * (double)pos,")
+            emit("        };")
         emit(f"        ++{E}seq;")
         for li in range(len(mdl.attn)):
             emit(f"        layer_{li}{layer_suffix}("
-                 f"{'E, ' if seq_mode else ''}x, pf);")
+                 f"{'E, ' if seq_mode else ''}x{', pf' if use_pf else ''});")
         for k, outs in enumerate(step_outs):
             off = 21 * k
             for i, (name, mask) in enumerate((
@@ -1159,8 +1205,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit(_MEM_QUERY)
     if n_regs:
         emit("")
-        emit("    // Running argmax for constant-query heads.")
-        emit(f"    double reg_s[{n_regs}];")
+        emit("    // Running argmax for constant-query heads (exact integer")
+        emit("    // scores; the query scale drops out of the ordering).")
+        emit(f"    long long reg_s[{n_regs}];")
         emit(f"    {elem} reg_v0[{n_regs}], reg_v1[{n_regs}];")
         emit(f"    bool reg_any[{n_regs}];")
     if has_run:
@@ -1199,13 +1246,14 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit('        if ((int)x_arr.size() != D) throw std::runtime_error("x size != d_model");')
     emit("        float* x = x_arr.mutable_data();")
     emit("        ++seq;")
-    emit("        const double pf[3] = {(double)x[0], (double)x[1], (double)x[2]};")
+    if use_pf:
+        emit("        const double pf[3] = {(double)x[0], (double)x[1], (double)x[2]};")
     emit(f"        {elem}* xi = xbuf;")
     emit("        xi[0] = 0; xi[1] = 0; xi[2] = 0;")
     emit("        for (int i = 3; i < D; ++i)")
     emit(f"            xi[i] = ({elem})(long long)std::nearbyint((double)x[i] * SCALE_D);")
     for li in range(n_layers):
-        emit(f"        layer_{li}(xi, pf);")
+        emit(f"        layer_{li}(xi{', pf' if use_pf else ''});")
     emit("        for (int i = 3; i < D; ++i) x[i] = (float)((double)xi[i] / SCALE_D);")
     emit("    }")
     emit("")

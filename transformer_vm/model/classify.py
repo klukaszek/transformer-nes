@@ -84,3 +84,52 @@ def register_query(
     if qx is None or qy is None:
         return None
     return qx, qy
+
+
+# clear_key gating shifts a key by -1e30; anything past this threshold is a
+# gate term, and the live/gated test on the double key is "ky > -1e29".
+CLEAR_GATE_MIN = 1e29
+
+
+def integer_score_terms(
+    qx: float,
+    qy: float,
+    kx_terms: Iterable[Term],
+    ky_terms: Iterable[Term],
+    *,
+    banned_ids: Iterable[int] = (),
+) -> tuple[list[Term], list[int]] | None:
+    """The integer form of a running-argmax score, if licensed.
+
+    With a constant query, qx == qy > 0 makes the score a positive multiple
+    of kx + ky, so the integer sum preserves the argmax and its >= ties
+    exactly.  ky's clear-gate terms (coeff <= -CLEAR_GATE_MIN on 0/1 gate
+    dims) split out as an exact zero test replacing the "ky > -1e29" guard;
+    after merging, every remaining coefficient must be an integer or +-0.5
+    below 2**24 reading none of ``banned_ids`` (the position features).
+    Returns ``(score_terms, gate_ids)`` or None.
+    """
+    if not (math.isfinite(qx) and qx == qy and qx > 0.0):
+        return None
+    banned = set(banned_ids)
+    gates: list[int] = []
+    acc: dict[int, float] = {}
+    for terms, allow_gate in ((kx_terms, False), (ky_terms, True)):
+        for c, i in terms:
+            c = float(c)
+            if not c:
+                continue
+            if i in banned:
+                return None
+            if allow_gate and c <= -CLEAR_GATE_MIN:
+                gates.append(i)
+                continue
+            acc[i] = acc.get(i, 0.0) + c
+    for c in acc.values():
+        if (
+            not math.isfinite(c)
+            or abs(c) >= 2**24
+            or (c != int(c) and abs(c) != 0.5)
+        ):
+            return None
+    return [(c, i) for i, c in acc.items() if c], gates
