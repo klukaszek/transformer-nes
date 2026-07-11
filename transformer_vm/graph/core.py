@@ -6,7 +6,6 @@ milp_schedule.py + build_model.py.
 """
 
 BIG = 1e30  # large constant used to effectively zero-out attention keys (clear_key mechanism)
-KEY_OFFSET = 0  # offset applied to all attention keys (for numerical stability tuning)
 
 _all_dims = []
 _all_lookups = []
@@ -170,11 +169,6 @@ position = InputDimension("position")
 inv_log_pos = InputDimension("inv_log_pos")
 position_sq = InputDimension("position_sq")
 
-# Retired to 0 (2026-07-10): recency scoring only ever broke exact ties,
-# which TieBreak::LATEST resolves positionally; with the term gone every
-# weight coefficient is an integer, +-0.5, or a clear sentinel -- exact in
-# any dtype with 24 mantissa bits.
-LATEST_ALPHA = 0.0
 
 
 class PersistDimension(Dimension):
@@ -292,8 +286,14 @@ def persist(expr, name=None):
 
 
 def _to_2d_key(k, clear_key_expr=None, tie_break="latest"):
-    """Map 1D key + optional clear_key to 2D key expressions via ReGLU."""
-    one_expr = Expression({one: 1})
+    """Map 1D key + optional clear_key to 2D key expressions via ReGLU.
+
+    Scores carry no recency term: exact ties are the tie-break's job
+    (TieBreak::LATEST, positional), which keeps every key coefficient an
+    integer function of the key expression.
+    """
+    if tie_break != "latest":
+        raise ValueError(f"only the LATEST tie-break is constructible, not {tie_break!r}")
     if len(k.terms) == 1 and one in k.terms:
         c = k.terms[one]
         k_abs = Expression({one: c * c})
@@ -302,8 +302,8 @@ def _to_2d_key(k, clear_key_expr=None, tie_break="latest"):
         k_abs = Expression({position_sq: c * c})
     else:
         k_abs = _make_multiply(k, k)
-    kx = k * 2 - one_expr * (2 * KEY_OFFSET)
-    ky = -k_abs + k * (2 * KEY_OFFSET) - one_expr * (KEY_OFFSET**2)
+    kx = k * 2
+    ky = -k_abs
     if clear_key_expr is not None:
         if len(clear_key_expr.terms) == 1:
             clear = clear_key_expr
@@ -313,17 +313,12 @@ def _to_2d_key(k, clear_key_expr=None, tie_break="latest"):
                 _clear_key_cache[ck_key] = persist(clear_key_expr)
             clear = _clear_key_cache[ck_key]
         ky = ky - clear * BIG
-    if tie_break == "latest" and LATEST_ALPHA:
-        ky = ky + Expression({inv_log_pos: LATEST_ALPHA})
-    elif tie_break == "average":
-        ky = Expression({one: 1})
     return [kx, ky]
 
 
 def _to_2d_query(q):
     """Map 1D query to 2D query expressions (purely linear)."""
-    one_expr = Expression({one: 1})
-    return [q - one_expr * KEY_OFFSET, one_expr]
+    return [q, Expression({one: 1})]
 
 
 def fetch(value, query=None, key=None, clear_key=None, tie_break="latest"):

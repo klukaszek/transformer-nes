@@ -11,7 +11,7 @@ Three arithmetic modes:
 
 - ``arith="f32"``: float32 arithmetic (CSR column order, left-to-right accumulation, float32 hexfloat literals); kept as a benchmarking reference for the int paths.
 
-All modes generate the direct-WRITE key construction from graph.core's LATEST_ALPHA/KEY_OFFSET instead of hand-copying it, so the generated engine cannot silently desync from the graph.
+The direct-WRITE key construction mirrors graph.core's `_to_2d_key` (kx = 2*local, ky = -local^2, exact ties resolved by the LATEST tie-break).
 """
 
 from __future__ import annotations
@@ -26,8 +26,6 @@ import time
 
 import numpy as np
 import scipy.sparse as sp
-
-from transformer_vm.graph.core import KEY_OFFSET, LATEST_ALPHA
 
 _ATTENTION_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "attention"
@@ -903,11 +901,6 @@ def generate_source(model, step_spec: dict | None = None,
     """
     experts = experts or []
     seq_mode = seq_module_core is not None
-    if KEY_OFFSET != 0:
-        raise RuntimeError(
-            "generated engine assumes KEY_OFFSET == 0 in the lookup key "
-            "construction; regenerate the emission for a shifted key"
-        )
     if arith not in ("int64", "int32", "f32"):
         raise ValueError(f"unknown arith {arith!r}")
     is_int = arith in ("int64", "int32")
@@ -1640,11 +1633,7 @@ def generate_source(model, step_spec: dict | None = None,
         emit("        const int local_i = addr - group * 4096;")
         emit("        const float local = (float)local_i;")
         emit("        const float kx_f = 2.0f * local;")
-        if LATEST_ALPHA:
-            emit("        const float inv_log_pos = (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
-            emit(f"        const float ky_f = -local * local + {_lit(LATEST_ALPHA)} * inv_log_pos;")
-        else:
-            emit("        const float ky_f = -local * local;")
+        emit("        const float ky_f = -local * local;")
         emit("        const double key[2] = {(double)kx_f, (double)ky_f};")
         emit("        const double val[2] = {(double)(value & 0xFF), (double)(addr & 0xFFFF)};")
         emit(f"        static const int offs[17] = {{{', '.join(map(str, hull_offs))}}};")
@@ -1801,7 +1790,6 @@ class GeneratedWeightsEngine:
     def __init__(self, model, *, step_spec: dict | None = None,
                  arith: str = "int32", experts=None, cache_key: str | None = None,
                  shapes_meta=None):
-        self.dtype = "float32"
         self.arith = arith
         self.n_experts = len(experts or [])
         # Shape-window scan metadata (id/signature/length/close rule) so a
@@ -1846,7 +1834,6 @@ class GeneratedWeightsEngine:
         ):
             return None
         self = cls.__new__(cls)
-        self.dtype = "float32"
         self.arith = entry["arith"]
         self.digest = entry["digest"]
         self.n_experts = entry["n_experts"]

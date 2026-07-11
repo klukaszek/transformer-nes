@@ -36,8 +36,6 @@ def _lockstep_vs_reference(trace, image):
 @pytest.mark.slow
 def test_transformer_weights_match_reference():
     machine = Cpu6502TransformerMachine(bcd=False)
-    assert machine.matmul == "codegen"
-    assert machine.dtype == "float32"
     image = verify_program()
     trace = machine.run_image(image, start_pc=VERIFY_START, max_steps=30)
     assert len(trace.rows) == 30
@@ -50,8 +48,6 @@ def test_transformer_float32_engine_matches_high_address_nestest_prefix():
 
     image = load_image()
     machine = Cpu6502TransformerMachine(bcd=False)
-    assert machine.matmul == "codegen"
-    assert machine.dtype == "float32"
     trace = machine.run_image(bytes(image), start_pc=START_PC, max_steps=20)
 
     ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)

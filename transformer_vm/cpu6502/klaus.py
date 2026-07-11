@@ -158,8 +158,7 @@ def run_weights(image: bytes, *, max_steps: int,
     machine = Cpu6502TransformerMachine(
         bcd=True, checkpoint_tokens=checkpoint_tokens,
     )
-    arith = getattr(machine._engine, "arith", None)
-    mode = f"{machine.matmul}-{arith}" if arith else f"{machine.matmul}/{machine.dtype}"
+    mode = f"codegen-{machine._engine.arith}"
     build_elapsed = time.perf_counter() - build_start
 
     ref_cpu = Cpu6502(memory=bytearray(image))

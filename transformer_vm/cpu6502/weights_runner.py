@@ -271,9 +271,6 @@ class Cpu6502TransformerMachine:
         # exact fixed-point int32 residual.  The grouped memory lookup keeps
         # K-side address scores below 2^24, so float32 Q/K rounding still
         # distinguishes adjacent high addresses.
-        self.matmul = "codegen"
-        self.dtype = "float32"
-        self.np_dtype = np.float32
         self._state_head_cols, self._state_head_vals = self._head_row(self._state_row)
         self._halt_head_cols, self._halt_head_vals = self._head_row(self._halt_row)
 
@@ -371,7 +368,7 @@ class Cpu6502TransformerMachine:
         enumerated exactly these values; the three position features (slots
         0-2) are added by _forward_values.
         """
-        x = np.zeros(self.d_model, dtype=self.np_dtype)
+        x = np.zeros(self.d_model, dtype=np.float32)
         x[self._one_slot] = 1.0
         for dim, value in values.items():
             x[self.slot_of[dim]] = float(value)
@@ -844,7 +841,7 @@ class Cpu6502TransformerMachine:
     def _head_row(self, row: int) -> tuple[np.ndarray, np.ndarray]:
         w = self.model.head.weight[row]
         cols = np.nonzero(w)[0].astype(np.int32)
-        return cols, w[cols].astype(self.np_dtype, copy=False)
+        return cols, w[cols].astype(np.float32, copy=False)
 
     def _head_logit(self, h: np.ndarray, cols: np.ndarray, vals: np.ndarray) -> float:
         return float(np.dot(h[cols], vals))
