@@ -5,13 +5,12 @@ model in place: per expert opcode it keeps only the live subset of the
 union's neurons and heads, but a ReGLU whose gate folds to a positive
 constant under the pin (the taken branch of a mux) must still run as a
 neuron, because the union arithmetic is shared.  That is the measured gap
-between the in-place experts (~0.29x of the union terms kept) and the
-moe_probe partial evaluation (~0.195x): the missing factor is exactly the
+between the in-place experts (~0.29x of the union terms kept) and full
+partial evaluation (~0.195x): the missing factor is exactly the
 gate=1 multiplies, which fold to plain linear maps and disappear into their
 consumers' expressions.
 
-This module graduates the probe's partial evaluator into a real graph
-transform.  ``GraphFolder.fold(pins)`` produces a new ProgramGraph --
+``GraphFolder.fold(pins)`` produces a new ProgramGraph --
 suitable for asap_schedule + build_model -- in which:
 
 - pinned decode gates (``is_op_XX``/``is_nmi`` persists) are constants;
@@ -126,7 +125,7 @@ class GraphFolder:
                 raise KeyError(f"root dim {name!r} not in the graph")
         self._hazard_cache: dict[frozenset[str], set] = {}
 
-    # ── Partial evaluation (the probe's rules, verbatim) ─────────────
+    # ── Partial evaluation ───────────────────────────────────────────
 
     def _partial_eval(self, pins: dict[str, float], frozen: frozenset = frozenset()):
         pg = self.pg

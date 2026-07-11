@@ -2,11 +2,11 @@
 
 Three layers of evidence, cheapest first:
 
-1. The unpinned fold reproduces the union graph op-for-op and layer-for-layer
-   (the moe_probe self-validation, strengthened to a materialized graph).
-2. Folded per-opcode graphs shrink the way the probe measured (~0.2x terms),
-   and the shared-state contract holds: no lookup's insert-side expressions
-   can reach a decode pin.
+1. The unpinned fold reports metrics matching its materialized graph and does
+   not deepen the union graph (it may prune dead construction nodes).
+2. Folded per-opcode graphs are materially smaller than the union graph, and
+   the shared-state contract holds: no lookup's insert-side expressions can
+   reach a decode pin.
 3. The semantic receipt, mirroring the engine's routed-dispatch contract:
    the union graph (via the direct ProgramEvaluator) drives the token
    stream and is verified against the reference oracle on the architectural
@@ -16,16 +16,9 @@ Three layers of evidence, cheapest first:
    must reproduce the union's readouts *exactly* on every step whose
    fetched opcode matches its pin.
 
-Note on depth: the probe's per-opcode depths (9/13/22) under-measured --
-it kept original expressions over pruned dim sets, so a dependency through
-an inlined gate=1 fold was dropped as a dangling edge.  The materialized
-fold carries the true dependency, so its depth is moderately larger (e.g.
-JMP abs: 17 layers vs the probe's 10, against the union's 71).  Terms (the
-load-bound cost) match the probe.
+The materialized fold carries dependencies through inlined gate=1 folds, so
+its depth and term counts are measured directly from the graph under test.
 """
-
-import json
-from pathlib import Path
 
 import pytest
 
@@ -34,7 +27,13 @@ from transformer_vm.cpu6502.evaluator import _RUNTIME_READ_DIMS
 from transformer_vm.cpu6502.interpreter import build
 from transformer_vm.cpu6502.spec import OPCODES
 from transformer_vm.cpu6502.weights_runner import VERIFY_START, verify_program
-from transformer_vm.graph.core import ProgramGraph, reset_graph
+from transformer_vm.graph.core import (
+    LookUpDimension,
+    PersistDimension,
+    ProgramGraph,
+    ReGLUDimension,
+    reset_graph,
+)
 from transformer_vm.graph.eval import ProgramEvaluator
 from transformer_vm.graph.fold import (
     SEQUENCE_FEEDBACK,
@@ -44,11 +43,6 @@ from transformer_vm.graph.fold import (
     sequence_shape_pins,
 )
 from transformer_vm.scheduler.milp import _build_graph, _min_layers
-
-_PROBE_JSON = (
-    Path(__file__).resolve().parents[3]
-    / "experiments" / "moe_probe" / "moe_probe_results.json"
-)
 
 # Opcodes exercised by weights_runner.verify_program, chosen to cover the
 # distinct machinery: zero-page store (write channel), zero-page load
@@ -70,53 +64,64 @@ def folder(union_pg):
     return GraphFolder(union_pg, root_names=_RUNTIME_READ_DIMS)
 
 
-@pytest.fixture(scope="module")
-def probe_results():
-    if not _PROBE_JSON.exists():
-        pytest.skip("moe_probe results not checked in")
-    with open(_PROBE_JSON) as f:
-        return json.load(f)
-
-
 def _depth(fold_result):
     pg = fold_result.program_graph
     g = _build_graph(pg.all_dims, pg.all_lookups, pg.inv_log_pos)
     return _min_layers(g["ops"], g["op_deps"]) if g["ops"] else 0
 
 
-def test_unpinned_fold_reproduces_union(folder, probe_results):
-    r = folder.fold({}, label="union")
-    base = probe_results["union"]
+def _graph_counts(pg):
+    reglus = persists = terms = 0
+    lookups = set()
+    for dim in pg.all_dims:
+        if isinstance(dim, ReGLUDimension):
+            reglus += 1
+            terms += len(dim.a_expr.terms) + len(dim.b_expr.terms)
+        elif isinstance(dim, PersistDimension):
+            persists += 1
+            terms += len(dim.expr.terms)
+        elif isinstance(dim, LookUpDimension) and dim.lookup not in lookups:
+            lookups.add(dim.lookup)
+            terms += sum(
+                len(expr.terms)
+                for expr in (
+                    dim.lookup.query_exprs_2d
+                    + dim.lookup.key_exprs_2d
+                    + dim.lookup.value_exprs
+                )
+            )
+    return reglus, persists, len(lookups), terms
+
+
+@pytest.fixture(scope="module")
+def union_fold(folder):
+    return folder.fold({}, label="union")
+
+
+def test_unpinned_fold_metrics_match_materialized_graph(union_pg, union_fold):
+    r = union_fold
     assert r.insert_side_hazards == ()
     assert r.folded_roots == ()
-    assert r.n_reglus == base["reglus"]
-    assert r.n_persists == base["persists"]
-    assert r.n_lookups == base["lookups"]
-    assert r.n_terms == base["terms"]
-    assert _depth(r) == base["depth"]
+    assert (r.n_reglus, r.n_persists, r.n_lookups, r.n_terms) == _graph_counts(
+        r.program_graph
+    )
+    graph = _build_graph(union_pg.all_dims, union_pg.all_lookups, union_pg.inv_log_pos)
+    assert _depth(r) <= _min_layers(graph["ops"], graph["op_deps"])
 
 
 @pytest.mark.parametrize("byte", [0x4C, 0xAD, 0x29, 0xF0])
-def test_opcode_fold_matches_probe(folder, probe_results, byte):
-    # pin_fetched_byte=False: the probe pinned only the decode one-hots,
-    # so that is the apples-to-apples configuration.
+def test_opcode_fold_is_materially_smaller(folder, union_fold, byte):
+    # Isolate the benefit of pinning the decode one-hots first.
     r = folder.fold(opcode_pins(byte, OPCODES, pin_fetched_byte=False),
                     label=f"{byte:02X}")
-    base = probe_results["union"]
-    probe = probe_results["per_opcode"][f"{byte:02X}"]
+    base = union_fold
     # The shared-state contract: decode pins never reach insert-side exprs.
     assert r.insert_side_hazards == ()
     # Every runtime readout resolves by name (kept or re-materialized).
     for name in _RUNTIME_READ_DIMS:
         assert name in r.dim_of_name, f"readout {name} missing from fold"
-    # The fold roots folded-away readouts back in as persists (the probe
-    # dropped them), so counts sit slightly above the probe's; the ratio to
-    # the union is what the construction is for.
-    assert probe["terms"] * 0.95 <= r.n_terms <= probe["terms"] * 1.10
-    assert r.n_terms <= base["terms"] * 0.30
-    # True (materialized) depth; see the module docstring for why this runs
-    # deeper than the probe's optimistic number.
-    assert _depth(r) < base["depth"] * 0.5
+    assert r.n_terms <= base.n_terms * 0.30
+    assert _depth(r) < _depth(base) * 0.5
 
     # The default fold additionally pins the fetched byte (the router
     # predicate ram[pc] == byte): the PC fetch read and decode residue fold

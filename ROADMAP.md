@@ -46,6 +46,9 @@ in priority order — the lockstep chain is the safety net for all of it:
    positional-slot bans, coefficient limits, non-finite values, and LATEST
    ties.  Receipt: all 85 tests green across the exact evaluator, generated
    kernel, generated weights engine, export runner, MMIO, and console.
+   The superseded `experiments/moe_probe/` scripts and frozen JSON results
+   were removed; fold receipts now compare directly with the live union graph
+   instead of treating research output as a test oracle.
 2. **Split weights_runner.**  Cpu6502TransformerMachine has accreted:
    machine protocol + engine cache orchestration + THREE expert builders
    + scanner + shape matcher + JIT + license checks + CLI.  Carve into
