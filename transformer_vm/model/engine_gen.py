@@ -19,7 +19,14 @@ import time
 import numpy as np
 import scipy.sparse as sp
 
-from transformer_vm.cpu6502.run_protocol import cycle_table, read_mode_table
+from transformer_vm.cpu6502.run_protocol import (
+    IN_RANGES_CPP,
+    MACHINE_API_CPP,
+    SHADOW_READ_TARGET_CPP,
+    mem_query_cpp,
+    run_loop_cpp,
+    run_state_members_cpp,
+)
 from transformer_vm.model.classify import memory_query, register_query
 
 _ATTENTION_DIR = os.path.join(
@@ -362,57 +369,9 @@ _FIXED_POINT_HELPERS = """\
         return v >> 1;
     }"""
 
-# Exact nearest-written-address argmax over one 4 KiB memory group.
-_MEM_QUERY = """\
-    // Exact memory-head argmax: nearest address wins; equal-distance
-    // ties use the latest write. One structure serves each 4 KiB group.
-    int mem_val[16][4096];
-    long long mem_seq[16][4096];
-    unsigned long long mem_bits[16][64];
-
-    void mem_query(const int g, const long long q, long long out[2]) const {
-        const unsigned long long* bits = mem_bits[g];
-        // Written addresses answer for themselves: below == above == q,
-        // and the tie-break picks the same entry either way.
-        if (q >= 0 && q <= 4095 && (bits[q >> 6] >> (q & 63)) & 1ULL) {
-            out[0] = mem_val[g][q];
-            out[1] = ((long long)g << 12) + q;
-            return;
-        }
-        long long below = -1, above = -1;
-        if (q >= 0) {
-            const long long start = q < 4095 ? q : 4095;
-            int w = (int)(start >> 6);
-            unsigned long long m = bits[w] & (~0ULL >> (63 - (start & 63)));
-            while (true) {
-                if (m) { below = ((long long)w << 6) + (63 - __builtin_clzll(m)); break; }
-                if (--w < 0) break;
-                m = bits[w];
-            }
-        }
-        if (q <= 4095) {
-            const long long start = q > 0 ? q : 0;
-            int w = (int)(start >> 6);
-            unsigned long long m = bits[w] & (~0ULL << (start & 63));
-            while (true) {
-                if (m) { above = ((long long)w << 6) + __builtin_ctzll(m); break; }
-                if (++w > 63) break;
-                m = bits[w];
-            }
-        }
-        long long win;
-        if (below < 0 && above < 0) { out[0] = 0; out[1] = 0; return; }
-        else if (below < 0) win = above;
-        else if (above < 0) win = below;
-        else {
-            const long long db = q - below, da = above - q;
-            if (db < da) win = below;
-            else if (da < db) win = above;
-            else win = mem_seq[g][below] > mem_seq[g][above] ? below : above;
-        }
-        out[0] = mem_val[g][win];
-        out[1] = ((long long)g << 12) + win;
-    }"""
+# Exact nearest-written-address argmax over one 4 KiB memory group; the
+# emission is shared with the C++ kernel (run_protocol.py).
+_MEM_QUERY = mem_query_cpp("long long")
 
 # Per-ROM sequence-module hook: a separately compiled window module attaches
 # its dispatch through a raw function pointer, so a new ROM's window set never
@@ -442,62 +401,9 @@ _SEQ_HOOK = """\
     }
     void detach_seq() { seq_fn = nullptr; seq_ctx = nullptr; }"""
 
-# Shadow-decode + the native run loop (KernelBus shape) + machine API.
-_RUN_LOOP = """\
-    // Shadow-decode the instruction at st_pc; return the address it
-    // will read, or -1 (mirrors nes/bus read_target and the kernel).
-    int shadow_read_target() const {
-        const int mode = READ_MODE[ram[st_pc]];
-        if (mode == 0) return -1;
-        const int lo = ram[(st_pc + 1) & 0xFFFF];
-        const int hi = ram[(st_pc + 2) & 0xFFFF];
-        switch (mode) {
-            case 1: return lo;
-            case 2: return (lo + st_x) & 0xFF;
-            case 3: return (lo + st_y) & 0xFF;
-            case 4: return lo | (hi << 8);
-            case 5: return ((lo | (hi << 8)) + st_x) & 0xFFFF;
-            case 6: return ((lo | (hi << 8)) + st_y) & 0xFFFF;
-            case 7: { const int zp = (lo + st_x) & 0xFF;
-                      return ram[zp] | (ram[(zp + 1) & 0xFF] << 8); }
-            case 8: { const int base = ram[lo] | (ram[(lo + 1) & 0xFF] << 8);
-                      return (base + st_y) & 0xFFFF; }
-        }
-        return -1;
-    }
-
-    static bool in_ranges(const std::vector<std::pair<int,int>>& v, int addr) {
-        for (const auto& r : v) if (addr >= r.first && addr <= r.second) return true;
-        return false;
-    }
-
-    // Run up to max_steps instructions natively, pausing back to
-    // Python only on halt / jump-to-self trap / watched device
-    // access / cycle budget -- the same protocol and result dict as
-    // the C++ kernel's run(), so KernelBus can drive this engine.
-    py::dict run(long max_steps, bool stop_on_trap, long max_cycles) {
-        std::vector<int> t_pc, t_a, t_x, t_y, t_s, t_p, t_ir, t_oplo, t_ophi, t_ea, t_data, t_halted;
-        std::vector<long> w_row; std::vector<int> w_addr, w_value;
-        std::vector<int> hit_addr, hit_value;
-        const char* reason = "budget";
-        int read_addr = -1;
-        long cycles_this = 0;
-        long long o[21];
-        for (long i = 0; i < max_steps; ++i) {
-            if (st_halted) { reason = "halt"; break; }
-            const bool skip = resume_read_skip;
-            resume_read_skip = false;
-            if (!nmi_pending && !skip && !rwatch.empty()) {
-                const int target = shadow_read_target();
-                if (target >= 0 && in_ranges(rwatch, target)) {
-                    if (target != lease_addr) {
-                        resume_read_skip = true; read_addr = target; reason = "watch_read"; break;
-                    }
-                    // Leased: serve the device read natively, exactly
-                    // what the Python pause path would inject.
-                    inject_write(target, lease_value);
-                }
-            }
+# Per-iteration body of the shared run loop (run_protocol.run_loop_cpp):
+# sequence dispatch, then the per-instruction step_core fallback.
+_ENGINE_STEP_BODY = """\
             // A routed sequence consumes a whole window in one forward;
             // its guards (in seq_dispatch) keep this step-for-step
             // equivalent to the per-instruction path below.
@@ -555,35 +461,16 @@ _RUN_LOOP = """\
             if (o[13]) { st_halted = true; reason = "halt"; break; }
             if (stop_on_trap && (int)o[12] == prev_pc) { reason = "trap"; break; }
             if (n_hits > 0) { reason = "watch_write"; break; }
-            if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }
-        }
-        py::dict out;
-        auto arr = [](const std::vector<int>& src) {
-            return py::array_t<int>((py::ssize_t)src.size(), src.data());
-        };
-        out["pc"] = arr(t_pc);
-        out["a"] = arr(t_a);
-        out["x"] = arr(t_x);
-        out["y"] = arr(t_y);
-        out["s"] = arr(t_s);
-        out["p"] = arr(t_p);
-        out["ir"] = arr(t_ir);
-        out["oplo"] = arr(t_oplo);
-        out["ophi"] = arr(t_ophi);
-        out["ea"] = arr(t_ea);
-        out["data"] = arr(t_data);
-        out["halted"] = arr(t_halted);
-        out["w_row"] = py::array_t<long>((py::ssize_t)w_row.size(), w_row.data());
-        out["w_addr"] = arr(w_addr);
-        out["w_value"] = arr(w_value);
-        out["hit_addr"] = arr(hit_addr);
-        out["hit_value"] = arr(hit_value);
-        out["read_addr"] = read_addr;
-        out["reason"] = reason;
-        out["cycles"] = cycles_this;
-        return out;
-    }
+            if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }"""
 
+# Shadow-decode + the shared run loop + machine API (run_protocol.py blocks;
+# the C++ kernel emits the same protocol).
+_RUN_LOOP = "\n\n".join((
+    SHADOW_READ_TARGET_CPP,
+    IN_RANGES_CPP,
+    run_loop_cpp(extra_locals="        long long o[21];",
+                 step_body=_ENGINE_STEP_BODY),
+    """\
     // ── JIT profile counter ──────────────────────────────────
     // The run loop counts every per-instruction (fallback) step by pc;
     // jit_hot reports pcs past the CUMULATIVE threshold that have no
@@ -603,16 +490,10 @@ _RUN_LOOP = """\
 
     int window_shape(int pc) { return shape_of_pc[pc & 0xFFFF]; }
 
-    // ── Machine API (mirrors the C++ kernel) ─────────────────
-    void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
-    void watch_write(int lo, int hi) { wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
-    void clear_watches() { rwatch.clear(); wwatch.clear(); }
-    void set_read_lease(int addr, int value) { lease_addr = addr & 0xFFFF; lease_value = value & 0xFF; }
-    void clear_read_lease() { lease_addr = -1; }
-    void set_nmi() { nmi_pending = true; }
+    // ── Machine API (mirrors the C++ kernel) ─────────────────""",
+    MACHINE_API_CPP,
+    """\
     void inject_write(int addr, int value) { insert_write(addr & 0xFFFF, value & 0xFF, seq + 1); }
-    int read_ram(int addr) { return ram[addr & 0xFFFF]; }
-    py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }
 
     void set_run_state(int pc, int a, int x, int y, int s, int p,
                        int ir, int oplo, int ophi, int ea, int data, int halted) {
@@ -632,7 +513,8 @@ _RUN_LOOP = """\
         st["steps"] = step_index; st["cycles"] = cycles_total;
         st["pos"] = (long)(seq + 1);
         return st;
-    }"""
+    }""",
+))
 
 # The pybind .def() lines gated on has_step (the machine_step + run-loop API).
 _PYBIND_STEP_METHODS = """\
@@ -1282,28 +1164,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit(f"    {elem} reg_v0[{n_regs}], reg_v1[{n_regs}];")
         emit(f"    bool reg_any[{n_regs}];")
     if has_run:
-        # Persistent-machine state for the C++ run loop, mirroring the C++
-        # kernel: a 64 KiB RAM mirror (for MMIO shadow decode), the
-        # architectural registers, pending-NMI/read-skip flags, counters,
-        # watch ranges, and the base-cycle / read-mode tables.
-        read_mode = ", ".join(str(v) for v in read_mode_table())
-        cycles_tab = ", ".join(str(v) for v in cycle_table())
+        # Persistent-machine state for the C++ run loop (shared with the C++
+        # kernel via run_protocol.py).
         emit("")
-        emit("    unsigned char ram[65536];  // mirror of the write log, for shadow decode")
-        emit("    int st_pc = 0, st_a = 0, st_x = 0, st_y = 0, st_s = 0xFD, st_p = 0x24;")
-        emit("    int st_ir = 0, st_oplo = 0, st_ophi = 0, st_ea = 0, st_data = 0;")
-        emit("    bool st_halted = false;")
-        emit("    bool nmi_pending = false;")
-        emit("    bool resume_read_skip = false;")
-        emit("    // Read lease: watched reads of this address are served natively")
-        emit("    // with this value (device semantics frozen until the bus clears it).")
-        emit("    int lease_addr = -1, lease_value = 0;")
-        emit("    long step_index = 0;")
-        emit("    long cycles_total = 0;")
-        emit("    std::vector<std::pair<int,int>> rwatch, wwatch;")
-        emit(f"    static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};")
-        emit("    // Base cycles per opcode (no penalty cycles); NMI costs 7.")
-        emit(f"    static constexpr unsigned char CYCLES[256] = {{ {cycles_tab} }};")
+        emit(run_state_members_cpp())
     emit("")
     emit("    ENGINE_T() { reset(); }")
     emit("")
