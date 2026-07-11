@@ -34,13 +34,6 @@ class BuildInfo(NamedTuple):
     d_model: int
 
 
-def add_position_encoding(x, pos):
-    """Add the three deterministic position features to a residual vector."""
-    x[0] += pos
-    x[1] += 1.0 / math.log(2) - 1.0 / math.log(pos + 2)
-    x[2] += pos * pos
-
-
 class _Weight:
     """A named weight matrix (mimics the ``.weight`` attribute access that the
     construction and the codegen reader use)."""
@@ -100,9 +93,6 @@ def build_model(program_graph=None, schedule=None):
         output_tokens = pg.output_tokens
         ALL_DIMS = pg.all_dims
         one = pg.one
-        position = pg.position
-        inv_log_pos = pg.inv_log_pos
-        position_sq = pg.position_sq
     else:
         raise ValueError(
             "build_model requires a program_graph (the default WASM "
@@ -122,10 +112,8 @@ def build_model(program_graph=None, schedule=None):
 
     # ── Slot assignment (interval coloring) ───────────────────
     input_dims = [d for d in ALL_DIMS if isinstance(d, InputDimension)]
-    FIXED = {position: 0, inv_log_pos: 1, position_sq: 2}
-    protected_slots = set(FIXED.values())
-    slot_of = dict(FIXED)
-    next_slot = 3
+    slot_of = {}
+    next_slot = 0
     for d in input_dims:
         if d not in slot_of:
             slot_of[d] = next_slot
@@ -151,8 +139,6 @@ def build_model(program_graph=None, schedule=None):
             erased = set()
             for d in dying:
                 s = slot_of[d]
-                if s in protected_slots:
-                    continue
                 pending_free.append(s)
                 erased.add(s)
 
@@ -209,10 +195,11 @@ def build_model(program_graph=None, schedule=None):
     internal_dims = internal_reglus | internal_lookups | internal_persists
 
     # ── Expressions for passthrough/erase Q/K ─────────────────
+    # Attend-to-self: constant query and key tie every token's score
+    # exactly, and the LATEST tie-break selects the current token.
     one_expr = Expression({one: 1})
-    pos_expr = Expression({position: 1})
-    erase_q2d = [pos_expr, one_expr]
-    erase_k2d = [pos_expr * 2, one_expr]
+    erase_q2d = [one_expr, one_expr]
+    erase_k2d = [one_expr, one_expr]
 
     def expr_to_tensor(expr):
         w = np.zeros(D, dtype=np.float64)
@@ -429,11 +416,13 @@ def build_model(program_graph=None, schedule=None):
             layer_heads[h] = pt_info
 
         n_pt_h += len(pt_items)
+        # Passthrough/erase heads rely on the LATEST tie-break (constant
+        # keys tie every token; latest == self).
         while len(layer_tiebreak) < head_idx:
-            layer_tiebreak.append(0)
+            layer_tiebreak.append(1)
         assert head_idx <= n_heads, f"L{layer_idx} attn: {head_idx} heads > {n_heads}"
         while len(layer_tiebreak) < n_heads:
-            layer_tiebreak.append(0)
+            layer_tiebreak.append(1)
         all_tiebreak.append(layer_tiebreak)
 
         cur = nxt1

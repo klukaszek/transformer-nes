@@ -76,10 +76,13 @@ either serving returns the identical winner.
 `backends/weights/` (`6502-transformer`) closes the loop on the project's
 premise: the graph is scheduled onto layers and compiled by
 `model/weights.py` into actual transformer weight matrices
-(`WeightModel` — d_model=1766, 74 layers, 883 attention heads),
-constructed analytically, no training.  Execution is genuine transformer inference: per-position
-embeddings, Q/K/V projections, hardmax attention, ReGLU FFN, residual
-stream, output head.  The runtime is the generated straight-line C++
+(`WeightModel` — d_model=1762, 74 layers, 881 attention heads),
+constructed analytically, no training.  Execution is genuine transformer
+inference: embeddings, Q/K/V projections, hardmax attention, ReGLU FFN,
+residual stream, output head.  There is **no position encoding** — token
+order enters the model only through the LATEST tie-break (passthrough
+heads tie every token with constant Q/K and take the latest, i.e.
+themselves).  The runtime is the generated straight-line C++
 engine (`model/engine_gen.py`), exact integer end-to-end: a fixed-point
 int32 residual, exact nearest-address memory structures, and integer
 running-argmax registers (`model/classify.py` holds the licenses; anything

@@ -31,7 +31,7 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
    model; the win is killing the indices/data loads of CSR gather.
 
 2. **Exact fixed-point integer residual** (~2x).  Certify invariants
-   first (integer coefficients, bounded values, position slots isolated),
+   first (integer coefficients, bounded values),
    then run the residual in int32 at scale 2^F with every rescaling shift
    guarded (throw, never round).  int64 lost (load-bound: value density
    wins); int16 died (range).  Transfers wherever the construction is

@@ -30,7 +30,7 @@ from transformer_nes.cpu6502.backends.weights.windows import (
 from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_nes.graph.core import ProgramGraph
-from transformer_nes.model.weights import add_position_encoding, build_model
+from transformer_nes.model.weights import build_model
 from transformer_nes.scheduler.milp import asap_schedule
 
 logger = logging.getLogger(__name__)
@@ -185,8 +185,8 @@ class Cpu6502TransformerMachine:
         """Engine input embedding: dim values at their residual slots.
 
         Equivalent to a vocabulary embedding row for a token type that
-        enumerated exactly these values; the three position features (slots
-        0-2) are added by forward_values.
+        enumerated exactly these values.  There is no position encoding:
+        order enters only through the LATEST tie-break.
         """
         x = np.zeros(self.d_model, dtype=np.float32)
         x[self.one_slot] = 1.0
@@ -195,10 +195,9 @@ class Cpu6502TransformerMachine:
         return x
 
     def forward_values(self, values: dict) -> np.ndarray:
-        """One genuine transformer position: embed, add position features,
-        and run the whole layer stack (hull attention + ReGLU) in C++."""
+        """One genuine transformer position: embed and run the whole layer
+        stack (attention + ReGLU) in C++."""
         x = self.embed_array(values)
-        add_position_encoding(x, self.pos)
         self.pos += 1
         self.engine.forward(x)  # in place, whole stack
         return x

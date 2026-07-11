@@ -165,9 +165,6 @@ class InputDimension(Dimension):
 
 
 one = InputDimension("one")
-position = InputDimension("position")
-inv_log_pos = InputDimension("inv_log_pos")
-position_sq = InputDimension("position_sq")
 
 
 
@@ -297,9 +294,6 @@ def to_2d_key(k, clear_key_expr=None, tie_break="latest"):
     if len(k.terms) == 1 and one in k.terms:
         c = k.terms[one]
         k_abs = Expression({one: c * c})
-    elif len(k.terms) == 1 and position in k.terms:
-        c = k.terms[position]
-        k_abs = Expression({position_sq: c * c})
     else:
         k_abs = make_multiply(k, k)
     kx = k * 2
@@ -391,10 +385,9 @@ def reset_graph():
     """Reset all graph state for building a new program.
 
     Must be called before constructing a new computation graph.
-    Recreates the built-in positional dimensions (one, position,
-    inv_log_pos, position_sq) that every ALM requires.
+    Recreates the built-in one dimension that every ALM requires.
     """
-    global one, position, inv_log_pos, position_sq
+    global one
     graph_dims.clear()
     graph_lookups.clear()
     multiply_cache.clear()
@@ -404,9 +397,6 @@ def reset_graph():
     Dimension.counter = 0
     LookUp.counter = 0
     one = InputDimension("one")
-    position = InputDimension("position")
-    inv_log_pos = InputDimension("inv_log_pos")
-    position_sq = InputDimension("position_sq")
 
 
 class ProgramGraph:
@@ -422,6 +412,3 @@ class ProgramGraph:
         self.all_dims = list(graph_dims)
         self.all_lookups = list(graph_lookups)
         self.one = one
-        self.position = position
-        self.inv_log_pos = inv_log_pos
-        self.position_sq = position_sq

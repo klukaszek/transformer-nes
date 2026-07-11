@@ -271,9 +271,6 @@ class GraphFolder:
         reset_graph()
         sub: dict = {
             pg.one: Expression({graph.one: 1}),
-            pg.position: Expression({graph.position: 1}),
-            pg.inv_log_pos: Expression({graph.inv_log_pos: 1}),
-            pg.position_sq: Expression({graph.position_sq: 1}),
         }
         for d in pg.all_dims:
             if isinstance(d, InputDimension) and d not in sub:
@@ -423,9 +420,6 @@ class GraphFolder:
         reset_graph()
         base_sub: dict = {
             pg.one: Expression({graph.one: 1}),
-            pg.position: Expression({graph.position: 1}),
-            pg.inv_log_pos: Expression({graph.inv_log_pos: 1}),
-            pg.position_sq: Expression({graph.position_sq: 1}),
         }
         for d in pg.all_dims:
             if isinstance(d, InputDimension) and d not in base_sub:

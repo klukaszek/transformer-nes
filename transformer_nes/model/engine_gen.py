@@ -682,21 +682,15 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     # order, expert passes resolve through the fold's lookup provenance.
     reg_of: dict[tuple[int, int], int] = {}
 
-    # Position features stay double and never enter integer residual rows;
-    # they reach the emission only through hull-path fallbacks, so a model
-    # with no such head drops them (and their per-forward log()) entirely.
     elem = "int"
     f_bits = 1
     inv_scale = f"0x1p-{f_bits}"
-    uses_pf: set[bool] = set()
 
     def xref(i):
-        if i <= 2:
-            raise RuntimeError("integer row reads a position slot")
         return f"x[{i}]"
 
     def dref(i):
-        return f"pf[{i}]" if i <= 2 else f"({inv_scale}*(double)x[{i}])"
+        return f"({inv_scale}*(double)x[{i}])"
 
     def row_int(csr_m, r, ref, where):
         return expr_int(*row(csr_m, r), ref, where)
@@ -793,7 +787,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 tb = "TieBreak::LATEST" if tiebreak[h] else "TieBreak::AVERAGE"
                 # Eligibility decisions live in model/classify.py, shared
                 # with the C++ kernel so the two engines cannot drift.
-                # Position features occupy slots 0-2: banned in queries.
                 q0_idx, q0_dat = row(ip, 2 * h)
                 q1_idx, q1_dat = row(ip, 2 * h + 1)
                 qx_terms = list(zip(q0_dat, q0_idx, strict=True))
@@ -802,7 +795,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 if mem_groups[h] >= 0:
                     mem_terms = memory_query(
                         qx_terms, qy_terms, one_id=mdl.one_slot,
-                        banned_ids=(0, 1, 2),
                     )
                 mem_ok = mem_terms is not None
                 if not is_union and mem_groups[h] >= 0 and not mem_ok:
@@ -829,7 +821,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                             reg_q[0], reg_q[1],
                             list(zip(k0_dat, k0_idx, strict=True)),
                             list(zip(k1_dat, k1_idx, strict=True)),
-                            banned_ids=(0, 1, 2),
                         )
                         if reg_score is None:
                             reg_q = None
@@ -855,7 +846,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     guard = integer_score_terms(
                         1.0, 1.0, [],
                         list(zip(k1_dat, k1_idx, strict=True)),
-                        banned_ids=(0, 1, 2),
                     )
                     b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
                     b.append("        {")
@@ -869,7 +859,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                         ) or "true"
                         b.append(f"                if ({live_cond})")
                     else:
-                        uses_pf.add(True)
                         k1 = expr_dbl(*row(ip, dm + 2 * h + 1), dref)
                         b.append(f"                const double kyg = {k1};")
                         b.append("                if (kyg > -1.0e29)")
@@ -938,11 +927,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                             "the union's across routed steps)"
                         )
                     n_hull_heads += 1
-                    uses_pf.add(True)
                     if mem_groups[h] >= 0:
                         mem_fallback_hulls.append(hid)
-                    # Q/K/V straight to double: the hull resolves in double
-                    # anyway, and only these rows may read position features.
+                    # Q/K/V straight to double: the hull resolves in double.
                     q0 = expr_dbl(*row(ip, 2 * h), dref)
                     q1 = expr_dbl(*row(ip, 2 * h + 1), dref)
                     k0 = expr_dbl(*row(ip, dm + 2 * h), dref)
@@ -1032,8 +1019,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         for exp in experts
     ]
     n_regs = len(reg_of)
-    use_pf = bool(uses_pf)
-    layer_sig = f"{elem}* x" + (", const double* pf" if use_pf else "")
+    layer_sig = f"{elem}* x"
     if seq_mode:
         layer_sig = f"Eng& E, {layer_sig}"
 
@@ -1117,17 +1103,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit(f"        x[{ins['halted']}] = {sc(f'{E}st_halted ? 1 : 0')};")
         emit(f"        x[{ins['nmi']}] = {sc(f'{E}nmi_pending ? 1 : 0')};")
         emit(f"        {E}nmi_pending = false;")
-        if use_pf:
-            emit(f"        const long long pos = {E}seq + 1;")
-            emit("        const double pf[3] = {")
-            emit("            (double)pos,")
-            emit("            1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0),")
-            emit("            (double)pos * (double)pos,")
-            emit("        };")
         emit(f"        ++{E}seq;")
         for li in range(len(mdl.attn)):
             emit(f"        layer_{li}{layer_suffix}("
-                 f"{'E, ' if seq_mode else ''}x{', pf' if use_pf else ''});")
+                 f"{'E, ' if seq_mode else ''}x);")
         for k, outs in enumerate(step_outs):
             off = 21 * k
             for i, (name, mask) in enumerate((
@@ -1246,15 +1225,12 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit('        if ((int)x_arr.size() != D) throw std::runtime_error("x size != d_model");')
     emit("        float* x = x_arr.mutable_data();")
     emit("        ++seq;")
-    if use_pf:
-        emit("        const double pf[3] = {(double)x[0], (double)x[1], (double)x[2]};")
     emit(f"        {elem}* xi = xbuf;")
-    emit("        xi[0] = 0; xi[1] = 0; xi[2] = 0;")
-    emit("        for (int i = 3; i < D; ++i)")
+    emit("        for (int i = 0; i < D; ++i)")
     emit(f"            xi[i] = ({elem})(long long)std::nearbyint((double)x[i] * SCALE_D);")
     for li in range(n_layers):
-        emit(f"        layer_{li}(xi{', pf' if use_pf else ''});")
-    emit("        for (int i = 3; i < D; ++i) x[i] = (float)((double)xi[i] / SCALE_D);")
+        emit(f"        layer_{li}(xi);")
+    emit("        for (int i = 0; i < D; ++i) x[i] = (float)((double)xi[i] / SCALE_D);")
     emit("    }")
     emit("")
     fb_set = set(mem_fallback_hulls)

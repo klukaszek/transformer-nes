@@ -51,14 +51,8 @@ class ProgramEvaluator:
         (= topological) order, insert-then-query every lookup.  Returns the
         full value map for this position."""
         pg = self.pg
-        pos = self.pos
         self.pos += 1
-        v: dict[Dimension, float] = {
-            pg.one: 1.0,
-            pg.position: float(pos),
-            pg.inv_log_pos: 1.0 / math.log(2) - 1.0 / math.log(pos + 2),
-            pg.position_sq: float(pos) * float(pos),
-        }
+        v: dict[Dimension, float] = {pg.one: 1.0}
         for d in pg.all_dims:
             if isinstance(d, InputDimension):
                 if d not in v:

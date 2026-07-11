@@ -28,7 +28,6 @@ def test_memory_query_rejects_unsafe_score_forms():
     assert memory_query(valid_qx, [], one_id=ONE) is None
     assert memory_query(valid_qx, [(-1.0, ONE)], one_id=ONE) is None
     assert memory_query([(1.5, 10)], [(1.0, ONE)], one_id=ONE) is None
-    assert memory_query([(1.0, 10)], [(1.0, ONE)], one_id=ONE, banned_ids=(10,)) is None
     assert memory_query([(float(2**24), 10)], [(1.0, ONE)], one_id=ONE) is None
     assert memory_query([(float("inf"), 10)], [(1.0, ONE)], one_id=ONE) is None
 

@@ -66,7 +66,7 @@ def folder(union_pg):
 
 def depth(fold_result):
     pg = fold_result.program_graph
-    g = build_graph(pg.all_dims, pg.all_lookups, pg.inv_log_pos)
+    g = build_graph(pg.all_dims, pg.all_lookups)
     return min_layers(g["ops"], g["op_deps"]) if g["ops"] else 0
 
 
@@ -105,7 +105,7 @@ def test_unpinned_fold_metrics_match_materialized_graph(union_pg, union_fold):
     assert (r.n_reglus, r.n_persists, r.n_lookups, r.n_terms) == graph_counts(
         r.program_graph
     )
-    graph = build_graph(union_pg.all_dims, union_pg.all_lookups, union_pg.inv_log_pos)
+    graph = build_graph(union_pg.all_dims, union_pg.all_lookups)
     assert depth(r) <= min_layers(graph["ops"], graph["op_deps"])
 
 

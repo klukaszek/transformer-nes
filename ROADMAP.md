@@ -44,6 +44,26 @@ backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+**Position features excised (2026-07-11):** the graph never referenced
+position/position_sq/inv_log_pos after the recency retirement (probe:
+zero references across every dim expression, key, value, and query in
+the bcd=True graph) — the sole live consumer was build_model's
+passthrough/erase gadget, whose attend-to-self used the position
+parabola.  Replaced with constant Q/K + the LATEST tie-break (every
+token ties; latest == self), which the torch runner's flip+argmax
+already implements.  Everything downstream died with them: the three
+builtin InputDimensions and the position-keyed k_abs branch (graph/
+core.py), evaluator/eval.py token seeding, the kernel's new_token
+setg's and builtin ids, classify's banned_ids params, weights.py's
+fixed slots 0-2 + add_position_encoding, engine_gen's pf/uses_pf
+machinery and position-slot ban, the export contract's "positions stay
+f64" caveat, and the torch runner's per-token log().  **The model now
+has NO position encoding: token order enters only through the LATEST
+tie-break.**  d_model 1766 → 1762, 881 heads.  Receipts: 85 tests
+green (incl. the torch-runner export lockstep); full nestest weights
+MATCHED; full Klaus kernel PASSED 45.5 s; **full Klaus weights
+(decimal) MATCHED 30,646,177 steps in 92.9 s**.
+
 **Refactor receipt (2026-07-11):** plan items 2, 4, and 5 landed (details
 in the plan below).  The weights runtime forward is integer END-TO-END:
 register argmax folds integer scores behind exact clear-gate zero tests,

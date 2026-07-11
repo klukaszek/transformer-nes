@@ -36,26 +36,22 @@ def memory_query(
     qy_terms: Iterable[Term],
     *,
     one_id: int,
-    banned_ids: Iterable[int] = (),
 ) -> list[tuple[int, int]] | None:
     """The integer local-address terms of a structure-eligible memory query.
 
     Eligible when qy is a lone positive constant s on ``one`` (the hardmax
     temperature -- a positive scale multiplies every score, so the argmax
-    is unchanged) and qx/s has integer coefficients below 2**24 reading
-    none of ``banned_ids`` (the position features).  Returns
+    is unchanged) and qx/s has integer coefficients below 2**24.  Returns
     ``[(int_coeff, id), ...]`` or None.
     """
     qy = const_query(qy_terms, one_id)
     if qy is None or qy <= 0.0:
         return None
-    banned_ids = set(banned_ids)
     out: list[tuple[int, int]] = []
     for c, i in qx_terms:
         r = float(c) / qy
         if (
             not math.isfinite(r)
-            or i in banned_ids
             or abs(r - round(r)) > 1e-9
             or abs(r) >= 2**24
         ):
@@ -96,8 +92,6 @@ def integer_score_terms(
     qy: float,
     kx_terms: Iterable[Term],
     ky_terms: Iterable[Term],
-    *,
-    banned_ids: Iterable[int] = (),
 ) -> tuple[list[Term], list[int]] | None:
     """The integer form of a running-argmax score, if licensed.
 
@@ -106,12 +100,10 @@ def integer_score_terms(
     exactly.  ky's clear-gate terms (coeff <= -CLEAR_GATE_MIN on 0/1 gate
     dims) split out as an exact zero test replacing the "ky > -1e29" guard;
     after merging, every remaining coefficient must be an integer or +-0.5
-    below 2**24 reading none of ``banned_ids`` (the position features).
-    Returns ``(score_terms, gate_ids)`` or None.
+    below 2**24.  Returns ``(score_terms, gate_ids)`` or None.
     """
     if not (math.isfinite(qx) and qx == qy and qx > 0.0):
         return None
-    banned = set(banned_ids)
     gates: list[int] = []
     acc: dict[int, float] = {}
     for terms, allow_gate in ((kx_terms, False), (ky_terms, True)):
@@ -119,8 +111,6 @@ def integer_score_terms(
             c = float(c)
             if not c:
                 continue
-            if i in banned:
-                return None
             if allow_gate and c <= -CLEAR_GATE_MIN:
                 gates.append(i)
                 continue

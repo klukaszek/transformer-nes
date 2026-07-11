@@ -37,33 +37,21 @@ from transformer_nes.graph.core import (
     graph_dims,
     graph_lookups,
 )
-from transformer_nes.graph.core import (
-    inv_log_pos as default_inv_log_pos,
-)
-from transformer_nes.graph.core import (
-    position as default_position,
-)
-from transformer_nes.graph.core import (
-    position_sq as default_position_sq,
-)
 
 logger = logging.getLogger(__name__)
 
 
-def build_graph(all_dims=None, all_lookups=None, ilp=None):
+def build_graph(all_dims=None, all_lookups=None):
     """Build dependency graph from dim/lookup lists.
 
     Args:
         all_dims: list of Dimension objects (defaults to module-global graph_dims)
         all_lookups: list of LookUp objects (defaults to module-global graph_lookups)
-        ilp: the inv_log_pos dimension (defaults to module-global inv_log_pos)
     """
     if all_dims is None:
         all_dims = graph_dims
     if all_lookups is None:
         all_lookups = graph_lookups
-    if ilp is None:
-        ilp = default_inv_log_pos
     inputs = [d for d in all_dims if isinstance(d, InputDimension)]
     reglus = [d for d in all_dims if isinstance(d, ReGLUDimension)]
     persists = [d for d in all_dims if isinstance(d, PersistDimension)]
@@ -90,7 +78,6 @@ def build_graph(all_dims=None, all_lookups=None, ilp=None):
         d = set()
         for expr in lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs:
             d |= edeps(expr)
-        d.add(ilp)
         deps_cache[lu] = d
 
     dim_to_op = {}
@@ -168,7 +155,7 @@ def all_result_dims(graph):
     return dims
 
 
-def layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, ilp, psq):
+def layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims):
     """Turn a phase assignment into layers, birth/death, and alive sets.
 
     Shared by the MILP extraction and the ASAP scheduler; the phase parity
@@ -203,9 +190,8 @@ def layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, il
 
     dim_death = {}
     last_boundary = 4 * num_layers - 1
-    protected_post = {pos, ilp, psq}
     for d in all_dims:
-        if d in output_dims or d in protected_post:
+        if d in output_dims:
             dim_death[d] = last_boundary + 1
             continue
         last = -1
@@ -265,10 +251,8 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
 
     if program_graph is not None:
         pg = program_graph
-        pos, ilp, psq = pg.position, pg.inv_log_pos, pg.position_sq
-        graph = build_graph(pg.all_dims, pg.all_lookups, ilp)
+        graph = build_graph(pg.all_dims, pg.all_lookups)
     else:
-        pos, ilp, psq = default_position, default_inv_log_pos, default_position_sq
         graph = build_graph()
 
     ops = graph["ops"]
@@ -369,7 +353,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
 
     (num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after) = (
         layers_and_liveness(
-            pa, all_dims, graph["dim_to_op"], graph["consumers"], output_dims, pos, ilp, psq
+            pa, all_dims, graph["dim_to_op"], graph["consumers"], output_dims
         )
     )
     max_dep = max((len(s) for s in alive_after.values()), default=0)
@@ -416,14 +400,8 @@ def milp_schedule(
 
     if program_graph is not None:
         pg = program_graph
-        pos = pg.position
-        ilp = pg.inv_log_pos
-        psq = pg.position_sq
-        graph = build_graph(pg.all_dims, pg.all_lookups, ilp)
+        graph = build_graph(pg.all_dims, pg.all_lookups)
     else:
-        pos = default_position
-        ilp = default_inv_log_pos
-        psq = default_position_sq
         graph = build_graph()
     ops = graph["ops"]
     od = graph["op_deps"]
@@ -478,19 +456,12 @@ def milp_schedule(
         if d in output_dims:
             continue
         cons = [c_op for c_op in consumers.get(d, set()) if c_op in k]
-        if not cons and d is not pos:
+        if not cons:
             continue
         dv = LpVariable(f"d_{id(d)}", 0, P - 1, LpInteger)
         for c_op in cons:
             prob += dv >= phase_of(c_op)
         death[d] = dv
-
-    # Position must survive until any persist1 phase (for passthrough keys).
-    # persist2 uses FFN passthrough (no hull key), so no position needed.
-    if pos in death:
-        for op in ops:
-            if isinstance(op, PersistDimension) and op in z:
-                prob += death[pos] >= phase_of(op) - P * z[op]
 
     # ── FFN width limit: at most max_ffn ReGLUs per layer ─────────
     if max_ffn is not None:
@@ -588,10 +559,6 @@ def milp_schedule(
     #
     # Also compute alive(c) = |{d : birth <= c AND death > c}|
     # for the head count dying computation.
-    #
-    # Positional dims always occupy their fixed slots because
-    # the embedding writes to them.
-    protected_dims = {pos, ilp, psq}
     alive_sum = {}
     n_inputs = sum(1 for d in all_dims if isinstance(d, InputDimension))
 
@@ -604,7 +571,7 @@ def milp_schedule(
             prod = dim_to_op.get(d)
             is_input = isinstance(d, InputDimension)
 
-            if d in output_dims or d in protected_dims:
+            if d in output_dims:
                 if is_input:
                     ew.append(1)
                     alive.append(1)
@@ -722,7 +689,7 @@ def milp_schedule(
             pa[op] = 4 * layer + 1 + 2 * is_p2
 
     (num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after) = (
-        layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, ilp, psq)
+        layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims)
     )
 
     # ── Linear width at persist boundaries ────────────────────────

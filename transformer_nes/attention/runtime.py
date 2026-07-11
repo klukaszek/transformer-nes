@@ -51,9 +51,9 @@ class HullAttention:
         self.num_value_pairs = (nv + 1) // 2
         self.nv = nv
         self.cache = ext.HullKVCache(1, self.num_value_pairs)
-        # Exact score ties (e.g. equidistant address keys whose inv_log_pos
-        # tie-break term vanishes in double rounding) must resolve according
-        # to the lookup's tie_break mode, not the C++ default of AVERAGE.
+        # Exact score ties (e.g. equidistant address keys) must resolve
+        # according to the lookup's tie_break mode, not the C++ default
+        # of AVERAGE.
         latest = lookup.tie_break == "latest"
         for head in range(self.num_value_pairs):
             self.cache.set_tiebreak(0, head, latest)

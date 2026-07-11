@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import math
 import time
 
 import numpy as np
@@ -83,9 +82,6 @@ class Cpu6502Runtime:
                 self.dim_id_by_name[dim.name] = dim.id
 
         self.one = find_builtin_dim("one")
-        self.position = find_builtin_dim("position")
-        self.position_sq = find_builtin_dim("position_sq")
-        self.inv_log_pos = find_builtin_dim("inv_log_pos")
 
         self.byte_value = find_input_dim("byte_value")
         self.is_memory_write = find_input_dim("is_memory_write")
@@ -427,9 +423,6 @@ class Cpu6502Runtime:
         embedding = self.input_tokens[token_name]
         for dim, coeff in embedding.terms.items():
             vals[dim] = coeff
-        vals[self.position] = float(self.pos)
-        vals[self.position_sq] = float(self.pos) ** 2
-        vals[self.inv_log_pos] = 1.0 / math.log(2) - 1.0 / math.log(self.pos + 2)
         if overrides:
             vals.update(overrides)
         return vals

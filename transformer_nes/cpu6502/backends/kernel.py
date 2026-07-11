@@ -113,12 +113,7 @@ class _KernelSpec:
         def input_id(name):
             return getattr(rt, name).id
 
-        self.builtin_ids = {
-            "one": rt.one.id,
-            "position": rt.position.id,
-            "position_sq": rt.position_sq.id,
-            "inv_log_pos": rt.inv_log_pos.id,
-        }
+        self.builtin_ids = {"one": rt.one.id}
         self.write_ids = {name: input_id(name) for name in
                           ("byte_value", "is_memory_write", "addr_lo", "addr_hi")}
         self.start_ids = {name: input_id(name) for name in
@@ -150,7 +145,6 @@ class _KernelSpec:
         # folded at insert time.  Anything else keeps its hull -- correctness
         # never rests on the classification, only speed.
         one_id = rt.one.id
-        pos_ids = {rt.position.id, rt.position_sq.id, rt.inv_log_pos.id}
 
         def q_terms(cq):
             _n, ids, coeffs = cq
@@ -178,7 +172,7 @@ class _KernelSpec:
                     == {"addr_lo": 1, "addr_hi": 256}
                 ):
                     terms = memory_query(q_terms(qx_c), q_terms(qy_c),
-                                         one_id=one_id, banned_ids=pos_ids)
+                                         one_id=one_id)
                 if terms is not None:
                     self.mem_lus[lu.id] = {"g": int(mg), "terms": terms}
                 else:
@@ -272,13 +266,10 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('')
     emit('    inline void setg(int id, double v) { g[id] = v; g_set.push_back(id); }')
     emit('')
-    emit('    inline void new_token(double pos) {')
+    emit('    inline void new_token() {')
     emit('        for (int id : g_set) g[id] = 0.0;')
     emit('        g_set.clear();')
     emit(f'        setg({spec.builtin_ids["one"]}, 1.0);')
-    emit(f'        setg({spec.builtin_ids["position"]}, pos);')
-    emit(f'        setg({spec.builtin_ids["position_sq"]}, pos * pos);')
-    emit(f'        setg({spec.builtin_ids["inv_log_pos"]}, 1.0 / std::log(2.0) - 1.0 / std::log(pos + 2.0));')
     emit('    }')
 
     # ── Per-group insert functions ─────────────────────────────────
@@ -338,7 +329,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     # ── Token builders ─────────────────────────────────────────────
     emit('')
     emit('    void insert_start(int pc, double pos) {')
-    emit('        new_token(pos);')
+    emit('        new_token();')
     emit(f'        setg({spec.start_ids["start_pc_lo"]}, (double)(pc & 0xFF));')
     emit(f'        setg({spec.start_ids["start_pc_hi"]}, (double)((pc >> 8) & 0xFF));')
     emit(f'        setg({spec.start_ids["is_start"]}, 1.0);')
@@ -352,7 +343,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        mem_bits[wg][wl >> 6] |= 1ULL << (wl & 63);')
     hull_mem = [gi for gi in spec.memory_groups if gi in spec.live_groups]
     if hull_mem:
-        emit('        new_token(pos);')
+        emit('        new_token();')
         emit(f'        setg({spec.write_ids["byte_value"]}, (double)value);')
         emit(f'        setg({spec.write_ids["is_memory_write"]}, 1.0);')
         emit(f'        setg({spec.write_ids["addr_lo"]}, (double)(addr & 0xFF));')
@@ -363,7 +354,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('')
     state_args = ", ".join(f"double {name}" for name in STATE_FIELDS[1:])
     emit(f'    void insert_state(double pos, {state_args}) {{')
-    emit('        new_token(pos);')
+    emit('        new_token();')
     emit(f'        setg({spec.state_ids["is_state"]}, 1.0);')
     for name in STATE_FIELDS[1:]:
         emit(f'        setg({spec.state_ids[name]}, {name});')

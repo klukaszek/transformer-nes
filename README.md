@@ -89,7 +89,7 @@ Standard softmax attention is O(n) per step.  Since this model uses hardmax atte
 ### The transformer itself
 
 `6502-transformer` runs the machine as **actual transformer weights**:
-`scheduler/milp.py`'s load-balanced critical-path scheduler assigns the gates to 74 layers, `model/weights.py` constructs the transformer's weight matrices analytically (`WeightModel`: d_model=1766, 883 heads, no training), and inference is genuine — Q/K/V projections, hardmax attention, ReGLU FFN, residual stream — run by generated straight-line C++ with a native run loop, exact integer arithmetic end-to-end, O(1) attention state, and three dispatch tiers (per-opcode experts, canonical shape experts serving any ROM with zero per-ROM compilation, and per-ROM pinned sequence modules).
+`scheduler/milp.py`'s load-balanced critical-path scheduler assigns the gates to 74 layers, `model/weights.py` constructs the transformer's weight matrices analytically (`WeightModel`: d_model=1762, 881 heads, no training), and inference is genuine — Q/K/V projections, hardmax attention, ReGLU FFN, residual stream, and no position encoding (token order enters only through the LATEST tie-break) — run by generated straight-line C++ with a native run loop, exact integer arithmetic end-to-end, O(1) attention state, and three dispatch tiers (per-opcode experts, canonical shape experts serving any ROM with zero per-ROM compilation, and per-ROM pinned sequence modules).
 **The full 8,991-instruction nestest suite passes through the weights in
 ~0.1 seconds**, the full 30.6M-instruction Klaus suite lockstep-matches
 with decimal mode in ~90 s, and SMB gameplay runs at ~333 fps

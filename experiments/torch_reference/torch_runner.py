@@ -11,7 +11,6 @@ stream, no normalization -- driven step-by-step as a 6502 machine.
 from __future__ import annotations
 
 import json
-import math
 import os
 
 import numpy as np
@@ -89,11 +88,7 @@ class TorchMachine:
         x[self.meta["one_slot"]] = 1.0
         for name, v in values.items():
             x[self.slots[name]] = float(v)
-        pos = self.pos
         self.pos += 1
-        x[0] += pos
-        x[1] += 1.0 / math.log(2) - 1.0 / math.log(pos + 2)
-        x[2] += float(pos) * float(pos)
 
         for li, lay in enumerate(self.layers):
             qkv = lay["in_proj"] @ x

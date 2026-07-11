@@ -1,3 +1,3 @@
-__all__ = ["WeightModel", "build_model", "add_position_encoding"]
+__all__ = ["WeightModel", "build_model"]
 
-from transformer_nes.model.weights import WeightModel, add_position_encoding, build_model
+from transformer_nes.model.weights import WeightModel, build_model
