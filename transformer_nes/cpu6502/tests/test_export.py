@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.weights_runner import VERIFY_START, verify_program
+from transformer_nes.cpu6502.backends.weights.runner import VERIFY_START, verify_program
 
 _RUNNER = (
     Path(__file__).resolve().parents[3]

@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.weights_runner import (
+from transformer_nes.cpu6502.backends.weights.runner import (
     VERIFY_START,
     Cpu6502TransformerMachine,
     verify_program,
@@ -44,7 +44,7 @@ def test_transformer_weights_match_reference():
 
 @pytest.mark.slow
 def test_transformer_int32_engine_matches_high_address_nestest_prefix():
-    from transformer_nes.nes.nestest import START_PC, load_image
+    from transformer_nes.nes.examples.nestest import START_PC, load_image
 
     image = load_image()
     machine = Cpu6502TransformerMachine(bcd=False)
@@ -66,7 +66,7 @@ def test_checkpoint_rebuild_is_invisible():
     """Snapshot-and-rebuild mid-run: attention reseeds from the RAM
     mirror without perturbing the executed trace.  Uses the nestest prefix
     so high-address reads cross checkpoint boundaries."""
-    from transformer_nes.nes.nestest import START_PC, load_image
+    from transformer_nes.nes.examples.nestest import START_PC, load_image
 
     image = load_image()
     machine = Cpu6502TransformerMachine(bcd=False, checkpoint_tokens=8)
@@ -96,7 +96,7 @@ def test_run_loop_matches_per_step():
     chunked stream (w_row rebased per chunk) against the single native run."""
     from collections import defaultdict
 
-    from transformer_nes.nes.nestest import START_PC, load_image
+    from transformer_nes.nes.examples.nestest import START_PC, load_image
 
     image = load_image()
     n = 120
@@ -167,7 +167,7 @@ def test_sequence_experts_match_per_step():
     fall-through, the spin, and chunk boundaries landing mid-window."""
     import numpy as np
 
-    from transformer_nes.cpu6502.backends.windows import (
+    from transformer_nes.cpu6502.backends.weights.windows import (
         match_shape_windows,
         scan_sequence_windows,
     )

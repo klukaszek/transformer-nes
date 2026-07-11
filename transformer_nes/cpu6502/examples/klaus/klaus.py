@@ -23,7 +23,7 @@ from transformer_nes.cpu6502.backends.reference import Cpu6502
 
 logger = logging.getLogger(__name__)
 
-KLAUS_BIN = os.path.join(os.path.dirname(__file__), "examples", "klaus", "6502_functional_test.bin")
+KLAUS_BIN = os.path.join(os.path.dirname(__file__), "6502_functional_test.bin")
 START_PC = 0x0400
 SUCCESS_PC = 0x3469
 DEFAULT_MAX_STEPS = 100_000_000
@@ -152,7 +152,7 @@ def run_weights(image: bytes, *, max_steps: int,
     Klaus at full length (30.6M instructions) is out of reach at
     transformer speeds; this verifies a prefix, like the graph runner.
     """
-    from transformer_nes.cpu6502.backends.weights_runner import Cpu6502TransformerMachine
+    from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(

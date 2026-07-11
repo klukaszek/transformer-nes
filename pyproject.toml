@@ -29,9 +29,9 @@ dev = [
 [project.scripts]
 6502-reference = "transformer_nes.cpu6502.backends.reference:main"
 6502-eval = "transformer_nes.cpu6502.cli:main"
-6502-klaus = "transformer_nes.cpu6502.klaus:main"
-6502-nestest = "transformer_nes.nes.nestest:main"
-6502-transformer = "transformer_nes.cpu6502.backends.weights_runner:main"
+6502-klaus = "transformer_nes.cpu6502.examples.klaus.klaus:main"
+6502-nestest = "transformer_nes.nes.examples.nestest:main"
+6502-transformer = "transformer_nes.cpu6502.backends.weights.runner:main"
 nes-run = "transformer_nes.nes.console:main"
 
 [build-system]

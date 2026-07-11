@@ -18,18 +18,18 @@ package one-way.
 | `spec.py` | Single source of truth: 227-opcode table (151 official + stable unofficial), flags, addressing modes, tiny assembler |
 | `interpreter.py` | The 6502 as a graph: ~9,200 dimensions built from ReGLU/persist/lookup primitives |
 | `trace.py` | Canonical trace format shared by every backend |
-| `klaus.py` | Klaus Dormann functional-test harness (`6502-klaus`) |
 | `backends/reference.py` | Plain-Python oracle core.  Trusted by construction; every other backend is verified against it |
 | `backends/evaluator.py` | Exact evaluator: compiles the graph's static schedule to one generated Python function |
 | `backends/kernel.py` | C++ backend: emits the same schedule as one C++ translation unit (attention state, token inserts, run loop) |
-| `backends/weights_runner.py` | The transformer machine: construction, engine-cache orchestration, machine protocol, JIT window discovery |
-| `backends/experts.py` | Fold-and-build expert models (per-opcode, sequence, shape) with their dispatch licenses |
-| `backends/windows.py` | ROM-independent shape library, window scanning, and shape matching |
 | `backends/run_protocol.py` | The native run-loop protocol both generated engines emit (tables + shared C++ blocks) |
+| `backends/weights/runner.py` | The transformer machine: construction, engine-cache orchestration, machine protocol, JIT window discovery |
+| `backends/weights/experts.py` | Fold-and-build expert models (per-opcode, sequence, shape) with their dispatch licenses |
+| `backends/weights/windows.py` | ROM-independent shape library, window scanning, and shape matching |
+| `examples/klaus/klaus.py` | Klaus Dormann functional-test harness (`6502-klaus`), next to its binary |
 
 The nestest harness (`6502-nestest`, Nintendulator golden-log comparison)
-lives in `transformer_nes/nes/nestest.py` — nestest.nes is an NES ROM, so it
-sits with its assets and depends downward on cpu6502.
+lives in `transformer_nes/nes/examples/nestest.py` — nestest.nes is an NES
+ROM, so it sits with its assets and depends downward on cpu6502.
 
 ## Execution model
 

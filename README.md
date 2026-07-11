@@ -52,7 +52,7 @@ Current status and prioritized next steps live in [`ROADMAP.md`](ROADMAP.md).
 |---------|------|
 | `transformer_nes/graph/` | Computation-graph DSL: Input/ReGLU/Persist/LookUp dimensions, `reglu`/`stepglu` helpers, partial evaluation (`fold.py`) |
 | `transformer_nes/attention/` | O(log n) convex-hull KV cache (`hull2d_cht.h` + pybind11 ext) and the exact-evaluator attention runtime |
-| `transformer_nes/cpu6502/` | The pure 6502: opcode spec, graph interpreter, trace format, Klaus harness, and `backends/` — the four verified machines (reference oracle, exact evaluator, generated C++ kernel, the transformer weights) with their expert builders and window policy |
+| `transformer_nes/cpu6502/` | The pure 6502: opcode spec, graph interpreter, trace format, `backends/` — the four verified machines (reference oracle, exact evaluator, generated C++ kernel, `weights/` — the transformer itself with its expert builders and window policy) — and `examples/klaus/` (harness + binary) |
 | `transformer_nes/nes/` | NES system layer: MMIO bus, iNES cartridge loader, frame-level PPU, controllers, and the cycle-budgeted frame loop (`nes-run`) |
 | `transformer_nes/model/` | Transformer machinery: analytical weight construction (`weights.py`), attention-serving classification (`classify.py`), the generated C++ engine (`engine_gen.py`), safetensors export (`export.py`) |
 | `transformer_nes/scheduler/` | Layer scheduler: load-balanced critical-path default plus the opt-in exact MILP |

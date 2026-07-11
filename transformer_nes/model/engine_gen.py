@@ -47,9 +47,9 @@ _CODE_FILES = (
     "cpu6502/backends/evaluator.py",
     "cpu6502/backends/reference.py",
     "cpu6502/backends/run_protocol.py",
-    "cpu6502/backends/windows.py",
-    "cpu6502/backends/experts.py",
-    "cpu6502/backends/weights_runner.py",
+    "cpu6502/backends/weights/windows.py",
+    "cpu6502/backends/weights/experts.py",
+    "cpu6502/backends/weights/runner.py",
 )
 _code_digest_cache: str | None = None
 

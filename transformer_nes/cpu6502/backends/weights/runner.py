@@ -15,14 +15,14 @@ import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
-from transformer_nes.cpu6502.backends.experts import (
+from transformer_nes.cpu6502.backends.weights.experts import (
     build_opcode_experts,
     build_sequence_expert,
     build_shape_experts,
     head_row,
     step_spec_base,
 )
-from transformer_nes.cpu6502.backends.windows import (
+from transformer_nes.cpu6502.backends.weights.windows import (
     SHAPE_LIBRARY,
     match_shape_at,
     match_shape_windows,
