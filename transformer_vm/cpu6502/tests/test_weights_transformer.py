@@ -43,7 +43,7 @@ def test_transformer_weights_match_reference():
 
 
 @pytest.mark.slow
-def test_transformer_float32_engine_matches_high_address_nestest_prefix():
+def test_transformer_int32_engine_matches_high_address_nestest_prefix():
     from transformer_vm.nes.nestest import START_PC, load_image
 
     image = load_image()

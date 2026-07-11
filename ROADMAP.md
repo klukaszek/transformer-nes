@@ -60,17 +60,12 @@ in priority order — the lockstep chain is the safety net for all of it:
    scanning and shape matching; console/tests use that canonical boundary,
    and the engine cache digest covers it.  Expert builders, JIT orchestration,
    and cache orchestration remain in the machine module.
-3. **Drop diagnostic arith modes (needs a user call).**  f32 mode is the
-   sole consumer of the real-hull emission path and forbids
-   experts/shapes; int64 is recorded slower.  Removing both shrinks
-   generate_source by roughly a third and kills the dual-flavor
-   emission closures.  The exact evaluator remains the semantics
-   diagnostic.  Same sweep: verify the Python per-step branch of
-   machine_step is unreachable (has_machine_step is always true for
-   built engines) and excise it.
-   **Partial:** the unreachable Python `machine_step` and WRITE-token fallback
-   are gone. Engine construction now rejects missing native step/direct-write
-   support. Diagnostic arithmetic modes remain pending an explicit decision.
+3. **DONE — one runtime arithmetic.**  The generated runtime is exact int32.
+   The slower int64 and expert-incompatible f32 diagnostic modes, their CLI
+   and cache-key surface, dual emission branches, and the unreachable Python
+   `machine_step`/WRITE fallbacks are gone. The exact evaluator remains the
+   semantics diagnostic; portable f32 safetensors export is unaffected.
+   Receipt so far: all six generated-weights tests pass from fresh artifacts.
 4. **One C++ run loop.**  kernel.py and engine_gen emit two
    near-identical run loops (watch/lease/trace/budget protocol).
    Template it once; the KernelBus contract is the spec.

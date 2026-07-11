@@ -88,7 +88,6 @@ class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
     def __init__(self, *, bcd: bool = False,
-                 codegen_arith: str = "int32",
                  checkpoint_tokens: int | None = None,
                  expert_opcodes=DEFAULT_EXPERT_OPCODES,
                  sequence_windows=(),
@@ -155,8 +154,8 @@ class Cpu6502TransformerMachine:
             raise ValueError(f"unknown expert_schedule {expert_schedule!r}")
         self._expert_schedule = expert_schedule
         self._expert_milp_seconds = expert_milp_seconds
-        # The core engine is fully determined by (source code, bcd, arith,
-        # expert set) -- deliberately NOT the ROM's sequence windows -- so it
+        # The core engine is determined by source, bcd, and expert set—not
+        # the ROM's sequence windows—so it
         # compiles once per code digest and every ROM shares it; a manifest
         # hit skips the expert folds and the emission and loads the compiled
         # artifact directly.  MILP schedules are excluded: their incumbents
@@ -164,19 +163,19 @@ class Cpu6502TransformerMachine:
         windows = [
             (int(head) & 0xFFFF, bytes(code), int(repeat))
             for head, code, repeat in (sequence_windows or ())
-        ] if codegen_arith != "f32" else []
-        shapes = tuple(shape_library or ()) if codegen_arith != "f32" else ()
+        ]
+        shapes = tuple(shape_library or ())
         cache_key = None
         self._engine = None
         if expert_schedule == "asap":
             expert_bytes = [
                 int(b) for b in (expert_opcodes or ()) if int(b) in OPCODES
-            ] if codegen_arith != "f32" else []
+            ]
             shape_tag = ",".join(
                 f"{name}:{bytes(t).hex()}x{r}" for name, t, r in shapes
             )
             cache_key = engine_config_key(
-                bcd=bcd, arith=codegen_arith, expert_bytes=expert_bytes,
+                bcd=bcd, expert_bytes=expert_bytes,
                 extra=f"shapes={shape_tag}",
             )
             self._engine = GeneratedWeightsEngine.from_cache(cache_key)
@@ -185,19 +184,13 @@ class Cpu6502TransformerMachine:
         if self._engine is None:
             experts = []
             shapes_meta: list[dict] = []
-            if codegen_arith != "f32":
-                experts = self._build_expert_models(expert_opcodes)
-                if shapes:
-                    shape_experts, shapes_meta = self._build_shape_experts(shapes)
-                    experts.extend(shape_experts)
-            elif expert_opcodes:
-                logger.info(
-                    "opcode-routed experts disabled: f32 arith keeps every lookup "
-                    "head on a real hull, which cannot be shared across models"
-                )
+            experts = self._build_expert_models(expert_opcodes)
+            if shapes:
+                shape_experts, shapes_meta = self._build_shape_experts(shapes)
+                experts.extend(shape_experts)
             self._engine = GeneratedWeightsEngine(
                 self.model, step_spec=self._step_spec(),
-                arith=codegen_arith, experts=experts, cache_key=cache_key,
+                experts=experts, cache_key=cache_key,
                 shapes_meta=shapes_meta,
             )
         # The ROM's windows land in a tiny per-ROM module attached through
@@ -208,7 +201,7 @@ class Cpu6502TransformerMachine:
         if not self._engine.supports_direct_writes:
             raise RuntimeError("generated 6502 engine is missing direct memory writes")
         if windows:
-            self._attach_sequence_module(windows, bcd=bcd, arith=codegen_arith)
+            self._attach_sequence_module(windows, bcd=bcd)
         self._step_out = np.empty(21, dtype=np.int64)
 
         # Profile-guided JIT: every jit_interval native run() returns, pcs
@@ -367,7 +360,7 @@ class Cpu6502TransformerMachine:
             "state_head": head_row(tok_to_idx["STATE"]),
         }
 
-    def _attach_sequence_module(self, windows, *, bcd: bool, arith: str) -> None:
+    def _attach_sequence_module(self, windows, *, bcd: bool) -> None:
         """Compile-or-load the per-ROM sequence module and attach its window
         dispatch to the core engine.  A new ROM's window set costs one small
         TU (cached by digest); the 43 MB core is never re-emitted for it."""
@@ -376,8 +369,9 @@ class Cpu6502TransformerMachine:
             seqmod_config_key,
         )
 
-        key = seqmod_config_key(core_digest=self._engine.digest, bcd=bcd,
-                                arith=arith, windows=windows)
+        key = seqmod_config_key(
+            core_digest=self._engine.digest, bcd=bcd, windows=windows
+        )
         mod = SequenceModule.from_cache(key, core_digest=self._engine.digest)
         if mod is None:
             experts = []
@@ -392,7 +386,7 @@ class Cpu6502TransformerMachine:
                 return
             mod = SequenceModule(
                 self.model, self._step_spec(), experts,
-                core_digest=self._engine.digest, arith=arith, cache_key=key,
+                core_digest=self._engine.digest, cache_key=key,
             )
         else:
             logger.info("sequence module cache hit (max window %d steps)", mod.max_k)
@@ -1021,24 +1015,18 @@ def main() -> None:
     )
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument(
-        "--codegen-arith", choices=["int32", "int64", "f32"], default="int32",
-        help="arithmetic mode for the generated engine (default: int32)",
-    )
-    parser.add_argument(
         "--no-experts", action="store_true",
         help="disable opcode-routed generated experts and run the union model",
     )
     args = parser.parse_args()
 
     machine = Cpu6502TransformerMachine(
-        bcd=False, codegen_arith=args.codegen_arith,
-        expert_opcodes=() if args.no_experts else DEFAULT_EXPERT_OPCODES,
+        bcd=False, expert_opcodes=() if args.no_experts else DEFAULT_EXPERT_OPCODES,
     )
     logger.info(
-        "transformer: d_model=%d n_layers=%d arith=%s (%.1fs build)",
+        "transformer: d_model=%d n_layers=%d exact-int32 (%.1fs build)",
         machine.d_model,
         machine.n_layers,
-        args.codegen_arith,
         machine.build_seconds,
     )
 

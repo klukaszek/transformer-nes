@@ -86,20 +86,12 @@ layer and d_model becomes head-bound at 1800; leveled, it is
 liveness-bound (~1550) under the grouped-memory lookup.
 
 Performance: the analytic weights are ~99.9% zeros, so inference runs the
-identical linear maps sparsely.  The engine is `model/engine_gen.py`, which
-emits model-specific generated C++: column indices as immediates, ±1
-coefficients as add/sub, other coefficients as float32 hexfloat literals,
-compiled once per model digest (~5–10 s, cached).  With a step_spec the whole
-machine_step (embed, readout, write inserts, halt logits) runs as one
-generated call; the default arith is an exact fixed-point int32 residual
-(guarded shifts, wrap-exact sums, cleared inserts skipped) with O(1) attention
-state — memory groups on an exact nearest-written-address structure,
-constant-query heads on running-argmax registers (zero hull2d calls in the
-forward; nothing grows with the token log) — a native run loop, and
-opcode-routed experts for hot paths.  It sustains **~130K instr/s on Klaus /
-~305K on routed SMB gameplay**; int64 and f32-replica arith variants remain
-for diagnostics.  Correctness is verified by lockstep against `reference.py`
-(the oracle), not against a second slow engine.
+same linear maps sparsely. `model/engine_gen.py` emits model-specific C++
+with indices and coefficients embedded in expressions. The residual is exact
+fixed-point int32; shifts are guarded and signed wrap is defined. Memory heads
+use exact nearest-address structures, constant-query heads use running argmax,
+and remaining heads use hull attention. Generated artifacts are cached by a
+digest covering every source file that shapes emission.
 
 With the generated engine, **the full 8,991-instruction nestest suite runs
 through the actual transformer weights in ~0.1 s** (`6502-nestest --runner
@@ -110,23 +102,10 @@ snapshot-and-rebuild machinery remains for the NES console).  Routed SMB
 gameplay through the weights is roughly 28 fps, byte-identical to the
 C++ kernel's frames and cycles.
 
-Precision: the original scalar 16-bit lookup needed float64 because
-`ky = -k² + ...` reached ~2³² with an adjacent-address gap of 1.  `_memory_at`
-now splits memory into 16 x 4 KiB lookup groups, so each local parabola is
-12-bit and K-side address scores stay below 2²⁴.  The default
-`dtype="float32"` engine matches high-address nestest end-to-end; hull
-sequence tie-breaks resolve same-address rewrites by latest write.
-
-Two departures from the WASM construction, both documented in the module:
-STATE tokens carry ~20 wide-domain fields, so the harness builds each
-position's input embedding directly instead of enumerating a vocabulary
-(the layers are untouched); and the run loop reads the machine outputs
-from the final layer's residual stream, kept alive by a synthetic READOUT
-output token.  Known numerics limit: at 16-bit-address score magnitudes
-(~2³²) the recency tie-break term is below one double ulp, so programs
-that rewrite *high* addresses need the hull cache's sequence tie-break
-(true softmax would average); rescaling the key construction is future
-work.
+Memory is split into 16 × 4 KiB groups. Address scores therefore remain in
+an exactly represented range, while LATEST ties are resolved by insertion
+order. The standalone safetensors export remains float32 by default; that
+storage choice is separate from the generated runtime's int32 arithmetic.
 
 ### Compilation pipeline (shared by both backends)
 

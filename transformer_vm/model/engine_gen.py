@@ -65,11 +65,11 @@ def _code_digest() -> str:
     return _code_digest_cache
 
 
-def engine_config_key(*, bcd: bool, arith: str, expert_bytes, extra: str = "") -> str:
+def engine_config_key(*, bcd: bool, expert_bytes, extra: str = "") -> str:
     """Cache key for a built engine, computable without folding or emitting:
     the config plus a digest of every source file that shapes the emission."""
     tag = ",".join(f"{int(b):02X}" for b in expert_bytes)
-    raw = f"{_code_digest()}|bcd={int(bcd)}|arith={arith}|experts={tag}|{extra}"
+    raw = f"{_code_digest()}|bcd={int(bcd)}|experts={tag}|{extra}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -142,11 +142,10 @@ def _shard_source(source: str, struct_name: str, n_shards: int) -> tuple[str, li
     return "\n".join(header) + "\n", ["\n".join(s) + "\n" for s in shards]
 
 
-def _load_engine_module(digest: str, arith: str) -> tuple[object, float]:
-    """Import the compiled engine, preferring the .so cached next to the
-    source (a direct dlopen, no ninja/clang -- the distributable path);
-    compile from the cached source shards only when the .so is absent."""
-    name = f"weights_gen_{digest}"
+def _load_module(
+    name: str, digest: str, sources: list[str]
+) -> tuple[object, float]:
+    """Load a cached extension or compile it from ``sources``."""
     if name in sys.modules:
         return sys.modules[name], 0.0
     build_dir = os.path.join(_CACHE_DIR, f"build_{digest}")
@@ -161,76 +160,43 @@ def _load_engine_module(digest: str, arith: str) -> tuple[object, float]:
     from torch.utils.cpp_extension import load
 
     build_start = time.perf_counter()
-    cflags = ["-O2", "-std=c++17"]
-    if arith == "int32":
-        # int32 exactness argument is mod-2^32: partial sums may wrap,
-        # every final value fits.  Wrap must be defined behavior.
-        cflags.append("-fwrapv")
+    cflags = ["-O2", "-std=c++17", "-fwrapv"]
     os.makedirs(build_dir, exist_ok=True)
+    module = load(
+        name=name,
+        sources=sources,
+        extra_cflags=cflags,
+        extra_include_paths=[_ATTENTION_DIR, _CACHE_DIR],
+        build_directory=build_dir,
+        verbose=False,
+    )
+    return module, time.perf_counter() - build_start
+
+
+def _load_engine_module(digest: str) -> tuple[object, float]:
     shard_glob = sorted(
         f for f in os.listdir(_CACHE_DIR)
         if f.startswith(f"engine_{digest}_s") and f.endswith(".cpp")
     )
-    module = load(
-        name=name,
-        sources=[os.path.join(_CACHE_DIR, f) for f in shard_glob],
-        extra_cflags=cflags,
-        extra_include_paths=[_ATTENTION_DIR, _CACHE_DIR],
-        build_directory=build_dir,
-        verbose=False,
-    )
-    return module, time.perf_counter() - build_start
+    sources = [os.path.join(_CACHE_DIR, path) for path in shard_glob]
+    return _load_module(f"weights_gen_{digest}", digest, sources)
 
 
-def seqmod_config_key(*, core_digest: str, bcd: bool, arith: str, windows) -> str:
+def seqmod_config_key(*, core_digest: str, bcd: bool, windows) -> str:
     """Cache key for a per-ROM sequence module.  The core digest covers the
     header the module compiles against; the code digest covers fold/emission
     changes that alter the module without altering the core's source."""
     tag = ",".join(f"{h:04X}:{bytes(c).hex()}x{r}" for h, c, r in windows)
-    raw = (f"{_code_digest()}|core={core_digest}|bcd={int(bcd)}"
-           f"|arith={arith}|seq={tag}")
+    raw = f"{_code_digest()}|core={core_digest}|bcd={int(bcd)}|seq={tag}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
-def _load_seqmod_module(digest: str, arith: str) -> tuple[object, float]:
-    """Import a compiled sequence module (single small TU), preferring the
-    cached .so exactly like _load_engine_module."""
-    name = f"seqmod_gen_{digest}"
-    if name in sys.modules:
-        return sys.modules[name], 0.0
-    build_dir = os.path.join(_CACHE_DIR, f"build_{digest}")
-    so_path = os.path.join(build_dir, f"{name}.so")
-    if os.path.exists(so_path):
-        spec = importlib.util.spec_from_file_location(name, so_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        sys.modules[name] = module
-        return module, 0.0
-
-    from torch.utils.cpp_extension import load
-
-    build_start = time.perf_counter()
-    cflags = ["-O2", "-std=c++17"]
-    if arith == "int32":
-        cflags.append("-fwrapv")
-    os.makedirs(build_dir, exist_ok=True)
-    module = load(
-        name=name,
-        sources=[os.path.join(_CACHE_DIR, f"seqmod_{digest}.cpp")],
-        extra_cflags=cflags,
-        extra_include_paths=[_ATTENTION_DIR, _CACHE_DIR],
-        build_directory=build_dir,
-        verbose=False,
+def _load_seqmod_module(digest: str) -> tuple[object, float]:
+    return _load_module(
+        f"seqmod_gen_{digest}",
+        digest,
+        [os.path.join(_CACHE_DIR, f"seqmod_{digest}.cpp")],
     )
-    return module, time.perf_counter() - build_start
-
-
-def _lit(value: float) -> str:
-    """A float32 value as an exact C++ hexfloat literal."""
-    f = float(np.float32(value))
-    if f == int(f) and abs(f) < 2**24:
-        return f"{int(f)}.0f"
-    return f"{f.hex()}f"
 
 
 def _lit_d(value: float) -> str:
@@ -249,25 +215,6 @@ def _join(terms) -> str:
     for sign, term in terms[1:]:
         out += f" {sign} {term}"
     return out
-
-
-def _expr(indices, data, ref) -> str:
-    """One CSR row as a float32 left-to-right accumulation expression.
-
-    Accumulates in CSR column order (`acc += data[k] * x[indices[k]]`):
-    C++ `+`/`-` are left-associative, so a single chained expression
-    rounds identically to that loop.
-    """
-    terms = []
-    for idx, c in zip(indices, data, strict=True):
-        c = np.float32(c)
-        if c == 1.0:
-            terms.append(("+", ref(idx)))
-        elif c == -1.0:
-            terms.append(("-", ref(idx)))
-        else:
-            terms.append(("+", f"{_lit(c)}*{ref(idx)}"))
-    return _join(terms) or "0.0f"
 
 
 def _expr_dbl(indices, data, ref) -> str:
@@ -309,7 +256,7 @@ def _expr_int(indices, data, ref, where: str) -> str:
         else:
             raise RuntimeError(
                 f"{where}: coefficient {c} is not representable in the "
-                "exact int64 emission; use arith='f32'"
+                "exact int32 emission"
             )
     return _join(terms) or "0"
 
@@ -662,7 +609,7 @@ _RUN_LOOP = """\
     void set_read_lease(int addr, int value) { lease_addr = addr & 0xFFFF; lease_value = value & 0xFF; }
     void clear_read_lease() { lease_addr = -1; }
     void set_nmi() { nmi_pending = true; }
-    void inject_write(int addr, int value) { insert_write_f32(addr & 0xFFFF, value & 0xFF, seq + 1); }
+    void inject_write(int addr, int value) { insert_write(addr & 0xFFFF, value & 0xFF, seq + 1); }
     int read_ram(int addr) { return ram[addr & 0xFFFF]; }
     py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }
 
@@ -800,8 +747,7 @@ def _assemble_seq_module(lines, body, experts, core_digest, elem,
     return "\n".join(lines) + "\n", 0, False
 
 
-def generate_source(model, step_spec: dict | None = None,
-                    arith: str = "int32", experts=None,
+def generate_source(model, step_spec: dict | None = None, experts=None,
                     seq_module_core: str | None = None) -> tuple[str, int, bool]:
     """Return ``(source, memory_head_count, has_machine_step)``.
 
@@ -812,9 +758,6 @@ def generate_source(model, step_spec: dict | None = None,
     """
     experts = experts or []
     seq_mode = seq_module_core is not None
-    if arith not in ("int64", "int32", "f32"):
-        raise ValueError(f"unknown arith {arith!r}")
-    is_int = arith in ("int64", "int32")
     if not seq_mode and any(e.get("kind") == "seq" for e in experts):
         raise RuntimeError(
             "sequence experts are compiled per-ROM (SequenceModule) and "
@@ -824,15 +767,8 @@ def generate_source(model, step_spec: dict | None = None,
         not experts or any(e.get("kind") != "seq" for e in experts)
     ):
         raise RuntimeError("a sequence module takes kind='seq' experts only")
-    if experts:
-        if not is_int:
-            raise RuntimeError(
-                "opcode-routed expert models require an integer arith mode "
-                "(f32 keeps every lookup head on a real hull, which cannot "
-                "be shared across models)"
-            )
-        if step_spec is None:
-            raise RuntimeError("opcode-routed expert models require a step_spec")
+    if experts and step_spec is None:
+        raise RuntimeError("opcode-routed expert models require a step_spec")
 
     # Shared-state prefix: "" emitting the engine itself (its own members),
     # "E." emitting a sequence module (a typed reference to the core engine).
@@ -859,51 +795,26 @@ def generate_source(model, step_spec: dict | None = None,
     # order, expert passes resolve through the fold's lookup provenance.
     reg_of: dict[tuple[int, int], int] = {}
 
-    # Residual references.  In int mode the position features (slots 0-2)
-    # never feed integer rows -- only hull-bound Q/K/V rows read them, via
-    # the pf[] doubles -- so integer refs to slots 0-2 are a hard error.
-    if is_int:
-        # int32 relies on mod-2^32 wrap (-fwrapv): partial sums may wrap,
-        # but every final graph value fits, so results are exact.
-        elem, zero = ("long long", "0") if arith == "int64" else ("int", "0")
-        # Fixed-point scale: residual holds value * 2**F.  F=1 covers the
-        # half-integer values the +-0.5 direct-map coefficients produce;
-        # every shift is guarded, so an insufficient F fails loudly.
-        f_bits = 1
-        inv_scale = f"0x1p-{f_bits}"
+    # Position features stay double and never enter integer residual rows.
+    elem = "int"
+    f_bits = 1
+    inv_scale = f"0x1p-{f_bits}"
 
-        def xref(i):
-            if i <= 2:
-                raise RuntimeError(
-                    "integer row reads a position slot; the int64 emission "
-                    "keeps position features out of the residual"
-                )
-            return f"x[{i}]"
+    def xref(i):
+        if i <= 2:
+            raise RuntimeError("integer row reads a position slot")
+        return f"x[{i}]"
 
-        def dref(i):
-            return f"pf[{i}]" if i <= 2 else f"({inv_scale}*(double)x[{i}])"
+    def dref(i):
+        return f"pf[{i}]" if i <= 2 else f"({inv_scale}*(double)x[{i}])"
 
-        def row_int(csr_m, r, ref, where):
-            return _expr_int(*_row(csr_m, r), ref, where)
+    def row_int(csr_m, r, ref, where):
+        return _expr_int(*_row(csr_m, r), ref, where)
 
-        def row_raw(indices, data, ref, where):
-            return _expr_int(indices, data, ref, where)
-    else:
-        elem, zero = "float", "0.0f"
+    def row_raw(indices, data, ref, where):
+        return _expr_int(indices, data, ref, where)
 
-        def xref(i):
-            return f"x[{i}]"
-
-        def dref(i):  # unused in f32 mode
-            return f"x[{i}]"
-
-        def row_int(csr_m, r, ref, where):
-            return _expr(*_row(csr_m, r), ref)
-
-        def row_raw(indices, data, ref, where):
-            return _expr(indices, data, ref)
-
-    layer_sig = f"{elem}* x, const double* pf" if is_int else "float* x"
+    layer_sig = f"{elem}* x, const double* pf"
     if seq_mode:
         layer_sig = f"Eng& E, {layer_sig}"
 
@@ -941,13 +852,12 @@ def generate_source(model, step_spec: dict | None = None,
 
             lookup = [h for h in range(nh) if kinds[h] == 1]
             passthrough = [h for h in range(nh) if kinds[h] == 2]
-            if is_int:
-                for h in lookup:
-                    if not tiebreak[h]:
-                        raise RuntimeError(
-                            f"{label} L{li} head {h}: AVERAGE tie-break can return "
-                            "fractional hull outputs; use arith='f32'"
-                        )
+            for h in lookup:
+                if not tiebreak[h]:
+                    raise RuntimeError(
+                        f"{label} L{li} head {h}: AVERAGE tie-break can return "
+                        "fractional hull outputs"
+                    )
 
             # Shared hulls, first-seen in ascending head order (engine order).
             # Expert hull ids exist only for the hull_seen live-insert guard;
@@ -1003,7 +913,7 @@ def generate_source(model, step_spec: dict | None = None,
                 qx_terms = list(zip(q0_dat, q0_idx, strict=True))
                 qy_terms = list(zip(q1_dat, q1_idx, strict=True))
                 mem_terms = None
-                if is_int and mem_groups[h] >= 0:
+                if mem_groups[h] >= 0:
                     mem_terms = memory_query(
                         qx_terms, qy_terms, one_id=mdl.one_slot,
                         banned_ids=(0, 1, 2),
@@ -1017,7 +927,7 @@ def generate_source(model, step_spec: dict | None = None,
 
                 reg_q = None
                 v0_i = v1_i = None
-                if is_int and not mem_ok:
+                if not mem_ok:
                     reg_q = register_query(qx_terms, qy_terms,
                                            one_id=mdl.one_slot,
                                            latest=bool(tiebreak[h]))
@@ -1097,7 +1007,7 @@ def generate_source(model, step_spec: dict | None = None,
                     b.append(f"            ho{2 * h} = {E}reg_any[{r}] ? {E}reg_v0[{r}] : 0;")
                     b.append(f"            ho{2 * h + 1} = {E}reg_any[{r}] ? {E}reg_v1[{r}] : 0;")
                     b.append("        }")
-                elif is_int:
+                else:
                     if not is_union:
                         raise RuntimeError(
                             f"{label} L{li} head {h}: expert lookup head needs a "
@@ -1142,30 +1052,6 @@ def generate_source(model, step_spec: dict | None = None,
                              '"hull output not representable at the fixed-point '
                              'scale");')
                     b.append("        }")
-                else:
-                    q0 = _expr(*_row(ip, 2 * h), xref)
-                    q1 = _expr(*_row(ip, 2 * h + 1), xref)
-                    k0 = _expr(*_row(ip, dm + 2 * h), xref)
-                    k1 = _expr(*_row(ip, dm + 2 * h + 1), xref)
-                    v0 = _expr(*_row(ip, 2 * dm + 2 * h), xref)
-                    v1 = _expr(*_row(ip, 2 * dm + 2 * h + 1), xref)
-                    b.append(f"        float ho{2 * h}, ho{2 * h + 1};")
-                    b.append("        {")
-                    b.append(f"            if (hull_seen[{hid}] != seq) {{")
-                    b.append(f"                const float k0 = {k0}, k1 = {k1};")
-                    b.append(f"                const float v0 = {v0}, v1 = {v1};")
-                    b.append("                const double key[2] = {(double)k0, (double)k1};")
-                    b.append("                const double val[2] = {(double)v0, (double)v1};")
-                    b.append(f"                hulls[{hid}].insert(key, val, seq);")
-                    b.append(f"                hull_seen[{hid}] = seq;")
-                    b.append("            }")
-                    b.append(f"            const float q0 = {q0}, q1 = {q1};")
-                    b.append("            const double query[2] = {(double)q0, (double)q1};")
-                    b.append("            double od[2] = {0.0, 0.0};")
-                    b.append(f"            hulls[{hid}].query(query, {tb}, od);")
-                    b.append(f"            ho{2 * h} = (float)od[0];")
-                    b.append(f"            ho{2 * h + 1} = (float)od[1];")
-                    b.append("        }")
                 b.append(f"        (void)ho{2 * h}; (void)ho{2 * h + 1};")
 
             # attn_direct reads pre-attention x; capture before updating.
@@ -1195,13 +1081,9 @@ def generate_source(model, step_spec: dict | None = None,
                 g = row_int(fi, j, xref, f"L{li} ff_gate")
                 v = row_int(fi, ffn + j, xref, f"L{li} ff_value")
                 nb = [f"        {elem} a{j};"]
-                if is_int:
-                    nb.append(f"        {{ const {elem} g = {g}; "
-                              f"const {elem} v = {v}; "
-                              f"a{j} = g > 0 ? shr(g*v) : 0; }}")
-                else:
-                    nb.append(f"        {{ const {elem} g = {g}; const {elem} v = {v}; "
-                              f"a{j} = g > {zero} ? g*v : {zero}; }}")
+                nb.append(f"        {{ const {elem} g = {g}; "
+                          f"const {elem} v = {v}; "
+                          f"a{j} = g > 0 ? shr(g*v) : 0; }}")
                 neuron_blocks[j] = nb
             # ff_out rows read the ReGLU activations a{..}.
             fokept: list[tuple[int, list[int], list[float]]] = []
@@ -1262,18 +1144,13 @@ def generate_source(model, step_spec: dict | None = None,
 
     # ── Step-core emission helpers, shared by the core engine and the
     # per-ROM sequence module ────────────────────────────────────────
-    if is_int:
-        one_e, zero_l = "SCALE", "0"
+    one_e, zero_l = "SCALE", "0"
 
-        def sc(v, e=elem):
-            return f"(({e})({v}) << F)"
-    else:
-        one_e, zero_l = "1.0f", "0.0f"
+    def sc(v, e=elem):
+        return f"(({e})({v}) << F)"
 
-        def sc(v):
-            return f"(float)({v})"
-
-    rdv = (lambda s: f"shr2(x[{s}])") if is_int else (lambda s: f"rd(x[{s}])")
+    def rdv(slot):
+        return f"shr2(x[{slot}])"
 
     def emit_step_core(fn_name, layer_suffix, mdl, spec):
         # One whole instruction, sharing the embed/readout/write/halt
@@ -1292,7 +1169,7 @@ def generate_source(model, step_spec: dict | None = None,
 
         emit(f"    void {fn_name}({'Eng& E, ' if seq_mode else ''}long long* out) {{")
         emit(f"        {elem}* x = xbuf;")
-        emit(f"        for (int i = 0; i < {dm}; ++i) x[i] = {zero};")
+        emit(f"        for (int i = 0; i < {dm}; ++i) x[i] = 0;")
         emit(f"        x[{mdl.one_slot}] = {one_e};")
         emit(f"        x[{ins['is_state']}] = {one_e};")
         emit(f"        x[{ins['pc_lo']}] = {sc(f'{E}st_pc & 0xFF')};")
@@ -1313,21 +1190,15 @@ def generate_source(model, step_spec: dict | None = None,
         emit(f"        x[{ins['nmi']}] = {sc(f'{E}nmi_pending ? 1 : 0')};")
         emit(f"        {E}nmi_pending = false;")
         emit(f"        const long long pos = {E}seq + 1;")
-        if is_int:
-            emit("        const double pf[3] = {")
-            emit("            (double)pos,")
-            emit("            1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0),")
-            emit("            (double)pos * (double)pos,")
-            emit("        };")
-        else:
-            emit("        x[0] += (float)pos;")
-            emit("        x[1] += (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
-            emit("        // integer square converted once, like NumPy's int -> float32")
-            emit("        x[2] += (float)((unsigned long long)pos * (unsigned long long)pos);")
+        emit("        const double pf[3] = {")
+        emit("            (double)pos,")
+        emit("            1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0),")
+        emit("            (double)pos * (double)pos,")
+        emit("        };")
         emit(f"        ++{E}seq;")
         for li in range(len(mdl.attn)):
             emit(f"        layer_{li}{layer_suffix}("
-                 f"{'E, ' if seq_mode else ''}x{', pf' if is_int else ''});")
+                 f"{'E, ' if seq_mode else ''}x, pf);")
         for k, outs in enumerate(step_outs):
             off = 21 * k
             for i, (name, mask) in enumerate((
@@ -1351,7 +1222,7 @@ def generate_source(model, step_spec: dict | None = None,
                 emit("        }")
             emit(f"        out[{off + 14}] = n_writes;")
             emit("        for (long long i = 0; i < n_writes; ++i)")
-            emit(f"            {E}insert_write_f32((int)out[{off + 15} + 2 * i], "
+            emit(f"            {E}insert_write((int)out[{off + 15} + 2 * i], "
                  f"(int)out[{off + 16} + 2 * i], {E}seq + 1);")
             emit("        }")
             if k + 1 < len(step_outs):
@@ -1359,14 +1230,10 @@ def generate_source(model, step_spec: dict | None = None,
                 # non-halting; only the final row competes STATE vs HALT.
                 emit(f"        out[{off + 13}] = 0;")
         last = 21 * (len(step_outs) - 1)
-        if is_int:
-            emit(f"        const long long halt_logit = "
-                 f"{_expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
-            emit(f"        const long long state_logit = "
-                 f"{_expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
-        else:
-            emit(f"        const float halt_logit = {_expr(hc, hv, lambda i: f'x[{i}]')};")
-            emit(f"        const float state_logit = {_expr(shc, shv, lambda i: f'x[{i}]')};")
+        emit(f"        const long long halt_logit = "
+             f"{_expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
+        emit(f"        const long long state_logit = "
+             f"{_expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
         emit(f"        out[{last + 13}] = halt_logit > state_logit ? 1 : 0;")
         emit("        // Advance the architectural state (inputs are fully")
         emit("        // consumed by the embed above before this update).")
@@ -1391,14 +1258,7 @@ def generate_source(model, step_spec: dict | None = None,
     # machine_step uses, so it is emitted under the same condition.
     has_run = step_spec is not None and n_memory_heads > 0
 
-    emit(f"// Generated straight-line {arith} engine (model/engine_gen.py).")
-    if is_int:
-        emit("// Residual stream is exact int64 (integer addition is")
-        emit("// associative, so the compiler may tree-reduce/vectorize);")
-        emit("// Q/K/V and position features are double, hull-resolved.")
-    else:
-        emit("// float32 arithmetic: CSR column order, left-to-right")
-        emit("// accumulation, float32 hexfloat literals.")
+    emit("// Generated exact-int32 engine (model/engine_gen.py).")
     emit(_INCLUDES)
     emit("")
     emit("struct ENGINE_T {")
@@ -1406,24 +1266,20 @@ def generate_source(model, step_spec: dict | None = None,
     emit("    long seq = -1;")
     emit(f"    HardAttentionHead hulls[{max(n_hulls, 1)}];")
     emit(f"    long hull_seen[{max(n_hulls, 1)}];")
-    if is_int:
-        emit(f"    static constexpr int F = {f_bits};")
-        emit(f"    static constexpr {elem} SCALE = 1 << F;")
-        emit("    static constexpr double SCALE_D = (double)SCALE;")
-        emit(f"    {elem} xbuf[{xbuf_size}];")
+    emit(f"    static constexpr int F = {f_bits};")
+    emit(f"    static constexpr {elem} SCALE = 1 << F;")
+    emit("    static constexpr double SCALE_D = (double)SCALE;")
+    emit(f"    {elem} xbuf[{xbuf_size}];")
+    emit("")
+    emit(_FIXED_POINT_HELPERS.replace("ELEM", elem))
+    emit("")
+    emit(_MEM_QUERY)
+    if n_regs:
         emit("")
-        emit(_FIXED_POINT_HELPERS.replace("ELEM", elem))
-        emit("")
-        emit(_MEM_QUERY)
-        if n_regs:
-            emit("")
-            emit("    // Running-argmax registers for constant-query lookup")
-            emit("    // heads: the score of each token is a fixed function")
-            emit("    // of its key, so the argmax is maintained at insert")
-            emit("    // time and a query is a register read.")
-            emit(f"    double reg_s[{n_regs}];")
-            emit(f"    {elem} reg_v0[{n_regs}], reg_v1[{n_regs}];")
-            emit(f"    bool reg_any[{n_regs}];")
+        emit("    // Running argmax for constant-query heads.")
+        emit(f"    double reg_s[{n_regs}];")
+        emit(f"    {elem} reg_v0[{n_regs}], reg_v1[{n_regs}];")
+        emit(f"    bool reg_any[{n_regs}];")
     if has_run:
         # Persistent-machine state for the C++ run loop, mirroring the C++
         # kernel: a 64 KiB RAM mirror (for MMIO shadow decode), the
@@ -1455,9 +1311,8 @@ def generate_source(model, step_spec: dict | None = None,
     emit("            hulls[i].clear();")
     emit("            hull_seen[i] = -1;")
     emit("        }")
-    if is_int:
-        emit("        for (int g = 0; g < 16; ++g)")
-        emit("            for (int w = 0; w < 64; ++w) mem_bits[g][w] = 0ULL;")
+    emit("        for (int g = 0; g < 16; ++g)")
+    emit("            for (int w = 0; w < 64; ++w) mem_bits[g][w] = 0ULL;")
     if n_regs:
         emit(f"        for (int r = 0; r < {n_regs}; ++r) reg_any[r] = false;")
     if has_run:
@@ -1475,52 +1330,40 @@ def generate_source(model, step_spec: dict | None = None,
     emit("")
     lines.extend(body)
     emit("")
-    emit("    void forward_f32(FArr x_arr) {")
+    emit("    void forward_token(FArr x_arr) {")
     emit('        if ((int)x_arr.size() != D) throw std::runtime_error("x size != d_model");')
     emit("        float* x = x_arr.mutable_data();")
     emit("        ++seq;")
-    if is_int:
-        emit("        // Machine-protocol adapter: exact-integer token values")
-        emit("        // arrive as floats; run the int stack and convert back.")
-        emit("        const double pf[3] = {(double)x[0], (double)x[1], (double)x[2]};")
-        emit(f"        {elem}* xi = xbuf;")
-        emit("        xi[0] = 0; xi[1] = 0; xi[2] = 0;")
-        emit("        for (int i = 3; i < D; ++i)")
-        emit(f"            xi[i] = ({elem})(long long)std::nearbyint((double)x[i] * SCALE_D);")
-        for li in range(n_layers):
-            emit(f"        layer_{li}(xi, pf);")
-        emit("        for (int i = 3; i < D; ++i) x[i] = (float)((double)xi[i] / SCALE_D);")
-    else:
-        for li in range(n_layers):
-            emit(f"        layer_{li}(x);")
+    emit("        const double pf[3] = {(double)x[0], (double)x[1], (double)x[2]};")
+    emit(f"        {elem}* xi = xbuf;")
+    emit("        xi[0] = 0; xi[1] = 0; xi[2] = 0;")
+    emit("        for (int i = 3; i < D; ++i)")
+    emit(f"            xi[i] = ({elem})(long long)std::nearbyint((double)x[i] * SCALE_D);")
+    for li in range(n_layers):
+        emit(f"        layer_{li}(xi, pf);")
+    emit("        for (int i = 3; i < D; ++i) x[i] = (float)((double)xi[i] / SCALE_D);")
     emit("    }")
     emit("")
-    offs = [0]
-    flat: list[int] = []
     fb_set = set(mem_fallback_hulls)
     fb_offs = [0]
     fb_flat: list[int] = []
     for g in range(16):
-        flat.extend(mem_hulls[g])
-        offs.append(len(flat))
         fb_flat.extend(i for i in mem_hulls[g] if i in fb_set)
         fb_offs.append(len(fb_flat))
 
-    emit("    void insert_write_f32(int addr, int value, long pos) {")
+    emit("    void insert_write(int addr, int value, long pos) {")
     emit("        ++seq;")
     emit("        if (seq != pos)")
     emit('            throw std::runtime_error("direct WRITE position does not match engine sequence");')
     if has_run:
         emit("        ram[addr & 0xFFFF] = (unsigned char)(value & 0xFF);  // shadow-decode mirror")
     emit("        const int group = (addr >> 12) & 0xF;")
-    if is_int:
-        # Structure-served memory: a write is three stores; no key math.
-        emit("        const int wl = addr & 0xFFF;")
-        emit("        mem_val[group][wl] = value & 0xFF;")
-        emit("        mem_seq[group][wl] = pos;")
-        emit("        mem_bits[group][wl >> 6] |= 1ULL << (wl & 63);")
-    hull_targets = fb_flat if is_int else flat
-    hull_offs = fb_offs if is_int else offs
+    emit("        const int wl = addr & 0xFFF;")
+    emit("        mem_val[group][wl] = value & 0xFF;")
+    emit("        mem_seq[group][wl] = pos;")
+    emit("        mem_bits[group][wl >> 6] |= 1ULL << (wl & 63);")
+    hull_targets = fb_flat
+    hull_offs = fb_offs
     if hull_targets:
         emit("        const int local_i = addr - group * 4096;")
         emit("        const float local = (float)local_i;")
@@ -1536,25 +1379,15 @@ def generate_source(model, step_spec: dict | None = None,
         emit("            hulls[hid].insert(key, val, seq);")
         emit("            hull_seen[hid] = seq;")
         emit("        }")
-    elif not is_int:
-        emit("        (void)group;")
     emit("    }")
 
-    has_step = step_spec is not None and bool(flat)
+    has_step = has_run
     if has_step:
         emit("")
         emit("    // One whole 6502 instruction from the persistent st_* state:")
         emit("    // STATE embed -> layers -> readout -> direct WRITE inserts ->")
         emit("    // halt logits.  Fills the 21-slot out buffer (trace row + next")
         emit("    // state + writes) and advances st_* to the next instruction.")
-        if not is_int:
-            emit(f"    float xbuf[{d_model}];")
-            emit("")
-            emit("    static long long rd(float v) {")
-            emit("        // Python round() is half-to-even; nearbyint under the")
-            emit("        // default FE_TONEAREST matches it (llround does not).")
-            emit("        return (long long)std::nearbyint((double)v);")
-            emit("    }")
         emit("")
         emit_step_core("step_core_union", "", model, step_spec)
         for exp in experts:
@@ -1665,10 +1498,10 @@ def generate_source(model, step_spec: dict | None = None,
     emit('    py::class_<ENGINE_T>(m, "Engine", py::module_local())')
     emit("        .def(py::init<>())")
     emit("        .def(\"reset\", &ENGINE_T::reset)")
-    emit("        .def(\"forward_f32\", &ENGINE_T::forward_f32)")
+    emit("        .def(\"forward_token\", &ENGINE_T::forward_token)")
     if has_step:
         emit(_PYBIND_STEP_METHODS)
-    emit("        .def(\"insert_write_f32\", &ENGINE_T::insert_write_f32);")
+    emit("        .def(\"insert_write\", &ENGINE_T::insert_write);")
     emit("}")
 
     source = "\n".join(lines) + "\n"
@@ -1676,18 +1509,17 @@ def generate_source(model, step_spec: dict | None = None,
 
 
 class GeneratedWeightsEngine:
-    """The 6502 transformer as generated C++; exact int32 residual by default."""
+    """The 6502 transformer as generated exact-int32 C++."""
 
     def __init__(self, model, *, step_spec: dict | None = None,
-                 arith: str = "int32", experts=None, cache_key: str | None = None,
+                 experts=None, cache_key: str | None = None,
                  shapes_meta=None):
-        self.arith = arith
         self.n_experts = len(experts or [])
         # Shape-window scan metadata (id/signature/length/close rule) so a
         # cache-hit load can populate the runtime table without refolding.
         self.shapes_meta = list(shapes_meta or [])
         source, self.n_memory_heads, self.has_machine_step = generate_source(
-            model, step_spec, arith, experts=experts
+            model, step_spec, experts=experts
         )
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         self.digest = digest
@@ -1703,10 +1535,10 @@ class GeneratedWeightsEngine:
                     f.write(f'#include "engine_{digest}.hpp"\n\n{body}')
             with open(hpp_path, "w") as f:
                 f.write(header)
-        module, self.compile_seconds = _load_engine_module(digest, arith)
+        module, self.compile_seconds = _load_engine_module(digest)
         if cache_key is not None:
             _manifest_put(cache_key, {
-                "digest": digest, "arith": arith, "n_experts": self.n_experts,
+                "digest": digest, "n_experts": self.n_experts,
                 "n_memory_heads": self.n_memory_heads,
                 "has_machine_step": self.has_machine_step,
                 "shapes": self.shapes_meta,
@@ -1725,15 +1557,12 @@ class GeneratedWeightsEngine:
         ):
             return None
         self = cls.__new__(cls)
-        self.arith = entry["arith"]
         self.digest = entry["digest"]
         self.n_experts = entry["n_experts"]
         self.n_memory_heads = entry["n_memory_heads"]
         self.has_machine_step = entry["has_machine_step"]
         self.shapes_meta = entry.get("shapes") or []
-        module, self.compile_seconds = _load_engine_module(
-            entry["digest"], entry["arith"]
-        )
+        module, self.compile_seconds = _load_engine_module(entry["digest"])
         self._bind(module)
         return self
 
@@ -1768,7 +1597,7 @@ class GeneratedWeightsEngine:
         self._engine.reset()
 
     def forward(self, x: np.ndarray) -> None:
-        self._engine.forward_f32(x)
+        self._engine.forward_token(x)
 
     @property
     def supports_direct_writes(self) -> bool:
@@ -1780,7 +1609,7 @@ class GeneratedWeightsEngine:
                 "model has no memory-tagged lookup heads; a direct WRITE would "
                 "be silently lost -- use a full WRITE-token forward instead"
             )
-        self._engine.insert_write_f32(addr, value, pos)
+        self._engine.insert_write(addr, value, pos)
 
 
 class SequenceModule:
@@ -1791,9 +1620,9 @@ class SequenceModule:
     object alive while it is attached."""
 
     def __init__(self, model, step_spec, experts, *, core_digest: str,
-                 arith: str, cache_key: str | None = None):
+                 cache_key: str | None = None):
         source, _, _ = generate_source(
-            model, step_spec, arith, experts=experts,
+            model, step_spec, experts=experts,
             seq_module_core=core_digest,
         )
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
@@ -1805,10 +1634,10 @@ class SequenceModule:
         if not os.path.exists(path):
             with open(path, "w") as f:
                 f.write(source)
-        module, self.compile_seconds = _load_seqmod_module(digest, arith)
+        module, self.compile_seconds = _load_seqmod_module(digest)
         if cache_key is not None:
             _manifest_put(cache_key, {
-                "kind": "seqmod", "digest": digest, "arith": arith,
+                "kind": "seqmod", "digest": digest,
                 "core": core_digest, "n_windows": len(experts),
             })
         self._bind(module)
@@ -1830,9 +1659,7 @@ class SequenceModule:
         self = cls.__new__(cls)
         self.core_digest = core_digest
         self.digest = entry["digest"]
-        module, self.compile_seconds = _load_seqmod_module(
-            entry["digest"], entry["arith"]
-        )
+        module, self.compile_seconds = _load_seqmod_module(entry["digest"])
         self._bind(module)
         return self
 
