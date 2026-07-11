@@ -25,12 +25,14 @@ Correctness contract for graph construction:
     decimal mode).
   - Flags in decimal mode: V always reflects the binary sum, as on NMOS
     hardware; the reference core matches this.
-  - NMI is graph logic, not harness magic: when a STATE token carries
-    in_nmi=1, the step performs the interrupt sequence instead of the fetched
-    instruction -- push PCH/PCL/P (B clear, U set) through the three write
-    channels, S-3, I=1, and vector through $FFFA/$FFFB via the shared
-    vector-read slots.  Every effect of the (decoded but not executed)
-    instruction at PC is discarded by final is_nmi muxes.  The NMI trace row
+  - Interrupts are graph logic, not harness magic: when a STATE token
+    carries in_nmi=1 or in_irq=1 (never both; the harness gates IRQ on the
+    I flag at the step boundary), the step performs the interrupt sequence
+    instead of the fetched instruction -- push PCH/PCL/P (B clear, U set)
+    through the three write channels, S-3, I=1, and vector through
+    $FFFA/$FFFB (NMI) or $FFFE/$FFFF (IRQ) via the shared vector-read
+    slots.  Every effect of the (decoded but not executed) instruction at
+    PC is discarded by final is_int muxes.  The interrupt trace row
     reports the interrupted PC with ea=0 and data=0.
 """
 
@@ -237,11 +239,13 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     in_ea_hi = InputDimension("in_ea_hi")
     in_data = InputDimension("in_data")
     in_halted = InputDimension("in_halted")
-    # NMI request: set to 1 by the harness on the STATE token *before* the
-    # interrupted instruction would execute.  The entire interrupt sequence
-    # (stack pushes, I flag, $FFFA vector fetch) is graph logic below; the
-    # harness never constructs CPU state by hand.
+    # Interrupt requests: set to 1 by the harness on the STATE token *before*
+    # the interrupted instruction would execute (never both; NMI wins, and
+    # IRQ delivery is gated on the I flag at the harness's step boundary).
+    # The entire interrupt sequence (stack pushes, I flag, vector fetch) is
+    # graph logic below; the harness never constructs CPU state by hand.
     in_nmi = InputDimension("in_nmi")
+    in_irq = InputDimension("in_irq")
 
     flag_bits = [in_p_c, in_p_z, in_p_i, in_p_d, in_p_b, in_p_u, in_p_v, in_p_n]
     flag_weights = [FLAG_C, FLAG_Z, FLAG_I, FLAG_D, FLAG_B, FLAG_U, FLAG_V, FLAG_N]
@@ -263,6 +267,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         + in_data
         + in_halted
         + in_nmi
+        + in_irq
         + is_state
     )
 
@@ -289,12 +294,13 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         "current_s", "current_p_c", "current_p_z", "current_p_i", "current_p_d",
         "current_p_b", "current_p_u", "current_p_v", "current_p_n", "current_ir",
         "current_oplo", "current_ophi", "current_ea_lo", "current_ea_hi",
-        "current_data", "current_halted", "is_nmi",
+        "current_data", "current_halted", "is_nmi", "is_irq",
     ]
     state_fields = [
         in_pc_lo, in_pc_hi, in_a, in_x, in_y, in_s,
         in_p_c, in_p_z, in_p_i, in_p_d, in_p_b, in_p_u, in_p_v, in_p_n,
-        in_ir, in_oplo, in_ophi, in_ea_lo, in_ea_hi, in_data, in_halted, in_nmi,
+        in_ir, in_oplo, in_ophi, in_ea_lo, in_ea_hi, in_data, in_halted,
+        in_nmi, in_irq,
     ]
     latest_state = fetch(
         state_fields,
@@ -313,8 +319,11 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         current_p_c, current_p_z, current_p_i, current_p_d,
         current_p_b, current_p_u, current_p_v, current_p_n,
         current_ir, current_oplo, current_ophi, current_ea_lo, current_ea_hi,
-        current_data, current_halted, is_nmi,
+        current_data, current_halted, is_nmi, is_irq,
     ) = latest_state
+
+    # Either interrupt runs the same sequence; only the vector differs.
+    is_int = is_nmi + is_irq
 
     current_pc = current_pc_lo + 256 * current_pc_hi
     current_pc = persist(current_pc, name="current_pc")
@@ -542,11 +551,11 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         ),
     )
     addrC = mux(op_pla + op_plp + op_rts + op_rti, stack_pull_addr3, 0)
-    # An NMI step reads its vector through the same two slots BRK uses for
-    # $FFFE/$FFFF; everything else the interrupted instruction would have
-    # read is left in place and discarded by the is_nmi muxes below.
-    addrA = mux(is_nmi, 0xFFFA, addrA)
-    addrB = mux(is_nmi, 0xFFFB, addrB)
+    # An interrupt step reads its vector through the same two slots BRK uses
+    # for $FFFE/$FFFF; everything else the interrupted instruction would have
+    # read is left in place and discarded by the is_int muxes below.
+    addrA = mux(is_nmi, 0xFFFA, mux(is_irq, 0xFFFE, addrA))
+    addrB = mux(is_nmi, 0xFFFB, mux(is_irq, 0xFFFF, addrB))
     addrA = persist(addrA, name="addrA")
     addrB = persist(addrB, name="addrB")
     addrC = persist(addrC, name="addrC")
@@ -566,9 +575,9 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     ind_ea = persist(ind_ptr_lo + 256 * ind_ptr_hi, name="ind_ea")
 
     # Effective address: indirect modes resolved from the pointer reads above.
-    # An NMI step performs no operand access; its trace EA is defined as 0.
+    # An interrupt step performs no operand access; its trace EA is 0.
     ea = mux(is_idx, idx_ea, mux(is_idy, idy_ea, mux(is_ind, ind_ea, base_ea)))
-    ea = mux(is_nmi, 0, ea)
+    ea = mux(is_int, 0, ea)
     ea = persist(ea, name="ea")
 
     # Stack/IRQ vector reads
@@ -820,7 +829,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
             mux(op_rol, rol_result,
                 mux(op_ror, ror_result, 0))))
     new_a = mux(is_acc, shift_result, new_a)
-    new_a = mux(is_nmi, current_a, new_a)
+    new_a = mux(is_int, current_a, new_a)
     new_a = persist(new_a, name="new_a")
 
     new_x = current_x
@@ -829,7 +838,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     new_x = mux(op_dex, dex_result, new_x)
     new_x = mux(op_tax, current_a, new_x)
     new_x = mux(op_tsx, current_s, new_x)
-    new_x = mux(is_nmi, current_x, new_x)
+    new_x = mux(is_int, current_x, new_x)
     new_x = persist(new_x, name="new_x")
 
     new_y = current_y
@@ -837,7 +846,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     new_y = mux(op_iny, iny_result, new_y)
     new_y = mux(op_dey, dey_result, new_y)
     new_y = mux(op_tay, current_a, new_y)
-    new_y = mux(is_nmi, current_y, new_y)
+    new_y = mux(is_int, current_y, new_y)
     new_y = persist(new_y, name="new_y")
 
     new_s = current_s
@@ -849,7 +858,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     new_s = mux(op_rti, wrap8(current_s + 3), new_s)
     new_s = mux(op_txs, current_x, new_s)
     # NMI pushes three bytes, exactly like BRK.
-    new_s = mux(is_nmi, wrap8(current_s - 3), new_s)
+    new_s = mux(is_int, wrap8(current_s - 3), new_s)
     new_s = persist(new_s, name="new_s")
 
     # ── Flags ───────────────────────────────────────────────────────
@@ -996,13 +1005,13 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # NMI: the interrupted instruction's flag effects are discarded; the
     # sequence only sets I (NMOS interrupts do not touch D).  These muxes
     # come last so they also override the PLP/RTI pull path above.
-    new_p_c = mux(is_nmi, current_p_c, new_p_c)
-    new_p_z = mux(is_nmi, current_p_z, new_p_z)
-    new_p_i = mux(is_nmi, 1, new_p_i)
-    new_p_d = mux(is_nmi, current_p_d, new_p_d)
-    new_p_b = mux(is_nmi, current_p_b, new_p_b)
-    new_p_v = mux(is_nmi, current_p_v, new_p_v)
-    new_p_n = mux(is_nmi, current_p_n, new_p_n)
+    new_p_c = mux(is_int, current_p_c, new_p_c)
+    new_p_z = mux(is_int, current_p_z, new_p_z)
+    new_p_i = mux(is_int, 1, new_p_i)
+    new_p_d = mux(is_int, current_p_d, new_p_d)
+    new_p_b = mux(is_int, current_p_b, new_p_b)
+    new_p_v = mux(is_int, current_p_v, new_p_v)
+    new_p_n = mux(is_int, current_p_n, new_p_n)
     new_p_c = persist(new_p_c, name="new_p_c_final")
     new_p_z = persist(new_p_z, name="new_p_z_final")
     new_p_i = persist(new_p_i, name="new_p_i_final")
@@ -1032,7 +1041,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     next_pc = mux(branch_taken, branch_target, next_pc)
     # NMI vectors through $FFFA/$FFFB (read into irq_vector above); this mux
     # is last so it overrides whatever the interrupted instruction decoded to.
-    next_pc = mux(is_nmi, irq_vector, next_pc)
+    next_pc = mux(is_int, irq_vector, next_pc)
     next_pc = persist(next_pc, name="next_pc")
 
     # ── Primary memory write for this instruction ─────────────────────
@@ -1044,7 +1053,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         op_store_a + op_store_x + op_store_y + op_inc + op_dec + shifts_mem
         + op_pha + op_php + op_jsr + op_brk + unofficial_store
     )
-    is_store = mux(is_nmi, 1, is_store)
+    is_store = mux(is_int, 1, is_store)
     is_store = persist(is_store, name="is_store")
 
     write_addr = mux(
@@ -1056,7 +1065,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
             0,
         ),
     )
-    write_addr = mux(is_nmi, 0x0100 + current_s, write_addr)
+    write_addr = mux(is_int, 0x0100 + current_s, write_addr)
     write_addr = persist(write_addr, name="write_addr_out")
 
     # JSR and BRK both push PC+2 (JSR: last byte of the 3-byte instruction;
@@ -1088,21 +1097,21 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     write_value = mux(op_sre, lsr_result, write_value)
     write_value = mux(op_rra, ror_result, write_value)
     # NMI pushes PCH first (the interrupted PC, not PC+2 as BRK pushes).
-    write_value = mux(is_nmi, current_pc_hi, write_value)
+    write_value = mux(is_int, current_pc_hi, write_value)
     write_value = persist(write_value, name="write_value_out")
 
     # Second and third stack pushes (JSR pushes 2 bytes, BRK and NMI push 3).
     # The push addresses are shared: NMI uses the same S-1/S-2 slots as
-    # JSR/BRK, so only the gates and pushed values need is_nmi muxes.
-    is_store2 = persist(mux(is_nmi, 1, op_jsr + op_brk), name="is_store2")
+    # JSR/BRK, so only the gates and pushed values need is_int muxes.
+    is_store2 = persist(mux(is_int, 1, op_jsr + op_brk), name="is_store2")
     write_addr2 = persist(0x0100 + wrap8(current_s - 1), name="write_addr2_out")
-    write_value2 = persist(mux(is_nmi, current_pc_lo, push_ret_lo), name="write_value2_out")
+    write_value2 = persist(mux(is_int, current_pc_lo, push_ret_lo), name="write_value2_out")
 
-    # NMI pushes P with B clear and U set (BRK/PHP push with B set).
-    nmi_push_p = current_p - FLAG_B * current_p_b + FLAG_U * (1 - current_p_u)
-    is_store3 = persist(mux(is_nmi, 1, op_brk), name="is_store3")
+    # NMI/IRQ push P with B clear and U set (BRK/PHP push with B set).
+    int_push_p = current_p - FLAG_B * current_p_b + FLAG_U * (1 - current_p_u)
+    is_store3 = persist(mux(is_int, 1, op_brk), name="is_store3")
     write_addr3 = persist(0x0100 + wrap8(current_s - 2), name="write_addr3_out")
-    write_value3 = persist(mux(is_nmi, nmi_push_p, php_push_value), name="write_value3_out")
+    write_value3 = persist(mux(is_int, int_push_p, php_push_value), name="write_value3_out")
 
     # ── Trace-context outputs (reference-aligned, 2026-07-09) ────────
     # The trace reports exactly what reference.py reports, field for field:
@@ -1115,9 +1124,9 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # instruction never used them.
     has_operand_lo = length - 1  # 0 for 1-byte instructions, else >= 1
     has_operand_hi = is_abs + is_abx + is_aby + is_ind
-    report_operand_lo = stepglu(fetched_operand_lo, has_operand_lo + is_nmi - 1)
+    report_operand_lo = stepglu(fetched_operand_lo, has_operand_lo + is_int - 1)
     report_operand_lo = persist(report_operand_lo, name="fetched_operand_lo")
-    report_operand_hi = stepglu(fetched_operand_hi, has_operand_hi + is_nmi - 1)
+    report_operand_hi = stepglu(fetched_operand_hi, has_operand_hi + is_int - 1)
     report_operand_hi = persist(report_operand_hi, name="fetched_operand_hi")
 
     # The operation-family gates are a mutually exclusive one-hot, so data
@@ -1151,14 +1160,14 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         + multiply(op_cpy, cpy_result)
         + multiply(op_bit, operand)
     )
-    data_out = mux(is_nmi, 0, data_ref)
+    data_out = mux(is_int, 0, data_ref)
     data_out = persist(data_out, name="data_out")
 
     # ── Halt ────────────────────────────────────────────────────────
-    # BRK halts only if the IRQ vector is 0 (uninitialized memory).  An NMI
-    # never halts, even if the interrupted byte happens to be $00 (BRK).
+    # BRK halts only if the IRQ vector is 0 (uninitialized memory).  An
+    # interrupt never halts, even if the interrupted byte happens to be $00.
     halted_now = multiply(op_brk, match_byte(irq_vector, 0))
-    halted_now = multiply(halted_now, 1 - is_nmi)
+    halted_now = multiply(halted_now, 1 - is_int)
     new_halted = current_halted + halted_now
     new_halted = persist(new_halted, name="new_halted")
 

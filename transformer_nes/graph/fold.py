@@ -688,7 +688,7 @@ def opcode_pins(byte: int, opcodes, *, pin_fetched_byte: bool = True) -> dict[st
     the memory read at PC provably returns the byte -- pinning it folds
     that read (one of the three grouped fetch reads) and any remaining
     decode residue out of the expert graph."""
-    pins: dict[str, float] = {"is_nmi": 0.0}
+    pins: dict[str, float] = {"is_nmi": 0.0, "is_irq": 0.0}
     for op in opcodes.values():
         pins[f"is_op_{op.byte:02X}"] = 1.0 if op.byte == byte else 0.0
     if pin_fetched_byte:

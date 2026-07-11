@@ -35,10 +35,18 @@ def inject_region(mapper, base: int, data: bytes) -> None:
             poke(base + i, byte)
 
 
-class Nrom:
-    """Mapper 0: fixed PRG, nothing to service."""
+class Mapper:
+    """Common contract the console drives every mapper through: whether
+    PRG banks switch at runtime, and this frame's scanline IRQ (if any)."""
 
     banked = False
+
+    def irq_scanline(self) -> int | None:
+        return None
+
+
+class Nrom(Mapper):
+    """Mapper 0: fixed PRG, nothing to service."""
 
     def __init__(self, cart: Cartridge):
         self.cart = cart
@@ -51,7 +59,7 @@ class Nrom:
         return bytes(image)
 
 
-class Mmc1:
+class Mmc1(Mapper):
     """Mapper 1 (SxROM): the serial 5-bit shift register at $8000-$FFFF.
 
     CHR-RAM carts only for now (Final Fantasy, Zelda, Metroid): PRG
@@ -136,13 +144,9 @@ class Mmc1:
         inject_region(self, base, self.prg[bank * BANK16:(bank + 1) * BANK16])
 
 
-class Mmc3:
-    """Mapper 4 (TxROM): 8 KiB PRG banks + 2/1 KiB CHR banks.
-
-    The scanline IRQ counter is accepted but NOT delivered yet -- the
-    machine model has NMI delivery only.  Games that gate a raster split
-    on it (SMB3's status bar) run with that split missing.
-    """
+class Mmc3(Mapper):
+    """Mapper 4 (TxROM): 8 KiB PRG banks + 2/1 KiB CHR banks, plus a
+    scanline IRQ used for status-bar raster splits (SMB3)."""
 
     banked = True
 
@@ -157,11 +161,22 @@ class Mmc3:
         self.regs = [0, 2, 4, 5, 6, 7, 0, 1]  # R0-R7
         self.irq_latch = 0
         self.irq_enabled = False
-        self.irq_warned = False
         self.poke = None            # set by the console per backend
         self.poke_region = None     # bulk variant (native on the engines)
         self.on_mirroring = None    # set by the console (PPU hook)
         self.set_chr_banks = None   # set by the console (PPU hook)
+        self.on_irq_ack = None      # set by the console (clears the IRQ line)
+
+    def irq_scanline(self) -> int | None:
+        """The visible scanline this frame's IRQ fires at, or None.
+
+        Frame model: games reload the counter each vblank ($C001) and the
+        counter decrements once per rendered scanline, so an enabled IRQ
+        with latch N fires at the end of scanline N.
+        """
+        if not self.irq_enabled or not 0 < self.irq_latch < 240:
+            return None
+        return self.irq_latch
 
     # ── Mapping ─────────────────────────────────────────────────────
 
@@ -210,13 +225,12 @@ class Mmc3:
             self.irq_latch = value
         elif reg == 0xE000:
             self.irq_enabled = False
+            if self.on_irq_ack is not None:
+                self.on_irq_ack()  # $E000 also acks a delivered IRQ
         elif reg == 0xE001:
             self.irq_enabled = True
-            if not self.irq_warned:
-                logger.warning("MMC3 scanline IRQ enabled by the game; "
-                               "IRQ delivery is not implemented yet")
-                self.irq_warned = True
-        # $A001 (PRG RAM protect) and $C001 (IRQ reload) need no action.
+        # $A001 (PRG RAM protect) and $C001 (IRQ reload) need no action in
+        # the frame model: irq_scanline() re-derives from the latch per frame.
         new_prg = self.prg_banks()
         for i, (old, new) in enumerate(zip(old_prg, new_prg, strict=True)):
             if old != new:

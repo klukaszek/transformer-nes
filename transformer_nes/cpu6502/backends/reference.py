@@ -40,6 +40,13 @@ from transformer_nes.cpu6502.spec import (
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 
 
+def irq_deliverable(p: int, irq_pending: bool, nmi_pending: bool = False) -> bool:
+    """An IRQ is taken at a step boundary only with the I flag clear and no
+    NMI ahead of it (NMI wins).  The canonical Python gate; the generated
+    C++ engines carry the identical test as their own irq_ready()."""
+    return irq_pending and not nmi_pending and not (p & FLAG_I)
+
+
 @dataclass
 class Cpu6502:
     """Reference 6502 CPU.
@@ -63,6 +70,9 @@ class Cpu6502:
     # Level-style NMI request: when set, the next step() executes the NMI
     # sequence instead of the instruction at PC, then clears the flag.
     nmi_pending: bool = False
+    # IRQ request: delivered at a step boundary only while the I flag is
+    # clear (stays pending until then); NMI wins when both are set.
+    irq_pending: bool = False
 
     # operation dispatch table, populated in __post_init__
     _ops: dict[str, Callable[[Opcode, int, int, int], tuple[int, int, tuple[MemWrite, ...]]]] = field(
@@ -274,7 +284,11 @@ class Cpu6502:
             return row
 
         if self.nmi_pending:
-            return self.nmi_step()
+            self.nmi_pending = False
+            return self.interrupt_step(0xFFFA)
+        if irq_deliverable(self.p, self.irq_pending):
+            self.irq_pending = False
+            return self.interrupt_step(0xFFFE)
 
         ir = self.fetch_byte(self.pc)
         opcode = opcode_for(ir)
@@ -296,15 +310,15 @@ class Cpu6502:
         self.step_count += 1
         return row
 
-    def nmi_step(self) -> TraceRow:
-        """Execute the NMI sequence as one step.
+    def interrupt_step(self, vector_addr: int) -> TraceRow:
+        """Execute an interrupt sequence (NMI or IRQ) as one step.  The
+        caller clears the pending flag it acted on.
 
-        Matches the graph's NMI convention: push PCH, PCL, then P with B
-        clear and U set; set I; vector through $FFFA.  The trace row reports
-        the interrupted PC, the (not executed) instruction bytes at PC, and
-        ea=0 / data=0.
+        Matches the graph's convention: push PCH, PCL, then P with B clear
+        and U set; set I; vector through $FFFA (NMI) or $FFFE (IRQ).  The
+        trace row reports the interrupted PC, the (not executed)
+        instruction bytes at PC, and ea=0 / data=0.
         """
-        self.nmi_pending = False
         pc = self.pc
         pushed_p = ((self.p | FLAG_U) & ~FLAG_B) & 0xFF
         writes = (
@@ -315,7 +329,7 @@ class Cpu6502:
         self.push_word(pc)
         self.push_byte(pushed_p)
         self.set_flag("I", True)
-        vector = self.fetch_byte(0xFFFA) | (self.fetch_byte(0xFFFB) << 8)
+        vector = self.fetch_byte(vector_addr) | (self.fetch_byte(vector_addr + 1) << 8)
 
         row = TraceRow(
             step=self.step_count,

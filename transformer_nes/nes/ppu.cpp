@@ -43,15 +43,67 @@ struct PPU {
     bool vblank = false, sprite0_hit = false, nmi_edge = false;
     int sprite0_scanline = -1;  // -1: none
     bool bg_opaque[240][256];
+    // Per-pixel sprite ownership: the lowest-index opaque sprite claims
+    // the pixel, and only its priority bit decides front-vs-behind.
+    bool sprite_claimed[240][256];
 
-    // Scroll state as of the visible span's start (latched at end_vblank):
-    // rows above the sprite-0 hit render from these, rows below from the
-    // live registers -- the sprite-0 split (status bar + scrolled field).
-    int frame_ctrl = 0, frame_t_addr = 0, frame_fine_x = 0;
+    // Background state as of the visible span's start (latched at
+    // end_vblank): rows above the sprite-0 hit render from these, rows
+    // below from the live registers -- the sprite-0 split.
+    int frame_ctrl = 0, frame_mask = 0, frame_mirroring = 3;
+    int frame_t_addr = 0, frame_fine_x = 0;
+    int frame_chr_bank[8];
     bool frame_latch_valid = false;
 
+    // A second mid-frame split (mapper IRQ): the console latches the state
+    // at delivery; rows above the split render from it, rows below from
+    // the live (post-IRQ-handler) registers.  Consumed per render.
+    int mid_scanline = -1;
+    int mid_ctrl = 0, mid_mask = 0, mid_mirroring = 3;
+    int mid_t_addr = 0, mid_fine_x = 0, mid_v_addr = 0;
+    int mid_chr_bank[8];
+
+    void mark_split(int scanline) {
+        mid_scanline = scanline;
+        mid_ctrl = ctrl;
+        mid_mask = mask;
+        mid_mirroring = mirroring;
+        mid_t_addr = t_addr;
+        mid_fine_x = fine_x;
+        mid_v_addr = vram_addr;
+        std::memcpy(mid_chr_bank, chr_bank, sizeof(chr_bank));
+    }
+
+    // Everything a background row depends on: pattern/enable/edge bits,
+    // nametable arrangement, scroll, and CHR banks.  y_base >= 0 pins the
+    // band's FIRST row to an absolute nametable y (a mid-frame $2006 v
+    // load -- the hardware y-jump; y otherwise derives from t).
+    struct BandState {
+        int ctrl, mask, mirroring, t_addr, fine_x, y_base;
+        const int* banks;
+    };
+
+    static bool same_band(const BandState& a, const BandState& b) {
+        return (a.ctrl & 0x10) == (b.ctrl & 0x10)
+            && (a.mask & 0x0A) == (b.mask & 0x0A)
+            && a.mirroring == b.mirroring
+            && (a.t_addr & 0x7FFF) == (b.t_addr & 0x7FFF)
+            && a.fine_x == b.fine_x
+            && a.y_base == b.y_base
+            && std::memcmp(a.banks, b.banks, 8 * sizeof(int)) == 0;
+    }
+
     int scroll_px_x() const { return ((t_addr & 0x1F) << 3) | fine_x; }
-    int scroll_px_y() const { return (((t_addr >> 5) & 0x1F) << 3) | ((t_addr >> 12) & 7); }
+    int scroll_px_y() const { return scroll_px_y_for(t_addr); }
+
+    // Coarse + fine y as an on-screen pixel row (0-239) from a loopy addr.
+    static int scroll_px_y_for(int addr) {
+        return (((addr >> 5) & 0x1F) << 3) | ((addr >> 12) & 7);
+    }
+    // ... plus the nametable-y bit, giving the 0-479 two-screen row.
+    static int scroll_row_480(int addr) {
+        return scroll_px_y_for(addr) + ((addr >> 11) & 1) * 240;
+    }
 
     PPU(py::bytes chr_data, bool writable, bool vertical) {
         std::string c = chr_data;
@@ -76,11 +128,11 @@ struct PPU {
         return index;
     }
 
-    int nt_offset(int addr) const {
+    static int nt_offset_for(int addr, int mirr) {
         const int a = (addr - 0x2000) & 0xFFF;
         const int table = a >> 10, offset = a & 0x3FF;
         int phys;
-        switch (mirroring) {
+        switch (mirr) {
             case 0:  phys = 0; break;           // single-screen low
             case 1:  phys = 1; break;           // single-screen high
             case 2:  phys = table & 1; break;   // vertical
@@ -88,6 +140,8 @@ struct PPU {
         }
         return phys * 0x400 + offset;
     }
+
+    int nt_offset(int addr) const { return nt_offset_for(addr, mirroring); }
 
     int chr_at(int addr) const {
         return chr[chr_bank[(addr >> 10) & 7] + (addr & 0x3FF)];
@@ -195,8 +249,11 @@ struct PPU {
         vblank = false;
         sprite0_hit = false;
         frame_ctrl = ctrl;
+        frame_mask = mask;
+        frame_mirroring = mirroring;
         frame_t_addr = t_addr;
         frame_fine_x = fine_x;
+        std::memcpy(frame_chr_bank, chr_bank, sizeof(chr_bank));
         frame_latch_valid = true;
     }
 
@@ -214,30 +271,50 @@ struct PPU {
 
     // ── Rendering ───────────────────────────────────────────────────
 
-    int tile_pixel(int tile, int row, int col) const {
+    int tile_pixel(const int* banks, int tile, int row, int col) const {
         const int base = tile * 16 + row;
-        const int b0 = (chr_at(base) >> (7 - col)) & 1;
-        const int b1 = (chr_at(base + 8) >> (7 - col)) & 1;
+        const int b0 = (chr[banks[(base >> 10) & 7] + (base & 0x3FF)] >> (7 - col)) & 1;
+        const int b1 = (chr[banks[((base + 8) >> 10) & 7] + ((base + 8) & 0x3FF)] >> (7 - col)) & 1;
         return b0 | (b1 << 1);
     }
 
     void render_bg_rows(uint8_t* frame, const uint8_t* pal, uint8_t backdrop,
-                        int bctrl, int bt_addr, int bfine_x, int y0, int y1) {
+                        const BandState& band, int y0, int y1) {
+        if (!(band.mask & 0x08)) {  // background disabled in this band
+            for (int y = y0; y < y1; ++y) {
+                std::memset(frame + y * 256, backdrop, 256);
+                std::memset(bg_opaque[y], 0, 256);
+            }
+            return;
+        }
+        const int bctrl = band.ctrl, bt_addr = band.t_addr;
         const int bg_table = (bctrl & 0x10) ? 256 : 0;
-        const int px_x = ((bt_addr & 0x1F) << 3) | bfine_x;
-        const int px_y = (((bt_addr >> 5) & 0x1F) << 3) | ((bt_addr >> 12) & 7);
+        const int px_x = ((bt_addr & 0x1F) << 3) | band.fine_x;
         const int sx = (px_x + ((bt_addr >> 10) & 1) * 256) % 512;
-        const int sy = (px_y + ((bt_addr >> 11) & 1) * 240) % 480;
+        // y: relative to the screen from t, or pinned absolute at the
+        // band's first row (a mid-frame $2006 v load; y self-increments
+        // from there on hardware, so the band scans forward from it).
+        const int sy = band.y_base >= 0
+            ? ((band.y_base - y0) % 480 + 480) % 480
+            : scroll_row_480(bt_addr) % 480;
+        // Left-edge masking: the leftmost 8 pixels show the backdrop (and
+        // count as transparent for sprite priority) with the bit clear.
+        const int x0 = (band.mask & 0x02) ? 0 : 8;
         for (int y = y0; y < y1; ++y) {
             const int cy = (y + sy) % 480;
             const int ly = cy % 240, quad_y = cy / 240;
-            for (int x = 0; x < 256; ++x) {
+            for (int x = 0; x < x0; ++x) {
+                frame[y * 256 + x] = backdrop;
+                bg_opaque[y][x] = false;
+            }
+            for (int x = x0; x < 256; ++x) {
                 const int cx = (x + sx) % 512;
                 const int lx = cx % 256, quad_x = cx / 256;
-                const int base = nt_offset(0x2000 + (quad_y * 2 + quad_x) * 0x400);
+                const int base = nt_offset_for(
+                    0x2000 + (quad_y * 2 + quad_x) * 0x400, band.mirroring);
                 const int trow = ly >> 3, tcol = lx >> 3;
                 const int tile = nametables[base + trow * 32 + tcol];
-                const int pix = tile_pixel(bg_table + tile, ly & 7, lx & 7);
+                const int pix = tile_pixel(band.banks, bg_table + tile, ly & 7, lx & 7);
                 const uint8_t attr =
                     nametables[base + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2)];
                 const int shift = ((trow % 4) / 2) * 4 + ((tcol % 4) / 2) * 2;
@@ -249,7 +326,7 @@ struct PPU {
     }
 
     // First scanline where an opaque sprite-0 pixel overlaps opaque bg.
-    int detect_sprite0() const {
+    int detect_sprite0(const int* banks) const {
         const bool tall = (ctrl & 0x20) != 0;
         const int y = oam[0], tile = oam[1], attr = oam[2], x = oam[3];
         const int top = y + 1;
@@ -268,8 +345,10 @@ struct PPU {
                 prow = src_r;
             }
             for (int c = 0; c < cols; ++c) {
+                // No hit in the left 8 columns when either side is masked.
+                if (x + c < 8 && (mask & 0x06) != 0x06) continue;
                 const int src_c = (attr & 0x40) ? (7 - c) : c;
-                if (tile_pixel(t, prow, src_c) && bg_opaque[top + r][x + c])
+                if (tile_pixel(banks, t, prow, src_c) && bg_opaque[top + r][x + c])
                     return top + r;
             }
         }
@@ -284,34 +363,75 @@ struct PPU {
         for (int i = 0; i < 0x20; ++i) pal[i] = palette[i] & 0x3F;
         const uint8_t backdrop = pal[0];
 
-        // Rows above the sprite-0 hit render from the visible-span-start
-        // scroll state, rows below from the live (post-hit-write) state.
-        const int top_ctrl = frame_latch_valid ? frame_ctrl : ctrl;
-        const int top_t = frame_latch_valid ? frame_t_addr : t_addr;
-        const int top_fx = frame_latch_valid ? frame_fine_x : fine_x;
-        const bool split = (top_ctrl & 0x10) != (ctrl & 0x10)
-            || (top_t & 0x7FFF) != (t_addr & 0x7FFF) || top_fx != fine_x;
-
-        if (!(mask & 0x08)) {
-            std::memset(frame, backdrop, 240 * 256);
-            std::memset(bg_opaque, 0, sizeof(bg_opaque));
-        } else {
-            render_bg_rows(frame, pal, backdrop, top_ctrl, top_t, top_fx, 0, 240);
+        // Piecewise state: rows through the sprite-0 hit render from the
+        // visible-span-start state, rows through the IRQ split (when the
+        // console marked one) from the state latched at delivery, rows
+        // below from the live registers.  Each band carries its own
+        // enable/edge bits, mirroring, scroll, and CHR banks.
+        // A live v differing from the one latched at the split means the
+        // IRQ handler loaded v via a $2006 pair -- the hardware mid-frame
+        // y-jump; the post-split band pins its y to it.
+        int live_y_base = -1;
+        if (mid_scanline >= 0 && (vram_addr & 0x7FFF) != (mid_v_addr & 0x7FFF)) {
+            live_y_base = scroll_row_480(vram_addr);
         }
+        const BandState live{ctrl, mask, mirroring, t_addr, fine_x,
+                             live_y_base, chr_bank};
+        const BandState span = frame_latch_valid
+            ? BandState{frame_ctrl, frame_mask, frame_mirroring,
+                        frame_t_addr, frame_fine_x, -1, frame_chr_bank}
+            : BandState{ctrl, mask, mirroring, t_addr, fine_x, -1, chr_bank};
+
+        render_bg_rows(frame, pal, backdrop, span, 0, 240);
 
         sprite0_scanline = -1;
+        if (mask & 0x10) sprite0_scanline = detect_sprite0(span.banks);
+
+        const int s0 = sprite0_scanline;
+        const bool have_mid = mid_scanline >= 0 && mid_scanline + 1 < 240
+            && (s0 < 0 || mid_scanline > s0);
+        const BandState mid_band = have_mid
+            ? BandState{mid_ctrl, mid_mask, mid_mirroring,
+                        mid_t_addr, mid_fine_x, -1, mid_chr_bank}
+            : live;
+
+        // The frame's ordered background bands, each starting at its first
+        // row: span from the top, then the post-sprite-0 and post-IRQ
+        // splits (mid_band collapses to live when there is no IRQ split).
+        struct Segment { int y0; const BandState* band; };
+        Segment segs[3];
+        int nseg = 0;
+        segs[nseg++] = {0, &span};
+        if (s0 >= 0 && s0 + 1 < 240) segs[nseg++] = {s0 + 1, &mid_band};
+        if (have_mid) segs[nseg++] = {mid_scanline + 1, &live};
+        mid_scanline = -1;
+
+        // Repaint each lower band over the full-frame span pass, skipping
+        // any whose state matches the band above it.
+        for (int i = 1; i < nseg; ++i) {
+            const int end = (i + 1 < nseg) ? segs[i + 1].y0 : 240;
+            if (!same_band(*segs[i].band, *segs[i - 1].band))
+                render_bg_rows(frame, pal, backdrop, *segs[i].band, segs[i].y0, end);
+        }
         if (!(mask & 0x10)) return out;
 
-        sprite0_scanline = detect_sprite0();
-        if (split && (mask & 0x08) && sprite0_scanline >= 0
-            && sprite0_scanline + 1 < 240) {
-            render_bg_rows(frame, pal, backdrop, ctrl, t_addr, fine_x,
-                           sprite0_scanline + 1, 240);
-        }
+        // Sprite pixels fetch through the banks of the band their row
+        // falls in (per-scanline fetches on hardware -- how games blank
+        // sprites below the split by switching to an empty CHR page).
+        auto banks_for_row = [&](int row) -> const int* {
+            const BandState* b = segs[0].band;
+            for (int i = 1; i < nseg; ++i)
+                if (row >= segs[i].y0) b = segs[i].band;
+            return b->banks;
+        };
 
         const bool tall = (ctrl & 0x20) != 0;
-        // Draw from sprite 63 down so lower-index sprites win overlaps.
-        for (int i = 63; i >= 0; --i) {
+        const int sprite_x_min = (mask & 0x04) ? 0 : 8;
+        std::memset(sprite_claimed, 0, sizeof(sprite_claimed));
+        // Low index first: the first opaque sprite claims the pixel, and
+        // only its priority bit decides front-vs-behind (an obscured
+        // behind-background sprite hides higher-index sprites too).
+        for (int i = 0; i < 64; ++i) {
             const int y = oam[i * 4], tile = oam[i * 4 + 1];
             const int attr = oam[i * 4 + 2], x = oam[i * 4 + 3];
             const int top = y + 1;
@@ -330,10 +450,14 @@ struct PPU {
                     t = ((ctrl & 0x08) ? 256 : 0) + tile;
                     prow = src_r;
                 }
+                const int* sbanks = banks_for_row(top + r);
                 for (int c = 0; c < cols; ++c) {
+                    if (x + c < sprite_x_min) continue;
                     const int src_c = (attr & 0x40) ? (7 - c) : c;
-                    const int pix = tile_pixel(t, prow, src_c);
+                    const int pix = tile_pixel(sbanks, t, prow, src_c);
                     if (!pix) continue;
+                    if (sprite_claimed[top + r][x + c]) continue;
+                    sprite_claimed[top + r][x + c] = true;
                     if ((attr & 0x20) && bg_opaque[top + r][x + c])
                         continue;  // behind background
                     frame[(top + r) * 256 + (x + c)] = pal[0x10 + (attr & 3) * 4 + pix];
@@ -356,6 +480,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_static("palette_index", &PPU::palette_index)
         .def("begin_vblank", &PPU::begin_vblank)
         .def("end_vblank", &PPU::end_vblank)
+        .def("mark_split", &PPU::mark_split)
         .def("take_nmi_edge", &PPU::take_nmi_edge)
         .def("oam_dma", &PPU::oam_dma)
         .def("render_frame", &PPU::render_frame)
@@ -375,9 +500,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("vblank", &PPU::vblank)
         .def_readwrite("sprite0_hit", &PPU::sprite0_hit)
         .def_readwrite("frame_ctrl", &PPU::frame_ctrl)
+        .def_readwrite("frame_mask", &PPU::frame_mask)
+        .def_readwrite("frame_mirroring", &PPU::frame_mirroring)
         .def_readwrite("frame_t_addr", &PPU::frame_t_addr)
         .def_readwrite("frame_fine_x", &PPU::frame_fine_x)
         .def_readwrite("frame_latch_valid", &PPU::frame_latch_valid)
+        .def_readwrite("mid_ctrl", &PPU::mid_ctrl)
+        .def_readwrite("mid_mask", &PPU::mid_mask)
+        .def_readwrite("mid_mirroring", &PPU::mid_mirroring)
+        .def_readwrite("mid_t_addr", &PPU::mid_t_addr)
+        .def_readwrite("mid_fine_x", &PPU::mid_fine_x)
+        .def_property_readonly("chr_banks", [](PPU& p) {
+            return std::vector<int>(p.chr_bank, p.chr_bank + 8);
+        })
         .def_property_readonly("sprite0_scanline", [](PPU& p) -> std::optional<int> {
             if (p.sprite0_scanline < 0) return std::nullopt;
             return p.sprite0_scanline;

@@ -44,8 +44,13 @@ def read_mode_table() -> tuple[int, ...]:
 
 
 def cycle_table() -> tuple[int, ...]:
-    """Base opcode cycles; dynamic penalties are outside the run protocol."""
-    table = [0] * 256
+    """Base opcode cycles; dynamic penalties are outside the run protocol.
+
+    Unknown bytes cost 2, never 0: a zero-cycle step can never satisfy a
+    cycle budget, so garbage execution (a bad pointer landing between
+    opcodes) would spin the native run loop forever instead of returning
+    at the frame boundary."""
+    table = [2] * 256
     for byte, op in OPCODES.items():
         table[byte] = op.cycles
     return tuple(table)
@@ -159,6 +164,9 @@ def run_state_members_cpp() -> str:
     int st_ir = 0, st_oplo = 0, st_ophi = 0, st_ea = 0, st_data = 0;
     bool st_halted = false;
     bool nmi_pending = false;
+    // IRQ line: delivered at a step boundary only while the I flag is
+    // clear (stays pending until then); NMI wins when both are set.
+    bool irq_pending = false;
     bool resume_read_skip = false;
     // Read lease: watched reads of this address are served natively
     // with this value (device semantics frozen until the bus clears it).
@@ -178,6 +186,10 @@ MACHINE_API_CPP = """\
     void set_read_lease(int addr, int value) { lease_addr = addr & 0xFFFF; lease_value = value & 0xFF; }
     void clear_read_lease() { lease_addr = -1; }
     void set_nmi() { nmi_pending = true; }
+    void set_irq() { irq_pending = true; }
+    void clear_irq() { irq_pending = false; }
+    // IRQ deliverable now: I clear and no NMI ahead of it.
+    bool irq_ready() const { return irq_pending && !nmi_pending && !(st_p & 0x04); }
     int read_ram(int addr) { return ram[addr & 0xFFFF]; }
     py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }"""
 
@@ -199,7 +211,7 @@ RUN_LOOP_TEMPLATE = """\
             if (st_halted) { reason = "halt"; break; }
             const bool skip = resume_read_skip;
             resume_read_skip = false;
-            if (!nmi_pending && !skip && !rwatch.empty()) {
+            if (!nmi_pending && !irq_ready() && !skip && !rwatch.empty()) {
                 const int target = shadow_read_target();
                 if (target >= 0 && in_ranges(rwatch, target)) {
                     if (target != lease_addr) {

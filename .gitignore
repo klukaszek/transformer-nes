@@ -29,3 +29,9 @@ vendor/imgui/
 transformer_nes/nes/examples/smb.nes
 transformer_nes/nes/examples/smb3.nes
 transformer_nes/nes/examples/ff.nes
+transformer_nes/nes/examples/punchout.nes
+transformer_nes/nes/examples/megaman6.nes
+
+# F1 debug snapshots
+_debug_dumps/
+

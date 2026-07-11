@@ -6,6 +6,7 @@
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -23,13 +24,18 @@ namespace py = pybind11;
 
 static const int FRAME_W = 256;
 static const int FRAME_H = 240;
+// Overscan-cropped presentation (8-pixel border, as on a CRT).
+static const int VIEW_W = 240;
+static const int VIEW_H = 224;
 // NTSC: 29781 CPU cycles per frame at 1.789773 MHz (console.py's pacing).
 static const double NES_FRAME_SECONDS = 29781.0 / 1789772.727272727;
 
-// Button bit i == console.BUTTONS[i].
+// Button bit i == console.BUTTONS[i].  Bit 8 is the F1 debug-dump
+// request, consumed by app.py rather than the controller.
 enum {
     BTN_A = 1 << 0, BTN_B = 1 << 1, BTN_SELECT = 1 << 2, BTN_START = 1 << 3,
     BTN_UP = 1 << 4, BTN_DOWN = 1 << 5, BTN_LEFT = 1 << 6, BTN_RIGHT = 1 << 7,
+    BTN_DEBUG = 1 << 8,
 };
 
 static const char* VS_SRC = R"(
@@ -52,7 +58,10 @@ struct vs_out { float4 pos [[position]]; float2 uv; };
 fragment float4 fs_main(vs_out in [[stage_in]],
                         texture2d<float> tex [[texture(0)]],
                         sampler smp [[sampler(0)]]) {
-    return tex.sample(smp, in.uv);
+    // NTSC overscan: crop the 8-pixel border a CRT never showed (games
+    // mask the left column and stream tiles through the right one).
+    return tex.sample(smp, float2((8.0 + in.uv.x * 240.0) / 256.0,
+                                  (8.0 + in.uv.y * 224.0) / 240.0));
 }
 )";
 
@@ -147,6 +156,13 @@ static void app_frame(void) {
     if (state->acc > 4 * NES_FRAME_SECONDS) {
         state->acc = 4 * NES_FRAME_SECONDS;
     }
+    // Wall-clock budget per callback: when the backend cannot keep up
+    // with real time, drop the backlog (the game slows down) instead of
+    // saturating the main thread -- the event loop must always breathe.
+    // Half the display cadence, so a 120 Hz callback keeps headroom too.
+    const auto deadline = std::chrono::steady_clock::now()
+        + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(0.5 * sapp_frame_duration()));
     bool fresh = false;
     while (state->acc >= NES_FRAME_SECONDS && !state->error) {
         state->acc -= NES_FRAME_SECONDS;
@@ -154,8 +170,13 @@ static void app_frame(void) {
             if (!emulate_frame()) break;
             fresh = true;
         } catch (py::error_already_set& e) {
+            fprintf(stderr, "frame callback raised:\n%s\n", e.what());
             state->error = std::make_unique<py::error_already_set>(std::move(e));
             sapp_request_quit();
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            state->acc = 0.0;
+            break;
         }
     }
     if (fresh) {
@@ -171,10 +192,10 @@ static void app_frame(void) {
     pass.action.colors[0].clear_value = {0.0f, 0.0f, 0.0f, 1.0f};
     sg_begin_pass(&pass);
     if (state->have_frame) {
-        // Letterbox to the frame's 256:240.
+        // Letterbox to the cropped frame's 256:224.
         int w = sapp_width(), h = sapp_height();
-        int vw = w, vh = w * FRAME_H / FRAME_W;
-        if (vh > h) { vh = h; vw = h * FRAME_W / FRAME_H; }
+        int vw = w, vh = w * VIEW_H / VIEW_W;
+        if (vh > h) { vh = h; vw = h * VIEW_W / VIEW_H; }
         sg_apply_viewport((w - vw) / 2, (h - vh) / 2, vw, vh, true);
         sg_apply_pipeline(state->pipeline);
         sg_bindings bind{};
@@ -205,6 +226,7 @@ static void app_event(const sapp_event* e) {
         case SAPP_KEYCODE_DOWN:        bit = BTN_DOWN; break;
         case SAPP_KEYCODE_LEFT:        bit = BTN_LEFT; break;
         case SAPP_KEYCODE_RIGHT:       bit = BTN_RIGHT; break;
+        case SAPP_KEYCODE_F1:          bit = BTN_DEBUG; break;
         default: return;
     }
     if (e->type == SAPP_EVENTTYPE_KEY_DOWN) {
@@ -242,8 +264,8 @@ static void run(const std::string& title, int scale, py::object frame_cb,
     desc.frame_cb = app_frame;
     desc.event_cb = app_event;
     desc.cleanup_cb = app_cleanup;
-    desc.width = FRAME_W * scale;
-    desc.height = FRAME_H * scale;
+    desc.width = VIEW_W * scale;
+    desc.height = VIEW_H * scale;
     desc.window_title = title.c_str();
     desc.high_dpi = true;
     desc.swap_interval = 1;

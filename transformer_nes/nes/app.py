@@ -60,6 +60,48 @@ def load_app_module():
     return app_module
 
 
+DUMP_DIR = os.path.join(NES_DIR, "_debug_dumps")
+
+
+def debug_dump(console: Console) -> None:
+    """F1: snapshot the frame + PPU/mapper state for offline analysis."""
+    import numpy as np
+
+    os.makedirs(DUMP_DIR, exist_ok=True)
+    ppu = console.ppu
+    n = console.frame_index
+    path = os.path.join(DUMP_DIR, f"dump_{n:06d}.npz")
+    cpu = console.snapshot()[1]
+    state = {
+        "pc": f"{int(cpu['pc']):04X}", "p": f"{int(cpu['p']):02X}",
+        "i_flag": bool(int(cpu["p"]) & 4),
+        "live_ctrl": ppu.ctrl, "live_mask": ppu.mask,
+        "live_mirroring": ppu.mirroring, "live_t": ppu.t_addr,
+        "live_fine_x": ppu.fine_x, "live_banks": list(ppu.chr_banks),
+        "frame_ctrl": ppu.frame_ctrl, "frame_mask": ppu.frame_mask,
+        "frame_mirroring": ppu.frame_mirroring, "frame_t": ppu.frame_t_addr,
+        "frame_fine_x": ppu.frame_fine_x,
+        "mid_ctrl": ppu.mid_ctrl, "mid_mask": ppu.mid_mask,
+        "mid_mirroring": ppu.mid_mirroring, "mid_t": ppu.mid_t_addr,
+        "mid_fine_x": ppu.mid_fine_x,
+        "sprite0_scanline": ppu.sprite0_scanline,
+    }
+    if console.mapper.irq_scanline() is not None:
+        state.update(irq_scanline=console.mapper.irq_scanline(),
+                     irq_enabled=console.mapper.irq_enabled,
+                     irq_latch=console.mapper.irq_latch,
+                     prg_banks=list(console.mapper.prg_banks()),
+                     mapper_chr=list(console.mapper.chr_banks()))
+    np.savez(path,
+             frame=np.asarray(console.run_frame()),
+             nametables=np.frombuffer(bytes(ppu.nametables), dtype=np.uint8),
+             palette=np.frombuffer(bytes(ppu.palette), dtype=np.uint8),
+             oam=np.frombuffer(bytes(ppu.oam), dtype=np.uint8),
+             **{k: np.asarray(v) for k, v in state.items()})
+    logger.info("debug dump: %s | %s", path,
+                " ".join(f"{k}={v}" for k, v in state.items()))
+
+
 def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
             max_frames: int = 0) -> None:
     """Open the window and play the console until quit.
@@ -76,6 +118,8 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
         nonlocal emu_seconds, last_buttons
         if console.halted or (max_frames and console.frame_index >= max_frames):
             return None
+        if buttons & 0x100 and not last_buttons & 0x100:
+            debug_dump(console)
         if buttons != last_buttons:
             last_buttons = buttons
             pressed = [name for i, name in enumerate(BUTTONS) if buttons >> i & 1]
@@ -85,7 +129,14 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
         )
         start = time.perf_counter()
         frame = console.run_frame()
-        emu_seconds += time.perf_counter() - start
+        elapsed = time.perf_counter() - start
+        emu_seconds += elapsed
+        if elapsed > 0.1:
+            logger.warning(
+                "slow frame %d: %.0f ms (checkpoints=%d, log=%s tokens)",
+                console.frame_index, 1e3 * elapsed, console.checkpoint_count,
+                getattr(console.bus, "log_tokens", "?"),
+            )
         return to_rgb(frame)
 
     def quit_cb():

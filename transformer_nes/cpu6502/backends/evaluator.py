@@ -114,6 +114,7 @@ class Cpu6502Runtime:
         self.in_data = find_input_dim("in_data")
         self.in_halted = find_input_dim("in_halted")
         self.in_nmi = find_input_dim("in_nmi")
+        self.in_irq = find_input_dim("in_irq")
 
         self.hull_ext = load_hull_ext()
         if self.hull_ext is None:
@@ -554,6 +555,7 @@ class Cpu6502Runtime:
         if state is not None:
             self.mstate.update({k: state[k] for k in self.mstate if k in state})
         self.nmi_pending = False
+        self.irq_pending = False
         self.machine_halted = False
         self.last_prefix_seconds = time.perf_counter() - prefix_start
 
@@ -566,6 +568,13 @@ class Cpu6502Runtime:
         """Request an NMI: the next machine_step executes the interrupt sequence."""
         self.nmi_pending = True
 
+    def set_irq(self):
+        """Request an IRQ: delivered at the next step with the I flag clear."""
+        self.irq_pending = True
+
+    def clear_irq(self):
+        self.irq_pending = False
+
     def inject_write(self, addr: int, value: int):
         """Append a device-originated WRITE token (a value appearing on the bus)."""
         self.insert_memory_write(addr & 0xFFFF, value & 0xFF, memory_ids=self.memory_ids)
@@ -576,6 +585,9 @@ class Cpu6502Runtime:
         nmi = 1 if self.nmi_pending else 0
         self.nmi_pending = False
         p = st["p"]
+        irq = 1 if reference.irq_deliverable(p, self.irq_pending, nmi) else 0
+        if irq:
+            self.irq_pending = False
         self.direct_insert(
             "STATE",
             {
@@ -602,6 +614,7 @@ class Cpu6502Runtime:
                 self.in_data: st["data"],
                 self.in_halted: st["halted"],
                 self.in_nmi: nmi,
+                self.in_irq: irq,
             },
             lookup_ids={self.state_lu.id},
         )

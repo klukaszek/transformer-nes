@@ -38,6 +38,7 @@ INPUT_SLOT_NAMES = {
     "ir": "in_ir", "oplo": "in_oplo", "ophi": "in_ophi",
     "ea_lo": "in_ea_lo", "ea_hi": "in_ea_hi",
     "data": "in_data", "halted": "in_halted", "nmi": "in_nmi",
+    "irq": "in_irq",
 }
 P_FLAG_NAMES = (
     ("in_p_c", reference.FLAG_C), ("in_p_z", reference.FLAG_Z),

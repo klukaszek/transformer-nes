@@ -211,6 +211,8 @@ class Console:
             if getattr(self.mapper, "chr_rom", False):
                 self.mapper.set_chr_banks = self.ppu.set_chr_banks
                 self.ppu.set_chr_banks(self.mapper.chr_banks())
+            if hasattr(self.mapper, "on_irq_ack"):
+                self.mapper.on_irq_ack = self.clear_irq
 
     def set_mirroring(self, mode: int) -> None:
         self.ppu.mirroring = mode
@@ -251,6 +253,18 @@ class Console:
         else:
             self.bus.set_nmi()
 
+    def set_irq(self) -> None:
+        if self.uses_kernel_bus:
+            self.rt.set_irq()
+        else:
+            self.bus.set_irq()
+
+    def clear_irq(self) -> None:
+        if self.uses_kernel_bus:
+            self.rt.clear_irq()
+        else:
+            self.bus.clear_irq()
+
     def check_nmi_edge(self) -> None:
         if self.ppu.take_nmi_edge():
             self.set_nmi()
@@ -285,13 +299,27 @@ class Console:
         """Run one NTSC frame; returns the rendered 240x256 index frame."""
         base = self.frame_base
 
-        # Visible portion, split by the sprite-0 hit event when pending.
+        # Visible portion, split by mid-frame events: the sprite-0 hit and
+        # the mapper's scanline IRQ (which also marks the render split).
         # Each PPU status transition invalidates any $2002 read lease.
+        events = []
         if self.sprite0_scanline is not None and self.ppu.rendering_enabled:
-            hit_cycle = base + int((self.sprite0_scanline + 1) * CYCLES_PER_SCANLINE)
-            self.run_until(min(hit_cycle, base + VBLANK_START_CYCLES))
+            events.append((self.sprite0_scanline, "sprite0"))
+        irq_line = self.mapper.irq_scanline()
+        if irq_line is not None and self.ppu.rendering_enabled:
+            events.append((irq_line, "irq"))
+        for scanline, kind in sorted(events):
+            cycle = base + int((scanline + 1) * CYCLES_PER_SCANLINE)
+            self.run_until(min(cycle, base + VBLANK_START_CYCLES))
             self.bus.clear_read_lease()
-            self.ppu.sprite0_hit = True
+            if kind == "sprite0":
+                self.ppu.sprite0_hit = True
+            # Re-validate the IRQ at delivery: the game may have disabled
+            # rendering (the counter only clocks while rendering) or
+            # disarmed the IRQ ($E000) since the frame started.
+            elif self.ppu.rendering_enabled and self.mapper.irq_scanline() == scanline:
+                self.ppu.mark_split(scanline)
+                self.set_irq()
         self.run_until(base + VBLANK_START_CYCLES)
         self.bus.clear_read_lease()
 

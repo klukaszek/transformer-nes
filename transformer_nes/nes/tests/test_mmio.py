@@ -75,6 +75,16 @@ def row_key(row):
     return (s.pc, s.a, s.x, s.y, s.s, s.p, s.halted, writes)
 
 
+def assert_registers_match(out, ref_rows):
+    """A native run's per-step registers match the reference trace."""
+    assert len(out["pc"]) == len(ref_rows)
+    for i, ref_row in enumerate(ref_rows):
+        s = ref_row.state
+        got = (int(out["pc"][i]), int(out["a"][i]), int(out["x"][i]),
+               int(out["y"][i]), int(out["s"][i]), int(out["p"][i]))
+        assert (s.pc, s.a, s.x, s.y, s.s, s.p) == got, f"step {i}"
+
+
 def run_reference(image: bytes):
     cpu = Cpu6502(memory=bytearray(image))
     cpu.pc = START_PC
@@ -102,6 +112,92 @@ def test_graph_bus_matches_reference_bus():
     assert ref_dev.log == device.log
     # Each scheduled NMI ran the handler exactly once.
     assert ref_bus.ram[0x20] == bus.ram[0x20] == len(NMI_AT)
+
+
+IRQ_START = 0x8000
+IRQ_STEPS = 80
+# 1 fires inside the SEI-protected prologue (delivery deferred until the
+# CLI lands); 30 and 55 fire in the unprotected loop.
+IRQ_AT = {1, 30, 55}
+
+
+def make_irq_image() -> bytes:
+    image = bytearray(0x10000)
+    main = bytes([
+        0x78,                    # SEI
+        0xA9, 0x00, 0x85, 0x30,  # LDA #$00 ; STA $30  ; IRQ counter
+        0xEA, 0xEA,              # NOP ; NOP           ; deferral window
+        0x58,                    # CLI
+        # loop ($8008):
+        0xE6, 0x31,              # INC $31
+        0x4C, 0x08, 0x80,        # JMP loop
+    ])
+    image[IRQ_START:IRQ_START + len(main)] = main
+    handler = bytes([
+        0xE6, 0x30,              # INC $30
+        0x40,                    # RTI
+    ])
+    image[0xA000:0xA000 + len(handler)] = handler
+    image[0xFFFE] = 0x00
+    image[0xFFFF] = 0xA0
+    return bytes(image)
+
+
+def run_irq_reference(image: bytes):
+    cpu = Cpu6502(memory=bytearray(image))
+    cpu.pc = IRQ_START
+    bus = Bus(ReferenceCore(cpu), image)
+    rows = bus.run(IRQ_STEPS, irq_at=set(IRQ_AT))
+    return rows, bus
+
+
+def test_irq_graph_bus_matches_reference_bus():
+    image = make_irq_image()
+    ref_rows, ref_bus = run_irq_reference(image)
+    # The SEI-window IRQ was deferred, not lost: all three delivered.
+    assert ref_bus.ram[0x30] == len(IRQ_AT)
+
+    rt = Cpu6502Runtime()
+    rt.boot_image(list(image), start_pc=IRQ_START)
+    bus = Bus(GraphCore(rt), image)
+    rows = bus.run(IRQ_STEPS, irq_at=set(IRQ_AT))
+
+    assert len(ref_rows) == len(rows) == IRQ_STEPS
+    for i, (a, b) in enumerate(zip(ref_rows, rows, strict=True)):
+        assert row_key(a) == row_key(b), f"step {i}: ref={a.state} graph={b.state}"
+    assert bus.ram[0x30] == len(IRQ_AT)
+
+
+@pytest.mark.slow
+def test_irq_kernel_bus_matches_reference_bus():
+    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
+
+    image = make_irq_image()
+    ref_rows, _ref_bus = run_irq_reference(image)
+
+    rt = Cpu6502CppRuntime(bcd=True)
+    bus = KernelBus(rt, image, start_pc=IRQ_START)
+    out = bus.run(IRQ_STEPS, irq_at=set(IRQ_AT))
+
+    assert_registers_match(out, ref_rows)
+    assert rt.read_ram(0x30) == len(IRQ_AT)
+
+
+@pytest.mark.slow
+def test_irq_weights_bus_matches_reference_bus():
+    from transformer_nes.cpu6502.backends.weights.runner import (
+        Cpu6502TransformerMachine,
+    )
+
+    image = make_irq_image()
+    ref_rows, _ref_bus = run_irq_reference(image)
+
+    machine = Cpu6502TransformerMachine(bcd=False, checkpoint_tokens=None)
+    bus = KernelBus(machine, image, start_pc=IRQ_START)
+    out = bus.run(IRQ_STEPS, irq_at=set(IRQ_AT))
+
+    assert_registers_match(out, ref_rows)
+    assert machine.read_ram(0x30) == len(IRQ_AT)
 
 
 @pytest.mark.slow

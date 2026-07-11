@@ -436,7 +436,7 @@ ENGINE_STEP_BODY = """\
                     continue;
                 }
             }
-            const bool was_nmi = nmi_pending;
+            const bool was_int = nmi_pending || irq_ready();
             const int prev_pc = st_pc;
             ++fallback_count[prev_pc];  // JIT profile: per-instruction steps only
             step_core(o);  // updates st_*, applies writes to ram + memory
@@ -458,7 +458,7 @@ ENGINE_STEP_BODY = """\
                 }
             }
             ++step_index;
-            const long step_cycles = was_nmi ? 7 : (long)CYCLES[(unsigned char)o[6]];
+            const long step_cycles = was_int ? 7 : (long)CYCLES[(unsigned char)o[6]];
             cycles_this += step_cycles; cycles_total += step_cycles;
             for (int k = 0; k < n_hits; ++k) { hit_addr.push_back(sh_addr[k]); hit_value.push_back(sh_value[k]); }
             if (halted) { st_halted = true; reason = "halt"; break; }
@@ -539,6 +539,8 @@ PYBIND_STEP_METHODS = """\
         .def("set_read_lease", &ENGINE_T::set_read_lease)
         .def("clear_read_lease", &ENGINE_T::clear_read_lease)
         .def("set_nmi", &ENGINE_T::set_nmi)
+        .def("set_irq", &ENGINE_T::set_irq)
+        .def("clear_irq", &ENGINE_T::clear_irq)
         .def("inject_write", &ENGINE_T::inject_write)
         .def("inject_region", &ENGINE_T::inject_region)
         .def("read_ram", &ENGINE_T::read_ram)
@@ -601,11 +603,11 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
                        exp["model"], exp["step_spec"])
     # Window dispatch: same guards as the per-instruction path needs for
     # step-for-step equivalence -- pc at the head, every window byte
-    # matched, no pending NMI, enough step/cycle budget for the window.
+    # matched, no deliverable interrupt, enough step/cycle budget.
     emit("")
     emit("    int dispatch(Eng& E, long i, long max_steps, long cycles_this,")
     emit("                 long max_cycles, bool stop_on_trap) {")
-    emit("        if (E.nmi_pending || stop_on_trap) return 0;")
+    emit("        if (E.nmi_pending || E.irq_ready() || stop_on_trap) return 0;")
     for exp in experts:
         head, window = exp["head"], exp["window"]
         k, prefix = exp["n_steps"], exp["cycles_prefix"]
@@ -1110,8 +1112,11 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit(f"        x[{ins['ea_hi']}] = {sc(f'({E}st_ea >> 8) & 0xFF')};")
         emit(f"        x[{ins['data']}] = {sc(f'{E}st_data')};")
         emit(f"        x[{ins['halted']}] = {sc(f'{E}st_halted ? 1 : 0')};")
+        emit(f"        const bool take_irq = {E}irq_ready();")
         emit(f"        x[{ins['nmi']}] = {sc(f'{E}nmi_pending ? 1 : 0')};")
         emit(f"        {E}nmi_pending = false;")
+        emit(f"        x[{ins['irq']}] = {sc('take_irq ? 1 : 0')};")
+        emit(f"        if (take_irq) {E}irq_pending = false;")
         emit(f"        ++{E}seq;")
         for li in range(len(mdl.attn)):
             emit(f"        layer_{li}{layer_suffix}("
@@ -1221,7 +1226,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("        std::memset(fallback_count, 0, sizeof(fallback_count));")
         emit("        st_pc = 0; st_a = st_x = st_y = 0; st_s = 0xFD; st_p = 0x24;")
         emit("        st_ir = st_oplo = st_ophi = st_ea = st_data = 0;")
-        emit("        st_halted = false; nmi_pending = false; resume_read_skip = false;")
+        emit("        st_halted = false; nmi_pending = false; irq_pending = false;")
+        emit("        resume_read_skip = false;")
         emit("        lease_addr = -1;")
         emit("        step_index = 0; cycles_total = 0;")
         emit("        rwatch.clear(); wwatch.clear();")
@@ -1302,7 +1308,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("")
         emit("    void step_core(long long* out) {")
         if op_experts:
-            emit("        if (!nmi_pending) {")
+            emit("        if (!nmi_pending && !irq_ready()) {")
             emit("            switch (ram[st_pc]) {")
             for exp in op_experts:
                 emit(f"                case 0x{exp['byte']:02X}: "
@@ -1341,7 +1347,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("                       long max_cycles, bool stop_on_trap) {")
         if n_shapes:
             emit("        const int sid = shape_of_pc[st_pc];")
-            emit("        if (!sid || nmi_pending || stop_on_trap) return 0;")
+            emit("        if (!sid || nmi_pending || irq_ready() || stop_on_trap) return 0;")
             emit("        switch (sid) {")
             for j, exp in enumerate(shape_experts):
                 # add_window guarantees head + length <= 0x10000: no wrap.
@@ -1376,13 +1382,14 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("    void machine_step(int pc, int a, int xr, int yr, int sr,")
         emit("                      int p, int ir, int oplo, int ophi,")
         emit("                      int ea, int data, int halted, int nmi,")
-        emit("                      LArr out_arr) {")
+        emit("                      int irq, LArr out_arr) {")
         emit('        if ((int)out_arr.size() != 21) throw std::runtime_error("step out buffer must have 21 slots");')
         emit("        st_pc = pc & 0xFFFF; st_a = a & 0xFF; st_x = xr & 0xFF;")
         emit("        st_y = yr & 0xFF; st_s = sr & 0xFF; st_p = p & 0xFF;")
         emit("        st_ir = ir & 0xFF; st_oplo = oplo & 0xFF; st_ophi = ophi & 0xFF;")
         emit("        st_ea = ea & 0xFFFF; st_data = data & 0xFF;")
         emit("        st_halted = halted != 0; nmi_pending = nmi != 0;")
+        emit("        irq_pending = irq != 0;")
         emit("        step_core(out_arr.mutable_data());")
         emit("    }")
 
@@ -1481,6 +1488,8 @@ class GeneratedWeightsEngine:
             self.set_read_lease = self.engine.set_read_lease
             self.clear_read_lease = self.engine.clear_read_lease
             self.set_nmi = self.engine.set_nmi
+            self.set_irq = self.engine.set_irq
+            self.clear_irq = self.engine.clear_irq
             self.engine_inject_write = self.engine.inject_write
             self.read_ram = self.engine.read_ram
             self.dump_ram = self.engine.dump_ram

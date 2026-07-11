@@ -310,6 +310,7 @@ class Cpu6502TransformerMachine:
         if state is not None:
             self.mstate.update({k: int(state[k]) for k in self.mstate if k in state})
         self.nmi_pending = False
+        self.irq_pending = False
         self.machine_halted = False
         self.populate_shape_windows()
 
@@ -324,6 +325,17 @@ class Cpu6502TransformerMachine:
         # (the per-step path passes it as an argument instead).
         if self.engine.has_run_loop:
             self.engine.set_nmi()
+
+    def set_irq(self):
+        """Delivered at the next step boundary with the I flag clear."""
+        self.irq_pending = True
+        if self.engine.has_run_loop:
+            self.engine.set_irq()
+
+    def clear_irq(self):
+        self.irq_pending = False
+        if self.engine.has_run_loop:
+            self.engine.clear_irq()
 
     def inject_write(self, addr: int, value: int):
         self.insert_write(addr & 0xFFFF, value & 0xFF)
@@ -349,10 +361,13 @@ class Cpu6502TransformerMachine:
         st = self.mstate
         nmi = 1 if self.nmi_pending else 0
         self.nmi_pending = False
+        irq = 1 if reference.irq_deliverable(st["p"], self.irq_pending, nmi) else 0
+        if irq:
+            self.irq_pending = False
         self.engine.machine_step(
             st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
             st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"],
-            st["halted"], nmi, self.step_out,
+            st["halted"], nmi, irq, self.step_out,
         )
         o = self.step_out.tolist()  # one C call instead of 21 scalar reads
         n_writes = o[14]
@@ -398,9 +413,12 @@ class Cpu6502TransformerMachine:
         state = self.machine_state
         trace_len = self.trace_len
         nmi = self.nmi_pending
+        irq = self.irq_pending
         self.boot_image(self.ram, start_pc=state["pc"], state=state)
         self.trace_len = trace_len
         self.nmi_pending = nmi
+        if irq:
+            self.set_irq()
         self.checkpoints += 1
         return True
 

@@ -45,7 +45,7 @@ STATE_FIELDS = (
     "is_state", "in_pc_lo", "in_pc_hi", "in_a", "in_x", "in_y", "in_s",
     "in_p_c", "in_p_z", "in_p_i", "in_p_d", "in_p_b", "in_p_u", "in_p_v", "in_p_n",
     "in_ir", "in_oplo", "in_ophi", "in_ea_lo", "in_ea_hi", "in_data", "in_halted",
-    "in_nmi",
+    "in_nmi", "in_irq",
 )
 
 def c_num(coeff) -> str:
@@ -449,7 +449,8 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        }')
     emit('        st_pc = start_pc & 0xFFFF; st_a = st_x = st_y = 0; st_s = 0xFD; st_p = 0x24;')
     emit('        st_ir = st_oplo = st_ophi = st_ea = st_data = 0;')
-    emit('        st_halted = false; nmi_pending = false; resume_read_skip = false;')
+    emit('        st_halted = false; nmi_pending = false; irq_pending = false;')
+    emit('        resume_read_skip = false;')
     emit('        cycles_total = 0;')
     emit('        rwatch.clear(); wwatch.clear();')
     emit('        lease_addr = -1;')
@@ -504,7 +505,9 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     body: list[str] = []
     b = body.append
     b('            const bool nmi = nmi_pending;')
+    b('            const bool irq = irq_ready();')
     b('            nmi_pending = false;')
+    b('            if (irq) irq_pending = false;')
     b('            insert_state(pos,')
     b('                (double)(st_pc & 0xFF), (double)((st_pc >> 8) & 0xFF),')
     b('                (double)st_a, (double)st_x, (double)st_y, (double)st_s,')
@@ -513,7 +516,8 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     b('                (double)((st_p >> 6) & 1), (double)((st_p >> 7) & 1),')
     b('                (double)st_ir, (double)st_oplo, (double)st_ophi,')
     b('                (double)(st_ea & 0xFF), (double)((st_ea >> 8) & 0xFF),')
-    b('                (double)st_data, (double)(st_halted ? 1 : 0), (double)(nmi ? 1 : 0));')
+    b('                (double)st_data, (double)(st_halted ? 1 : 0), (double)(nmi ? 1 : 0),')
+    b('                (double)(irq ? 1 : 0));')
     b('            pos += 1.0;')
     b('            step(v);')
     b(f'            t_pc.push_back((int)(iround(v[{t["current_pc"]}]) & 0xFFFF));')
@@ -558,7 +562,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     b('            st_ir = t_ir.back(); st_oplo = t_oplo.back(); st_ophi = t_ophi.back();')
     b('            st_ea = t_ea.back(); st_data = t_data.back();')
     b('            ++step_index;')
-    b('            const long step_cycles = nmi ? 7 : (long)CYCLES[(unsigned char)t_ir.back()];')
+    b('            const long step_cycles = (nmi || irq) ? 7 : (long)CYCLES[(unsigned char)t_ir.back()];')
     b('            cycles_this += step_cycles; cycles_total += step_cycles;')
     b('            for (int k = 0; k < n_hits; ++k) { hit_addr.push_back(sh_addr[k]); hit_value.push_back(sh_value[k]); }')
     b('            if (halted) { st_halted = true; reason = "halt"; break; }')
@@ -592,6 +596,8 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        .def("set_read_lease", &KERNEL_T::set_read_lease)')
     emit('        .def("clear_read_lease", &KERNEL_T::clear_read_lease)')
     emit('        .def("set_nmi", &KERNEL_T::set_nmi)')
+    emit('        .def("set_irq", &KERNEL_T::set_irq)')
+    emit('        .def("clear_irq", &KERNEL_T::clear_irq)')
     emit('        .def("inject_write", &KERNEL_T::inject_write)')
     emit('        .def("inject_region", &KERNEL_T::inject_region)')
     emit('        .def("read_ram", &KERNEL_T::read_ram)')
@@ -671,6 +677,12 @@ class Cpu6502CppRuntime:
 
     def set_nmi(self):
         self.kernel.set_nmi()
+
+    def set_irq(self):
+        self.kernel.set_irq()
+
+    def clear_irq(self):
+        self.kernel.clear_irq()
 
     def inject_write(self, addr: int, value: int):
         self.kernel.inject_write(addr, value)

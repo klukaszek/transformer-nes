@@ -22,12 +22,70 @@ window over the console frame loop — SMB is playable on a keyboard
 through the transformer weights, and getting it playable forced the
 PPU's real scroll model (loopy t + the sprite-0 split, same log).
 **Mappers landed same day** (log below): MMC1 (Final Fantasy plays)
-and MMC3 (SMB3 runs at 5.2 ms/frame through the weights) — but MMC3's
-scanline IRQ is NOT delivered yet, so SMB3's bottom status bar renders
-garbage.  Next up: **IRQ delivery in the machine model** (the graph
-has NMI only; IRQ = same interrupt sequence with the $FFFE vector and
-I-flag gating, paced by the console like the sprite-0 hit), then the
-APU + sokol_audio for sound.
+and MMC3 with the scanline IRQ delivered through the machine model
+(log above) — **SMB3 is fully playable** at 5.2 ms/frame through the
+weights, HUD and all.  Next up: the **APU + sokol_audio** for sound;
+more mappers (MMC2/4 latch CHR — Punch-Out!!/Fire Emblem; MMC5 far
+later) as wanted.
+
+## 2026-07-11 IRQ through the machine model + the PPU's v register — SMB3 fully playable
+
+The MMC3 arc's second half: the scanline IRQ, delivered as graph logic
+like the NMI, plus every PPU model gap SMB3's status bar exposed.
+Debugged live against gameplay with an F1 state-dump loop (app.py
+`debug_dump`: frame + nametables + band latches + mapper state + the
+IRQ handler's captured register writes); each fix below was pinned by a
+dump receipt before it was written.
+
+- **IRQ in the machine model.**  The graph gains `in_irq`: one shared
+  interrupt sequence (`is_int = is_nmi + is_irq`), vectors muxed
+  $FFFA/$FFFE — everything else (pushes, I=1, B-clear) identical, so
+  the union grew one input and no new machinery.  Delivery is gated at
+  the step boundary by `irq_ready()` (pending, no NMI ahead, I clear —
+  faithful 6502 polling); the flag is level-held until deliverable.
+  All four backends deliver identically: reference (`interrupt_step`),
+  evaluator, kernel, weights — with every expert/shape/sequence
+  dispatch tier guarded so a deliverable IRQ always reaches the
+  per-instruction path.  Receipts: 3 new lockstep tests (graph/kernel/
+  weights vs reference) including SEI-deferral; a shape-window spin
+  test (IRQ into a JIT-dispatched DEX/BNE loop) delivers on both
+  engines.
+- **The zero-cycle hang class, dead.**  Non-opcode bytes had CYCLES=0,
+  so garbage execution (a bad pointer) could spin the native run loop
+  forever inside one call — unbounded trace growth (observed: 12 GB)
+  with Python never regaining control.  Unknown bytes now cost 2
+  cycles: any runaway still returns at the frame boundary.  A 100K-
+  pause runaway guard in KernelBus.run stays as a permanent tripwire.
+- **MMC3 IRQ pacing** (console): the counter fires once per frame at
+  the latch scanline, re-validated at delivery (rendering still on,
+  mapper still armed — on silicon the counter only clocks while
+  rendering); $E000 acks through to the machine line.
+- **The PPU learns v.**  The write-capture receipt showed SMB3's IRQ
+  handler loads the HUD's vertical position with a mid-frame $2006
+  pair — on hardware the visible y comes from loopy **v** (self-
+  incrementing, reloaded from t only by that pair), while $2005/$2000
+  writes only arm t for the next frame.  The band model now latches v
+  at the split and pins the post-split band's y to it (absolute),
+  x from t — the ground-level HUD had only ever worked because t.y
+  happened to be 239.  Bands also carry their own $2001 mask bits,
+  mirroring, and CHR banks (the handler swaps all three for the HUD).
+- **Hardware sprite compositing.**  Sprites composite lowest-index-
+  first with per-pixel ownership (the claiming sprite's priority bit
+  alone decides front-vs-behind — emerging powerups stay obscured),
+  fetch through the banks of the band their row falls in (SMB3 blanks
+  sprites under the HUD by switching to an empty CHR page), and honor
+  the $2001 left-edge masks, sprite-0 included.
+- **App presentation + pacing**: NTSC overscan crop (visible 240x224
+  — the masked left column and SMB3's right-edge tile seam are gone),
+  and a wall-clock budget (half the display cadence) per frame
+  callback so a backend slower than realtime degrades to a slow game
+  instead of starving the Cocoa event loop (the beach-ball class).
+
+Receipts: 29 nes tests green (nestest PPM byte-identical throughout),
+93 total; SMB3 played through world 1 with correct HUD at ground and
+in the sky, sprites obscured correctly, no hang — plus SMB/FF/nestest
+unchanged.  MMC1-class games keep byte-identical rendering (the new
+band fields collapse to the old single pass when nothing splits).
 
 ## 2026-07-11 mappers — MMC1 + MMC3, banked ROMs on every backend
 

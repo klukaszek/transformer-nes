@@ -28,6 +28,7 @@ from typing import Protocol
 
 import numpy as np
 
+from transformer_nes.cpu6502.backends.reference import irq_deliverable
 from transformer_nes.cpu6502.spec import (
     MEMORY_MODES,
     MODE_ABSOLUTE,
@@ -127,8 +128,18 @@ class ReferenceCore:
     def nmi_pending(self) -> bool:
         return self.cpu.nmi_pending
 
+    @property
+    def irq_ready(self) -> bool:
+        return irq_deliverable(self.cpu.p, self.cpu.irq_pending)
+
     def set_nmi(self) -> None:
         self.cpu.nmi_pending = True
+
+    def set_irq(self) -> None:
+        self.cpu.irq_pending = True
+
+    def clear_irq(self) -> None:
+        self.cpu.irq_pending = False
 
     def poke(self, addr: int, value: int) -> None:
         self.cpu.memory[addr & 0xFFFF] = value & 0xFF
@@ -166,8 +177,18 @@ class GraphCore:
     def nmi_pending(self) -> bool:
         return self.rt.nmi_pending
 
+    @property
+    def irq_ready(self) -> bool:
+        return irq_deliverable(self.rt.mstate["p"], self.rt.irq_pending)
+
     def set_nmi(self) -> None:
         self.rt.set_nmi()
+
+    def set_irq(self) -> None:
+        self.rt.set_irq()
+
+    def clear_irq(self) -> None:
+        self.rt.clear_irq()
 
     def poke(self, addr: int, value: int) -> None:
         self.rt.inject_write(addr, value)
@@ -219,6 +240,12 @@ class Bus:
     def set_nmi(self) -> None:
         self.core.set_nmi()
 
+    def set_irq(self) -> None:
+        self.core.set_irq()
+
+    def clear_irq(self) -> None:
+        self.core.clear_irq()
+
     @property
     def halted(self) -> bool:
         return self.core.halted
@@ -250,10 +277,10 @@ class Bus:
         return None
 
     def step(self) -> TraceRow:
-        """Execute one instruction (or pending NMI) with device servicing."""
+        """Execute one instruction (or pending interrupt) with device servicing."""
         # Device -> CPU: pre-inject the register value before a device read.
-        # A pending NMI preempts the instruction, so no read happens then.
-        if self.core.nmi_pending:
+        # A pending interrupt preempts the instruction, so no read happens.
+        if self.core.nmi_pending or self.core.irq_ready:
             self.cycles += 7
         else:
             op = OPCODES.get(self.ram[self.core.pc])
@@ -279,13 +306,16 @@ class Bus:
                 self.cycles += drain_stall(device)
         return row
 
-    def run(self, max_steps: int, *, nmi_at: set[int] | None = None) -> list[TraceRow]:
-        """Step up to max_steps, requesting an NMI before each step index in
-        nmi_at (indices are absolute instruction counts from this call)."""
+    def run(self, max_steps: int, *, nmi_at: set[int] | None = None,
+            irq_at: set[int] | None = None) -> list[TraceRow]:
+        """Step up to max_steps, requesting an NMI/IRQ before each step index
+        in nmi_at/irq_at (absolute instruction counts from this call)."""
         rows: list[TraceRow] = []
         for i in range(max_steps):
             if nmi_at and i in nmi_at:
                 self.set_nmi()
+            if irq_at and i in irq_at:
+                self.set_irq()
             if self.halted:
                 break
             rows.append(self.step())
@@ -352,20 +382,22 @@ class KernelBus:
         return True
 
     def run(self, max_steps: int, *, nmi_at: set[int] | None = None,
+            irq_at: set[int] | None = None,
             stop_on_trap: bool = False, max_cycles: int = 0,
             on_pause=None) -> dict:
         """Run up to max_steps instructions, servicing device pauses.
 
-        nmi_at uses the same convention as Bus.run: an NMI is requested
-        before executing step index i (absolute count from this call).
-        max_cycles > 0 also stops once that many base CPU cycles (device
-        stalls included) have elapsed in this call.  on_pause, if given, is
-        called after every serviced pause -- the hook the console uses to
-        check device-raised NMI edges before execution resumes.
+        nmi_at/irq_at use the same convention as Bus.run: the interrupt is
+        requested before executing step index i (absolute count from this
+        call).  max_cycles > 0 also stops once that many base CPU cycles
+        (device stalls included) have elapsed in this call.  on_pause, if
+        given, is called after every serviced pause -- the hook the console
+        uses to check device-raised NMI edges before execution resumes.
         Returns the merged kernel result arrays plus the final "reason"
         and "cycles" (elapsed this call, stalls included).
         """
         nmi_list = sorted(nmi_at) if nmi_at else []
+        irq_list = sorted(irq_at) if irq_at else []
         outs: list[dict] = []
         executed = 0
         cycles_done = 0
@@ -374,9 +406,14 @@ class KernelBus:
             while nmi_list and nmi_list[0] <= executed:
                 self.rt.set_nmi()
                 nmi_list.pop(0)
+            while irq_list and irq_list[0] <= executed:
+                self.rt.set_irq()
+                irq_list.pop(0)
             limit = max_steps - executed
             if nmi_list:
                 limit = min(limit, nmi_list[0] - executed)
+            if irq_list:
+                limit = min(limit, irq_list[0] - executed)
             cycle_limit = max_cycles - cycles_done if max_cycles > 0 else 0
             out = self.rt.run(limit, stop_on_trap=stop_on_trap, max_cycles=cycle_limit)
             outs.append(out)
@@ -392,6 +429,14 @@ class KernelBus:
                     device.write(int(addr), int(value))
                     cycles_done += drain_stall(device)
             reason = out["reason"]
+            if len(outs) > 100_000:
+                st = self.rt.get_state()
+                raise RuntimeError(
+                    f"bus runaway: {len(outs)} pauses in one run "
+                    f"(executed={executed}, cycles={cycles_done}/{max_cycles}, "
+                    f"reason={reason!r}, read_addr={int(out['read_addr'])}, "
+                    f"pc={st['pc']:04X}, p={st['p']:02X})"
+                )
             if reason == "watch_read":
                 # Device -> CPU: place the register value on the bus, resume.
                 addr = int(out["read_addr"])
