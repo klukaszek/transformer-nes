@@ -250,10 +250,10 @@ must produce identical traces, memory writes, and device event logs.
 
 ## The NES on top of this
 
-The console layer in `transformer_nes/nes/` (cartridge loader, frame-level
-PPU, controllers, frame loop) runs NROM ROMs against any of the four CPU
-backends; frame pacing uses base-cycle counting implemented identically in
-the native engines and the Python bus.  nestest boots through its reset
+The console layer in `transformer_nes/nes/` (cartridge loader, the native
+C++ frame-level PPU, controllers, frame loop) runs NROM ROMs against any
+of the four CPU backends; frame pacing uses base-cycle counting
+implemented identically in the native engines and the Python bus.  nestest boots through its reset
 vector and passes its full official-opcode suite interactively (controller
 input, vblank NMI, OAM DMA); SMB plays at ~74 fps on the kernel and ~333
 fps through the transformer weights, frames byte-identical across

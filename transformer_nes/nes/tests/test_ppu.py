@@ -1,14 +1,16 @@
-"""Unit tests for the frame-level PPU register semantics."""
+"""PPU register semantics and renderer checks (nes/ppu.cpp)."""
 
 from __future__ import annotations
 
+import numpy as np
+
 from transformer_nes.nes.cartridge import Cartridge
-from transformer_nes.nes.ppu import PPU
+from transformer_nes.nes.ppu import make_ppu as load_ppu
 
 
-def make_ppu(mirroring: str = "horizontal") -> PPU:
-    cart = Cartridge(prg=bytes(0x4000), chr=b"", mirroring=mirroring, mapper=0)
-    return PPU(cart)
+def make_ppu(mirroring: str = "horizontal", chr_rom: bytes = b""):
+    cart = Cartridge(prg=bytes(0x4000), chr=chr_rom, mirroring=mirroring, mapper=0)
+    return load_ppu(cart)
 
 
 def test_status_read_clears_vblank_and_latch():
@@ -97,3 +99,45 @@ def test_nmi_edge_on_enable_during_vblank():
     assert ppu.take_nmi_edge() is False  # consumed
     ppu.write(0x2000, 0x80)              # no rising edge
     assert ppu.take_nmi_edge() is False
+
+
+def test_render_sprites_priority_flips_and_sprite0():
+    """A register-built scene: patterned CHR RAM, both nametables +
+    attributes, coarse scroll, a flipped sprite, a behind-background
+    sprite, and a sprite-0 overlap with a known scanline."""
+    ppu = make_ppu()
+    for tile in range(3):
+        for row in range(8):
+            ppu.vram_write(tile * 16 + row, 0xFF if tile else 0x00)  # plane 0
+            ppu.vram_write(tile * 16 + 8 + row, 0x0F if tile == 2 else 0x00)
+
+    ppu.write(0x2006, 0x20)  # tile row 2: an opaque strip of tile 1
+    ppu.write(0x2006, 0x40)
+    for _ in range(32):
+        ppu.write(0x2007, 1)
+    ppu.write(0x2006, 0x3F)  # palette: distinct entries
+    ppu.write(0x2006, 0x00)
+    for i in range(0x20):
+        ppu.write(0x2007, (i * 3 + 1) & 0x3F)
+
+    ppu.write(0x2003, 0)     # sprite 0 at (8, y=15): overlaps the strip
+    for value in (15, 2, 0x00, 8):
+        ppu.write(0x2004, value)
+    for value in (99, 2, 0xC0, 60):   # sprite 1: h+v flipped, in the open
+        ppu.write(0x2004, value)
+    for value in (17, 2, 0x20, 40):   # sprite 2: behind the background
+        ppu.write(0x2004, value)
+
+    ppu.write(0x2001, 0x18)  # rendering on
+    frame = np.asarray(ppu.render_frame())
+    assert frame.shape == (240, 256)
+    assert ppu.sprite0_scanline == 16              # strip starts at y=16
+    # The $3F10 write mirrors onto $3F00, so the backdrop is entry $10's.
+    assert frame[0, 0] == (0x10 * 3 + 1) & 0x3F
+    assert frame[16, 8] == (0x11 * 3 + 1) & 0x3F   # sprite 0 in front of strip
+    assert frame[100, 60] == (0x13 * 3 + 1) & 0x3F  # flipped corner pixel (pix=3)
+    # Behind-background sprite: hidden over the strip, visible below it.
+    assert frame[18, 40] == (1 * 3 + 1) & 0x3F     # strip color wins
+    assert frame[24, 40] == (0x11 * 3 + 1) & 0x3F  # sprite shows over backdrop
+    again = np.asarray(ppu.render_frame())
+    assert np.array_equal(frame, again)            # renderer is deterministic

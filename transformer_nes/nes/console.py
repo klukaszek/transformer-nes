@@ -25,7 +25,7 @@ import time
 
 from transformer_nes.nes.bus import Bus, GraphCore, KernelBus, ReferenceCore
 from transformer_nes.nes.cartridge import Cartridge
-from transformer_nes.nes.ppu import PPU
+from transformer_nes.nes.ppu import make_ppu, to_rgb
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ class Controller:
 class OamDma:
     """$4014: copy CPU page -> PPU OAM, stalling the CPU for 513 cycles."""
 
-    def __init__(self, ppu: PPU, read_cpu):
+    def __init__(self, ppu, read_cpu):
         self.ppu = ppu
         self.read_cpu = read_cpu
         self.stall = 0
@@ -102,7 +102,7 @@ class Console:
         if isinstance(cart, str):
             cart = Cartridge.load(cart)
         self.cart = cart
-        self.ppu = PPU(cart)
+        self.ppu = make_ppu(cart)
         self.controller = Controller()
         image = cart.cpu_image()
 
@@ -300,7 +300,7 @@ class Console:
 
 def write_ppm(path: str, frame) -> None:
     """Write a rendered frame as a binary PPM (no dependencies)."""
-    rgb = PPU.to_rgb(frame)
+    rgb = to_rgb(frame)
     with open(path, "wb") as f:
         f.write(b"P6\n256 240\n255\n")
         f.write(rgb.tobytes())

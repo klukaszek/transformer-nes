@@ -15,9 +15,10 @@ expert builders + window policy — with `run_protocol.py` emitting the one
 native run-loop protocol for both generated engines), and the console
 (`nes/`).  Harnesses live next to their assets (`cpu6502/examples/klaus/`,
 `nes/examples/nestest.py`).  The weights forward is integer end-to-end
-(full Klaus decimal record: 89.0 s, 344K steps/s).  Next up: **the native
-app** — PPU to C++ (plan item 7) plus an SDL3/Sokol frontend with video,
-sound, and controls.
+(full Klaus decimal record: 89.0 s, 344K steps/s).  The PPU is native
+(`nes/ppu.cpp`, pixel-identical to the Python reference, the console
+default).  Next up: **the native app** — a Sokol frontend (decision log
+below) with video, sound, and controls over the existing backends.
 
 **Previous snapshot (2026-07-10, 350 fps + universal shapes):** SMB gameplay
 through the transformer weights runs at **~333 fps (3.0 ms/frame)**
@@ -144,8 +145,34 @@ in priority order — the lockstep chain is the safety net for all of it:
    term as a numerics rule), the components tables cover the new modules,
    speed/fps claims match the 2026-07-11 receipts, and the MMIO section
    documents the single run-loop protocol + read lease.
-7. **PPU to C++** — unlocks the native SDL/Sokol app; do it as the
-   console layer's part of the refactor, not before.
+7. **DONE (2026-07-11) — PPU to C++.**  `nes/ppu.cpp` (same registers,
+   same frame-at-once renderer, same documented approximations), compiled
+   once and digest-cached, is THE PPU; the Python PPU was deleted once
+   identity was proven.  Pre-deletion receipts, all against the Python
+   reference: every register test ran on both implementations; a
+   register-built scene (CHR patterns, both nametables, attributes,
+   scroll, flips, priority, sprite-0) rendered byte-identical across four
+   ctrl modes; a 4-frame console run matched frames/sprite-0/cycles; and
+   60 frames of the real nestest ROM produced a byte-identical PPM
+   (63.8 fps on the kernel backend).  Post-deletion the suite pins the
+   native renderer with concrete pixel/priority/sprite-0 assertions.
+   The native frontend (decision log below) is what remains of this item.
+
+## Recorded decision: Sokol over SDL3 for the native app (2026-07-11)
+
+Per explicit user call ("pick the lightest of the two"): the frontend is
+**Sokol** — single-file, header-only libraries (`sokol_app.h` window +
+input, `sokol_gfx.h` one textured quad for the 256x240 framebuffer,
+`sokol_audio.h` callback audio when the APU exists).  No build system, no
+vendored dylib: the headers compile into the same one-TU-and-cache style
+every native piece of this repo already uses.  SDL3 is a full library
+build for the same three capabilities.  App shape (next step): a frame
+loop hosting the existing backends — the PPU is already native
+(`nes/ppu.cpp`), the machines are dlopened C++; the remaining design
+decision is whether the app embeds Python for orchestration (cheapest:
+the console layer already paces frames) or the engines grow a C ABI for
+a fully Python-free binary.  Start with the embedded/orchestrated form;
+measure; only then consider the C ABI.
 
 ## Recorded decision: package rename + module placement (2026-07-11)
 

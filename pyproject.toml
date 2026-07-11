@@ -48,6 +48,7 @@ include = ["transformer_nes*"]
     "attention/CMakeLists.txt",
     "cpu6502/examples/klaus/*",
     "nes/examples/nestest.*",
+    "nes/ppu.cpp",
 ]
 
 [tool.ruff]
