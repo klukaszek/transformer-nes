@@ -6,7 +6,18 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
-**START HERE (2026-07-10, 350 fps + universal shapes):** SMB gameplay
+**START HERE (2026-07-11, refactor complete):** the structural refactor
+plan below is DONE through item 6 — the codebase now splits cleanly into
+the model (graph → schedule → weights; `model/classify.py` holds every
+attention-serving license), the engines (`model/engine_gen.py` +
+`cpu6502/kernel.py`, sharing one native run-loop protocol from
+`cpu6502/run_protocol.py`), expert construction (`cpu6502/experts.py`),
+window policy (`cpu6502/windows.py`), and the machine/console layers.
+The weights forward is integer end-to-end (full Klaus decimal record:
+89.0 s, 344K steps/s).  Next up: **the native app** — PPU to C++ (plan
+item 7) plus an SDL3/Sokol frontend with video, sound, and controls.
+
+**Previous snapshot (2026-07-10, 350 fps + universal shapes):** SMB gameplay
 through the transformer weights runs at **~333 fps (3.0 ms/frame)**
 with its per-ROM pinned module, and at **155 fps with ZERO
 ROM-specific compilation** — the shape-expert tier serves any ROM,
@@ -30,6 +41,15 @@ both dispatch substrates are landed), shape-library growth, the kernel
 backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
+
+**Refactor receipt (2026-07-11):** plan items 2, 4, and 5 landed (details
+in the plan below).  The weights runtime forward is integer END-TO-END:
+register argmax folds integer scores behind exact clear-gate zero tests,
+the memory-guard f64 key test became an integer gate test, and the
+position features (with their per-forward log()) left the hot path — no
+double survives in the emitted step.  Receipts: 85 tests green; full
+nestest MATCHED through the weights (~194K steps/s); **full Klaus MATCHED
+30,646,177 steps (decimal) in 89.0 s (344K steps/s)** — the record run.
 
 **Refactor receipt (2026-07-10):** generated runtime is exact-int32 only;
 the unreachable Python step/write paths and duplicated run-protocol tables
@@ -57,41 +77,60 @@ in priority order — the lockstep chain is the safety net for all of it:
    The superseded `experiments/moe_probe/` scripts and frozen JSON results
    were removed; fold receipts now compare directly with the live union graph
    instead of treating research output as a test oracle.
-2. **Split weights_runner.**  Cpu6502TransformerMachine has accreted:
-   machine protocol + engine cache orchestration + THREE expert builders
-   + scanner + shape matcher + JIT + license checks + CLI.  Carve into
-   `experts.py` (builders + licenses incl. _eval_over_heads),
-   `windows.py` (SHAPE_LIBRARY, scanner, matcher, JIT policy), and the
-   machine core.  The engine cache/manifest logic moves next to
-   engine_gen.
-   **In progress:** `windows.py` now owns SHAPE_LIBRARY plus static sequence
-   scanning and shape matching; console/tests use that canonical boundary,
-   and the engine cache digest covers it.  Expert builders, JIT orchestration,
-   and cache orchestration remain in the machine module.
+2. **DONE — split weights_runner.**  `experts.py` owns the three fold-and-
+   build expert builders with their licenses (write-free/non-halting
+   const_root checks, first-read-only, _eval_over_heads) plus the shared
+   step-spec builders — the input/p-flag slot maps that were triplicated
+   are one function now.  `windows.py` owns SHAPE_LIBRARY, the scanners,
+   and the anchored matcher the JIT uses (match_shape_at).  The machine
+   module keeps orchestration, the machine protocol, the JIT tick, and the
+   CLI (632 lines, from 1,057).  The manifest/cache logic already lived
+   in engine_gen; the machine only computes keys.  `experts.py` joined the
+   engine-cache digest.  Receipt: 85 tests green (jj kutolxul).
 3. **DONE — one runtime arithmetic.**  The generated runtime is exact int32.
    The slower int64 and expert-incompatible f32 diagnostic modes, their CLI
    and cache-key surface, dual emission branches, and the unreachable Python
    `machine_step`/WRITE fallbacks are gone. The exact evaluator remains the
    semantics diagnostic; portable f32 safetensors export is unaffected.
    Receipt so far: all six generated-weights tests pass from fresh artifacts.
-4. **One C++ run loop.**  kernel.py and engine_gen emit two
-   near-identical run loops (watch/lease/trace/budget protocol).
-   Template it once; the KernelBus contract is the spec.
-   **Partial:** opcode read-mode and cycle tables now come from
-   `cpu6502/run_protocol.py`, removing the first duplicated protocol logic.
-5. **Integer register scores** (finishes the f64 retirement in the
-   runtime): keys are integer-valued now, so reg_s goes i64 and the
-   position features leave the hot path; the score-form license moves
-   into classify.py.
-6. **Docs pass.**  README/docstrings still reference retired things
-   (weights_engine.cpp, dense/sparse paths, f64 caveats, the recency
-   term).  Rewrite around the artifact boundary: graph -> schedule ->
-   weights (the model) vs engines (execution strategies) vs
-   console/frontends.
+4. **DONE — one C++ run loop.**  `run_protocol.py` now emits the shared
+   protocol for both generated engines: the exact nearest-address memory
+   structure (mem_query, parameterized only by output type), the shadow
+   decoder, in_ranges, the persistent run-state members with the
+   READ_MODE/CYCLES tables, the machine API, and the whole run() skeleton
+   (prologue, watch/lease check, result dict) — each engine supplies only
+   its locals and per-iteration step body.  Receipt: 85 tests green with
+   both engines freshly recompiled (jj rrqzmomk).
+5. **DONE — integer register scores** (the weights runtime's f64
+   retirement, complete).  The license lives in
+   `classify.integer_score_terms`: qx == qy > 0 makes the score a positive
+   multiple of kx + ky, so the integer sum preserves the argmax and its >=
+   ties exactly; clear-gate terms (-1e30) split out as exact zero tests on
+   the gate slots, replacing every "ky > -1e29" double compare (register
+   folds AND the memory-head live-insert guard).  reg_s is i64; with no
+   hull head left in the model, the position features (and their
+   per-forward log()) are not emitted at all — the forward is integer
+   end-to-end.  Anything unlicensed keeps a hull and pf comes back, so
+   classification stays a speed decision.  The KERNEL deliberately stays
+   f64: it is the emission mirror of the evaluator (same IEEE doubles in
+   the same order), and that definitional role is worth one double
+   backend.  Receipts: 85 tests; full nestest weights MATCHED; full Klaus
+   decimal MATCHED 89.0 s — the record (jj osnuzrvw).
+6. **DONE — docs pass.**  Both READMEs rewritten around the artifact
+   boundary (graph -> schedule -> weights vs engines vs console): retired
+   references gone (weights_engine.cpp, dense/sparse paths, the recency
+   term as a numerics rule), the components tables cover the new modules,
+   speed/fps claims match the 2026-07-11 receipts, and the MMIO section
+   documents the single run-loop protocol + read lease.
 7. **PPU to C++** — unlocks the native SDL/Sokol app; do it as the
    console layer's part of the refactor, not before.
 
-## Recorded decision: retire f64 (not started; early refactor items)
+## Recorded decision: retire f64 (CLOSED 2026-07-11)
+
+Both items landed: (2) the recency term left the construction on
+2026-07-10 (jj ttlvorys), and (1) integer register scores landed as
+refactor item 5 above — for the weights runtime.  The kernel keeps f64 as
+the evaluator's emission mirror (recorded there).  Original note:
 
 Per explicit user call: runtime f64 is vestigial.  The last hot-path
 doubles are the register scores, the K-row clear-gate guards, and the

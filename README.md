@@ -39,7 +39,7 @@ uv run nes-run path/to/rom.nes --frames 120 --out frame.ppm
 |---------|-------------|
 | `6502-reference` | Run a 6502 binary on the plain-Python reference core |
 | `6502-eval` | Run a 6502 binary through the computation graph (exact arithmetic) |
-| `6502-klaus` | Klaus Dormann functional test suite (reference / graph / C++ kernel) |
+| `6502-klaus` | Klaus Dormann functional test suite (reference / graph / C++ kernel / weights) |
 | `6502-nestest` | nestest suite vs the Nintendulator golden log (incl. unofficial opcodes) |
 | `6502-transformer` | Run the 6502 as real transformer weights, lockstep vs the reference |
 | `nes-run` | Run an NES ROM (NROM) on the console layer: PPU, NMI, DMA, controllers |
@@ -52,12 +52,12 @@ Current status and prioritized next steps live in [`ROADMAP.md`](ROADMAP.md).
 
 | Package | Role |
 |---------|------|
-| `transformer_vm/graph/` | Computation-graph DSL: Input/ReGLU/Persist/LookUp/CumSum dimensions, `reglu`/`stepglu` helpers |
+| `transformer_vm/graph/` | Computation-graph DSL: Input/ReGLU/Persist/LookUp dimensions, `reglu`/`stepglu` helpers, partial evaluation (`fold.py`) |
 | `transformer_vm/attention/` | O(log n) convex-hull KV cache (`hull2d_cht.h` + pybind11 ext) and the exact-evaluator attention runtime |
-| `transformer_vm/cpu6502/` | The pure 6502: opcode spec, reference oracle, graph interpreter, exact Python evaluator, generated C++ kernel, Klaus/nestest harnesses |
+| `transformer_vm/cpu6502/` | The pure 6502: opcode spec, reference oracle, graph interpreter, exact Python evaluator, generated C++ kernel, the transformer machine (`weights_runner.py` + expert builders + window policy), Klaus harness |
 | `transformer_vm/nes/` | NES system layer: MMIO bus, iNES cartridge loader, frame-level PPU, controllers, and the cycle-budgeted frame loop (`nes-run`) |
-| `transformer_vm/model/` | Transformer machinery: analytical weight construction (`weights.py`), PyTorch model, standalone C++ inference engine |
-| `transformer_vm/scheduler/` | MILP solver assigning graph gates to transformer layers |
+| `transformer_vm/model/` | Transformer machinery: analytical weight construction (`weights.py`), attention-serving classification (`classify.py`), the generated C++ engine (`engine_gen.py`), safetensors export (`export.py`) |
+| `transformer_vm/scheduler/` | Layer scheduler: load-balanced critical-path default plus the opt-in exact MILP |
 
 The dependency direction is one-way: `nes/` uses `cpu6502/`, which uses `graph/` + `attention/`; `cpu6502/` knows nothing about the NES.
 
@@ -65,13 +65,12 @@ The dependency direction is one-way: `nes/` uses `cpu6502/`, which uses `graph/`
 
 ### Computation Graph
 
-The core abstraction (`transformer_vm/graph/core.py`) defines five primitive types that compose into a DAG:
+The core abstraction (`transformer_vm/graph/core.py`) defines four primitive types that compose into a DAG:
 
 - **InputDimension** — token embedding values (set per-token)
 - **ReGLUDimension** — `ReLU(b) * a`, the gated FFN unit
 - **PersistDimension** — materializes an expression into a residual slot
 - **LookUpDimension** — attention-based retrieval from token history
-- **CumSumDimension** — cumulative sum via attention averaging
 
 From these primitives, two helper functions build all conditional logic:
 
@@ -82,21 +81,22 @@ From these primitives, two helper functions build all conditional logic:
 
 `transformer_vm/cpu6502/interpreter.py` encodes the full official NMOS opcode set plus the stable unofficial opcodes as one graph: per-opcode one-hot gates decode the instruction, mode gates resolve the effective address, ALU results are computed for every operation family in parallel, and mux chains select the new state. Memory is an append-only log of WRITE tokens; reads (including instruction fetch) are attention lookups. NMI is graph logic too: a state token flagged `in_nmi` executes the interrupt sequence instead of the fetched instruction.
 
-Three backends share this single semantics and are verified against each other instruction-by-instruction: the plain-Python reference oracle
-(~2.5M steps/s), the exact graph evaluator (~6K steps/s), and a generated C++ kernel (~600K steps/s) that passes the full Klaus suite and nestest bit-identically to the Python evaluator.
+Four backends share this single semantics and are verified against each other instruction-by-instruction: the plain-Python reference oracle
+(~2.5M steps/s), the exact graph evaluator (~6K steps/s), a generated C++ kernel (~790K steps/s) that passes the full Klaus suite and nestest bit-identically to the Python evaluator, and the transformer weights themselves (next sections).
 
-### O(log n) Hull KV Cache
+### Sub-linear attention state
 
-Standard softmax attention is O(n) per step.  Since this model uses hardmax attention (softmax with a very large temperature scaling, effectively argmax), the winning key for each query is a vertex of the 2D convex hull of all keys.  The `transformer_vm/attention/` module maintains an incremental convex hull per attention head, giving O(log n) insert and query — critical for runs of millions of instructions.
+Standard softmax attention is O(n) per step.  Since this model uses hardmax attention (effectively argmax), the winning key for each query is a vertex of the 2D convex hull of all keys; `transformer_vm/attention/` maintains an incremental convex hull per head, giving O(log n) insert and query.  That is the exact evaluator's mechanism.  The generated engines go further: heads whose queries pass the licenses in `model/classify.py` are served by O(1) state instead — an exact nearest-written-address structure per 4 KiB memory group, and integer running-argmax registers for constant-query heads — with the hull kept as the fallback for anything unlicensed.
 
 ### The transformer itself
 
 `6502-transformer` runs the machine as **actual transformer weights**:
-`scheduler/milp.py`'s load-balanced critical-path scheduler assigns the gates to 71 layers, `model/weights.py` constructs `VanillaTransformer` weights analytically (d_model≈1550, ~777 heads, no training), and inference is genuine — Q/K/V projections, attention (hull hardmax or true softmax), ReGLU FFN, residual stream — run by generated straight-line C++ with a native run loop, exact-int32 arithmetic, O(1) attention state, and opcode-routed experts.
+`scheduler/milp.py`'s load-balanced critical-path scheduler assigns the gates to 74 layers, `model/weights.py` constructs the transformer's weight matrices analytically (`WeightModel`: d_model=1766, 883 heads, no training), and inference is genuine — Q/K/V projections, hardmax attention, ReGLU FFN, residual stream — run by generated straight-line C++ with a native run loop, exact integer arithmetic end-to-end, O(1) attention state, and three dispatch tiers (per-opcode experts, canonical shape experts serving any ROM with zero per-ROM compilation, and per-ROM pinned sequence modules).
 **The full 8,991-instruction nestest suite passes through the weights in
 ~0.1 seconds**, the full 30.6M-instruction Klaus suite lockstep-matches
-with decimal mode, and routed SMB gameplay runs at roughly 305K CPU
-instructions/s (~28 fps), byte-identical to the C++ kernel.  See
+with decimal mode in ~90 s, and SMB gameplay runs at ~333 fps
+(155 fps with zero ROM-specific compilation), byte-identical to the
+C++ kernel.  See
 [`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md).
 
 ## Development
