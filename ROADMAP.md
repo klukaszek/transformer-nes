@@ -56,6 +56,10 @@ in priority order — the lockstep chain is the safety net for all of it:
    `windows.py` (SHAPE_LIBRARY, scanner, matcher, JIT policy), and the
    machine core.  The engine cache/manifest logic moves next to
    engine_gen.
+   **In progress:** `windows.py` now owns SHAPE_LIBRARY plus static sequence
+   scanning and shape matching; console/tests use that canonical boundary,
+   and the engine cache digest covers it.  Expert builders, JIT orchestration,
+   and cache orchestration remain in the machine module.
 3. **Drop diagnostic arith modes (needs a user call).**  f32 mode is the
    sole consumer of the real-hull emission path and forbids
    experts/shapes; int64 is recorded slower.  Removing both shrinks

@@ -39,6 +39,11 @@ from transformer_vm.cpu6502 import reference
 from transformer_vm.cpu6502.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_vm.cpu6502.spec import OPCODES, READS_MEMORY
 from transformer_vm.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
+from transformer_vm.cpu6502.windows import (
+    BRANCH_OPERATIONS,
+    SHAPE_LIBRARY,
+    match_shape_windows,
+)
 from transformer_vm.graph.core import ProgramGraph
 from transformer_vm.graph.fold import GraphFolder, opcode_pins
 from transformer_vm.model.weights import add_position_encoding, build_model
@@ -50,77 +55,6 @@ logger = logging.getLogger(__name__)
 # routing is workload-independent (no game-derived tuning set).  NMI steps and
 # any opcode outside a narrowed set fall back to the exact union step.
 DEFAULT_EXPERT_OPCODES = tuple(sorted(OPCODES))
-
-
-# Instructions that write memory (stores, RMW outside accumulator mode,
-# stack pushes) or leave the sequence license some other way -- the scanner's
-# cheap pre-filter; _build_sequence_expert's folded-constant checks remain
-# the backstop.
-_SEQ_WRITERS = frozenset({
-    "store_a", "store_x", "store_y", "sax", "pha", "php",
-    "jsr", "brk", "rti", "rts", "pla", "plp",
-})
-_SEQ_RMW = frozenset({
-    "asl", "lsr", "rol", "ror", "inc", "dec",
-    "slo", "rla", "sre", "rra", "dcp", "isb", "lax",
-})
-_SEQ_BRANCHES = frozenset({"bcc", "bcs", "beq", "bmi", "bne", "bpl", "bvc", "bvs"})
-_SEQ_MAX_INSTR = 4
-
-# Canonical window shapes compiled ONCE into the core engine with pc and
-# every operand byte symbolic (graph/fold.py pc_offsets): any ROM's matching
-# idiom dispatches into the same shipped weights -- zero per-ROM compile.
-# Entries are (name, template, spin_repeat); operand bytes in a template are
-# placeholders (the fold never reads them), opcode bytes are the shape.
-SHAPE_LIBRARY: tuple[tuple[str, bytes, int], ...] = (
-    ("jmp_self", bytes([0x4C, 0, 0]), 4),
-    ("dex_bne", bytes([0xCA, 0xD0, 0]), 1),
-    ("dey_bne", bytes([0x88, 0xD0, 0]), 1),
-    ("inx_bne", bytes([0xE8, 0xD0, 0]), 1),
-    ("iny_bne", bytes([0xC8, 0xD0, 0]), 1),
-    ("lda_zp_bpl", bytes([0xA5, 0, 0x10, 0]), 1),
-    ("lda_zp_bmi", bytes([0xA5, 0, 0x30, 0]), 1),
-    ("lda_zp_beq", bytes([0xA5, 0, 0xF0, 0]), 1),
-    ("lda_zp_bne", bytes([0xA5, 0, 0xD0, 0]), 1),
-    ("lda_abs_bpl", bytes([0xAD, 0, 0, 0x10, 0]), 1),
-    ("lda_abs_bmi", bytes([0xAD, 0, 0, 0x30, 0]), 1),
-    ("bit_abs_bpl", bytes([0x2C, 0, 0, 0x10, 0]), 1),
-    ("bit_abs_bvc", bytes([0x2C, 0, 0, 0x50, 0]), 1),
-    ("lda_abs_and_beq", bytes([0xAD, 0, 0, 0x29, 0, 0xF0, 0]), 1),
-    ("lda_abs_and_bne", bytes([0xAD, 0, 0, 0x29, 0, 0xD0, 0]), 1),
-)
-
-
-def match_shape_windows(image, shapes_meta, *, limit: int = 512):
-    """Runtime shape-table population: every head whose opcode bytes match a
-    shape signature and whose closing op targets the head.  Closure is a
-    profitability filter, not a correctness one -- the fold licenses any
-    operand values, and dispatch re-verifies the opcode bytes live."""
-    data = bytes(image)
-    n = len(data)
-    out = []
-    for m in shapes_meta:
-        sig = [(int(o), int(b)) for o, b in m["sig"]]
-        length = int(m["length"])
-        first = bytes([sig[0][1]])
-        start = 0
-        while len(out) < limit:
-            head = data.find(first, start, n - length + 1)
-            if head < 0:
-                break
-            start = head + 1
-            if any(data[head + off] != b for off, b in sig[1:]):
-                continue
-            if m["close"] == "jmp":
-                if data[head + 1] | (data[head + 2] << 8) != head:
-                    continue
-            else:  # closing branch is the window's last instruction
-                rel = data[head + length - 1]
-                target = (head + length + rel - (256 if rel & 0x80 else 0)) & 0xFFFF
-                if target != head:
-                    continue
-            out.append((int(m["id"]), head))
-    return out
 
 
 def _eval_over_heads(fold_result, dim, length):
@@ -170,46 +104,6 @@ def _eval_over_heads(fold_result, dim, length):
         return acc
 
     return heads, np.asarray(ev(dim))
-
-
-def scan_sequence_windows(image, *, spin_repeat: int = 4, limit: int = 16):
-    """Find sequence-expert windows generically: any closed micro-loop --
-    straight-line code whose final control flow (conditional branch or JMP
-    abs) targets the loop head.  This is an ISA-shape scan, not a workload
-    histogram: idle idioms of any game qualify (BIT $2002/BPL, LDA zp/BEQ,
-    DEX/BNE delays, JMP-to-self...).  Pre-filters here are cheap
-    necessities; the fold's license checks (write-free, non-halting,
-    straight-line, only-first-reads) arbitrate, and the router re-verifies
-    every window byte at dispatch, so a stale match only costs the fast
-    path, never correctness.  JMP-closed loops fold spin_repeat iterations
-    per forward; branch-closed loops fold one."""
-    data = bytes(image)
-    wins = []
-    for head in range(len(data)):
-        pc = head
-        for n in range(_SEQ_MAX_INSTR):
-            op = OPCODES.get(data[pc]) if pc < len(data) - 2 else None
-            if op is None:
-                break
-            reads = op.operation in READS_MEMORY and op.mode not in (
-                "imp", "acc", "imm")
-            if (op.operation in _SEQ_WRITERS
-                    or (op.operation in _SEQ_RMW and op.mode != "acc")
-                    or (n > 0 and reads)):
-                break
-            nxt = pc + op.length
-            if op.operation in _SEQ_BRANCHES:
-                off = data[pc + 1]
-                target = (nxt + off - (256 if off & 0x80 else 0)) & 0xFFFF
-                if target == head and n > 0:
-                    wins.append((head, data[head:nxt], 1))
-                break
-            if op.operation == "jmp":
-                if op.mode == "abs" and data[pc + 1] | (data[pc + 2] << 8) == head:
-                    wins.append((head, data[head:nxt], spin_repeat))
-                break
-            pc = nxt
-    return tuple(wins[:limit])
 
 
 class Cpu6502TransformerMachine:
@@ -649,7 +543,7 @@ class Cpu6502TransformerMachine:
             )
             if repeat > 1 and not self_target:
                 raise RuntimeError(f"shape {name}: only a JMP self-spin may repeat")
-            if not self_target and ops[-1].operation not in _SEQ_BRANCHES:
+            if not self_target and ops[-1].operation not in BRANCH_OPERATIONS:
                 raise RuntimeError(f"shape {name}: window must close via its last op")
 
             pins, offsets = sequence_shape_pins(template, OPCODES)

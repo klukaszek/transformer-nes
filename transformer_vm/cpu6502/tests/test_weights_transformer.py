@@ -167,7 +167,7 @@ def test_sequence_experts_match_per_step():
     fall-through, the spin, and chunk boundaries landing mid-window."""
     import numpy as np
 
-    from transformer_vm.cpu6502.weights_runner import (
+    from transformer_vm.cpu6502.windows import (
         match_shape_windows,
         scan_sequence_windows,
     )

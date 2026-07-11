@@ -42,6 +42,7 @@ _CODE_FILES = (
     "cpu6502/spec.py",
     "cpu6502/evaluator.py",
     "cpu6502/reference.py",
+    "cpu6502/windows.py",
     "cpu6502/weights_runner.py",
 )
 _code_digest_cache: str | None = None

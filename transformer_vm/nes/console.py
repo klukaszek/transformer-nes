@@ -144,10 +144,8 @@ class Console:
             # The real transformer through its generated C++ run loop:
             # KernelBus drives it natively (MMIO pauses back to Python), the
             # same protocol as the kernel.
-            from transformer_vm.cpu6502.weights_runner import (
-                Cpu6502TransformerMachine,
-                scan_sequence_windows,
-            )
+            from transformer_vm.cpu6502.weights_runner import Cpu6502TransformerMachine
+            from transformer_vm.cpu6502.windows import scan_sequence_windows
 
             machine = Cpu6502TransformerMachine(
                 bcd=False, checkpoint_tokens=None,
