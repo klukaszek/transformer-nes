@@ -31,6 +31,28 @@ backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## Recorded decision: retire f64 (not started; early refactor items)
+
+Per explicit user call: runtime f64 is vestigial.  The last hot-path
+doubles are the register scores, the K-row clear-gate guards, and the
+position features -- and the integer argument covers all of them (score
+integer parts fit i32; replace-on->= in insertion order IS a positional
+LATEST tie-break, so the fractional recency term contributes nothing at
+runtime).  Two items, receipts = the full lockstep chain:
+
+1. Integer register scores + positional ties in both generated engines
+   (weights + kernel); position features drop out of the hot path with
+   them.
+2. Remove the 0.3·inv_log_pos recency term from the graph construction
+   itself.  Every coefficient becomes integer/±0.5: the model is dyadic
+   end-to-end, f32 storage is exact by inspection (no certification
+   needed), the evaluator can run integer, and "hardmax + LATEST
+   tie-break" becomes an explicit architecture rule -- which it already
+   effectively is (the recency term vanishes below one double ulp at
+   score scale; that is why TieBreak::LATEST exists at all).  Until (2)
+   lands, f64 survives only as the definitional medium of the current
+   graph in the evaluator/verification layer.
+
 ## 2026-07-10 standard-ML artifact — safetensors + standalone PyTorch runner
 
 The weights are now a portable artifact.  `model/export.py`
