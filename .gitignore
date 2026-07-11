@@ -18,9 +18,7 @@ build/
 transformer
 _kernel_cache/
 _engine_cache/
-_ppu_cache/
-_apu_cache/
-_app_cache/
+_nes_cache/
 
 # Vendored deps are fetched by vendor/install_deps.sh
 vendor/sokol/
@@ -32,7 +30,7 @@ transformer_nes/nes/examples/smb3.nes
 transformer_nes/nes/examples/ff.nes
 transformer_nes/nes/examples/punchout.nes
 transformer_nes/nes/examples/megaman6.nes
+transformer_nes/nes/examples/castlevania3.nes
 
 # F1 debug snapshots
 _debug_dumps/
-

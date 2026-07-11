@@ -7,8 +7,8 @@ PPU (`nes/ppu.py`).  Plain fixed silicon; nothing here is model-generated.
 
 The console attaches it as a bus device and calls `end_frame(cpu_cycles)`
 once per frame to pull that frame's mono samples; the native app pushes
-them to `sokol_audio`.  Pulse x2 + triangle + noise are implemented; the
-DMC (sample) channel is stubbed (registers accepted, no output).
+them to `sokol_audio`.  All five channels are implemented; DMC fetches
+read through the console's CPU-memory callback and report DMA stalls.
 """
 
 from __future__ import annotations
@@ -16,8 +16,9 @@ from __future__ import annotations
 import hashlib
 import os
 
+from transformer_nes.nes.native_cache import build_dir
+
 APU_CPP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apu.cpp")
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_apu_cache")
 
 apu_module = None
 
@@ -30,13 +31,12 @@ def load_apu_module():
 
         with open(APU_CPP, "rb") as f:
             digest = hashlib.sha256(f.read()).hexdigest()[:16]
-        build_dir = os.path.join(CACHE_DIR, f"build_{digest}")
-        os.makedirs(build_dir, exist_ok=True)
+        cache_dir = build_dir("apu", digest)
         apu_module = load(
             name=f"nes_apu_{digest}",
             sources=[APU_CPP],
             extra_cflags=["-O2", "-std=c++17"],
-            build_directory=build_dir,
+            build_directory=cache_dir,
             verbose=False,
         )
     return apu_module

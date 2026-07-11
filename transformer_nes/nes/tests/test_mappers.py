@@ -115,3 +115,53 @@ def test_mmc1_rejects_chr_rom():
                      mirroring="horizontal", mapper=1)
     with pytest.raises(NotImplementedError):
         make_mapper(cart)
+
+
+def test_mmc2_prg_switch_fixed_banks_and_repair():
+    cart = Cartridge(prg=prg_of(16, BANK8), chr=bytes(0x20000),
+                     mirroring="horizontal", mapper=9)
+    mapper = make_mapper(cart)
+    memory, _ = wired(mapper)
+    assert mapper.prg_banks() == (0, 13, 14, 15)
+    mapper.write(0xA123, 7)
+    assert mapper.prg_banks() == (7, 13, 14, 15)
+    assert memory[0x8000:0xA000] == bytes([7]) * BANK8
+    assert memory[0xA000] == 13 and memory[0xE000] == 15
+    assert memory[0xA123] == 13
+
+
+def test_mmc2_chr_registers_and_mirroring():
+    cart = Cartridge(prg=prg_of(4, BANK8), chr=bytes(0x20000),
+                     mirroring="horizontal", mapper=9)
+    mapper = make_mapper(cart)
+    _, events = wired(mapper)
+    chr_sets = []
+    mapper.set_mmc2_banks = lambda banks: chr_sets.append(banks)
+    for addr, value in zip((0xB000, 0xC000, 0xD000, 0xE000),
+                           (3, 5, 7, 9), strict=True):
+        mapper.write(addr, value)
+    assert mapper.mmc2_banks() == [3, 5, 7, 9]
+    assert chr_sets[-1] == [3, 5, 7, 9]
+    mapper.write(0xF000, 0)
+    mapper.write(0xF000, 1)
+    assert events[-2:] == [2, 3]
+
+
+def test_mmc4_prg_chr_and_mirroring():
+    cart = Cartridge(prg=prg_of(16, BANK16), chr=bytes(0x20000),
+                     mirroring="horizontal", mapper=10)
+    mapper = make_mapper(cart)
+    memory, events = wired(mapper)
+    chr_sets = []
+    mapper.set_mmc4_banks = lambda banks: chr_sets.append(banks)
+    assert mapper.prg_banks() == (0, 15)
+    mapper.write(0xA123, 6)
+    assert mapper.prg_banks() == (6, 15)
+    assert memory[0x8000:0xC000] == bytes([6]) * BANK16
+    for addr, value in zip((0xB000, 0xC000, 0xD000, 0xE000),
+                           (2, 4, 6, 8), strict=True):
+        mapper.write(addr, value)
+    assert chr_sets[-1] == [2, 4, 6, 8]
+    mapper.write(0xF000, 0)
+    mapper.write(0xF000, 1)
+    assert events[-2:] == [2, 3]

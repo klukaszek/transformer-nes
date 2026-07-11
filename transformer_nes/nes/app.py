@@ -19,6 +19,7 @@ import os
 import time
 
 from transformer_nes.nes.console import BUTTONS, Console
+from transformer_nes.nes.native_cache import build_dir
 from transformer_nes.nes.ppu import to_rgb
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,6 @@ logger = logging.getLogger(__name__)
 NES_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_CPP = os.path.join(NES_DIR, "app.cpp")
 SOKOL_DIR = os.path.normpath(os.path.join(NES_DIR, "..", "..", "vendor", "sokol"))
-CACHE_DIR = os.path.join(NES_DIR, "_app_cache")
 
 SOKOL_HEADERS = ("sokol_app.h", "sokol_gfx.h", "sokol_glue.h", "sokol_log.h",
                  "sokol_audio.h")
@@ -46,8 +46,7 @@ def load_app_module():
             with open(path, "rb") as f:
                 digest.update(f.read())
         digest = digest.hexdigest()[:16]
-        build_dir = os.path.join(CACHE_DIR, f"build_{digest}")
-        os.makedirs(build_dir, exist_ok=True)
+        cache_dir = build_dir("app", digest)
         ldflags = [flag for fw in MACOS_FRAMEWORKS for flag in ("-framework", fw)]
         app_module = load(
             name=f"nes_app_{digest}",
@@ -55,7 +54,7 @@ def load_app_module():
             extra_cflags=["-O2", "-std=c++17", "-x", "objective-c++"],
             extra_include_paths=[SOKOL_DIR],
             extra_ldflags=ldflags,
-            build_directory=build_dir,
+            build_directory=cache_dir,
             verbose=False,
         )
     return app_module
@@ -87,6 +86,14 @@ def debug_dump(console: Console) -> None:
         "mid_fine_x": ppu.mid_fine_x,
         "sprite0_scanline": ppu.sprite0_scanline,
     }
+    if hasattr(console.mapper, "mmc2_banks"):
+        state.update(prg_banks=list(console.mapper.prg_banks()),
+                     mapper_chr=list(console.mapper.mmc2_banks()),
+                     mapper_latches=list(ppu.chr_latches))
+    elif hasattr(console.mapper, "mmc4_banks"):
+        state.update(prg_banks=list(console.mapper.prg_banks()),
+                     mapper_chr=list(console.mapper.mmc4_banks()),
+                     mapper_latches=list(ppu.chr_latches))
     if console.mapper.irq_scanline() is not None:
         state.update(irq_scanline=console.mapper.irq_scanline(),
                      irq_enabled=console.mapper.irq_enabled,

@@ -13,6 +13,63 @@ def make_ppu(mirroring: str = "horizontal", chr_rom: bytes = b""):
     return load_ppu(cart)
 
 
+def test_ppu_views_keep_native_owner_alive():
+    ppu = make_ppu()
+    palette = ppu.palette
+    assert palette.base is ppu
+    del ppu
+    palette[3] = 0x2A
+    assert palette[3] == 0x2A
+
+
+def test_mmc2_pattern_fetches_switch_chr_latches():
+    chr_rom = b"".join(bytes([bank + 1]) * 0x1000 for bank in range(4))
+    ppu = make_ppu(chr_rom=chr_rom)
+    ppu.set_mmc2_banks([0, 1, 2, 3])
+
+    assert ppu.vram_read(0x0000) == 2
+    assert ppu.vram_read(0x1000) == 4
+    assert ppu.vram_read(0x0FD8) == 2         # trigger tile uses old bank
+    assert ppu.vram_read(0x0000) == 1
+    assert ppu.vram_read(0x1FD8) == 4         # then subsequent reads switch
+    assert ppu.vram_read(0x1000) == 3
+    assert ppu.vram_read(0x0FE8) == 1
+    assert ppu.vram_read(0x0000) == 2
+
+
+def test_mmc2_hidden_background_prefetch_switches_next_scanline():
+    banks = [bytearray(0x1000) for _ in range(4)]
+    # Upper FE bank: tile 1 is opaque; upper FD bank leaves it blank.
+    banks[3][16:24] = b"\xff" * 8
+    chr_rom = b"".join(bytes(bank) for bank in banks)
+    ppu = make_ppu(mirroring="vertical", chr_rom=chr_rom)
+    ppu.set_mmc2_banks([0, 1, 2, 3])
+    for col in range(32):
+        ppu.vram_write(0x2000 + col, 1)
+    # First hidden prefetch crosses into vertical-mirrored nametable 1.
+    ppu.vram_write(0x2400, 0xFD)
+    ppu.vram_write(0x3F00, 0)
+    ppu.vram_write(0x3F01, 1)
+    ppu.write(0x2000, 0x10)  # background patterns at $1000
+    ppu.write(0x2001, 0x0A)  # background + left edge
+    frame = np.asarray(ppu.render_frame())
+
+    assert frame[0, 0] == 1               # row 0 fetched from FE bank
+    assert frame[1, 0] == 0               # hidden $FD selected FD for row 1
+
+
+def test_mmc4_low_pattern_latch_responds_on_every_tile_row():
+    chr_rom = b"".join(bytes([bank + 1]) * 0x1000 for bank in range(4))
+    ppu = make_ppu(chr_rom=chr_rom)
+    ppu.set_mmc4_banks([0, 1, 2, 3])
+
+    assert ppu.vram_read(0x0000) == 2
+    assert ppu.vram_read(0x0FDF) == 2     # unlike MMC2, row 7 triggers FD
+    assert ppu.vram_read(0x0000) == 1
+    assert ppu.vram_read(0x0FEF) == 1
+    assert ppu.vram_read(0x0000) == 2
+
+
 def test_status_read_clears_vblank_and_latch():
     ppu = make_ppu()
     ppu.begin_vblank()

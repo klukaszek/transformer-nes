@@ -144,6 +144,73 @@ class Mmc1(Mapper):
         inject_region(self, base, self.prg[bank * BANK16:(bank + 1) * BANK16])
 
 
+class Mmc2(Mapper):
+    """Mapper 9 (PxROM): Punch-Out's 8 KiB PRG switch and CHR latches.
+
+    Four registers select 4 KiB CHR banks. The PPU chooses each pattern
+    half's FD or FE register when it fetches the corresponding latch tile;
+    ``set_mmc2_banks`` sends all four choices to that native latch model.
+    """
+
+    banked = True
+
+    def __init__(self, cart: Cartridge):
+        if len(cart.prg) % BANK8 or len(cart.prg) < 4 * BANK8:
+            raise ValueError("MMC2 PRG size must be at least four 8 KiB banks")
+        if len(cart.chr) % 0x1000 or not cart.chr:
+            raise ValueError("MMC2 requires CHR ROM in 4 KiB banks")
+        self.prg = cart.prg
+        self.n_banks = len(cart.prg) // BANK8
+        self.n_chr = len(cart.chr) // 0x1000
+        self.prg_reg = 0
+        self.chr_regs = [0, 0, 0, 0]  # lower FD/FE, upper FD/FE
+        self.chr_rom = True
+        self.poke = None
+        self.poke_region = None
+        self.on_mirroring = None
+        self.set_mmc2_banks = None
+
+    def prg_banks(self) -> tuple[int, int, int, int]:
+        return (self.prg_reg % self.n_banks,
+                self.n_banks - 3, self.n_banks - 2, self.n_banks - 1)
+
+    def mmc2_banks(self) -> list[int]:
+        return [bank % self.n_chr for bank in self.chr_regs]
+
+    def rom_byte(self, addr: int) -> int:
+        bank = self.prg_banks()[(addr - 0x8000) >> 13]
+        return self.prg[bank * BANK8 + (addr & 0x1FFF)]
+
+    def cpu_image(self) -> bytes:
+        image = bytearray(0x10000)
+        for i, bank in enumerate(self.prg_banks()):
+            base = 0x8000 + i * BANK8
+            image[base:base + BANK8] = self.prg[bank * BANK8:(bank + 1) * BANK8]
+        return bytes(image)
+
+    def read(self, addr: int) -> int:
+        raise RuntimeError("mapper range is attached write-only")
+
+    def write(self, addr: int, value: int) -> None:
+        region = addr & 0xF000
+        if region == 0xA000:
+            old = self.prg_banks()[0]
+            self.prg_reg = value & 0x0F
+            new = self.prg_banks()[0]
+            if new != old:
+                self.load_bank(0x8000, new)
+        elif 0xB000 <= region <= 0xE000:
+            self.chr_regs[(region - 0xB000) >> 12] = value & 0x1F
+            if self.set_mmc2_banks is not None:
+                self.set_mmc2_banks(self.mmc2_banks())
+        elif region == 0xF000 and self.on_mirroring is not None:
+            self.on_mirroring(3 if value & 1 else 2)
+        self.poke(addr, self.rom_byte(addr))
+
+    def load_bank(self, base: int, bank: int) -> None:
+        inject_region(self, base, self.prg[bank * BANK8:(bank + 1) * BANK8])
+
+
 class Mmc3(Mapper):
     """Mapper 4 (TxROM): 8 KiB PRG banks + 2/1 KiB CHR banks, plus a
     scanline IRQ used for status-bar raster splits (SMB3)."""
@@ -244,12 +311,75 @@ class Mmc3(Mapper):
         inject_region(self, base, self.prg[bank * BANK8:(bank + 1) * BANK8])
 
 
+class Mmc4(Mapper):
+    """Mapper 10 (FxROM): 16 KiB PRG banking and symmetric CHR latches."""
+
+    banked = True
+
+    def __init__(self, cart: Cartridge):
+        if len(cart.prg) % BANK16 or len(cart.prg) < 2 * BANK16:
+            raise ValueError("MMC4 PRG size must be at least two 16 KiB banks")
+        if len(cart.chr) % 0x1000 or not cart.chr:
+            raise ValueError("MMC4 requires CHR ROM in 4 KiB banks")
+        self.prg = cart.prg
+        self.n_banks = len(cart.prg) // BANK16
+        self.n_chr = len(cart.chr) // 0x1000
+        self.prg_reg = 0
+        self.chr_regs = [0, 0, 0, 0]
+        self.chr_rom = True
+        self.poke = None
+        self.poke_region = None
+        self.on_mirroring = None
+        self.set_mmc4_banks = None
+
+    def prg_banks(self) -> tuple[int, int]:
+        return self.prg_reg % self.n_banks, self.n_banks - 1
+
+    def mmc4_banks(self) -> list[int]:
+        return [bank % self.n_chr for bank in self.chr_regs]
+
+    def rom_byte(self, addr: int) -> int:
+        bank = self.prg_banks()[0 if addr < 0xC000 else 1]
+        return self.prg[bank * BANK16 + (addr & 0x3FFF)]
+
+    def cpu_image(self) -> bytes:
+        image = bytearray(0x10000)
+        lo, hi = self.prg_banks()
+        image[0x8000:0xC000] = self.prg[lo * BANK16:(lo + 1) * BANK16]
+        image[0xC000:0x10000] = self.prg[hi * BANK16:(hi + 1) * BANK16]
+        return bytes(image)
+
+    def read(self, addr: int) -> int:
+        raise RuntimeError("mapper range is attached write-only")
+
+    def write(self, addr: int, value: int) -> None:
+        region = addr & 0xF000
+        if region == 0xA000:
+            old = self.prg_banks()[0]
+            self.prg_reg = value & 0x0F
+            new = self.prg_banks()[0]
+            if new != old:
+                inject_region(self, 0x8000,
+                              self.prg[new * BANK16:(new + 1) * BANK16])
+        elif 0xB000 <= region <= 0xE000:
+            self.chr_regs[(region - 0xB000) >> 12] = value & 0x1F
+            if self.set_mmc4_banks is not None:
+                self.set_mmc4_banks(self.mmc4_banks())
+        elif region == 0xF000 and self.on_mirroring is not None:
+            self.on_mirroring(3 if value & 1 else 2)
+        self.poke(addr, self.rom_byte(addr))
+
+
 def make_mapper(cart: Cartridge):
     if cart.mapper == 0:
         return Nrom(cart)
     if cart.mapper == 1:
         return Mmc1(cart)
+    if cart.mapper == 9:
+        return Mmc2(cart)
     if cart.mapper == 4:
         return Mmc3(cart)
+    if cart.mapper == 10:
+        return Mmc4(cart)
     raise NotImplementedError(
-        f"mapper {cart.mapper} not supported (NROM, MMC1, MMC3)")
+        f"mapper {cart.mapper} not supported (NROM, MMC1, MMC2, MMC3, MMC4)")

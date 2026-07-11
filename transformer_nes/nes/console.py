@@ -121,6 +121,7 @@ class Console:
         self.frame_base = 0
         self.sprite0_scanline: int | None = None
         self.last_audio = None      # this frame's APU samples (float32 mono)
+        self.irq_sources: set[str] = set()
         # Snapshot-and-rebuild: once the append-only token log passes this
         # many tokens, it is reseeded from the RAM mirror at the next frame
         # boundary (a quiet point: no pending NMI or read pause).  Keeps
@@ -214,7 +215,13 @@ class Console:
             self.mapper.poke = self.poke_cpu
             self.mapper.poke_region = self.poke_region
             self.mapper.on_mirroring = self.set_mirroring
-            if getattr(self.mapper, "chr_rom", False):
+            if hasattr(self.mapper, "mmc2_banks"):
+                self.mapper.set_mmc2_banks = self.ppu.set_mmc2_banks
+                self.ppu.set_mmc2_banks(self.mapper.mmc2_banks())
+            elif hasattr(self.mapper, "mmc4_banks"):
+                self.mapper.set_mmc4_banks = self.ppu.set_mmc4_banks
+                self.ppu.set_mmc4_banks(self.mapper.mmc4_banks())
+            elif getattr(self.mapper, "chr_rom", False):
                 self.mapper.set_chr_banks = self.ppu.set_chr_banks
                 self.ppu.set_chr_banks(self.mapper.chr_banks())
             if hasattr(self.mapper, "on_irq_ack"):
@@ -248,6 +255,7 @@ class Console:
         self.boot(backend, ram, int(state["pc"]), state)
         self.dma.read_cpu = self.read_cpu
         self.attach_devices()
+        self._sync_irq()
         if isinstance(self.bus, Bus):
             self.bus.cycles = self.cycles  # console clock continues
 
@@ -259,21 +267,30 @@ class Console:
         else:
             self.bus.set_nmi()
 
-    def set_irq(self) -> None:
+    def _sync_irq(self) -> None:
+        action = "set_irq" if self.irq_sources else "clear_irq"
         if self.uses_kernel_bus:
-            self.rt.set_irq()
+            getattr(self.rt, action)()
         else:
-            self.bus.set_irq()
+            getattr(self.bus, action)()
 
-    def clear_irq(self) -> None:
-        if self.uses_kernel_bus:
-            self.rt.clear_irq()
-        else:
-            self.bus.clear_irq()
+    def set_irq(self, source: str = "mapper") -> None:
+        self.irq_sources.add(source)
+        self._sync_irq()
+
+    def clear_irq(self, source: str = "mapper") -> None:
+        self.irq_sources.discard(source)
+        self._sync_irq()
 
     def check_nmi_edge(self) -> None:
         if self.ppu.take_nmi_edge():
             self.set_nmi()
+
+    def check_interrupt_lines(self) -> None:
+        """Refresh device-owned interrupt levels after an MMIO pause."""
+        self.check_nmi_edge()
+        if "apu" in self.irq_sources and not self.apu.irq_pending:
+            self.clear_irq("apu")
 
     def run_until(self, target: int) -> None:
         """Run the CPU until the console clock reaches target cycles."""
@@ -285,7 +302,7 @@ class Console:
             out = self.bus.run(
                 1 << 60,
                 max_cycles=target - self.cycles,
-                on_pause=lambda out: self.check_nmi_edge(),
+                on_pause=lambda out: self.check_interrupt_lines(),
             )
             self.cycles += int(out["cycles"])
             if out["reason"] in ("halt", "trap"):
@@ -294,7 +311,7 @@ class Console:
             bus = self.bus
             while bus.cycles < target and not bus.halted:
                 bus.step()
-                self.check_nmi_edge()
+                self.check_interrupt_lines()
             self.cycles = bus.cycles
             if bus.halted:
                 self.halted = True
@@ -325,7 +342,7 @@ class Console:
             # disarmed the IRQ ($E000) since the frame started.
             elif self.ppu.rendering_enabled and self.mapper.irq_scanline() == scanline:
                 self.ppu.mark_split(scanline)
-                self.set_irq()
+                self.set_irq("mapper")
         self.run_until(base + VBLANK_START_CYCLES)
         self.bus.clear_read_lease()
 
@@ -343,11 +360,20 @@ class Console:
         self.frame_index += 1
 
         # Audio for the frame just executed (includes this frame's NMI
-        # music writes).  The APU frame IRQ flag is readable at $4015 but
-        # is deliberately not driven onto the CPU IRQ line (the frame-batch
-        # model can't time it precisely; games that need it are rare and
-        # most inhibit it at boot).
-        self.last_audio = self.apu.end_frame(FRAME_CYCLES)
+        # music writes). Frame and DMC IRQs become visible at this batch
+        # boundary; their device flags retain the hardware read/ack rules.
+        self.last_audio = self.apu.end_frame(FRAME_CYCLES, self.read_cpu)
+        # DMC DMA happened during the just-synthesized batch. Charge its
+        # four-cycle steals against the following CPU run; the frame clock
+        # remains fixed, so the next run_until naturally executes fewer
+        # CPU cycles by exactly this amount.
+        self.cycles += self.apu.take_dma_stall()
+        if isinstance(self.bus, Bus):
+            self.bus.cycles = self.cycles
+        if self.apu.irq_pending:
+            self.set_irq("apu")
+        else:
+            self.clear_irq("apu")
 
         if (
             self.checkpoint_tokens
@@ -379,7 +405,7 @@ def write_ppm(path: str, frame) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(
-        description="Run an NES ROM (NROM/MMC1) on the 6502 graph machine.")
+        description="Run an NES ROM on the 6502 graph machine.")
     parser.add_argument("rom", help="path to an iNES .nes file")
     parser.add_argument("--frames", type=int, default=60)
     parser.add_argument(

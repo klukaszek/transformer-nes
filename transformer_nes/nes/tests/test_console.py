@@ -212,6 +212,19 @@ def nametable_text(console: Console) -> str:
     )
 
 
+def test_irq_sources_share_the_cpu_line_without_clearing_each_other():
+    console = Console(make_cart(), backend="reference")
+    cpu = console.bus.core.cpu
+
+    console.set_irq("mapper")
+    console.set_irq("apu")
+    assert cpu.irq_pending
+    console.clear_irq("mapper")
+    assert cpu.irq_pending
+    console.clear_irq("apu")
+    assert not cpu.irq_pending
+
+
 @pytest.mark.slow
 def test_nestest_boots_and_passes_interactively():
     console = Console(NESTEST_ROM, backend="kernel")

@@ -24,11 +24,77 @@ PPU's real scroll model (loopy t + the sprite-0 split, same log).
 **Mappers landed same day** (log below): MMC1 (Final Fantasy plays)
 and MMC3 with the scanline IRQ delivered through the machine model
 (log above) — **SMB3 is fully playable** at 5.2 ms/frame through the
-weights, HUD and all.  **The APU landed 2026-07-11** (log above): native
-audio through sokol_audio, sound across multiple games (pulse/triangle/
-noise; DMC stubbed).  Next up: the **DMC channel** (SMB's percussion),
-the frame/DMC IRQ onto the CPU line if a game needs it, and more mappers
-(MMC2/4 latch CHR — Punch-Out!!/Fire Emblem; MMC5 far later) as wanted.
+weights, HUD and all. **The APU landed 2026-07-11** and its DMC/IRQ
+completion is recorded below: native audio through sokol_audio, all five
+channels including sampled percussion, and frame/DMC IRQs on the shared
+CPU line. **MMC2 and MMC4 landed in the follow-ups below**: latch-driven
+CHR is now a shared PPU interface with mapper-specific header-only silicon.
+Next up: MMC5 as its own larger console-subsystem arc.
+
+## 2026-07-11 MMC4 — FxROM completion + native latch interface
+
+Mapper 10 adds its switchable 16 KiB `$8000-$BFFF` PRG bank, fixed final
+16 KiB bank, fixed `$6000-$7FFF` RAM, four 4 KiB CHR registers, and
+runtime mirroring. Its PPU-side rules live in header-only `mmc4.h`:
+unlike MMC2, both pattern-table halves respond symmetrically across all
+eight rows of the `$FD/$FE` switching tiles.
+
+The PPU now talks through one `ChrLatchMapper` interface in
+`chr_latch.h`; `mmc2.h` and `mmc4.h` independently own mapping, latch
+state, and post-fetch trigger decoding. The renderer retains only the
+mapper-agnostic ordered PPU fetch path. Receipts cover MMC4 PRG switching,
+fixed-bank preservation, write repair, CHR registers, mirroring, and the
+low-pattern row-range difference from MMC2.
+
+## 2026-07-11 MMC2 — Punch-Out!! and fetch-ordered CHR latches
+
+Mapper 9/PxROM adds its switchable 8 KiB PRG window, three fixed upper
+windows, four 4 KiB CHR registers, and runtime mirroring. The PPU owns
+the hardware FD/FE latches: pattern fetches in `$0FD8/$0FE8` and
+`$1FD8-$1FDF/$1FE8-$1FEF` select the corresponding lower/upper bank.
+Unlike fixed-bank rendering, these fetches are order-dependent, so MMC2
+uses a scanline path that fetches background then OAM-order sprites. It
+also performs the 2C02's 34 background tile fetches (two beyond the
+visible edge): Punch-Out deliberately places latch tiles in that hidden
+prefetch area. The trigger tile's two pattern bytes use the old bank and
+only subsequent reads see the new latch. Omitting those hidden fetches
+left the wrong bank selected and produced garbage across the boxing
+screen's top rows. F1 dumps include all four mapper CHR registers and
+both live latch states.
+
+The native lifetime audit was also closed out: APU DMC callbacks clear
+on exceptional exits, and PPU debug arrays retain their native PPU owner
+instead of exposing ownerless memoryviews. Receipts: mapper PRG/fixed-bank/
+repair, CHR-register/mirroring, exact post-fetch latch ranges, a hidden-
+prefetch-to-next-scanline scene, owner retention, and exceptional callback
+release tests.
+
+## 2026-07-11 APU completion — DMC samples + shared IRQ line
+
+The fifth channel is live: `$4010-$4013` program the NTSC DMC rate,
+direct DAC load, sample address, and sample length; `$4015` starts/stops
+playback and reports activity; the output unit shifts fetched bytes into
+the nonlinear TND mixer. Address wrap, looping, the 7-bit saturating DAC,
+DMC IRQ acknowledgement, and four-cycle DMA steals are implemented. DMC
+fetches read the console's current CPU image, so mapper bank changes and
+backend handoffs remain transparent. Because audio is still generated in
+one end-of-frame batch, DMA steals and IRQ visibility occur at that
+boundary (and reduce the following frame's CPU budget).
+
+Frame and DMC IRQ flags now drive the machine model's existing IRQ input.
+The console tracks independent sources for the shared level-sensitive
+line, so acknowledging MMC3 cannot clear a pending APU IRQ and
+acknowledging the APU cannot clear MMC3.
+
+The follow-up code review covered APU/PPU state ownership, buffer
+lifetimes, duplicated responsibilities, IRQ ownership, and Python/C++
+lifetime boundaries. Two concrete APU smells were removed: returned audio
+now owns its sample storage instead of viewing a reusable C++ vector, and
+the DMC reader callback is frame-scoped instead of forming a retained
+Python/C++ ownership cycle. The PPU's output was already owned and its
+loopy/split-band state has one clear owner, so no speculative rewrite was
+made. Receipts: 3 new DMC tests plus a shared-IRQ-source regression; 40 NES
+tests green, and Ruff clean.
 
 ## 2026-07-11 APU — native audio, sound across games
 

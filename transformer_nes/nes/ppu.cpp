@@ -11,9 +11,14 @@
 #include <pybind11/stl.h>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "mmc2.h"
+#include "mmc4.h"
 
 namespace py = pybind11;
 
@@ -22,6 +27,7 @@ struct PPU {
     // the PPU's $0000-$1FFF window maps through eight 1 KiB bank slots.
     std::vector<uint8_t> chr;
     int chr_bank[8];
+    std::unique_ptr<ChrLatchMapper> chr_latch;
     bool chr_writable;
     // Nametable arrangement, runtime-switchable by mappers (MMC1
     // encoding): 0/1 single-screen low/high, 2 vertical, 3 horizontal.
@@ -143,8 +149,15 @@ struct PPU {
 
     int nt_offset(int addr) const { return nt_offset_for(addr, mirroring); }
 
-    int chr_at(int addr) const {
-        return chr[chr_bank[(addr >> 10) & 7] + (addr & 0x3FF)];
+    int chr_index(const int* banks, int addr) const {
+        if (chr_latch) return chr_latch->map(addr);
+        return banks[(addr >> 10) & 7] + (addr & 0x3FF);
+    }
+
+    int chr_at(int addr) {
+        const int value = chr[chr_index(chr_bank, addr)];
+        if (chr_latch) chr_latch->after_fetch(addr);
+        return value;
     }
 
     void set_chr_banks(const std::vector<int>& banks_1k) {
@@ -153,7 +166,19 @@ struct PPU {
         for (int i = 0; i < 8; ++i) chr_bank[i] = (banks_1k[i] % n) * 0x400;
     }
 
-    int vram_read(int addr) const {
+    void set_mmc2_banks(const std::vector<int>& banks_4k) {
+        if (!dynamic_cast<Mmc2Chr*>(chr_latch.get()))
+            chr_latch = std::make_unique<Mmc2Chr>();
+        chr_latch->configure(banks_4k, chr.size());
+    }
+
+    void set_mmc4_banks(const std::vector<int>& banks_4k) {
+        if (!dynamic_cast<Mmc4Chr*>(chr_latch.get()))
+            chr_latch = std::make_unique<Mmc4Chr>();
+        chr_latch->configure(banks_4k, chr.size());
+    }
+
+    int vram_read(int addr) {
         addr &= 0x3FFF;
         if (addr < 0x2000) return chr_at(addr);
         if (addr < 0x3F00) return nametables[nt_offset(addr)];
@@ -271,11 +296,68 @@ struct PPU {
 
     // ── Rendering ───────────────────────────────────────────────────
 
-    int tile_pixel(const int* banks, int tile, int row, int col) const {
+    int tile_pixel(const int* banks, int tile, int row, int col) {
         const int base = tile * 16 + row;
-        const int b0 = (chr[banks[(base >> 10) & 7] + (base & 0x3FF)] >> (7 - col)) & 1;
-        const int b1 = (chr[banks[((base + 8) >> 10) & 7] + ((base + 8) & 0x3FF)] >> (7 - col)) & 1;
+        const int b0 = (chr[chr_index(banks, base)] >> (7 - col)) & 1;
+        const int b1 = (chr[chr_index(banks, base + 8)] >> (7 - col)) & 1;
         return b0 | (b1 << 1);
+    }
+
+    std::pair<uint8_t, uint8_t> fetch_pattern_pair(int pattern_addr) {
+        const uint8_t b0 = chr[chr_index(chr_bank, pattern_addr)];
+        const uint8_t b1 = chr[chr_index(chr_bank, pattern_addr + 8)];
+        // The switching tile itself uses the old bank. Both pattern bytes
+        // are fetched before the latch affects subsequent PPU reads.
+        chr_latch->after_fetch(pattern_addr);
+        chr_latch->after_fetch(pattern_addr + 8);
+        return {b0, b1};
+    }
+
+    void render_ordered_bg_row(uint8_t* frame, const uint8_t* pal,
+                               uint8_t backdrop, const BandState& band, int y) {
+        if (!(band.mask & 0x08)) {
+            std::memset(frame + y * 256, backdrop, 256);
+            std::memset(bg_opaque[y], 0, 256);
+            return;
+        }
+        const int px_x = ((band.t_addr & 0x1F) << 3) | band.fine_x;
+        const int coarse_start = ((px_x - band.fine_x) >> 3)
+            + ((band.t_addr >> 10) & 1) * 32;
+        const int sy = band.y_base >= 0
+            ? ((band.y_base - y) % 480 + 480) % 480
+            : scroll_row_480(band.t_addr) % 480;
+        const int cy = (y + sy) % 480;
+        const int ly = cy % 240, quad_y = cy / 240;
+        const int trow = ly >> 3;
+        const int x0 = (band.mask & 0x02) ? 0 : 8;
+        for (int x = 0; x < x0; ++x) {
+            frame[y * 256 + x] = backdrop;
+            bg_opaque[y][x] = false;
+        }
+        // The 2C02 fetches 32 visible tiles plus two prefetch tiles. PxROM
+        // games intentionally hide latch tiles in those final fetch slots.
+        for (int fetch = 0; fetch < 34; ++fetch) {
+            const int coarse = (coarse_start + fetch) & 63;
+            const int quad_x = coarse >> 5, tcol = coarse & 31;
+            const int base = nt_offset_for(
+                0x2000 + (quad_y * 2 + quad_x) * 0x400, band.mirroring);
+            const int tile = nametables[base + trow * 32 + tcol];
+            const int pattern = ((band.ctrl & 0x10) ? 0x1000 : 0) + tile * 16 + (ly & 7);
+            const auto [b0, b1] = fetch_pattern_pair(pattern);
+            const uint8_t attr =
+                nametables[base + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2)];
+            const int shift = ((trow % 4) / 2) * 4 + ((tcol % 4) / 2) * 2;
+            const int palsel = (attr >> shift) & 3;
+            const int screen_x = fetch * 8 - band.fine_x;
+            for (int col = 0; col < 8; ++col) {
+                const int x = screen_x + col;
+                if (x < x0 || x >= 256) continue;
+                const int bit = 7 - col;
+                const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
+                frame[y * 256 + x] = pix ? pal[palsel * 4 + pix] : backdrop;
+                bg_opaque[y][x] = pix != 0;
+            }
+        }
     }
 
     void render_bg_rows(uint8_t* frame, const uint8_t* pal, uint8_t backdrop,
@@ -326,7 +408,7 @@ struct PPU {
     }
 
     // First scanline where an opaque sprite-0 pixel overlaps opaque bg.
-    int detect_sprite0(const int* banks) const {
+    int detect_sprite0(const int* banks) {
         const bool tall = (ctrl & 0x20) != 0;
         const int y = oam[0], tile = oam[1], attr = oam[2], x = oam[3];
         const int top = y + 1;
@@ -381,6 +463,60 @@ struct PPU {
             ? BandState{frame_ctrl, frame_mask, frame_mirroring,
                         frame_t_addr, frame_fine_x, -1, frame_chr_bank}
             : BandState{ctrl, mask, mirroring, t_addr, fine_x, -1, chr_bank};
+
+        // MMC2's CHR latches observe the real fetch order. The ordinary
+        // renderer can batch all backgrounds and then all sprites because
+        // fixed-bank pixels are order-independent; PxROM cannot. Render it
+        // scanline by scanline (background fetches, then OAM-order sprite
+        // fetches) so the next row and next frame inherit the right latch.
+        if (chr_latch) {
+            const int split_s0 = sprite0_scanline;  // prediction from prior frame
+            sprite0_scanline = -1;
+            std::memset(sprite_claimed, 0, sizeof(sprite_claimed));
+            const bool tall = (ctrl & 0x20) != 0;
+            const int h = tall ? 16 : 8;
+            const int sprite_x_min = (mask & 0x04) ? 0 : 8;
+            for (int y = 0; y < 240; ++y) {
+                const BandState& band = (split_s0 >= 0 && y > split_s0) ? live : span;
+                render_ordered_bg_row(frame, pal, backdrop, band, y);
+                if (!(mask & 0x10)) continue;
+                for (int i = 0; i < 64; ++i) {
+                    const int sy = oam[i * 4] + 1;
+                    if (y < sy || y >= sy + h) continue;
+                    const int tile = oam[i * 4 + 1], attr = oam[i * 4 + 2];
+                    const int x = oam[i * 4 + 3];
+                    const int src_r0 = y - sy;
+                    const int src_r = (attr & 0x80) ? (h - 1 - src_r0) : src_r0;
+                    int t, prow;
+                    if (tall) {
+                        t = (tile & 1) * 256 + (tile & 0xFE) + (src_r >> 3);
+                        prow = src_r & 7;
+                    } else {
+                        t = ((ctrl & 0x08) ? 256 : 0) + tile;
+                        prow = src_r;
+                    }
+                    const auto [b0, b1] = fetch_pattern_pair(t * 16 + prow);
+                    const int cols = (256 - x) < 8 ? (256 - x) : 8;
+                    for (int c = 0; c < cols; ++c) {
+                        const int px = x + c;
+                        const int src_c = (attr & 0x40) ? (7 - c) : c;
+                        const int bit = 7 - src_c;
+                        const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
+                        if (!pix) continue;
+                        if (i == 0 && bg_opaque[y][px]
+                            && !(px < 8 && (mask & 0x06) != 0x06)) {
+                            if (sprite0_scanline < 0) sprite0_scanline = y;
+                        }
+                        if (px < sprite_x_min || sprite_claimed[y][px]) continue;
+                        sprite_claimed[y][px] = true;
+                        if ((attr & 0x20) && bg_opaque[y][px]) continue;
+                        frame[y * 256 + px] = pal[0x10 + (attr & 3) * 4 + pix];
+                    }
+                }
+            }
+            mid_scanline = -1;
+            return out;
+        }
 
         render_bg_rows(frame, pal, backdrop, span, 0, 240);
 
@@ -477,6 +613,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("vram_read", &PPU::vram_read)
         .def("vram_write", &PPU::vram_write)
         .def("set_chr_banks", &PPU::set_chr_banks)
+        .def("set_mmc2_banks", &PPU::set_mmc2_banks)
+        .def("set_mmc4_banks", &PPU::set_mmc4_banks)
         .def_static("palette_index", &PPU::palette_index)
         .def("begin_vblank", &PPU::begin_vblank)
         .def("end_vblank", &PPU::end_vblank)
@@ -513,17 +651,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_property_readonly("chr_banks", [](PPU& p) {
             return std::vector<int>(p.chr_bank, p.chr_bank + 8);
         })
+        .def_property_readonly("chr_latches", [](PPU& p) {
+            return p.chr_latch ? p.chr_latch->latches() : std::vector<bool>{};
+        })
         .def_property_readonly("sprite0_scanline", [](PPU& p) -> std::optional<int> {
             if (p.sprite0_scanline < 0) return std::nullopt;
             return p.sprite0_scanline;
         })
         .def_property_readonly("nametables", [](PPU& p) {
-            return py::memoryview::from_memory(p.nametables, sizeof(p.nametables));
+            return py::array_t<uint8_t>({0x800}, {1}, p.nametables,
+                py::cast(&p, py::return_value_policy::reference));
         })
         .def_property_readonly("palette", [](PPU& p) {
-            return py::memoryview::from_memory(p.palette, sizeof(p.palette));
+            return py::array_t<uint8_t>({0x20}, {1}, p.palette,
+                py::cast(&p, py::return_value_policy::reference));
         })
         .def_property_readonly("oam", [](PPU& p) {
-            return py::memoryview::from_memory(p.oam, sizeof(p.oam));
+            return py::array_t<uint8_t>({0x100}, {1}, p.oam,
+                py::cast(&p, py::return_value_policy::reference));
         });
 }

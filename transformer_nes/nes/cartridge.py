@@ -2,7 +2,7 @@
 
 Parses the header and raw PRG/CHR data; the CPU-visible image and any
 banking live in `nes/mappers.py` (NROM covers the launch-era library and
-the test ROMs; MMC1 adds the Final Fantasy / Zelda class of carts).  A
+the test ROMs; MMC1/MMC2/MMC3 add banked cartridge families). A
 CHR size of zero means the cart has 8 KiB of CHR RAM.
 """
 

@@ -30,9 +30,12 @@ import os
 import numpy as np
 
 from transformer_nes.nes.cartridge import MIRROR_VERTICAL, Cartridge
+from transformer_nes.nes.native_cache import build_dir
 
 PPU_CPP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ppu.cpp")
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ppu_cache")
+MMC2_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mmc2.h")
+MMC4_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mmc4.h")
+CHR_LATCH_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chr_latch.h")
 
 # Standard 2C02 palette (RGB triples for the 64 NES colors).
 NES_PALETTE = np.array([
@@ -69,15 +72,17 @@ def load_ppu_module():
     if ppu_module is None:
         from torch.utils.cpp_extension import load
 
-        with open(PPU_CPP, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()[:16]
-        build_dir = os.path.join(CACHE_DIR, f"build_{digest}")
-        os.makedirs(build_dir, exist_ok=True)
+        digest_hash = hashlib.sha256()
+        for path in (PPU_CPP, CHR_LATCH_H, MMC2_H, MMC4_H):
+            with open(path, "rb") as f:
+                digest_hash.update(f.read())
+        digest = digest_hash.hexdigest()[:16]
+        cache_dir = build_dir("ppu", digest)
         ppu_module = load(
             name=f"nes_ppu_{digest}",
             sources=[PPU_CPP],
             extra_cflags=["-O2", "-std=c++17"],
-            build_directory=build_dir,
+            build_directory=cache_dir,
             verbose=False,
         )
     return ppu_module

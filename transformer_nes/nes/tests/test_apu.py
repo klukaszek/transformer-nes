@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import gc
+import weakref
+
 import numpy as np
+import pytest
 
 from transformer_nes.nes.apu import make_apu
 
@@ -101,3 +105,82 @@ def test_irq_inhibit():
     for _ in range(3):
         apu.end_frame(FRAME_CYCLES)
     assert not apu.irq_pending
+
+
+def test_dmc_fetches_sample_and_generates_output():
+    apu = make_apu(SR)
+    reads = []
+
+    def read_cpu(addr: int) -> int:
+        reads.append(addr)
+        return 0xFF
+
+    apu.write(0x4010, 0x0F)                 # fastest rate, no loop/IRQ
+    apu.write(0x4011, 0x20)                 # starting DAC level
+    apu.write(0x4012, 0x00)                 # sample starts at $C000
+    apu.write(0x4013, 0x00)                 # one byte
+    apu.write(0x4015, 0x10)                 # enable/restart DMC
+    sig = np.asarray(apu.end_frame(1000, read_cpu))
+
+    assert reads == [0xC000]
+    assert apu.take_dma_stall() == 4
+    assert apu.take_dma_stall() == 0         # stalls drain exactly once
+    assert np.ptp(sig) > 0.001               # $FF raises the 7-bit DAC
+    assert not (apu.read(0x4015) & 0x10)     # no bytes remain
+
+
+def test_dmc_irq_and_disable_acknowledgement():
+    apu = make_apu(SR)
+
+    def read_cpu(_addr: int) -> int:
+        return 0x00
+
+    apu.write(0x4010, 0x8F)                 # DMC IRQ enabled
+    apu.write(0x4012, 0x00)
+    apu.write(0x4013, 0x00)
+    apu.write(0x4015, 0x10)
+    apu.end_frame(1, read_cpu)              # the one-byte DMA completes
+
+    assert apu.irq_pending
+    assert apu.read(0x4015) & 0x80
+    assert apu.irq_pending                  # status reads do not clear DMC IRQ
+    apu.write(0x4015, 0x00)
+    assert not apu.irq_pending              # $4015 write acknowledges it
+
+
+def test_dmc_loop_restarts_without_irq():
+    apu = make_apu(SR)
+    reads = []
+
+    def read_cpu(addr: int) -> int:
+        reads.append(addr)
+        return 0xAA
+
+    apu.write(0x4010, 0xCF)                 # loop + IRQ-enable (loop wins)
+    apu.write(0x4012, 0x01)                 # $C040
+    apu.write(0x4013, 0x00)                 # one byte per loop
+    apu.write(0x4015, 0x10)
+    apu.end_frame(2000, read_cpu)
+
+    assert len(reads) >= 2
+    assert set(reads) == {0xC040}
+    assert not apu.irq_pending
+    assert apu.read(0x4015) & 0x10          # loop remains active
+
+
+def test_dmc_reader_is_released_when_callback_raises():
+    class BrokenReader:
+        def __call__(self, _addr: int) -> int:
+            raise RuntimeError("sample read failed")
+
+    apu = make_apu(SR)
+    apu.write(0x4012, 0)
+    apu.write(0x4013, 0)
+    apu.write(0x4015, 0x10)
+    reader = BrokenReader()
+    ref = weakref.ref(reader)
+    with pytest.raises(RuntimeError, match="sample read failed"):
+        apu.end_frame(1, reader)
+    del reader
+    gc.collect()
+    assert ref() is None
