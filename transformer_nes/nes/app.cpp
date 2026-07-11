@@ -199,7 +199,7 @@ static void app_event(const sapp_event* e) {
     switch (e->key_code) {
         case SAPP_KEYCODE_X:           bit = BTN_A; break;
         case SAPP_KEYCODE_Z:           bit = BTN_B; break;
-        case SAPP_KEYCODE_RIGHT_SHIFT: bit = BTN_SELECT; break;
+        case SAPP_KEYCODE_TAB: bit = BTN_SELECT; break;
         case SAPP_KEYCODE_ENTER:       bit = BTN_START; break;
         case SAPP_KEYCODE_UP:          bit = BTN_UP; break;
         case SAPP_KEYCODE_DOWN:        bit = BTN_DOWN; break;

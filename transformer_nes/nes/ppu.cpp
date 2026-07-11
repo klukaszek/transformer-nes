@@ -19,7 +19,9 @@ namespace py = pybind11;
 struct PPU {
     uint8_t chr[0x2000];
     bool chr_writable;
-    bool vertical_mirroring;
+    // Nametable arrangement, runtime-switchable by mappers (MMC1
+    // encoding): 0/1 single-screen low/high, 2 vertical, 3 horizontal.
+    int mirroring;
     uint8_t nametables[0x800];
     uint8_t palette[0x20];
     uint8_t oam[0x100];
@@ -52,7 +54,7 @@ struct PPU {
         std::memset(chr, 0, sizeof(chr));
         std::memcpy(chr, c.data(), c.size() < sizeof(chr) ? c.size() : sizeof(chr));
         chr_writable = writable;
-        vertical_mirroring = vertical;
+        mirroring = vertical ? 2 : 3;
         std::memset(nametables, 0, sizeof(nametables));
         std::memset(palette, 0, sizeof(palette));
         std::memset(oam, 0, sizeof(oam));
@@ -72,7 +74,13 @@ struct PPU {
     int nt_offset(int addr) const {
         const int a = (addr - 0x2000) & 0xFFF;
         const int table = a >> 10, offset = a & 0x3FF;
-        const int phys = vertical_mirroring ? (table & 1) : (table >> 1);
+        int phys;
+        switch (mirroring) {
+            case 0:  phys = 0; break;           // single-screen low
+            case 1:  phys = 1; break;           // single-screen high
+            case 2:  phys = table & 1; break;   // vertical
+            default: phys = table >> 1; break;  // horizontal
+        }
         return phys * 0x400 + offset;
     }
 
@@ -337,6 +345,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_property_readonly("nmi_enabled", &PPU::nmi_enabled)
         .def_property_readonly("rendering_enabled", &PPU::rendering_enabled)
         .def_readwrite("ctrl", &PPU::ctrl)
+        .def_readwrite("mirroring", &PPU::mirroring)
         .def_readwrite("mask", &PPU::mask)
         .def_readwrite("oam_addr", &PPU::oam_addr)
         .def_property_readonly("scroll_x", &PPU::scroll_px_x)

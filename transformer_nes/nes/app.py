@@ -6,8 +6,8 @@ the PPU.  Python stays the orchestrator: the app calls back here once
 per NTSC frame with the controller bitmask, and the callback runs
 Console.run_frame() on the chosen backend and returns the RGB frame.
 
-Keys: arrows = d-pad, X = A, Z = B, Enter = Start, Right Shift =
-Select, Esc = quit.
+Keys: arrows = d-pad, X = A, Z = B, Enter = Start, Tab = Select,
+Esc = quit.
 """
 
 from __future__ import annotations
@@ -101,7 +101,8 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Play an NES ROM (NROM) in a native window.")
+    parser = argparse.ArgumentParser(
+        description="Play an NES ROM (NROM/MMC1) in a native window.")
     parser.add_argument("rom", help="path to an iNES .nes file")
     parser.add_argument(
         "--backend", choices=["kernel", "reference", "graph", "weights"], default="weights"
@@ -120,7 +121,7 @@ def main() -> None:
     logger.info("machine + app build %.2fs", time.perf_counter() - build_start)
 
     logger.info("keys: arrows = d-pad, X = A, Z = B, Enter = Start, "
-                "Right Shift = Select, Esc = quit")
+                "Tab = Select, Esc = quit")
     title = f"transformer-nes: {os.path.basename(args.rom)} ({args.backend})"
     stats = run_app(console, title=title, scale=args.scale, max_frames=args.frames)
 

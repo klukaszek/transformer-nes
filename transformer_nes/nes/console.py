@@ -25,6 +25,7 @@ import time
 
 from transformer_nes.nes.bus import Bus, GraphCore, KernelBus, ReferenceCore
 from transformer_nes.nes.cartridge import Cartridge
+from transformer_nes.nes.mappers import make_mapper
 from transformer_nes.nes.ppu import make_ppu, to_rgb
 
 logger = logging.getLogger(__name__)
@@ -104,9 +105,11 @@ class Console:
         self.cart = cart
         self.ppu = make_ppu(cart)
         self.controller = Controller()
-        image = cart.cpu_image()
+        self.mapper = make_mapper(cart)
+        image = self.mapper.cpu_image()
+        reset_vector = image[0xFFFC] | (image[0xFFFD] << 8)
 
-        self.boot(backend, image, cart.reset_vector, state=None)
+        self.boot(backend, image, reset_vector, state=None)
         self.dma = OamDma(self.ppu, self.read_cpu)
         self.attach_devices()
 
@@ -138,6 +141,7 @@ class Console:
             if state is not None:
                 self.rt.set_state(state)
             self.read_cpu = self.rt.read_ram
+            self.poke_cpu = self.rt.inject_write
             self.uses_kernel_bus = True
             return
         if backend == "weights":
@@ -158,6 +162,7 @@ class Console:
             if state is not None:
                 machine.set_state(state)
             self.read_cpu = machine.read_ram
+            self.poke_cpu = machine.inject_write
             self.uses_kernel_bus = True
             return
         if backend == "reference":
@@ -181,10 +186,23 @@ class Console:
         self.bus = Bus(core, image)
         self.read_cpu = lambda addr: self.bus.ram[addr & 0xFFFF]
 
+        def poke(addr: int, value: int) -> None:
+            core.poke(addr, value)
+            self.bus.ram[addr & 0xFFFF] = value & 0xFF
+        self.poke_cpu = poke
+
     def attach_devices(self):
         self.bus.attach(self.ppu, 0x2000, 0x3FFF)     # registers + mirrors
         self.bus.attach(self.dma, 0x4014, 0x4014)
         self.bus.attach(self.controller, 0x4016, 0x4017)
+        if self.mapper.banked:
+            # Registers live in ROM space; reads there must stay native.
+            self.bus.attach(self.mapper, 0x8000, 0xFFFF, writes_only=True)
+            self.mapper.poke = self.poke_cpu
+            self.mapper.on_mirroring = self.set_mirroring
+
+    def set_mirroring(self, mode: int) -> None:
+        self.ppu.mirroring = mode
 
     def snapshot(self) -> tuple[bytes, dict]:
         if self.uses_kernel_bus:
@@ -308,7 +326,8 @@ def write_ppm(path: str, frame) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    parser = argparse.ArgumentParser(description="Run an NES ROM (NROM) on the 6502 graph machine.")
+    parser = argparse.ArgumentParser(
+        description="Run an NES ROM (NROM/MMC1) on the 6502 graph machine.")
     parser.add_argument("rom", help="path to an iNES .nes file")
     parser.add_argument("--frames", type=int, default=60)
     parser.add_argument(

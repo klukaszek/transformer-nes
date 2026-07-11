@@ -205,14 +205,16 @@ class Bus:
         self.ram = bytearray(memory_image)
         if len(self.ram) != 0x10000:
             raise ValueError("memory_image must be exactly 64 KiB")
-        self.ranges: list[tuple[int, int, Device]] = []
+        self.ranges: list[tuple[int, int, Device, bool]] = []
         # Base CPU cycles executed (no penalty cycles; NMI = 7 cycles;
         # device stalls included).  Matches the C++ kernel's accounting.
         self.cycles = 0
 
-    def attach(self, device: Device, lo: int, hi: int) -> None:
-        """Map a device over [lo, hi] (inclusive)."""
-        self.ranges.append((lo, hi, device))
+    def attach(self, device: Device, lo: int, hi: int, *,
+               writes_only: bool = False) -> None:
+        """Map a device over [lo, hi] (inclusive).  writes_only devices
+        (mappers: registers in ROM space) never intercept reads."""
+        self.ranges.append((lo, hi, device, writes_only))
 
     def set_nmi(self) -> None:
         self.core.set_nmi()
@@ -241,9 +243,9 @@ class Bus:
         rebuild(self.ram)
         return True
 
-    def device_at(self, addr: int) -> Device | None:
-        for lo, hi, device in self.ranges:
-            if lo <= addr <= hi:
+    def device_at(self, addr: int, *, for_read: bool = False) -> Device | None:
+        for lo, hi, device, writes_only in self.ranges:
+            if lo <= addr <= hi and not (for_read and writes_only):
                 return device
         return None
 
@@ -259,7 +261,7 @@ class Bus:
                 self.cycles += op.cycles
             target = read_target(self.ram, self.core.pc, self.core.x, self.core.y)
             if target is not None:
-                device = self.device_at(target)
+                device = self.device_at(target, for_read=True)
                 if device is not None:
                     value = device.read(target) & 0xFF
                     self.core.poke(target, value)
@@ -305,15 +307,20 @@ class KernelBus:
     def __init__(self, rt, memory_image, *, start_pc: int):
         self.rt = rt
         rt.load_image(memory_image, start_pc=start_pc)
-        self.ranges: list[tuple[int, int, Device]] = []
+        self.ranges: list[tuple[int, int, Device, bool]] = []
 
-    def attach(self, device: Device, lo: int, hi: int) -> None:
-        self.ranges.append((lo, hi, device))
-        self.rt.watch_read(lo, hi)
+    def attach(self, device: Device, lo: int, hi: int, *,
+               writes_only: bool = False) -> None:
+        """Map a device over [lo, hi].  writes_only devices (mappers:
+        registers in ROM space) never watch reads -- ROM fetches and
+        table reads stay native."""
+        self.ranges.append((lo, hi, device, writes_only))
+        if not writes_only:
+            self.rt.watch_read(lo, hi)
         self.rt.watch_write(lo, hi)
 
     def device_at(self, addr: int) -> Device | None:
-        for lo, hi, device in self.ranges:
+        for lo, hi, device, _writes_only in self.ranges:
             if lo <= addr <= hi:
                 return device
         return None
@@ -338,8 +345,9 @@ class KernelBus:
         ram = self.rt.dump_ram()
         self.rt.load_image(ram, start_pc=state["pc"])
         self.rt.set_state(state)
-        for lo, hi, _device in self.ranges:
-            self.rt.watch_read(lo, hi)
+        for lo, hi, _device, writes_only in self.ranges:
+            if not writes_only:
+                self.rt.watch_read(lo, hi)
             self.rt.watch_write(lo, hi)
         return True
 

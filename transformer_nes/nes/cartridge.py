@@ -1,9 +1,9 @@
-"""iNES cartridge loader (mapper 0 / NROM).
+"""iNES cartridge loader.
 
-NROM covers the launch-era library (Donkey Kong, Super Mario Bros, and the
-test ROMs this project verifies against): 16 or 32 KiB of PRG ROM at
-$8000-$FFFF (16 KiB carts mirror it at $C000) and 8 KiB of CHR at PPU
-$0000-$1FFF.  A CHR size of zero means the cart has 8 KiB of CHR RAM.
+Parses the header and raw PRG/CHR data; the CPU-visible image and any
+banking live in `nes/mappers.py` (NROM covers the launch-era library and
+the test ROMs; MMC1 adds the Final Fantasy / Zelda class of carts).  A
+CHR size of zero means the cart has 8 KiB of CHR RAM.
 """
 
 from __future__ import annotations
@@ -16,10 +16,11 @@ MIRROR_VERTICAL = "vertical"
 
 @dataclass(frozen=True)
 class Cartridge:
-    prg: bytes                 # 16 KiB or 32 KiB
-    chr: bytes                 # 8 KiB CHR ROM, or b"" for CHR RAM
-    mirroring: str             # nametable arrangement
+    prg: bytes                 # 16 KiB banks (mapper-dependent count)
+    chr: bytes                 # CHR ROM, or b"" for 8 KiB CHR RAM
+    mirroring: str             # nametable arrangement from the header
     mapper: int
+    battery: bool = False      # battery-backed PRG RAM at $6000-$7FFF
 
     @classmethod
     def load(cls, path: str) -> Cartridge:
@@ -33,10 +34,6 @@ class Cartridge:
             raise ValueError("not an iNES file")
         prg_banks, chr_banks, flags6, flags7 = data[4], data[5], data[6], data[7]
         mapper = (flags7 & 0xF0) | (flags6 >> 4)
-        if mapper != 0:
-            raise NotImplementedError(f"mapper {mapper} not supported (NROM only)")
-        if prg_banks not in (1, 2):
-            raise ValueError(f"NROM expects 1-2 PRG banks, got {prg_banks}")
         offset = 16 + (512 if flags6 & 0x04 else 0)  # skip trainer if present
         prg_size = prg_banks * 0x4000
         chr_size = chr_banks * 0x2000
@@ -45,17 +42,5 @@ class Cartridge:
         if len(prg) != prg_size or len(chr_rom) != chr_size:
             raise ValueError("truncated iNES file")
         mirroring = MIRROR_VERTICAL if flags6 & 0x01 else MIRROR_HORIZONTAL
-        return cls(prg=prg, chr=chr_rom, mirroring=mirroring, mapper=mapper)
-
-    def cpu_image(self) -> bytes:
-        """The 64 KiB CPU address space with PRG mapped at $8000-$FFFF."""
-        image = bytearray(0x10000)
-        image[0x8000:0x8000 + len(self.prg)] = self.prg
-        if len(self.prg) == 0x4000:  # NROM-128: mirror at $C000
-            image[0xC000:0x10000] = self.prg
-        return bytes(image)
-
-    @property
-    def reset_vector(self) -> int:
-        image = self.cpu_image()
-        return image[0xFFFC] | (image[0xFFFD] << 8)
+        return cls(prg=prg, chr=chr_rom, mirroring=mirroring, mapper=mapper,
+                   battery=bool(flags6 & 0x02))
