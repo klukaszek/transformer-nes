@@ -9,13 +9,13 @@ BIG = 1e30  # large constant used to effectively zero-out attention keys (clear_
 
 graph_dims = []
 graph_lookups = []
-_multiply_cache = {}
-_reglu_cache = {}
-_stepglu_cache = {}
-_clear_key_cache = {}
+multiply_cache = {}
+reglu_cache = {}
+stepglu_cache = {}
+clear_key_cache = {}
 
 
-def _expr_key(expr):
+def expr_key(expr):
     return tuple(sorted((id(d), c) for d, c in expr.terms.items()))
 
 
@@ -114,29 +114,29 @@ class Expression:
 
 
 class Dimension:
-    _counter = 0
+    counter = 0
 
     def __init__(self, name=None, kind="generic"):
-        self.id = Dimension._counter
-        Dimension._counter += 1
+        self.id = Dimension.counter
+        Dimension.counter += 1
         self.name = name or f"dim_{self.id}"
         self.kind = kind
         graph_dims.append(self)
 
-    def _as_expr(self):
+    def as_expr(self):
         return Expression({self: 1})
 
     def __add__(self, o):
-        return self._as_expr().__add__(o)
+        return self.as_expr().__add__(o)
 
     def __radd__(self, o):
-        return self._as_expr().__radd__(o)
+        return self.as_expr().__radd__(o)
 
     def __sub__(self, o):
-        return self._as_expr().__sub__(o)
+        return self.as_expr().__sub__(o)
 
     def __rsub__(self, o):
-        return self._as_expr().__rsub__(o)
+        return self.as_expr().__rsub__(o)
 
     def __mul__(self, o):
         if isinstance(o, (int, float)):
@@ -180,23 +180,23 @@ class PersistDimension(Dimension):
     """
 
     def __init__(self, expr, name=None):
-        super().__init__(name or f"persist_{Dimension._counter}", kind="persist")
+        super().__init__(name or f"persist_{Dimension.counter}", kind="persist")
         self.expr = expr
 
 
 class ReGLUDimension(Dimension):
     def __init__(self, a_expr, b_expr, name=None):
-        super().__init__(name or f"reglu_{Dimension._counter}", kind="reglu")
+        super().__init__(name or f"reglu_{Dimension.counter}", kind="reglu")
         self.a_expr = a_expr
         self.b_expr = b_expr
 
 
 class LookUp:
-    _counter = 0
+    counter = 0
 
     def __init__(self, value_exprs, query_exprs_2d, key_exprs_2d, tie_break="latest"):
-        self.id = LookUp._counter
-        LookUp._counter += 1
+        self.id = LookUp.counter
+        LookUp.counter += 1
         self.name = None
         self.value_exprs = value_exprs
         self.query_exprs_2d = query_exprs_2d  # [qx_expr, qy_expr]
@@ -214,15 +214,15 @@ class LookUpDimension(Dimension):
 
 
 def make_multiply(a, b):
-    ka, kb = _expr_key(a), _expr_key(b)
+    ka, kb = expr_key(a), expr_key(b)
     key = (ka, kb)
-    if key in _multiply_cache:
-        return _multiply_cache[key]
+    if key in multiply_cache:
+        return multiply_cache[key]
     neg_b = Expression({d: -c for d, c in b.terms.items()})
     r1 = ReGLUDimension(a, b)
     r2 = ReGLUDimension(a, neg_b)
     result = persist(Expression({r1: 1, r2: -1}))
-    _multiply_cache[key] = result
+    multiply_cache[key] = result
     return result
 
 
@@ -245,11 +245,11 @@ def reglu(a, b):
     """
     a_expr = to_expr(a)
     b_expr = to_expr(b)
-    key = (_expr_key(a_expr), _expr_key(b_expr))
-    if key in _reglu_cache:
-        return Expression({_reglu_cache[key]: 1})
+    key = (expr_key(a_expr), expr_key(b_expr))
+    if key in reglu_cache:
+        return Expression({reglu_cache[key]: 1})
     r = ReGLUDimension(a_expr, b_expr)
-    _reglu_cache[key] = r
+    reglu_cache[key] = r
     return Expression({r: 1})
 
 
@@ -263,13 +263,13 @@ def stepglu(a, b):
     """
     a_expr = to_expr(a)
     b_expr = to_expr(b)
-    key = (_expr_key(a_expr), _expr_key(b_expr))
-    if key in _stepglu_cache:
-        return _stepglu_cache[key]
+    key = (expr_key(a_expr), expr_key(b_expr))
+    if key in stepglu_cache:
+        return stepglu_cache[key]
     r1 = ReGLUDimension(a_expr, b_expr + Expression({one: 1}))
     r2 = ReGLUDimension(a_expr, b_expr)
     result = persist(Expression({r1: 1, r2: -1}))
-    _stepglu_cache[key] = result
+    stepglu_cache[key] = result
     return result
 
 
@@ -285,7 +285,7 @@ def persist(expr, name=None):
     return Expression({dim: 1})
 
 
-def _to_2d_key(k, clear_key_expr=None, tie_break="latest"):
+def to_2d_key(k, clear_key_expr=None, tie_break="latest"):
     """Map 1D key + optional clear_key to 2D key expressions via ReGLU.
 
     Scores carry no recency term: exact ties are the tie-break's job
@@ -308,15 +308,15 @@ def _to_2d_key(k, clear_key_expr=None, tie_break="latest"):
         if len(clear_key_expr.terms) == 1:
             clear = clear_key_expr
         else:
-            ck_key = _expr_key(clear_key_expr)
-            if ck_key not in _clear_key_cache:
-                _clear_key_cache[ck_key] = persist(clear_key_expr)
-            clear = _clear_key_cache[ck_key]
+            ck_key = expr_key(clear_key_expr)
+            if ck_key not in clear_key_cache:
+                clear_key_cache[ck_key] = persist(clear_key_expr)
+            clear = clear_key_cache[ck_key]
         ky = ky - clear * BIG
     return [kx, ky]
 
 
-def _to_2d_query(q):
+def to_2d_query(q):
     """Map 1D query to 2D query expressions (purely linear)."""
     return [q, Expression({one: 1})]
 
@@ -328,15 +328,15 @@ def fetch(value, query=None, key=None, clear_key=None, tie_break="latest"):
     q = to_expr(query) if query is not None else Expression()
     k = to_expr(key) if key is not None else Expression()
     ck = to_expr(clear_key) if clear_key is not None else None
-    key_2d = _to_2d_key(k, ck, tie_break=tie_break)
-    query_2d = _to_2d_query(q)
+    key_2d = to_2d_key(k, ck, tie_break=tie_break)
+    query_2d = to_2d_query(q)
     lookup = LookUp(value_exprs, query_2d, key_2d, tie_break=tie_break)
     if is_list:
         return tuple(lookup.dims)
     return lookup.dims[0]
 
 
-def _name_expr_dims(name, expr):
+def name_expr_dims(name, expr):
     """Name ReGLU, Persist and LookUp dims embedded in an Expression."""
     if not isinstance(expr, Expression):
         return
@@ -353,7 +353,7 @@ def _name_expr_dims(name, expr):
                 dim.name = f"{name}-" if neg_idx == 0 else f"{name}-{neg_idx}"
                 neg_idx += 1
         elif isinstance(dim, LookUpDimension) and dim.name.startswith("lookup_"):
-            dim.name = f"{name}_lu" if lu_idx == 0 else f"{name}_lu{lu_idx}"
+            dim.name = f"{name}lu" if lu_idx == 0 else f"{name}lu{lu_idx}"
             if dim.lookup.name is None:
                 dim.lookup.name = dim.name
             lu_idx += 1
@@ -373,7 +373,7 @@ def auto_name(local_vars):
             if isinstance(val, LookUpDimension) and val.lookup.name is None:
                 val.lookup.name = name
         elif isinstance(val, Expression):
-            _name_expr_dims(name, val)
+            name_expr_dims(name, val)
         elif isinstance(val, (list, tuple)):
             for i, item in enumerate(val):
                 if isinstance(item, Dimension) and not isinstance(item, InputDimension):
@@ -381,7 +381,7 @@ def auto_name(local_vars):
                     if isinstance(item, LookUpDimension) and item.lookup.name is None:
                         item.lookup.name = name
                 elif isinstance(item, Expression):
-                    _name_expr_dims(f"{name}[{i}]", item)
+                    name_expr_dims(f"{name}[{i}]", item)
 
 
 # ── Graph lifecycle ──────────────────────────────────────────────────
@@ -397,12 +397,12 @@ def reset_graph():
     global one, position, inv_log_pos, position_sq
     graph_dims.clear()
     graph_lookups.clear()
-    _multiply_cache.clear()
-    _reglu_cache.clear()
-    _stepglu_cache.clear()
-    _clear_key_cache.clear()
-    Dimension._counter = 0
-    LookUp._counter = 0
+    multiply_cache.clear()
+    reglu_cache.clear()
+    stepglu_cache.clear()
+    clear_key_cache.clear()
+    Dimension.counter = 0
+    LookUp.counter = 0
     one = InputDimension("one")
     position = InputDimension("position")
     inv_log_pos = InputDimension("inv_log_pos")

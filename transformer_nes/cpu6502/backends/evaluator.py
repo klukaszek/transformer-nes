@@ -55,7 +55,7 @@ OP_REGLU = 2
 OP_PERSIST = 3
 OP_LOOKUP = 4
 
-# Dimensions the run loop reads back from evaluate_current() via _read_dim.
+# Dimensions the run loop reads back from evaluate_current() via read_dim.
 # The compiled step function only materializes these (and the output-token
 # score terms); everything else stays in locals and is dead-code-eliminated
 # when it does not feed them.
@@ -75,49 +75,49 @@ class Cpu6502Runtime:
     def __init__(self, *, bcd: bool = True):
         reset_graph()
         self.input_tokens, self.output_tokens = build_6502_graph(bcd=bcd)
-        self.all_dims = list(_graph_all_dims())
-        self.all_lookups = list(_graph_all_lookups())
+        self.all_dims = list(graph_all_dims())
+        self.all_lookups = list(graph_all_lookups())
         self.dim_id_by_name: dict[str, int] = {}
         for dim in self.all_dims:
             if dim.name not in self.dim_id_by_name:
                 self.dim_id_by_name[dim.name] = dim.id
 
-        self.one = _find_builtin_dim("one")
-        self.position = _find_builtin_dim("position")
-        self.position_sq = _find_builtin_dim("position_sq")
-        self.inv_log_pos = _find_builtin_dim("inv_log_pos")
+        self.one = find_builtin_dim("one")
+        self.position = find_builtin_dim("position")
+        self.position_sq = find_builtin_dim("position_sq")
+        self.inv_log_pos = find_builtin_dim("inv_log_pos")
 
-        self.byte_value = _find_input_dim("byte_value")
-        self.is_memory_write = _find_input_dim("is_memory_write")
-        self.addr_lo = _find_input_dim("addr_lo")
-        self.addr_hi = _find_input_dim("addr_hi")
-        self.is_state = _find_input_dim("is_state")
-        self.is_start = _find_input_dim("is_start")
-        self.start_pc_lo = _find_input_dim("start_pc_lo")
-        self.start_pc_hi = _find_input_dim("start_pc_hi")
+        self.byte_value = find_input_dim("byte_value")
+        self.is_memory_write = find_input_dim("is_memory_write")
+        self.addr_lo = find_input_dim("addr_lo")
+        self.addr_hi = find_input_dim("addr_hi")
+        self.is_state = find_input_dim("is_state")
+        self.is_start = find_input_dim("is_start")
+        self.start_pc_lo = find_input_dim("start_pc_lo")
+        self.start_pc_hi = find_input_dim("start_pc_hi")
 
-        self.in_pc_lo = _find_input_dim("in_pc_lo")
-        self.in_pc_hi = _find_input_dim("in_pc_hi")
-        self.in_a = _find_input_dim("in_a")
-        self.in_x = _find_input_dim("in_x")
-        self.in_y = _find_input_dim("in_y")
-        self.in_s = _find_input_dim("in_s")
-        self.in_p_c = _find_input_dim("in_p_c")
-        self.in_p_z = _find_input_dim("in_p_z")
-        self.in_p_i = _find_input_dim("in_p_i")
-        self.in_p_d = _find_input_dim("in_p_d")
-        self.in_p_b = _find_input_dim("in_p_b")
-        self.in_p_u = _find_input_dim("in_p_u")
-        self.in_p_v = _find_input_dim("in_p_v")
-        self.in_p_n = _find_input_dim("in_p_n")
-        self.in_ir = _find_input_dim("in_ir")
-        self.in_oplo = _find_input_dim("in_oplo")
-        self.in_ophi = _find_input_dim("in_ophi")
-        self.in_ea_lo = _find_input_dim("in_ea_lo")
-        self.in_ea_hi = _find_input_dim("in_ea_hi")
-        self.in_data = _find_input_dim("in_data")
-        self.in_halted = _find_input_dim("in_halted")
-        self.in_nmi = _find_input_dim("in_nmi")
+        self.in_pc_lo = find_input_dim("in_pc_lo")
+        self.in_pc_hi = find_input_dim("in_pc_hi")
+        self.in_a = find_input_dim("in_a")
+        self.in_x = find_input_dim("in_x")
+        self.in_y = find_input_dim("in_y")
+        self.in_s = find_input_dim("in_s")
+        self.in_p_c = find_input_dim("in_p_c")
+        self.in_p_z = find_input_dim("in_p_z")
+        self.in_p_i = find_input_dim("in_p_i")
+        self.in_p_d = find_input_dim("in_p_d")
+        self.in_p_b = find_input_dim("in_p_b")
+        self.in_p_u = find_input_dim("in_p_u")
+        self.in_p_v = find_input_dim("in_p_v")
+        self.in_p_n = find_input_dim("in_p_n")
+        self.in_ir = find_input_dim("in_ir")
+        self.in_oplo = find_input_dim("in_oplo")
+        self.in_ophi = find_input_dim("in_ophi")
+        self.in_ea_lo = find_input_dim("in_ea_lo")
+        self.in_ea_hi = find_input_dim("in_ea_hi")
+        self.in_data = find_input_dim("in_data")
+        self.in_halted = find_input_dim("in_halted")
+        self.in_nmi = find_input_dim("in_nmi")
 
         self.hull_ext = load_hull_ext()
         if self.hull_ext is None:
@@ -144,15 +144,15 @@ class Cpu6502Runtime:
             elif self.is_state in key_terms:
                 self.state_lu = lu
 
-        self._share_identical_memory_caches()
-        self._build_indexed_schedule()
+        self.share_identical_memory_caches()
+        self.build_indexed_schedule()
         self.reset()
 
-    def _build_indexed_schedule(self):
+    def build_indexed_schedule(self):
         self.num_dims = len(self.all_dims)
 
-        self._indexed_dim_ops = [OP_SKIP] * self.num_dims
-        self._indexed_dim_args = [None] * self.num_dims
+        self.indexed_dim_ops = [OP_SKIP] * self.num_dims
+        self.indexed_dim_args = [None] * self.num_dims
         self.lookup_dim_ids = {
             lu.id: [dim.id for dim in lu.dims]
             for lu in self.all_lookups
@@ -167,21 +167,21 @@ class Cpu6502Runtime:
 
         for dim in self.all_dims:
             if isinstance(dim, ReGLUDimension):
-                self._indexed_dim_ops[dim.id] = OP_REGLU
-                self._indexed_dim_args[dim.id] = (
+                self.indexed_dim_ops[dim.id] = OP_REGLU
+                self.indexed_dim_args[dim.id] = (
                     self.compile_expr(dim.a_expr),
                     self.compile_expr(dim.b_expr),
                 )
             elif isinstance(dim, PersistDimension):
-                self._indexed_dim_ops[dim.id] = OP_PERSIST
-                self._indexed_dim_args[dim.id] = self.compile_expr(dim.expr)
+                self.indexed_dim_ops[dim.id] = OP_PERSIST
+                self.indexed_dim_args[dim.id] = self.compile_expr(dim.expr)
             elif isinstance(dim, LookUpDimension):
-                self._indexed_dim_ops[dim.id] = OP_LOOKUP
-                self._indexed_dim_args[dim.id] = dim.lookup.id
+                self.indexed_dim_ops[dim.id] = OP_LOOKUP
+                self.indexed_dim_args[dim.id] = dim.lookup.id
 
-        self._indexed_schedule = [
+        self.indexed_schedule = [
             (dim_id, op, arg)
-            for dim_id, (op, arg) in enumerate(zip(self._indexed_dim_ops, self._indexed_dim_args, strict=True))
+            for dim_id, (op, arg) in enumerate(zip(self.indexed_dim_ops, self.indexed_dim_args, strict=True))
             if op != OP_SKIP
         ]
         self.indexed_outputs = [
@@ -190,17 +190,17 @@ class Cpu6502Runtime:
         ]
 
         # Compile the static schedule to straight-line Python once: the
-        # interpreted loop spends most of its time in _eval_indexed_expr
+        # interpreted loop spends most of its time in eval_indexed_expr
         # (~9K calls per instruction), which codegen eliminates entirely.
-        self._step_fn = self._compile_step_fn()
-        self._insert_kv_fns = {lu.id: self._compile_insert_kv_fn(lu) for lu in self.all_lookups}
+        self.step_fn = self.compile_step_fn()
+        self.insert_kv_fns = {lu.id: self.compile_insert_kv_fn(lu) for lu in self.all_lookups}
 
     @staticmethod
-    def _expr_src(arg, fmt="v[{}]"):
+    def expr_src(arg, fmt="v[{}]"):
         """Render a compiled (n, ids, coeffs) expression as Python source.
 
         Terms are emitted in storage order so float addition order (and
-        therefore exact results) matches _eval_indexed_expr.
+        therefore exact results) matches eval_indexed_expr.
         """
         n, ids, coeffs = arg
         if n == 0:
@@ -216,7 +216,7 @@ class Cpu6502Runtime:
                 parts.append(f"{coeff!r}*{ref}")
         return " + ".join(parts)
 
-    def _compile_step_fn(self):
+    def compile_step_fn(self):
         """Generate one function that evaluates the whole indexed schedule.
 
         Every intermediate dimension becomes a Python local (STORE_FAST is
@@ -226,7 +226,7 @@ class Cpu6502Runtime:
         score terms -- are written back to the values list.
         """
         fmt = "d{}"
-        computed = {dim_id for dim_id, _op, _arg in self._indexed_schedule}
+        computed = {dim_id for dim_id, _op, _arg in self.indexed_schedule}
         external = {
             self.dim_id_by_name[name]
             for name in RUNTIME_READ_DIMS
@@ -239,7 +239,7 @@ class Cpu6502Runtime:
         # an externally read dimension.  Dimension ids are topologically
         # ordered, so a single reverse sweep finds the closure.
         needed = set(external)
-        for dim_id, op, arg in reversed(self._indexed_schedule):
+        for dim_id, op, arg in reversed(self.indexed_schedule):
             if op == OP_LOOKUP:
                 lu_dim_ids = self.lookup_dim_ids[arg]
                 if any(d in needed for d in lu_dim_ids):
@@ -255,7 +255,7 @@ class Cpu6502Runtime:
                     needed.update(arg[1])
         live_schedule = [
             (dim_id, op, arg)
-            for dim_id, op, arg in self._indexed_schedule
+            for dim_id, op, arg in self.indexed_schedule
             if dim_id in needed
         ]
 
@@ -265,44 +265,44 @@ class Cpu6502Runtime:
         self.external_store_ids = sorted(external & computed)
 
         namespace = {}
-        lines = ["def _step(g, v):"]
+        lines = ["def step(g, v):"]
         for dim_id in self.step_input_ids:
             lines.append(f"    d{dim_id} = g.get({dim_id}, 0.0)")
         emitted_lookups = set()
         for dim_id, op, arg in live_schedule:
             if op == OP_PERSIST:
-                lines.append(f"    d{dim_id} = {self._expr_src(arg, fmt)}")
+                lines.append(f"    d{dim_id} = {self.expr_src(arg, fmt)}")
             elif op == OP_REGLU:
                 a_expr, b_expr = arg
-                lines.append(f"    _b = {self._expr_src(b_expr, fmt)}")
-                lines.append(f"    d{dim_id} = ({self._expr_src(a_expr, fmt)}) * _b if _b > 0.0 else 0.0")
+                lines.append(f"    _b = {self.expr_src(b_expr, fmt)}")
+                lines.append(f"    d{dim_id} = ({self.expr_src(a_expr, fmt)}) * _b if _b > 0.0 else 0.0")
             elif op == OP_LOOKUP and arg not in emitted_lookups:
                 emitted_lookups.add(arg)
-                lines.extend(self._lookup_query_lines(arg, namespace, fmt))
+                lines.extend(self.lookup_query_lines(arg, namespace, fmt))
         for dim_id in self.external_store_ids:
             lines.append(f"    v[{dim_id}] = d{dim_id}")
         logger.debug(
             "compiled step: %d/%d schedule entries live",
-            len(live_schedule), len(self._indexed_schedule),
+            len(live_schedule), len(self.indexed_schedule),
         )
         exec("\n".join(lines), namespace)  # noqa: S102
-        return namespace["_step"]
+        return namespace["step"]
 
-    def _lookup_query_lines(self, lu_id, namespace, fmt):
+    def lookup_query_lines(self, lu_id, namespace, fmt):
         """Emit inline query code for one lookup into the step function."""
         attn = self.attention[lu_id]
         qx_expr, qy_expr = self.lookup_query_exprs[lu_id]
-        buf = f"_q{lu_id}_buf"
-        cache = f"_q{lu_id}_cache"
+        buf = f"_q{lu_id}buf"
+        cache = f"_q{lu_id}cache"
         namespace[buf] = np.empty((attn.num_value_pairs, 2))
         namespace[cache] = attn.cache
         lines = [
-            f"    {buf}[:, 0] = {self._expr_src(qx_expr, fmt)}",
-            f"    {buf}[:, 1] = {self._expr_src(qy_expr, fmt)}",
-            f"    _o = {cache}.query(0, {buf}).ravel().tolist()",
+            f"    {buf}[:, 0] = {self.expr_src(qx_expr, fmt)}",
+            f"    {buf}[:, 1] = {self.expr_src(qy_expr, fmt)}",
+            f"    o = {cache}.query(0, {buf}).ravel().tolist()",
         ]
         for i, dim_id in enumerate(self.lookup_dim_ids[lu_id]):
-            lines.append(f"    d{dim_id} = _o[{i}]")
+            lines.append(f"    d{dim_id} = o[{i}]")
         return lines
 
     def insert_kv_plan(self, lu):
@@ -346,7 +346,7 @@ class Cpu6502Runtime:
         )
         return order, input_ids
 
-    def _compile_insert_kv_fn(self, lu):
+    def compile_insert_kv_fn(self, lu):
         """Generate a direct (kx, ky, values) evaluator for one lookup.
 
         Token insertion only needs the lookup's key and value expressions,
@@ -362,27 +362,27 @@ class Cpu6502Runtime:
         order, input_ids = plan
 
         fmt = "d{}"
-        lines = ["def _kv(g):"]
+        lines = ["def kv(g):"]
         for dim_id in input_ids:
             lines.append(f"    d{dim_id} = g.get({dim_id}, 0.0)")
         for dim in order:
             if isinstance(dim, PersistDimension):
-                src = self._expr_src(self.compile_expr(dim.expr), fmt)
+                src = self.expr_src(self.compile_expr(dim.expr), fmt)
                 lines.append(f"    d{dim.id} = {src}")
             else:
-                a_src = self._expr_src(self.compile_expr(dim.a_expr), fmt)
-                b_src = self._expr_src(self.compile_expr(dim.b_expr), fmt)
+                a_src = self.expr_src(self.compile_expr(dim.a_expr), fmt)
+                b_src = self.expr_src(self.compile_expr(dim.b_expr), fmt)
                 lines.append(f"    _b = {b_src}")
                 lines.append(f"    d{dim.id} = ({a_src}) * _b if _b > 0.0 else 0.0")
-        kx_src = self._expr_src(self.compile_expr(lu.key_exprs_2d[0]), fmt)
-        ky_src = self._expr_src(self.compile_expr(lu.key_exprs_2d[1]), fmt)
+        kx_src = self.expr_src(self.compile_expr(lu.key_exprs_2d[0]), fmt)
+        ky_src = self.expr_src(self.compile_expr(lu.key_exprs_2d[1]), fmt)
         val_srcs = ", ".join(
-            self._expr_src(self.compile_expr(expr), fmt) for expr in lu.value_exprs
+            self.expr_src(self.compile_expr(expr), fmt) for expr in lu.value_exprs
         )
         lines.append(f"    return {kx_src}, {ky_src}, ({val_srcs},)")
         namespace = {}
         exec("\n".join(lines), namespace)  # noqa: S102
-        return namespace["_kv"]
+        return namespace["kv"]
 
     @staticmethod
     def compile_expr(expr):
@@ -393,7 +393,7 @@ class Cpu6502Runtime:
             coeffs.append(coeff)
         return len(ids), tuple(ids), tuple(coeffs)
 
-    def _share_identical_memory_caches(self):
+    def share_identical_memory_caches(self):
         """Use one KV cache for memory lookups with identical keys and values.
 
         The graph still has multiple memory lookup sites because it needs
@@ -409,8 +409,8 @@ class Cpu6502Runtime:
             if (
                 attn.num_value_pairs != first.num_value_pairs
                 or attn.nv != first.nv
-                or not _same_exprs(lu.value_exprs, self.memory_read_lus[0].value_exprs)
-                or not _same_exprs(lu.key_exprs_2d, self.memory_read_lus[0].key_exprs_2d)
+                or not same_exprs(lu.value_exprs, self.memory_read_lus[0].value_exprs)
+                or not same_exprs(lu.key_exprs_2d, self.memory_read_lus[0].key_exprs_2d)
             ):
                 continue
             attn.cache = first.cache
@@ -419,10 +419,10 @@ class Cpu6502Runtime:
         self.pos = 0
         for attn in self.attention.values():
             attn.clear()
-        self._last_vals: dict | None = None
-        self._trace_len = 0
+        self.last_vals: dict | None = None
+        self.trace_len = 0
 
-    def _set_token(self, token_name: str, overrides: dict | None = None):
+    def set_token(self, token_name: str, overrides: dict | None = None):
         vals = {self.one: 1.0}
         embedding = self.input_tokens[token_name]
         for dim, coeff in embedding.terms.items():
@@ -441,7 +441,7 @@ class Cpu6502Runtime:
         memory reads, start -> start lookup, STATE -> state lookup); shared
         backing caches receive one insert per token.
         """
-        vals = self._set_token(token_name, overrides)
+        vals = self.set_token(token_name, overrides)
         g = {dim.id: value for dim, value in vals.items()}
         inserted_caches: set[int] = set()
         for lid in sorted(lookup_ids):
@@ -450,30 +450,30 @@ class Cpu6502Runtime:
             if cache_id in inserted_caches:
                 continue
             inserted_caches.add(cache_id)
-            kx, ky, raw_vals = self._insert_kv_fns[lid](g)
+            kx, ky, raw_vals = self.insert_kv_fns[lid](g)
             attn.insert_raw(kx, ky, raw_vals)
         self.pos += 1
-        self._last_vals = vals
+        self.last_vals = vals
         return vals
 
     def evaluate_current(self):
         """Evaluate the graph over the latest token without inserting a new one."""
-        if self._last_vals is None:
+        if self.last_vals is None:
             raise RuntimeError("no prior token to evaluate from")
         g = {}
         values = [0.0] * self.num_dims
-        for dim, value in self._last_vals.items():
+        for dim, value in self.last_vals.items():
             value = float(value)
             g[dim.id] = value
             values[dim.id] = value
-        self._step_fn(g, values)
+        self.step_fn(g, values)
         return values
 
     def predict_next(self, values: list[float]) -> str:
         best_score = -1e300
         best_name = None
         for name, score_expr in self.indexed_outputs:
-            score = _eval_indexed_expr(score_expr, values)
+            score = eval_indexed_expr(score_expr, values)
             if score > best_score:
                 best_score = score
                 best_name = name
@@ -484,15 +484,15 @@ class Cpu6502Runtime:
         # default WRITE at address 0 so reads of uninitialized memory return 0.  Any
         # writes performed by the program itself add their own WRITE tokens.
         memory_image = [0] * 0x10000
-        return self._run_with_image(memory_image, program, start_pc=start_pc, max_steps=max_steps)
+        return self.run_with_image(memory_image, program, start_pc=start_pc, max_steps=max_steps)
 
     def run_image(self, memory_image: bytes | bytearray, *, start_pc: int = 0x0400, max_steps: int = 100_000):
         if len(memory_image) != 0x10000:
             raise ValueError("memory_image must be exactly 64 KiB")
         image = list(memory_image)
-        return self._run_with_image(image, None, start_pc=start_pc, max_steps=max_steps)
+        return self.run_with_image(image, None, start_pc=start_pc, max_steps=max_steps)
 
-    def _run_with_image(
+    def run_with_image(
         self,
         memory_image: list[int],
         program_bytes: list[int] | None,
@@ -532,7 +532,7 @@ class Cpu6502Runtime:
         """
         self.reset()
         prefix_start = time.perf_counter()
-        self._memory_ids = {lu.id for lu in self.memory_read_lus}
+        self.memory_ids = {lu.id for lu in self.memory_read_lus}
 
         # Feed start token with initial PC.
         self.direct_insert(
@@ -551,7 +551,7 @@ class Cpu6502Runtime:
         for addr, byte in enumerate(memory_image):
             if byte == 0:
                 continue
-            self._insert_memory_write(addr, byte, memory_ids=self._memory_ids)
+            self.insert_memory_write(addr, byte, memory_ids=self.memory_ids)
 
         self.mstate = {
             "pc": start_pc & 0xFFFF, "a": 0, "x": 0, "y": 0, "s": 0xFD,
@@ -575,7 +575,7 @@ class Cpu6502Runtime:
 
     def inject_write(self, addr: int, value: int):
         """Append a device-originated WRITE token (a value appearing on the bus)."""
-        self._insert_memory_write(addr & 0xFFFF, value & 0xFF, memory_ids=self._memory_ids)
+        self.insert_memory_write(addr & 0xFFFF, value & 0xFF, memory_ids=self.memory_ids)
 
     def machine_step(self) -> TraceRow:
         """Insert the next STATE token, evaluate one step, append its writes."""
@@ -593,14 +593,14 @@ class Cpu6502Runtime:
                 self.in_x: st["x"],
                 self.in_y: st["y"],
                 self.in_s: st["s"],
-                self.in_p_c: self._flag_bit(p, reference.FLAG_C),
-                self.in_p_z: self._flag_bit(p, reference.FLAG_Z),
-                self.in_p_i: self._flag_bit(p, reference.FLAG_I),
-                self.in_p_d: self._flag_bit(p, reference.FLAG_D),
-                self.in_p_b: self._flag_bit(p, reference.FLAG_B),
-                self.in_p_u: self._flag_bit(p, reference.FLAG_U),
-                self.in_p_v: self._flag_bit(p, reference.FLAG_V),
-                self.in_p_n: self._flag_bit(p, reference.FLAG_N),
+                self.in_p_c: self.flag_bit(p, reference.FLAG_C),
+                self.in_p_z: self.flag_bit(p, reference.FLAG_Z),
+                self.in_p_i: self.flag_bit(p, reference.FLAG_I),
+                self.in_p_d: self.flag_bit(p, reference.FLAG_D),
+                self.in_p_b: self.flag_bit(p, reference.FLAG_B),
+                self.in_p_u: self.flag_bit(p, reference.FLAG_U),
+                self.in_p_v: self.flag_bit(p, reference.FLAG_V),
+                self.in_p_n: self.flag_bit(p, reference.FLAG_N),
                 self.in_ir: st["ir"],
                 self.in_oplo: st["oplo"],
                 self.in_ophi: st["ophi"],
@@ -614,14 +614,14 @@ class Cpu6502Runtime:
         )
 
         vals = self.evaluate_current()
-        row = self._make_trace_row(vals)
-        self._trace_len += 1
+        row = self.make_trace_row(vals)
+        self.trace_len += 1
         for write in row.writes:
-            self._insert_memory_write(write.addr, write.value, memory_ids=self._memory_ids)
+            self.insert_memory_write(write.addr, write.value, memory_ids=self.memory_ids)
 
         s = row.state
         st.update(
-            pc=int(round(self._read_dim("next_pc", vals))) & 0xFFFF,
+            pc=int(round(self.read_dim("next_pc", vals))) & 0xFFFF,
             a=s.a, x=s.x, y=s.y, s=s.s, p=s.p,
             ir=s.ir, oplo=s.operand_lo, ophi=s.operand_hi,
             ea=s.ea, data=s.data, halted=1 if s.halted else 0,
@@ -630,7 +630,7 @@ class Cpu6502Runtime:
             self.machine_halted = True
         return row
 
-    def _insert_memory_write(self, addr: int, value: int, *, memory_ids: set[int]):
+    def insert_memory_write(self, addr: int, value: int, *, memory_ids: set[int]):
         self.direct_insert(
             "WRITE",
             {
@@ -642,21 +642,21 @@ class Cpu6502Runtime:
             lookup_ids=memory_ids,
         )
 
-    def _make_trace_row(self, vals):
+    def make_trace_row(self, vals):
         # The trace row describes the instruction that just executed, so PC is
         # the *current* PC; registers/memory reflect the post-execution state.
-        pc = int(round(self._read_dim("current_pc", vals))) & 0xFFFF
-        a = int(round(self._read_dim("new_a", vals))) & 0xFF
-        x = int(round(self._read_dim("new_x", vals))) & 0xFF
-        y = int(round(self._read_dim("new_y", vals))) & 0xFF
-        s = int(round(self._read_dim("new_s", vals))) & 0xFF
-        p = int(round(self._read_dim("new_p", vals))) & 0xFF
-        halted = int(round(self._read_dim("new_halted", vals))) != 0
-        ir = int(round(self._read_dim("fetched_opcode", vals))) & 0xFF
-        oplo = int(round(self._read_dim("fetched_operand_lo", vals))) & 0xFF
-        ophi = int(round(self._read_dim("fetched_operand_hi", vals))) & 0xFF
-        ea = int(round(self._read_dim("ea", vals))) & 0xFFFF
-        data = int(round(self._read_dim("data_out", vals))) & 0xFF
+        pc = int(round(self.read_dim("current_pc", vals))) & 0xFFFF
+        a = int(round(self.read_dim("new_a", vals))) & 0xFF
+        x = int(round(self.read_dim("new_x", vals))) & 0xFF
+        y = int(round(self.read_dim("new_y", vals))) & 0xFF
+        s = int(round(self.read_dim("new_s", vals))) & 0xFF
+        p = int(round(self.read_dim("new_p", vals))) & 0xFF
+        halted = int(round(self.read_dim("new_halted", vals))) != 0
+        ir = int(round(self.read_dim("fetched_opcode", vals))) & 0xFF
+        oplo = int(round(self.read_dim("fetched_operand_lo", vals))) & 0xFF
+        ophi = int(round(self.read_dim("fetched_operand_hi", vals))) & 0xFF
+        ea = int(round(self.read_dim("ea", vals))) & 0xFFFF
+        data = int(round(self.read_dim("data_out", vals))) & 0xFF
 
         writes = []
         for store_dim, addr_dim, value_dim in (
@@ -664,14 +664,14 @@ class Cpu6502Runtime:
             ("is_store2", "write_addr2_out", "write_value2_out"),
             ("is_store3", "write_addr3_out", "write_value3_out"),
         ):
-            if int(round(self._read_dim(store_dim, vals))):
-                write_addr = int(round(self._read_dim(addr_dim, vals))) & 0xFFFF
-                write_value = int(round(self._read_dim(value_dim, vals))) & 0xFF
-                writes.append(MemWrite(self._trace_len, write_addr, write_value))
+            if int(round(self.read_dim(store_dim, vals))):
+                write_addr = int(round(self.read_dim(addr_dim, vals))) & 0xFFFF
+                write_value = int(round(self.read_dim(value_dim, vals))) & 0xFF
+                writes.append(MemWrite(self.trace_len, write_addr, write_value))
         writes = tuple(writes)
 
         return TraceRow(
-            step=self._trace_len,
+            step=self.trace_len,
             state=Cpu6502State(
                 pc=pc,
                 a=a,
@@ -690,46 +690,46 @@ class Cpu6502Runtime:
         )
 
     @staticmethod
-    def _flag_bit(p: int, mask: int) -> int:
+    def flag_bit(p: int, mask: int) -> int:
         return 1 if (p & mask) != 0 else 0
 
-    def _read_dim(self, name: str, values: list[float]) -> float:
+    def read_dim(self, name: str, values: list[float]) -> float:
         dim_id = self.dim_id_by_name.get(name)
         return values[dim_id] if dim_id is not None else 0.0
 
 
-def _graph_all_dims():
+def graph_all_dims():
     from transformer_nes.graph.core import graph_dims
 
     return graph_dims
 
 
-def _graph_all_lookups():
+def graph_all_lookups():
     from transformer_nes.graph.core import graph_lookups
 
     return graph_lookups
 
 
-def _find_builtin_dim(name: str):
+def find_builtin_dim(name: str):
     from transformer_nes.graph import core as graph_core
 
     return getattr(graph_core, name)
 
 
-def _find_input_dim(name: str):
-    for d in _graph_all_dims():
+def find_input_dim(name: str):
+    for d in graph_all_dims():
         if isinstance(d, InputDimension) and d.name == name:
             return d
     raise KeyError(name)
 
 
-def _same_exprs(left, right) -> bool:
+def same_exprs(left, right) -> bool:
     if len(left) != len(right):
         return False
     return all(a.terms == b.terms for a, b in zip(left, right, strict=True))
 
 
-def _eval_indexed_expr(expr, values: list[float]) -> float:
+def eval_indexed_expr(expr, values: list[float]) -> float:
     _n, ids, coeffs = expr
     total = 0.0
     for dim_id, coeff in zip(ids, coeffs, strict=True):

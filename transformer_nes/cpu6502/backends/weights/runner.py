@@ -57,7 +57,7 @@ class Cpu6502TransformerMachine:
         # step function is not used here).
         self.rt = Cpu6502Runtime(bcd=bcd)
         dim_by_id = {d.id: d for d in self.rt.all_dims}
-        self._dim_by_name = {
+        self.dim_by_name = {
             name: dim_by_id[dim_id] for name, dim_id in self.rt.dim_id_by_name.items()
         }
 
@@ -68,11 +68,11 @@ class Cpu6502TransformerMachine:
         output_tokens = dict(self.rt.output_tokens)
         readout = 0
         for name in RUNTIME_READ_DIMS:
-            readout = readout + 1e-6 * self._dim_by_name[name]
+            readout = readout + 1e-6 * self.dim_by_name[name]
         output_tokens["READOUT"] = readout
 
         pg = ProgramGraph(self.rt.input_tokens, output_tokens)
-        self._pg = pg  # kept for the expert folds (graph/fold.py)
+        self.pg = pg  # kept for the expert folds (graph/fold.py)
         build_start = time.perf_counter()
         # ASAP schedule: the optimal-width MILP does not solve at this graph
         # size (~5M integer variables); critical-path scheduling costs some
@@ -85,13 +85,13 @@ class Cpu6502TransformerMachine:
         self.n_layers = info.n_layers
         self.slot_of = info.slot_of
         self.d_model = info.d_model
-        self._state_row = tok_to_idx["STATE"]
-        self._halt_row = tok_to_idx["HALT"]
-        self._read_slots = {
-            name: self.slot_of[self._dim_by_name[name]]
+        self.state_row = tok_to_idx["STATE"]
+        self.halt_row = tok_to_idx["HALT"]
+        self.read_slots = {
+            name: self.slot_of[self.dim_by_name[name]]
             for name in RUNTIME_READ_DIMS
         }
-        self._one_slot = self.slot_of[self.rt.one]
+        self.one_slot = self.slot_of[self.rt.one]
 
         # The whole layer stack -- hull attention plus the structural
         # passthrough fusion -- runs inside the generated C++ engine
@@ -106,8 +106,8 @@ class Cpu6502TransformerMachine:
 
         if expert_schedule not in ("asap", "milp"):
             raise ValueError(f"unknown expert_schedule {expert_schedule!r}")
-        self._expert_schedule = expert_schedule
-        self._expert_milp_seconds = expert_milp_seconds
+        self.expert_schedule = expert_schedule
+        self.expert_milp_seconds = expert_milp_seconds
         # The core engine is determined by source, bcd, and expert set—not
         # the ROM's sequence windows—so it
         # compiles once per code digest and every ROM shares it; a manifest
@@ -120,7 +120,7 @@ class Cpu6502TransformerMachine:
         ]
         shapes = tuple(shape_library or ())
         cache_key = None
-        self._engine = None
+        self.engine = None
         if expert_schedule == "asap":
             expert_bytes = [
                 int(b) for b in (expert_opcodes or ()) if int(b) in OPCODES
@@ -132,78 +132,78 @@ class Cpu6502TransformerMachine:
                 bcd=bcd, expert_bytes=expert_bytes,
                 extra=f"shapes={shape_tag}",
             )
-            self._engine = GeneratedWeightsEngine.from_cache(cache_key)
-            if self._engine is not None:
-                logger.info("engine cache hit (%d experts)", self._engine.n_experts)
-        if self._engine is None:
+            self.engine = GeneratedWeightsEngine.from_cache(cache_key)
+            if self.engine is not None:
+                logger.info("engine cache hit (%d experts)", self.engine.n_experts)
+        if self.engine is None:
             shapes_meta: list[dict] = []
             experts = build_opcode_experts(
-                self._pg, expert_opcodes,
-                schedule=self._expert_schedule,
-                milp_seconds=self._expert_milp_seconds,
+                self.pg, expert_opcodes,
+                schedule=self.expert_schedule,
+                milp_seconds=self.expert_milp_seconds,
             )
             if shapes:
-                shape_experts, shapes_meta = build_shape_experts(self._pg, shapes)
+                shape_experts, shapes_meta = build_shape_experts(self.pg, shapes)
                 experts.extend(shape_experts)
-            self._engine = GeneratedWeightsEngine(
-                self.model, step_spec=self._step_spec(),
+            self.engine = GeneratedWeightsEngine(
+                self.model, step_spec=self.step_spec(),
                 experts=experts, cache_key=cache_key,
                 shapes_meta=shapes_meta,
             )
         # The ROM's windows land in a tiny per-ROM module attached through
         # the core's function-pointer hook (no core recompile per ROM).
-        self._seq_module = None
-        if not self._engine.has_machine_step:
+        self.seq_module = None
+        if not self.engine.has_machine_step:
             raise RuntimeError("generated 6502 engine is missing machine_step")
-        if not self._engine.supports_direct_writes:
+        if not self.engine.supports_direct_writes:
             raise RuntimeError("generated 6502 engine is missing direct memory writes")
         if windows:
-            self._attach_sequence_module(windows, bcd=bcd)
-        self._step_out = np.empty(21, dtype=np.int64)
+            self.attach_sequence_module(windows, bcd=bcd)
+        self.step_out = np.empty(21, dtype=np.int64)
 
         # Profile-guided JIT: every jit_interval native run() returns, pcs
         # with >= jit_min_count fallback steps since the last poll are
         # matched against the shape library at their live RAM bytes --
         # discovering windows the boot scan could not see (code copied to
         # RAM at runtime, hot straight-line idioms).
-        self._jit_interval = int(jit_interval)
-        self._jit_min_count = int(jit_min_count)
-        self._jit_calls = 0
-        self._jit_rejected: set[int] = set()
+        self.jit_interval = int(jit_interval)
+        self.jit_min_count = int(jit_min_count)
+        self.jit_calls = 0
+        self.jit_rejected: set[int] = set()
 
         self.pos = 0
-        self._trace_len = 0
+        self.trace_len = 0
         # RAM mirror for optional snapshot/reseed checkpoints.
-        self._ram = bytearray(0x10000)
-        self._checkpoint_tokens = checkpoint_tokens
-        self._seed_pos = 0
+        self.ram = bytearray(0x10000)
+        self.checkpoint_tokens = checkpoint_tokens
+        self.seed_pos = 0
         self.checkpoints = 0
 
     # ── Transformer plumbing ────────────────────────────────────────
 
-    def _embed_array(self, values: dict) -> np.ndarray:
+    def embed_array(self, values: dict) -> np.ndarray:
         """Engine input embedding: dim values at their residual slots.
 
         Equivalent to a vocabulary embedding row for a token type that
         enumerated exactly these values; the three position features (slots
-        0-2) are added by _forward_values.
+        0-2) are added by forward_values.
         """
         x = np.zeros(self.d_model, dtype=np.float32)
-        x[self._one_slot] = 1.0
+        x[self.one_slot] = 1.0
         for dim, value in values.items():
             x[self.slot_of[dim]] = float(value)
         return x
 
-    def _forward_values(self, values: dict) -> np.ndarray:
+    def forward_values(self, values: dict) -> np.ndarray:
         """One genuine transformer position: embed, add position features,
         and run the whole layer stack (hull attention + ReGLU) in C++."""
-        x = self._embed_array(values)
+        x = self.embed_array(values)
         add_position_encoding(x, self.pos)
         self.pos += 1
-        self._engine.forward(x)  # in place, whole stack
+        self.engine.forward(x)  # in place, whole stack
         return x
 
-    def _attach_sequence_module(self, windows, *, bcd: bool) -> None:
+    def attach_sequence_module(self, windows, *, bcd: bool) -> None:
         """Compile-or-load the per-ROM sequence module and attach its window
         dispatch to the core engine.  A new ROM's window set costs one small
         TU (cached by digest); the 43 MB core is never re-emitted for it."""
@@ -213,72 +213,72 @@ class Cpu6502TransformerMachine:
         )
 
         key = seqmod_config_key(
-            core_digest=self._engine.digest, bcd=bcd, windows=windows
+            core_digest=self.engine.digest, bcd=bcd, windows=windows
         )
-        mod = SequenceModule.from_cache(key, core_digest=self._engine.digest)
+        mod = SequenceModule.from_cache(key, core_digest=self.engine.digest)
         if mod is None:
             experts = []
             for w in windows:
                 # The scanner proposes shapes; the fold's license checks
                 # arbitrate.  A rejected window only loses its fast path.
                 try:
-                    experts.append(build_sequence_expert(self._pg, *w))
+                    experts.append(build_sequence_expert(self.pg, *w))
                 except RuntimeError as e:
                     logger.info("sequence window skipped: %s", e)
             if not experts:
                 return
             mod = SequenceModule(
-                self.model, self._step_spec(), experts,
-                core_digest=self._engine.digest, cache_key=key,
+                self.model, self.step_spec(), experts,
+                core_digest=self.engine.digest, cache_key=key,
             )
         else:
             logger.info("sequence module cache hit (max window %d steps)", mod.max_k)
-        self._seq_module = mod
-        self._engine.attach_seq(mod.fn_ptr, mod.ctx_ptr)
+        self.seq_module = mod
+        self.engine.attach_seq(mod.fn_ptr, mod.ctx_ptr)
 
-    def _populate_shape_windows(self) -> None:
+    def populate_shape_windows(self) -> None:
         """Fill the engine's runtime window table from the current RAM image
         (called at every boot/reseed; dispatch re-verifies bytes live, so a
         stale entry is only a missed fast path)."""
-        self._jit_calls = 0
-        self._jit_rejected.clear()
-        meta = getattr(self._engine, "shapes_meta", None) or []
-        if not (meta and self._engine.has_run_loop):
+        self.jit_calls = 0
+        self.jit_rejected.clear()
+        meta = getattr(self.engine, "shapes_meta", None) or []
+        if not (meta and self.engine.has_run_loop):
             return
-        self._engine.clear_windows()
-        for sid, head in match_shape_windows(self._ram, meta):
-            self._engine.add_window(sid, head)
+        self.engine.clear_windows()
+        for sid, head in match_shape_windows(self.ram, meta):
+            self.engine.add_window(sid, head)
 
-    def _jit_tick(self) -> None:
+    def jit_tick(self) -> None:
         """Periodic JIT poll after a native run: table-add any hot fallback
         pc whose bytes match a library shape, read from the ENGINE's live RAM
         (the native run loop's writes never reach the Python mirror -- a
         runtime-copied loop exists only engine-side)."""
-        meta = getattr(self._engine, "shapes_meta", None) or []
+        meta = getattr(self.engine, "shapes_meta", None) or []
         if not meta:
             return
-        self._jit_calls += 1
-        if self._jit_calls % self._jit_interval:
+        self.jit_calls += 1
+        if self.jit_calls % self.jit_interval:
             return
-        for pc in self._engine.jit_hot(self._jit_min_count):
+        for pc in self.engine.jit_hot(self.jit_min_count):
             pc = int(pc)
-            if pc in self._jit_rejected:
+            if pc in self.jit_rejected:
                 continue
-            sid = match_shape_at(self._engine.read_ram, pc, meta)
+            sid = match_shape_at(self.engine.read_ram, pc, meta)
             if sid is None:
-                self._jit_rejected.add(pc)
+                self.jit_rejected.add(pc)
             else:
-                self._engine.add_window(sid, pc)
+                self.engine.add_window(sid, pc)
                 logger.info("jit window: %s at %04X", meta[sid]["name"], pc)
 
-    def _step_spec(self) -> dict:
+    def step_spec(self) -> dict:
         """Slot map for the generated C++ machine_step (engine_gen.py)."""
         spec = step_spec_base(
-            lambda name: self.slot_of[self._dim_by_name[name]]
+            lambda name: self.slot_of[self.dim_by_name[name]]
         )
-        spec["outputs"] = dict(self._read_slots)
-        spec["halt_head"] = head_row(self.model, self._halt_row)
-        spec["state_head"] = head_row(self.model, self._state_row)
+        spec["outputs"] = dict(self.read_slots)
+        spec["halt_head"] = head_row(self.model, self.halt_row)
+        spec["state_head"] = head_row(self.model, self.state_row)
         return spec
 
     # ── Machine protocol (mirrors evaluator.Cpu6502Runtime, so the NES
@@ -287,22 +287,22 @@ class Cpu6502TransformerMachine:
     def boot_image(self, memory_image, *, start_pc: int, state: dict | None = None):
         # Fresh token log: clear the engine's attention state so a machine
         # instance can be reused for another program.
-        self._engine.reset()
+        self.engine.reset()
         self.pos = 0
-        self._trace_len = 0
+        self.trace_len = 0
         ram = bytearray(0x10000)
         ram[: len(memory_image)] = bytes(memory_image)
-        self._ram = ram
+        self.ram = ram
         rt = self.rt
-        self._forward_values({
+        self.forward_values({
             rt.start_pc_lo: start_pc & 0xFF,
             rt.start_pc_hi: (start_pc >> 8) & 0xFF,
             rt.is_start: 1,
         })
         for addr, byte in enumerate(ram):
             if byte:
-                self._insert_write(addr, byte)
-        self._seed_pos = self.pos
+                self.insert_write(addr, byte)
+        self.seed_pos = self.pos
         self.mstate = {
             "pc": start_pc & 0xFFFF, "a": 0, "x": 0, "y": 0, "s": 0xFD,
             "p": reference.FLAG_U | reference.FLAG_I,
@@ -312,7 +312,7 @@ class Cpu6502TransformerMachine:
             self.mstate.update({k: int(state[k]) for k in self.mstate if k in state})
         self.nmi_pending = False
         self.machine_halted = False
-        self._populate_shape_windows()
+        self.populate_shape_windows()
 
     @property
     def machine_state(self) -> dict:
@@ -323,43 +323,43 @@ class Cpu6502TransformerMachine:
         self.nmi_pending = True
         # In the native run loop the pending-NMI flag lives in the engine
         # (the per-step path passes it as an argument instead).
-        if self._engine.has_run_loop:
-            self._engine.set_nmi()
+        if self.engine.has_run_loop:
+            self.engine.set_nmi()
 
     def inject_write(self, addr: int, value: int):
-        self._insert_write(addr & 0xFFFF, value & 0xFF)
+        self.insert_write(addr & 0xFFFF, value & 0xFF)
 
-    def _insert_write(self, addr: int, value: int):
+    def insert_write(self, addr: int, value: int):
         addr &= 0xFFFF
         value &= 0xFF
-        self._ram[addr] = value
-        self._engine.insert_write(addr, value, self.pos)
+        self.ram[addr] = value
+        self.engine.insert_write(addr, value, self.pos)
         self.pos += 1
 
-    def _machine_step_cpp(self) -> TraceRow:
+    def machine_step_cpp(self) -> TraceRow:
         """One instruction entirely in generated C++ (embed, layers,
         readout, direct WRITE inserts, halt logits); Python only unpacks
         the 21-slot result and keeps the mirrors in sync."""
         st = self.mstate
         nmi = 1 if self.nmi_pending else 0
         self.nmi_pending = False
-        self._engine.machine_step(
+        self.engine.machine_step(
             st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
             st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"],
-            st["halted"], nmi, self._step_out,
+            st["halted"], nmi, self.step_out,
         )
-        o = self._step_out.tolist()  # one C call instead of 21 scalar reads
+        o = self.step_out.tolist()  # one C call instead of 21 scalar reads
         n_writes = o[14]
         writes = []
         for i in range(n_writes):
             addr, value = o[15 + 2 * i], o[16 + 2 * i]
-            self._ram[addr] = value
-            writes.append(MemWrite(self._trace_len, addr, value))
+            self.ram[addr] = value
+            writes.append(MemWrite(self.trace_len, addr, value))
         self.pos += 1 + n_writes
 
         halted = o[11] != 0
         row = TraceRow(
-            step=self._trace_len,
+            step=self.trace_len,
             state=Cpu6502State(
                 pc=o[0], a=o[1], x=o[2], y=o[3], s=o[4], p=o[5], ir=o[6],
                 operand_lo=o[7], operand_hi=o[8],
@@ -367,7 +367,7 @@ class Cpu6502TransformerMachine:
             ),
             writes=tuple(writes),
         )
-        self._trace_len += 1
+        self.trace_len += 1
         st.update(
             pc=o[12], a=o[1], x=o[2], y=o[3], s=o[4], p=o[5], ir=o[6],
             oplo=o[7], ophi=o[8], ea=o[9], data=o[10],
@@ -390,21 +390,21 @@ class Cpu6502TransformerMachine:
         if self.machine_halted:
             return False
         state = self.machine_state
-        trace_len = self._trace_len
+        trace_len = self.trace_len
         nmi = self.nmi_pending
-        self.boot_image(self._ram, start_pc=state["pc"], state=state)
-        self._trace_len = trace_len
+        self.boot_image(self.ram, start_pc=state["pc"], state=state)
+        self.trace_len = trace_len
         self.nmi_pending = nmi
         self.checkpoints += 1
         return True
 
     def machine_step(self) -> TraceRow:
         if (
-            self._checkpoint_tokens
-            and self.pos - self._seed_pos >= self._checkpoint_tokens
+            self.checkpoint_tokens
+            and self.pos - self.seed_pos >= self.checkpoint_tokens
         ):
             self.checkpoint()
-        return self._machine_step_cpp()
+        return self.machine_step_cpp()
 
     def run_image(self, memory_image, *, start_pc: int, max_steps: int) -> Trace:
         self.boot_image(list(memory_image), start_pc=start_pc)
@@ -420,19 +420,19 @@ class Cpu6502TransformerMachine:
 
     @property
     def supports_run_loop(self) -> bool:
-        return self._engine.has_run_loop
+        return self.engine.has_run_loop
 
-    def _seed_run_state(self) -> None:
+    def seed_run_state(self) -> None:
         st = self.mstate
-        self._engine.set_run_state(
+        self.engine.set_run_state(
             st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
             st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"], st["halted"],
         )
 
-    def _pull_run_state(self) -> None:
+    def pull_run_state(self) -> None:
         """Copy the engine's architectural state back into the Python mirror
         (called after a native run so machine protocol / checkpointing see it)."""
-        s = self._engine.get_run_state()
+        s = self.engine.get_run_state()
         self.mstate.update(
             pc=int(s["pc"]), a=int(s["a"]), x=int(s["x"]), y=int(s["y"]),
             s=int(s["s"]), p=int(s["p"]), ir=int(s["ir"]), oplo=int(s["oplo"]),
@@ -456,9 +456,9 @@ class Cpu6502TransformerMachine:
         if not self.supports_run_loop:
             raise RuntimeError("this engine has no C++ run loop")
         self.boot_image(list(memory_image), start_pc=start_pc)
-        self._seed_run_state()
-        out = self._engine.run(max_steps, stop_on_trap, 0)
-        self._pull_run_state()
+        self.seed_run_state()
+        out = self.engine.run(max_steps, stop_on_trap, 0)
+        self.pull_run_state()
         return out
 
     def iter_run_arrays(self, memory_image, *, start_pc: int, max_steps: int,
@@ -474,11 +474,11 @@ class Cpu6502TransformerMachine:
         if not self.supports_run_loop:
             raise RuntimeError("this engine has no C++ run loop")
         self.boot_image(list(memory_image), start_pc=start_pc)
-        self._seed_run_state()
+        self.seed_run_state()
         done = 0
         while done < max_steps:
-            base = int(self._engine.get_run_state()["steps"])
-            out = self._engine.run(min(chunk, max_steps - done), stop_on_trap, 0)
+            base = int(self.engine.get_run_state()["steps"])
+            out = self.engine.run(min(chunk, max_steps - done), stop_on_trap, 0)
             n = len(out["pc"])
             if n == 0:
                 break
@@ -488,7 +488,7 @@ class Cpu6502TransformerMachine:
             yield out
             if out["reason"] in ("halt", "trap"):
                 break
-        self._pull_run_state()
+        self.pull_run_state()
 
     # ── Kernel-shape machine API (lets KernelBus drive the run loop) ─
     # These mirror cpu6502.kernel.Cpu6502CppRuntime so the NES bus's
@@ -497,37 +497,37 @@ class Cpu6502TransformerMachine:
 
     def load_image(self, memory_image, *, start_pc: int) -> None:
         self.boot_image(list(memory_image), start_pc=start_pc)
-        self._seed_run_state()
+        self.seed_run_state()
 
     def run(self, max_steps: int, *, stop_on_trap: bool = False,
             max_cycles: int = 0) -> dict:
         """Resume the native run loop from the engine's persistent state
         (no reboot), pausing on halt/trap/watch/cycle budget."""
-        out = self._engine.run(max_steps, stop_on_trap, max_cycles)
-        self._pull_run_state()
-        self._jit_tick()
+        out = self.engine.run(max_steps, stop_on_trap, max_cycles)
+        self.pull_run_state()
+        self.jit_tick()
         return out
 
     def watch_read(self, lo: int, hi: int) -> None:
-        self._engine.watch_read(lo, hi)
+        self.engine.watch_read(lo, hi)
 
     def watch_write(self, lo: int, hi: int) -> None:
-        self._engine.watch_write(lo, hi)
+        self.engine.watch_write(lo, hi)
 
     def set_read_lease(self, addr: int, value: int) -> None:
-        self._engine.set_read_lease(addr, value)
+        self.engine.set_read_lease(addr, value)
 
     def clear_read_lease(self) -> None:
-        self._engine.clear_read_lease()
+        self.engine.clear_read_lease()
 
     def read_ram(self, addr: int) -> int:
-        return self._engine.read_ram(addr)
+        return self.engine.read_ram(addr)
 
     def dump_ram(self) -> bytes:
-        return self._engine.dump_ram()
+        return self.engine.dump_ram()
 
     def get_state(self) -> dict:
-        return dict(self._engine.get_run_state())
+        return dict(self.engine.get_run_state())
 
     def set_state(self, state: dict) -> None:
         """Restore architectural state after a snapshot rebuild (mirrors the
@@ -536,7 +536,7 @@ class Cpu6502TransformerMachine:
         for k in st:
             if k in state:
                 st[k] = int(state[k])
-        self._engine.set_run_state(
+        self.engine.set_run_state(
             st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
             st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"],
             1 if state.get("halted") else 0,

@@ -19,7 +19,7 @@ from transformer_nes.cpu6502.backends.weights.runner import (
 )
 
 
-def _lockstep_vs_reference(trace, image):
+def lockstep_vs_reference(trace, image):
     ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
     ref.pc = VERIFY_START
     for i, row in enumerate(trace):
@@ -39,7 +39,7 @@ def test_transformer_weights_match_reference():
     image = verify_program()
     trace = machine.run_image(image, start_pc=VERIFY_START, max_steps=30)
     assert len(trace.rows) == 30
-    _lockstep_vs_reference(trace, image)
+    lockstep_vs_reference(trace, image)
 
 
 @pytest.mark.slow
@@ -203,7 +203,7 @@ def test_sequence_experts_match_per_step():
         m.load_image(bytes(image), start_pc=0x0400)
         if "shape_library" not in cfg:
             # Every idiom in the program must be covered by a library shape.
-            assert len(match_shape_windows(image, m._engine.shapes_meta)) == 4
+            assert len(match_shape_windows(image, m.engine.shapes_meta)) == 4
         chunks = []
 
         def drain(n, chunks=chunks, m=m):
@@ -256,7 +256,7 @@ def test_jit_discovers_runtime_window():
         m.load_image(bytes(image), start_pc=0x0400)
         if "shape_library" not in cfg:
             # The loop does not exist at boot; only the JIT can find it.
-            assert m._engine.window_shape(0x0300) == 0
+            assert m.engine.window_shape(0x0300) == 0
         chunks = []
         done = 0
         while done < 800:
@@ -266,7 +266,7 @@ def test_jit_discovers_runtime_window():
             done += len(out["pc"])
         traces.append({k: np.concatenate([c[k] for c in chunks]) for k in fields})
         if "shape_library" not in cfg:
-            assert m._engine.window_shape(0x0300) != 0, "JIT never added the window"
+            assert m.engine.window_shape(0x0300) != 0, "JIT never added the window"
     n = min(len(traces[0]["pc"]), len(traces[1]["pc"]))
     for k in fields:
         assert np.array_equal(traces[0][k][:n], traces[1][k][:n]), f"{k} diverged"

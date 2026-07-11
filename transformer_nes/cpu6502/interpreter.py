@@ -12,12 +12,12 @@ nearest-address hits masked to zero (so unwritten memory reads as 0).
 Correctness contract for graph construction:
   - stepglu(one, b) equals step(b >= 0) ONLY for integer-valued b; every
     threshold expression must therefore be an integer (never `x - 9.5`).
-    Likewise _match_zero/_match_byte require integer arguments.
-  - _wrap8 / _wrap16 subtract at most one modulus, so their arguments must
+    Likewise match_zero/match_byte require integer arguments.
+  - wrap8 / wrap16 subtract at most one modulus, so their arguments must
     lie in [-256, 511] / [-65536, 131071]; splitting a full 16-bit value
     into bytes must instead be derived from values that are already bytes
     (see the JSR/BRK push-address construction).
-  - Opcode/mode gates are one-hot 0/1 signals; _mux chains rely on this.
+  - Opcode/mode gates are one-hot 0/1 signals; mux chains rely on this.
   - bcd=False models the NES 2A03, which ignores the D flag: ADC/SBC (and
     the unofficial RRA/ISB) always compute in binary, and the decimal
     circuitry is left out of the graph entirely.  The unofficial RRA/ISB
@@ -60,7 +60,7 @@ from transformer_nes.cpu6502.spec import (
     MODE_ZERO_PAGE_Y,
     OPCODES,
 )
-from transformer_nes.graph import core as _graph
+from transformer_nes.graph import core as graph
 from transformer_nes.graph.core import (
     Expression,
     InputDimension,
@@ -74,51 +74,51 @@ from transformer_nes.graph.core import (
 # ── Low-level gating helpers ───────────────────────────────────────
 
 
-def _match_byte(value: Expression, byte: int) -> Expression:
+def match_byte(value: Expression, byte: int) -> Expression:
     """Return a 0/1 gate: 1 iff value == byte."""
-    return _match_zero(value - byte)
+    return match_zero(value - byte)
 
 
-def _match_zero(value: Expression) -> Expression:
+def match_zero(value: Expression) -> Expression:
     """Return a 0/1 gate: 1 iff an integer expression is exactly zero."""
-    one = _graph.one
+    one = graph.one
     abs_diff = persist(reglu(value, value) + reglu(-value, -value))
     return stepglu(one, -abs_diff)
 
 
-def _multiply(a, b) -> Expression:
+def multiply(a, b) -> Expression:
     """Multiply two scalar expressions using the graph DSL's internal helper."""
     from transformer_nes.graph.core import make_multiply, to_expr
 
     return make_multiply(to_expr(a), to_expr(b))
 
 
-def _mux(gate: Expression, if_one: Expression, if_zero: Expression) -> Expression:
+def mux(gate: Expression, if_one: Expression, if_zero: Expression) -> Expression:
     """Select between two linear expressions using a 0/1 gate."""
-    return if_zero + _multiply(if_one - if_zero, gate)
+    return if_zero + multiply(if_one - if_zero, gate)
 
 
-def _wrap8(value: Expression) -> Expression:
+def wrap8(value: Expression) -> Expression:
     """Reduce an integer expression to an unsigned 8-bit value."""
-    one = _graph.one
+    one = graph.one
     return value - 256 * stepglu(one, value - 256) + 256 * stepglu(one, -value - 1)
 
 
-def _wrap16(value: Expression) -> Expression:
+def wrap16(value: Expression) -> Expression:
     """Reduce an integer expression to an unsigned 16-bit value."""
-    one = _graph.one
+    one = graph.one
     return value - 65536 * stepglu(one, value - 65536) + 65536 * stepglu(one, -value - 1)
 
 
-def _signed_byte(value: Expression) -> Expression:
+def signed_byte(value: Expression) -> Expression:
     """Interpret an unsigned byte as a signed 8-bit value."""
-    one = _graph.one
+    one = graph.one
     return value - 256 * stepglu(one, value - 128)
 
 
-def _memory_at(address: Expression, name: str) -> Expression:
+def memory_at(address: Expression, name: str) -> Expression:
     """Read the latest WRITE token at the given 16-bit address."""
-    one = _graph.one
+    one = graph.one
     write_addr_expr = addr_lo + 256 * addr_hi
     # Split 64 KiB memory into 4 KiB lookup groups.  Each group uses a
     # 12-bit local-address parabola, keeping K-side scores below 2^24 so
@@ -140,12 +140,12 @@ def _memory_at(address: Expression, name: str) -> Expression:
         else:
             query_ge_lo = stepglu(one, address - lo)
             query_le_hi = stepglu(one, hi - address)
-            query_in_group = _multiply(query_ge_lo, query_le_hi)
+            query_in_group = multiply(query_ge_lo, query_le_hi)
             write_ge_lo = stepglu(one, write_addr_expr - lo)
             write_le_hi = stepglu(one, hi - write_addr_expr)
-            write_in_group = _multiply(write_ge_lo, write_le_hi)
+            write_in_group = multiply(write_ge_lo, write_le_hi)
 
-        group_write = _multiply(is_memory_write, write_in_group)
+        group_write = multiply(is_memory_write, write_in_group)
         group_value, found_addr = fetch(
             [byte_value, write_addr_expr],
             query=address - lo,
@@ -154,48 +154,48 @@ def _memory_at(address: Expression, name: str) -> Expression:
             tie_break="latest",
         )
         group_value.lookup.memory_group = group
-        exact = _match_zero(address - found_addr)
-        value = value + _multiply(query_in_group, _multiply(group_value, exact))
+        exact = match_zero(address - found_addr)
+        value = value + multiply(query_in_group, multiply(group_value, exact))
     return persist(value, name=name)
 
 
 # ── Graph helper implementations ───────────────────────────────────
 
 
-def _overflow(a: Expression, b: Expression, r: Expression) -> Expression:
+def overflow(a: Expression, b: Expression, r: Expression) -> Expression:
     """Return 1 iff the sign of r differs from a and b while a and b agree."""
-    one = _graph.one
+    one = graph.one
     a_sign = stepglu(one, a - 128)
     b_sign = stepglu(one, b - 128)
     r_sign = stepglu(one, r - 128)
-    same_sign = 1 - _multiply(a_sign - b_sign, a_sign - b_sign)
-    diff_from_result = _multiply(a_sign - r_sign, a_sign - r_sign)
-    return _multiply(same_sign, diff_from_result)
+    same_sign = 1 - multiply(a_sign - b_sign, a_sign - b_sign)
+    diff_from_result = multiply(a_sign - r_sign, a_sign - r_sign)
+    return multiply(same_sign, diff_from_result)
 
 
-def _extract_bits(value: Expression, name: str) -> list[Expression]:
+def extract_bits(value: Expression, name: str) -> list[Expression]:
     """Extract bits 7..0 of an 8-bit value expression using binary thresholds.
 
     Returns a list where bits[0] is bit 7 (MSB) and bits[7] is bit 0 (LSB).
     """
-    one = _graph.one
+    one = graph.one
     bits = []
     remaining = value
     for i, place in enumerate((128, 64, 32, 16, 8, 4, 2, 1)):
         bit = stepglu(one, remaining - place)
-        bit = persist(bit, name=f"{name}_bit{7 - i}")
+        bit = persist(bit, name=f"{name}bit{7 - i}")
         bits.append(bit)
         remaining = remaining - place * bit
     return bits
 
 
-def _low_bit(value: Expression, mask: int) -> Expression:
+def low_bit(value: Expression, mask: int) -> Expression:
     """Extract the bit corresponding to mask (e.g., FLAG_C) from an 8-bit value."""
     bit = (mask.bit_length() - 1) if mask else 0
     result = 0
     for v in range(256):
         if (v >> bit) & 1:
-            result = result + _match_byte(value, v)
+            result = result + match_byte(value, v)
     return persist(result, name=f"low_bit_{mask:02X}")
 
 
@@ -205,7 +205,7 @@ def _low_bit(value: Expression, mask: int) -> Expression:
 def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Expression]]:
     """Build the 6502 graph.  See the module docstring for the construction
     contract; bcd=False builds the NES 2A03 variant (no decimal mode)."""
-    one = _graph.one
+    one = graph.one
 
     # ── Input dimensions ────────────────────────────────────────────
     global byte_value, is_memory_write, addr_lo, addr_hi, is_start, is_state
@@ -335,9 +335,9 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # ── Instruction fetch ───────────────────────────────────────────
     # Code and data share the attention-backed memory, so instruction fetch
     # is three memory reads at PC, PC+1, PC+2.
-    fetched_opcode = _memory_at(current_pc, "fetched_opcode_raw")
-    fetched_operand_lo = _memory_at(_wrap16(current_pc + 1), "fetched_operand_lo_raw")
-    fetched_operand_hi = _memory_at(_wrap16(current_pc + 2), "fetched_operand_hi_raw")
+    fetched_opcode = memory_at(current_pc, "fetched_opcode_raw")
+    fetched_operand_lo = memory_at(wrap16(current_pc + 1), "fetched_operand_lo_raw")
+    fetched_operand_hi = memory_at(wrap16(current_pc + 2), "fetched_operand_hi_raw")
 
     fetched_opcode = persist(fetched_opcode, name="fetched_opcode")
     # Raw operand bytes, used by the addressing machinery below.  The trace
@@ -350,7 +350,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     opcode_gates: dict[int, Expression] = {}
     for op in OPCODES.values():
         opcode_gates[op.byte] = persist(
-            _match_byte(fetched_opcode, op.byte), name=f"is_op_{op.byte:02X}"
+            match_byte(fetched_opcode, op.byte), name=f"is_op_{op.byte:02X}"
         )
 
     # ── Table-driven mode / operation families ──────────────────────
@@ -450,7 +450,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     abs_addr = fetched_operand_lo + 256 * fetched_operand_hi
     abs_addr = persist(abs_addr, name="abs_addr")
 
-    rel_offset = persist(_signed_byte(fetched_operand_lo), name="rel_offset")
+    rel_offset = persist(signed_byte(fetched_operand_lo), name="rel_offset")
 
     length = persist(
         1 * (is_imp + is_acc)
@@ -462,28 +462,28 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     branch_target = persist(pc_after + rel_offset, name="branch_target")
 
     # Base EA for simple modes
-    base_ea = _mux(
+    base_ea = mux(
         is_zpg,
         fetched_operand_lo,
-        _mux(
+        mux(
             is_zpx,
-            _wrap8(fetched_operand_lo + current_x),
-            _mux(
+            wrap8(fetched_operand_lo + current_x),
+            mux(
                 is_zpy,
-                _wrap8(fetched_operand_lo + current_y),
-                _mux(
+                wrap8(fetched_operand_lo + current_y),
+                mux(
                     is_abs,
                     abs_addr,
-                    _mux(
+                    mux(
                         is_abx,
-                        _wrap16(abs_addr + current_x),
-                        _mux(
+                        wrap16(abs_addr + current_x),
+                        mux(
                             is_aby,
-                            _wrap16(abs_addr + current_y),
-                            _mux(
+                            wrap16(abs_addr + current_y),
+                            mux(
                                 is_rel,
                                 branch_target,
-                                _mux(
+                                mux(
                                     is_imm,
                                     fetched_operand_lo,
                                     0,
@@ -500,75 +500,75 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # Indirect pointers: (zp+X) for idx, zp for idy, abs for JMP (ind).
     # The effective address itself is resolved after the pointer memory
     # reads below.
-    idx_ptr = persist(_wrap8(fetched_operand_lo + current_x), name="idx_ptr")
+    idx_ptr = persist(wrap8(fetched_operand_lo + current_x), name="idx_ptr")
     idy_ptr = persist(fetched_operand_lo, name="idy_ptr")
 
     # Stack read addresses (shared by PLA/PLP/RTS/RTI).  The stack pointer
     # wraps within page 1, so the offset is reduced mod 256 before adding
     # the page base.
-    stack_pull_addr = persist(0x0100 + _wrap8(current_s + 1), name="stack_pull_addr")
-    stack_pull_addr2 = persist(0x0100 + _wrap8(current_s + 2), name="stack_pull_addr2")
-    stack_pull_addr3 = persist(0x0100 + _wrap8(current_s + 3), name="stack_pull_addr3")
+    stack_pull_addr = persist(0x0100 + wrap8(current_s + 1), name="stack_pull_addr")
+    stack_pull_addr2 = persist(0x0100 + wrap8(current_s + 2), name="stack_pull_addr2")
+    stack_pull_addr3 = persist(0x0100 + wrap8(current_s + 3), name="stack_pull_addr3")
 
     # ── Memory read ─────────────────────────────────────────────────
     # Shared memory-read slots.  A single instruction only uses one family of
     # reads at a time, so we mux the addresses into three slots and share the
     # attention lookups across pointer reads, stack reads, and IRQ-vector reads.
     is_pointer_read = is_idx + is_idy + is_ind
-    pointer_base = _mux(is_idx, idx_ptr, _mux(is_idy, idy_ptr, abs_addr))
-    addrA = _mux(
+    pointer_base = mux(is_idx, idx_ptr, mux(is_idy, idy_ptr, abs_addr))
+    addrA = mux(
         is_pointer_read,
         pointer_base,
-        _mux(
+        mux(
             op_pla + op_plp + op_rts + op_rti,
             stack_pull_addr,
-            _mux(op_brk, 0xFFFE, 0),
+            mux(op_brk, 0xFFFE, 0),
         ),
     )
     # Second pointer byte: zero-page wrap for (zp,X)/(zp),Y; NMOS page-wrap
     # bug for JMP (abs) -- the high byte is read from the same page.
-    pointer_next = _mux(
+    pointer_next = mux(
         is_ind,
-        256 * fetched_operand_hi + _wrap8(fetched_operand_lo + 1),
-        _wrap8(pointer_base + 1),
+        256 * fetched_operand_hi + wrap8(fetched_operand_lo + 1),
+        wrap8(pointer_base + 1),
     )
-    addrB = _mux(
+    addrB = mux(
         is_pointer_read,
         pointer_next,
-        _mux(
+        mux(
             op_pla + op_plp + op_rts + op_rti,
             stack_pull_addr2,
-            _mux(op_brk, 0xFFFF, 0),
+            mux(op_brk, 0xFFFF, 0),
         ),
     )
-    addrC = _mux(op_pla + op_plp + op_rts + op_rti, stack_pull_addr3, 0)
+    addrC = mux(op_pla + op_plp + op_rts + op_rti, stack_pull_addr3, 0)
     # An NMI step reads its vector through the same two slots BRK uses for
     # $FFFE/$FFFF; everything else the interrupted instruction would have
     # read is left in place and discarded by the is_nmi muxes below.
-    addrA = _mux(is_nmi, 0xFFFA, addrA)
-    addrB = _mux(is_nmi, 0xFFFB, addrB)
+    addrA = mux(is_nmi, 0xFFFA, addrA)
+    addrB = mux(is_nmi, 0xFFFB, addrB)
     addrA = persist(addrA, name="addrA")
     addrB = persist(addrB, name="addrB")
     addrC = persist(addrC, name="addrC")
 
-    mem_A = _memory_at(addrA, "mem_A")
-    mem_B = _memory_at(addrB, "mem_B")
-    mem_C = _memory_at(addrC, "mem_C")
+    mem_A = memory_at(addrA, "mem_A")
+    mem_B = memory_at(addrB, "mem_B")
+    mem_C = memory_at(addrC, "mem_C")
 
     idx_lo = mem_A
     idx_hi = mem_B
     idx_ea = persist(idx_lo + 256 * idx_hi, name="idx_ea")
     idy_lo = mem_A
     idy_hi = mem_B
-    idy_ea = persist(_wrap16(idy_lo + 256 * idy_hi + current_y), name="idy_ea")
+    idy_ea = persist(wrap16(idy_lo + 256 * idy_hi + current_y), name="idy_ea")
     ind_ptr_lo = mem_A
     ind_ptr_hi = mem_B
     ind_ea = persist(ind_ptr_lo + 256 * ind_ptr_hi, name="ind_ea")
 
     # Effective address: indirect modes resolved from the pointer reads above.
     # An NMI step performs no operand access; its trace EA is defined as 0.
-    ea = _mux(is_idx, idx_ea, _mux(is_idy, idy_ea, _mux(is_ind, ind_ea, base_ea)))
-    ea = _mux(is_nmi, 0, ea)
+    ea = mux(is_idx, idx_ea, mux(is_idy, idy_ea, mux(is_ind, ind_ea, base_ea)))
+    ea = mux(is_nmi, 0, ea)
     ea = persist(ea, name="ea")
 
     # Stack/IRQ vector reads
@@ -585,11 +585,11 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     irq_vector = persist(irq_vector_lo + 256 * irq_vector_hi, name="irq_vector")
 
     # Operand memory read (for loads/stores/ALU with memory addressing)
-    operand_mem = _memory_at(ea, "operand_mem")
-    operand = _mux(
+    operand_mem = memory_at(ea, "operand_mem")
+    operand = mux(
         is_imm,
         fetched_operand_lo,
-        _mux(
+        mux(
             is_acc,
             current_a,
             operand_mem,
@@ -598,8 +598,8 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     operand = persist(operand, name="operand")
 
     # ── Bit extraction for bitwise / shift ops ────────────────────────
-    a_bits = _extract_bits(current_a, "a")
-    operand_bits = _extract_bits(operand, "operand")
+    a_bits = extract_bits(current_a, "a")
+    operand_bits = extract_bits(operand, "operand")
 
     # ── ALU operations ──────────────────────────────────────────────
     carry_in = current_p_c
@@ -607,15 +607,15 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # Binary ADC
     adc_raw = current_a + operand + carry_in
     adc_carry = stepglu(one, adc_raw - 256)
-    adc_result = _wrap8(adc_raw)
-    adc_overflow = _overflow(current_a, operand, adc_result)
+    adc_result = wrap8(adc_raw)
+    adc_overflow = overflow(current_a, operand, adc_result)
 
     # Binary SBC
     sbc_operand = 255 - operand
     sbc_raw = current_a + sbc_operand + carry_in
     sbc_carry = stepglu(one, sbc_raw - 256)
-    sbc_result = _wrap8(sbc_raw)
-    sbc_overflow = _overflow(current_a, sbc_operand, sbc_result)
+    sbc_result = wrap8(sbc_raw)
+    sbc_overflow = overflow(current_a, sbc_operand, sbc_result)
 
     if bcd:
         # Nibbles for decimal mode (bits[0] = bit 7, bits[4] = bit 3, bits[7] = bit 0)
@@ -638,9 +638,9 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         ah_adc_mod = ah_adc - 10 * carry_out_adc
         adc_decimal_result = ah_adc_mod * 16 + al_adc_mod
         adc_decimal_result = persist(adc_decimal_result, name="adc_decimal_result")
-        decimal_adc = _mux(current_p_d, adc_decimal_result, adc_result)
+        decimal_adc = mux(current_p_d, adc_decimal_result, adc_result)
         decimal_adc = persist(decimal_adc, name="decimal_adc")
-        decimal_adc_carry = _mux(current_p_d, carry_out_adc, adc_carry)
+        decimal_adc_carry = mux(current_p_d, carry_out_adc, adc_carry)
 
         # Decimal SBC (integer thresholds, as above)
         al_sbc = a_lo_nibble - m_lo_nibble - (1 - carry_in)
@@ -651,9 +651,9 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         ah_sbc_mod = ah_sbc + 10 * (1 - carry_out_sbc)
         sbc_decimal_result = ah_sbc_mod * 16 + al_sbc_mod
         sbc_decimal_result = persist(sbc_decimal_result, name="sbc_decimal_result")
-        decimal_sbc = _mux(current_p_d, sbc_decimal_result, sbc_result)
+        decimal_sbc = mux(current_p_d, sbc_decimal_result, sbc_result)
         decimal_sbc = persist(decimal_sbc, name="decimal_sbc")
-        decimal_sbc_carry = _mux(current_p_d, carry_out_sbc, sbc_carry)
+        decimal_sbc_carry = mux(current_p_d, carry_out_sbc, sbc_carry)
     else:
         # 2A03: the D flag is ignored, arithmetic is always binary.
         decimal_adc = persist(adc_result, name="decimal_adc")
@@ -664,19 +664,19 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # Compare operations (A/M/X/Y - operand)
     cmp_raw = current_a - operand
     cmp_carry = stepglu(one, cmp_raw)
-    cmp_result = _wrap8(cmp_raw)
+    cmp_result = wrap8(cmp_raw)
     cmp_n = stepglu(one, cmp_result - 128)
     cmp_z = 1 - stepglu(one, cmp_result - 1)
 
     cpx_raw = current_x - operand
     cpx_carry = stepglu(one, cpx_raw)
-    cpx_result = _wrap8(cpx_raw)
+    cpx_result = wrap8(cpx_raw)
     cpx_n = stepglu(one, cpx_result - 128)
     cpx_z = 1 - stepglu(one, cpx_result - 1)
 
     cpy_raw = current_y - operand
     cpy_carry = stepglu(one, cpy_raw)
-    cpy_result = _wrap8(cpy_raw)
+    cpy_result = wrap8(cpy_raw)
     cpy_n = stepglu(one, cpy_result - 128)
     cpy_z = 1 - stepglu(one, cpy_result - 1)
 
@@ -687,7 +687,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     for i in range(8):
         a_bit = a_bits[7 - i]
         m_bit = operand_bits[7 - i]
-        bit_and = _multiply(a_bit, m_bit)
+        bit_and = multiply(a_bit, m_bit)
         bit_or = a_bit + m_bit - bit_and
         bit_xor = a_bit + m_bit - 2 * bit_and
         and_result = and_result + (1 << i) * bit_and
@@ -703,7 +703,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     bit_z = 1 - stepglu(one, and_result - 1)
 
     # Shifts (using arithmetic and the extracted LSB for LSR/ROR carry)
-    asl_result = _wrap8(2 * operand)
+    asl_result = wrap8(2 * operand)
     asl_carry = operand_bits[0]
     asl_n = stepglu(one, asl_result - 128)
     asl_z = 1 - stepglu(one, asl_result - 1)
@@ -714,7 +714,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     lsr_n = 0
     lsr_z = 1 - stepglu(one, lsr_result - 1)
 
-    rol_result = _wrap8(2 * operand + carry_in)
+    rol_result = wrap8(2 * operand + carry_in)
     rol_carry = operand_bits[0]
     rol_n = stepglu(one, rol_result - 128)
     rol_z = 1 - stepglu(one, rol_result - 1)
@@ -726,25 +726,25 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     ror_z = 1 - stepglu(one, ror_result - 1)
 
     # Increments / decrements
-    inc_result = _wrap8(operand + 1)
+    inc_result = wrap8(operand + 1)
     inc_n = stepglu(one, inc_result - 128)
     inc_z = 1 - stepglu(one, inc_result - 1)
 
-    dec_result = _wrap8(operand - 1)
+    dec_result = wrap8(operand - 1)
     dec_n = stepglu(one, dec_result - 128)
     dec_z = 1 - stepglu(one, dec_result - 1)
 
-    inx_result = _wrap8(current_x + 1)
-    iny_result = _wrap8(current_y + 1)
-    dex_result = _wrap8(current_x - 1)
-    dey_result = _wrap8(current_y - 1)
+    inx_result = wrap8(current_x + 1)
+    iny_result = wrap8(current_y + 1)
+    dex_result = wrap8(current_x - 1)
+    dey_result = wrap8(current_y - 1)
 
     # ── Unofficial opcode ALU ───────────────────────────────────────
     # SAX stores A & X.
-    x_bits = _extract_bits(current_x, "x")
+    x_bits = extract_bits(current_x, "x")
     sax_result = 0
     for j in range(8):
-        sax_result = sax_result + (1 << (7 - j)) * _multiply(a_bits[j], x_bits[j])
+        sax_result = sax_result + (1 << (7 - j)) * multiply(a_bits[j], x_bits[j])
     sax_result = persist(sax_result, name="sax_result")
 
     # SLO/RLA/SRE combine A with the shifted memory value.  The shifted
@@ -763,14 +763,14 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         if asl_bits[j] is None:
             slo_result = slo_result + weight * a_bit
         else:
-            both = _multiply(a_bit, asl_bits[j])
+            both = multiply(a_bit, asl_bits[j])
             slo_result = slo_result + weight * (a_bit + asl_bits[j] - both)
         if rla_bits[j] is not None:
-            rla_result = rla_result + weight * _multiply(a_bit, rla_bits[j])
+            rla_result = rla_result + weight * multiply(a_bit, rla_bits[j])
         if lsr_bits[j] is None:
             sre_result = sre_result + weight * a_bit
         else:
-            both = _multiply(a_bit, lsr_bits[j])
+            both = multiply(a_bit, lsr_bits[j])
             sre_result = sre_result + weight * (a_bit + lsr_bits[j] - 2 * both)
     slo_result = persist(slo_result, name="slo_result")
     rla_result = persist(rla_result, name="rla_result")
@@ -779,7 +779,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # DCP: DEC memory then CMP against A.
     dcp_raw = current_a - dec_result
     dcp_carry = stepglu(one, dcp_raw)
-    dcp_cmp = _wrap8(dcp_raw)
+    dcp_cmp = wrap8(dcp_raw)
     dcp_n = stepglu(one, dcp_cmp - 128)
     dcp_z = 1 - stepglu(one, dcp_cmp - 1)
 
@@ -789,79 +789,79 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     isb_inv = 255 - inc_result
     isb_raw = current_a + isb_inv + carry_in
     isb_carry = stepglu(one, isb_raw - 256)
-    isb_result = persist(_wrap8(isb_raw), name="isb_result")
-    isb_overflow = _overflow(current_a, isb_inv, isb_result)
+    isb_result = persist(wrap8(isb_raw), name="isb_result")
+    isb_overflow = overflow(current_a, isb_inv, isb_result)
 
     rra_carry_in = operand_bits[7]
     rra_raw = current_a + ror_result + rra_carry_in
     rra_carry = stepglu(one, rra_raw - 256)
-    rra_result = persist(_wrap8(rra_raw), name="rra_result")
-    rra_overflow = _overflow(current_a, ror_result, rra_result)
+    rra_result = persist(wrap8(rra_raw), name="rra_result")
+    rra_overflow = overflow(current_a, ror_result, rra_result)
 
     # ── New register values ─────────────────────────────────────────
     new_a = current_a
-    new_a = _mux(op_load_a + op_lax, operand, new_a)
-    new_a = _mux(op_and, and_result, new_a)
-    new_a = _mux(op_ora, ora_result, new_a)
-    new_a = _mux(op_eor, eor_result, new_a)
-    new_a = _mux(op_adc, decimal_adc, new_a)
-    new_a = _mux(op_sbc, decimal_sbc, new_a)
-    new_a = _mux(op_pla, stack_pull_byte, new_a)
-    new_a = _mux(op_txa, current_x, new_a)
-    new_a = _mux(op_tya, current_y, new_a)
-    new_a = _mux(op_slo, slo_result, new_a)
-    new_a = _mux(op_rla, rla_result, new_a)
-    new_a = _mux(op_sre, sre_result, new_a)
-    new_a = _mux(op_rra, rra_result, new_a)
-    new_a = _mux(op_isb, isb_result, new_a)
+    new_a = mux(op_load_a + op_lax, operand, new_a)
+    new_a = mux(op_and, and_result, new_a)
+    new_a = mux(op_ora, ora_result, new_a)
+    new_a = mux(op_eor, eor_result, new_a)
+    new_a = mux(op_adc, decimal_adc, new_a)
+    new_a = mux(op_sbc, decimal_sbc, new_a)
+    new_a = mux(op_pla, stack_pull_byte, new_a)
+    new_a = mux(op_txa, current_x, new_a)
+    new_a = mux(op_tya, current_y, new_a)
+    new_a = mux(op_slo, slo_result, new_a)
+    new_a = mux(op_rla, rla_result, new_a)
+    new_a = mux(op_sre, sre_result, new_a)
+    new_a = mux(op_rra, rra_result, new_a)
+    new_a = mux(op_isb, isb_result, new_a)
     # Shifts only write A in accumulator mode (memory modes leave A alone).
-    shift_result = _mux(op_asl, asl_result,
-        _mux(op_lsr, lsr_result,
-            _mux(op_rol, rol_result,
-                _mux(op_ror, ror_result, 0))))
-    new_a = _mux(is_acc, shift_result, new_a)
-    new_a = _mux(is_nmi, current_a, new_a)
+    shift_result = mux(op_asl, asl_result,
+        mux(op_lsr, lsr_result,
+            mux(op_rol, rol_result,
+                mux(op_ror, ror_result, 0))))
+    new_a = mux(is_acc, shift_result, new_a)
+    new_a = mux(is_nmi, current_a, new_a)
     new_a = persist(new_a, name="new_a")
 
     new_x = current_x
-    new_x = _mux(op_load_x + op_lax, operand, new_x)
-    new_x = _mux(op_inx, inx_result, new_x)
-    new_x = _mux(op_dex, dex_result, new_x)
-    new_x = _mux(op_tax, current_a, new_x)
-    new_x = _mux(op_tsx, current_s, new_x)
-    new_x = _mux(is_nmi, current_x, new_x)
+    new_x = mux(op_load_x + op_lax, operand, new_x)
+    new_x = mux(op_inx, inx_result, new_x)
+    new_x = mux(op_dex, dex_result, new_x)
+    new_x = mux(op_tax, current_a, new_x)
+    new_x = mux(op_tsx, current_s, new_x)
+    new_x = mux(is_nmi, current_x, new_x)
     new_x = persist(new_x, name="new_x")
 
     new_y = current_y
-    new_y = _mux(op_load_y, operand, new_y)
-    new_y = _mux(op_iny, iny_result, new_y)
-    new_y = _mux(op_dey, dey_result, new_y)
-    new_y = _mux(op_tay, current_a, new_y)
-    new_y = _mux(is_nmi, current_y, new_y)
+    new_y = mux(op_load_y, operand, new_y)
+    new_y = mux(op_iny, iny_result, new_y)
+    new_y = mux(op_dey, dey_result, new_y)
+    new_y = mux(op_tay, current_a, new_y)
+    new_y = mux(is_nmi, current_y, new_y)
     new_y = persist(new_y, name="new_y")
 
     new_s = current_s
-    new_s = _mux(op_pha + op_php, _wrap8(current_s - 1), new_s)
-    new_s = _mux(op_jsr, _wrap8(current_s - 2), new_s)
-    new_s = _mux(op_brk, _wrap8(current_s - 3), new_s)
-    new_s = _mux(op_pla + op_plp, _wrap8(current_s + 1), new_s)
-    new_s = _mux(op_rts, _wrap8(current_s + 2), new_s)
-    new_s = _mux(op_rti, _wrap8(current_s + 3), new_s)
-    new_s = _mux(op_txs, current_x, new_s)
+    new_s = mux(op_pha + op_php, wrap8(current_s - 1), new_s)
+    new_s = mux(op_jsr, wrap8(current_s - 2), new_s)
+    new_s = mux(op_brk, wrap8(current_s - 3), new_s)
+    new_s = mux(op_pla + op_plp, wrap8(current_s + 1), new_s)
+    new_s = mux(op_rts, wrap8(current_s + 2), new_s)
+    new_s = mux(op_rti, wrap8(current_s + 3), new_s)
+    new_s = mux(op_txs, current_x, new_s)
     # NMI pushes three bytes, exactly like BRK.
-    new_s = _mux(is_nmi, _wrap8(current_s - 3), new_s)
+    new_s = mux(is_nmi, wrap8(current_s - 3), new_s)
     new_s = persist(new_s, name="new_s")
 
     # ── Flags ───────────────────────────────────────────────────────
     # NZ source selection
-    nz_alu = _mux(
+    nz_alu = mux(
         op_load_a + op_adc + op_sbc + op_and + op_ora + op_eor + op_pla + op_txa + op_tya
         + op_lax + op_slo + op_rla + op_sre + op_rra + op_isb,
         new_a,
-        _mux(
+        mux(
             op_load_x + op_inx + op_dex + op_tax + op_tsx,
             new_x,
-            _mux(
+            mux(
                 op_load_y + op_iny + op_dey + op_tay,
                 new_y,
                 0,
@@ -873,26 +873,26 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     z_alu = 1 - stepglu(one, nz_alu - 1)
 
     # For memory-modifying operations (inc/dec/shifts), NZ comes from the result
-    nz_mem = _mux(
+    nz_mem = mux(
         op_inc, inc_result,
-        _mux(op_dec, dec_result,
-            _mux(op_asl, asl_result,
-                _mux(op_lsr, lsr_result,
-                    _mux(op_rol, rol_result,
-                        _mux(op_ror, ror_result, 0))))))
+        mux(op_dec, dec_result,
+            mux(op_asl, asl_result,
+                mux(op_lsr, lsr_result,
+                    mux(op_rol, rol_result,
+                        mux(op_ror, ror_result, 0))))))
     nz_mem = persist(nz_mem, name="nz_mem")
     n_mem = stepglu(one, nz_mem - 128)
     z_mem = 1 - stepglu(one, nz_mem - 1)
 
     # Branch/flag ops
-    bpl_taken = _multiply(1 - current_p_n, op_bpl)
-    bmi_taken = _multiply(current_p_n, op_bmi)
-    bvc_taken = _multiply(1 - current_p_v, op_bvc)
-    bvs_taken = _multiply(current_p_v, op_bvs)
-    bcc_taken = _multiply(1 - current_p_c, op_bcc)
-    bcs_taken = _multiply(current_p_c, op_bcs)
-    bne_taken = _multiply(1 - current_p_z, op_bne)
-    beq_taken = _multiply(current_p_z, op_beq)
+    bpl_taken = multiply(1 - current_p_n, op_bpl)
+    bmi_taken = multiply(current_p_n, op_bmi)
+    bvc_taken = multiply(1 - current_p_v, op_bvc)
+    bvs_taken = multiply(current_p_v, op_bvs)
+    bcc_taken = multiply(1 - current_p_c, op_bcc)
+    bcs_taken = multiply(current_p_c, op_bcs)
+    bne_taken = multiply(1 - current_p_z, op_bne)
+    beq_taken = multiply(current_p_z, op_beq)
     branch_taken = (
         bpl_taken + bmi_taken + bvc_taken + bvs_taken
         + bcc_taken + bcs_taken + bne_taken + beq_taken
@@ -905,24 +905,24 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         + op_clc + op_sec + op_dcp + op_slo + op_rla + op_sre + op_rra + op_isb
     )
     new_p_c = (
-        _multiply(current_p_c, 1 - carry_op)
-        + _multiply(op_adc, decimal_adc_carry)
-        + _multiply(op_sbc, decimal_sbc_carry)
-        + _multiply(op_cmp, cmp_carry)
-        + _multiply(op_cpx, cpx_carry)
-        + _multiply(op_cpy, cpy_carry)
-        + _multiply(op_asl, asl_carry)
-        + _multiply(op_lsr, lsr_carry)
-        + _multiply(op_rol, rol_carry)
-        + _multiply(op_ror, ror_carry)
-        + _multiply(op_clc, 0)
-        + _multiply(op_sec, 1)
-        + _multiply(op_dcp, dcp_carry)
-        + _multiply(op_slo, asl_carry)
-        + _multiply(op_rla, rol_carry)
-        + _multiply(op_sre, lsr_carry)
-        + _multiply(op_rra, rra_carry)
-        + _multiply(op_isb, isb_carry)
+        multiply(current_p_c, 1 - carry_op)
+        + multiply(op_adc, decimal_adc_carry)
+        + multiply(op_sbc, decimal_sbc_carry)
+        + multiply(op_cmp, cmp_carry)
+        + multiply(op_cpx, cpx_carry)
+        + multiply(op_cpy, cpy_carry)
+        + multiply(op_asl, asl_carry)
+        + multiply(op_lsr, lsr_carry)
+        + multiply(op_rol, rol_carry)
+        + multiply(op_ror, ror_carry)
+        + multiply(op_clc, 0)
+        + multiply(op_sec, 1)
+        + multiply(op_dcp, dcp_carry)
+        + multiply(op_slo, asl_carry)
+        + multiply(op_rla, rol_carry)
+        + multiply(op_sre, lsr_carry)
+        + multiply(op_rra, rra_carry)
+        + multiply(op_isb, isb_carry)
     )
     new_p_c = persist(new_p_c, name="new_p_c")
 
@@ -933,76 +933,76 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         + op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror
         + op_lax + op_slo + op_rla + op_sre + op_rra + op_isb
     )
-    new_p_z = _mux(
+    new_p_z = mux(
         writes_z,
-        _mux(op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror, z_mem, z_alu),
+        mux(op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror, z_mem, z_alu),
         current_p_z,
     )
-    new_p_z = _mux(op_cmp, cmp_z, _mux(op_cpx, cpx_z, _mux(op_cpy, cpy_z, _mux(op_dcp, dcp_z, new_p_z))))
+    new_p_z = mux(op_cmp, cmp_z, mux(op_cpx, cpx_z, mux(op_cpy, cpy_z, mux(op_dcp, dcp_z, new_p_z))))
     new_p_z = persist(new_p_z, name="new_p_z")
 
     # Negative flag updates
-    new_p_n = _mux(
+    new_p_n = mux(
         writes_z,
-        _mux(op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror, n_mem, n_alu),
+        mux(op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror, n_mem, n_alu),
         current_p_n,
     )
-    new_p_n = _mux(op_cmp, cmp_n, _mux(op_cpx, cpx_n, _mux(op_cpy, cpy_n, _mux(op_dcp, dcp_n, new_p_n))))
+    new_p_n = mux(op_cmp, cmp_n, mux(op_cpx, cpx_n, mux(op_cpy, cpy_n, mux(op_dcp, dcp_n, new_p_n))))
     new_p_n = persist(new_p_n, name="new_p_n")
 
     # Overflow flag updates
     writes_v = op_adc + op_sbc + op_bit + op_clv + op_rra + op_isb
-    new_p_v = _mux(
+    new_p_v = mux(
         writes_v,
-        _mux(op_adc, adc_overflow,
-            _mux(op_sbc, sbc_overflow,
-                _mux(op_bit, bit_v,
-                    _mux(op_rra, rra_overflow,
-                        _mux(op_isb, isb_overflow,
-                            _mux(op_clv, 0, current_p_v)))))),
+        mux(op_adc, adc_overflow,
+            mux(op_sbc, sbc_overflow,
+                mux(op_bit, bit_v,
+                    mux(op_rra, rra_overflow,
+                        mux(op_isb, isb_overflow,
+                            mux(op_clv, 0, current_p_v)))))),
         current_p_v,
     )
     new_p_v = persist(new_p_v, name="new_p_v")
 
     # Decimal flag
-    new_p_d = _mux(op_cld, 0, _mux(op_sed, 1, current_p_d))
+    new_p_d = mux(op_cld, 0, mux(op_sed, 1, current_p_d))
     new_p_d = persist(new_p_d, name="new_p_d")
 
     # Interrupt flag
-    new_p_i = _mux(op_cli, 0, _mux(op_sei + op_brk, 1, current_p_i))
+    new_p_i = mux(op_cli, 0, mux(op_sei + op_brk, 1, current_p_i))
     new_p_i = persist(new_p_i, name="new_p_i")
 
     # Break flag (cleared by PLP/RTI; PHP pushes B=1 but does not set live P)
-    new_p_b = _mux(op_plp + op_rti, 0, current_p_b)
+    new_p_b = mux(op_plp + op_rti, 0, current_p_b)
     new_p_b = persist(new_p_b, name="new_p_b")
 
     # Unused flag always 1
     new_p_u = one
 
     # BIT special: N and V come from operand, Z from A & operand
-    new_p_n = _mux(op_bit, bit_n, new_p_n)
-    new_p_z = _mux(op_bit, bit_z, new_p_z)
+    new_p_n = mux(op_bit, bit_n, new_p_n)
+    new_p_z = mux(op_bit, bit_z, new_p_z)
     new_p_n = persist(new_p_n, name="new_p_n_bit")
     new_p_z = persist(new_p_z, name="new_p_z_bit")
 
     # PLP/RTI update all flags from the pulled byte (B cleared, U set)
     op_pull_p = op_plp + op_rti
-    new_p_c = _mux(op_pull_p, _low_bit(stack_pull_byte, FLAG_C), new_p_c)
-    new_p_z = _mux(op_pull_p, _low_bit(stack_pull_byte, FLAG_Z), new_p_z)
-    new_p_i = _mux(op_pull_p, _low_bit(stack_pull_byte, FLAG_I), new_p_i)
-    new_p_d = _mux(op_pull_p, _low_bit(stack_pull_byte, FLAG_D), new_p_d)
-    new_p_v = _mux(op_pull_p, _low_bit(stack_pull_byte, FLAG_V), new_p_v)
-    new_p_n = _mux(op_pull_p, _low_bit(stack_pull_byte, FLAG_N), new_p_n)
+    new_p_c = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_C), new_p_c)
+    new_p_z = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_Z), new_p_z)
+    new_p_i = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_I), new_p_i)
+    new_p_d = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_D), new_p_d)
+    new_p_v = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_V), new_p_v)
+    new_p_n = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_N), new_p_n)
     # NMI: the interrupted instruction's flag effects are discarded; the
     # sequence only sets I (NMOS interrupts do not touch D).  These muxes
     # come last so they also override the PLP/RTI pull path above.
-    new_p_c = _mux(is_nmi, current_p_c, new_p_c)
-    new_p_z = _mux(is_nmi, current_p_z, new_p_z)
-    new_p_i = _mux(is_nmi, 1, new_p_i)
-    new_p_d = _mux(is_nmi, current_p_d, new_p_d)
-    new_p_b = _mux(is_nmi, current_p_b, new_p_b)
-    new_p_v = _mux(is_nmi, current_p_v, new_p_v)
-    new_p_n = _mux(is_nmi, current_p_n, new_p_n)
+    new_p_c = mux(is_nmi, current_p_c, new_p_c)
+    new_p_z = mux(is_nmi, current_p_z, new_p_z)
+    new_p_i = mux(is_nmi, 1, new_p_i)
+    new_p_d = mux(is_nmi, current_p_d, new_p_d)
+    new_p_b = mux(is_nmi, current_p_b, new_p_b)
+    new_p_v = mux(is_nmi, current_p_v, new_p_v)
+    new_p_n = mux(is_nmi, current_p_n, new_p_n)
     new_p_c = persist(new_p_c, name="new_p_c_final")
     new_p_z = persist(new_p_z, name="new_p_z_final")
     new_p_i = persist(new_p_i, name="new_p_i_final")
@@ -1025,14 +1025,14 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
 
     # ── PC update ───────────────────────────────────────────────────
     next_pc = pc_after
-    next_pc = _mux(op_jmp + op_jsr, ea, next_pc)
-    next_pc = _mux(op_rts, _wrap16(pulled_word + 1), next_pc)
-    next_pc = _mux(op_rti, rti_return, next_pc)
-    next_pc = _mux(op_brk, irq_vector, next_pc)
-    next_pc = _mux(branch_taken, branch_target, next_pc)
+    next_pc = mux(op_jmp + op_jsr, ea, next_pc)
+    next_pc = mux(op_rts, wrap16(pulled_word + 1), next_pc)
+    next_pc = mux(op_rti, rti_return, next_pc)
+    next_pc = mux(op_brk, irq_vector, next_pc)
+    next_pc = mux(branch_taken, branch_target, next_pc)
     # NMI vectors through $FFFA/$FFFB (read into irq_vector above); this mux
     # is last so it overrides whatever the interrupted instruction decoded to.
-    next_pc = _mux(is_nmi, irq_vector, next_pc)
+    next_pc = mux(is_nmi, irq_vector, next_pc)
     next_pc = persist(next_pc, name="next_pc")
 
     # ── Primary memory write for this instruction ─────────────────────
@@ -1044,65 +1044,65 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         op_store_a + op_store_x + op_store_y + op_inc + op_dec + shifts_mem
         + op_pha + op_php + op_jsr + op_brk + unofficial_store
     )
-    is_store = _mux(is_nmi, 1, is_store)
+    is_store = mux(is_nmi, 1, is_store)
     is_store = persist(is_store, name="is_store")
 
-    write_addr = _mux(
+    write_addr = mux(
         op_store_a + op_store_x + op_store_y + op_inc + op_dec + shifts_mem + unofficial_store,
         ea,
-        _mux(
+        mux(
             op_pha + op_php + op_jsr + op_brk,
-            _wrap16(0x0100 + current_s),
+            wrap16(0x0100 + current_s),
             0,
         ),
     )
-    write_addr = _mux(is_nmi, 0x0100 + current_s, write_addr)
+    write_addr = mux(is_nmi, 0x0100 + current_s, write_addr)
     write_addr = persist(write_addr, name="write_addr_out")
 
     # JSR and BRK both push PC+2 (JSR: last byte of the 3-byte instruction;
     # BRK: the byte after its padding byte).  The bytes are derived from the
-    # PC bytes so _wrap8 stays within its valid domain.
-    push_ret_lo = persist(_wrap8(current_pc_lo + 2), name="push_ret_lo")
+    # PC bytes so wrap8 stays within its valid domain.
+    push_ret_lo = persist(wrap8(current_pc_lo + 2), name="push_ret_lo")
     push_ret_carry = stepglu(one, current_pc_lo - 254)
-    push_ret_hi = persist(_wrap8(current_pc_hi + push_ret_carry), name="push_ret_hi")
+    push_ret_hi = persist(wrap8(current_pc_hi + push_ret_carry), name="push_ret_hi")
 
     php_push_value = current_p + FLAG_B * (1 - current_p_b) + FLAG_U * (1 - current_p_u)
-    write_value = _mux(
+    write_value = mux(
         op_store_a, current_a,
-        _mux(op_store_x, current_x,
-            _mux(op_store_y, current_y,
-                _mux(op_inc, inc_result,
-                    _mux(op_dec, dec_result,
-                        _mux(op_asl, asl_result,
-                            _mux(op_lsr, lsr_result,
-                                _mux(op_rol, rol_result,
-                                    _mux(op_ror, ror_result,
-                                        _mux(op_pha, current_a,
-                                            _mux(op_php, php_push_value,
-                                                _mux(op_jsr + op_brk, push_ret_hi, 0))))))))))))
-    write_value = _mux(op_sax, sax_result, write_value)
-    write_value = _mux(op_dcp, dec_result, write_value)
-    write_value = _mux(op_isb, inc_result, write_value)
-    write_value = _mux(op_slo, asl_result, write_value)
-    write_value = _mux(op_rla, rol_result, write_value)
-    write_value = _mux(op_sre, lsr_result, write_value)
-    write_value = _mux(op_rra, ror_result, write_value)
+        mux(op_store_x, current_x,
+            mux(op_store_y, current_y,
+                mux(op_inc, inc_result,
+                    mux(op_dec, dec_result,
+                        mux(op_asl, asl_result,
+                            mux(op_lsr, lsr_result,
+                                mux(op_rol, rol_result,
+                                    mux(op_ror, ror_result,
+                                        mux(op_pha, current_a,
+                                            mux(op_php, php_push_value,
+                                                mux(op_jsr + op_brk, push_ret_hi, 0))))))))))))
+    write_value = mux(op_sax, sax_result, write_value)
+    write_value = mux(op_dcp, dec_result, write_value)
+    write_value = mux(op_isb, inc_result, write_value)
+    write_value = mux(op_slo, asl_result, write_value)
+    write_value = mux(op_rla, rol_result, write_value)
+    write_value = mux(op_sre, lsr_result, write_value)
+    write_value = mux(op_rra, ror_result, write_value)
     # NMI pushes PCH first (the interrupted PC, not PC+2 as BRK pushes).
-    write_value = _mux(is_nmi, current_pc_hi, write_value)
+    write_value = mux(is_nmi, current_pc_hi, write_value)
     write_value = persist(write_value, name="write_value_out")
 
     # Second and third stack pushes (JSR pushes 2 bytes, BRK and NMI push 3).
     # The push addresses are shared: NMI uses the same S-1/S-2 slots as
     # JSR/BRK, so only the gates and pushed values need is_nmi muxes.
-    is_store2 = persist(_mux(is_nmi, 1, op_jsr + op_brk), name="is_store2")
-    write_addr2 = persist(0x0100 + _wrap8(current_s - 1), name="write_addr2_out")
-    write_value2 = persist(_mux(is_nmi, current_pc_lo, push_ret_lo), name="write_value2_out")
+    is_store2 = persist(mux(is_nmi, 1, op_jsr + op_brk), name="is_store2")
+    write_addr2 = persist(0x0100 + wrap8(current_s - 1), name="write_addr2_out")
+    write_value2 = persist(mux(is_nmi, current_pc_lo, push_ret_lo), name="write_value2_out")
 
     # NMI pushes P with B clear and U set (BRK/PHP push with B set).
     nmi_push_p = current_p - FLAG_B * current_p_b + FLAG_U * (1 - current_p_u)
-    is_store3 = persist(_mux(is_nmi, 1, op_brk), name="is_store3")
-    write_addr3 = persist(0x0100 + _wrap8(current_s - 2), name="write_addr3_out")
-    write_value3 = persist(_mux(is_nmi, nmi_push_p, php_push_value), name="write_value3_out")
+    is_store3 = persist(mux(is_nmi, 1, op_brk), name="is_store3")
+    write_addr3 = persist(0x0100 + wrap8(current_s - 2), name="write_addr3_out")
+    write_value3 = persist(mux(is_nmi, nmi_push_p, php_push_value), name="write_value3_out")
 
     # ── Trace-context outputs (reference-aligned, 2026-07-09) ────────
     # The trace reports exactly what reference.py reports, field for field:
@@ -1126,39 +1126,39 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # absent.  Shift families report the shift result in both accumulator
     # and memory modes, exactly as the reference handlers return it.
     data_ref = (
-        _multiply(op_store_a + op_pha, current_a)
-        + _multiply(op_store_x, current_x)
-        + _multiply(op_store_y, current_y)
-        + _multiply(op_php, current_p)
-        + _multiply(op_inc + op_isb, inc_result)
-        + _multiply(op_dec + op_dcp, dec_result)
-        + _multiply(op_asl + op_slo, asl_result)
-        + _multiply(op_lsr + op_sre, lsr_result)
-        + _multiply(op_rol + op_rla, rol_result)
-        + _multiply(op_ror + op_rra, ror_result)
-        + _multiply(op_sax, sax_result)
-        + _multiply(
+        multiply(op_store_a + op_pha, current_a)
+        + multiply(op_store_x, current_x)
+        + multiply(op_store_y, current_y)
+        + multiply(op_php, current_p)
+        + multiply(op_inc + op_isb, inc_result)
+        + multiply(op_dec + op_dcp, dec_result)
+        + multiply(op_asl + op_slo, asl_result)
+        + multiply(op_lsr + op_sre, lsr_result)
+        + multiply(op_rol + op_rla, rol_result)
+        + multiply(op_ror + op_rra, ror_result)
+        + multiply(op_sax, sax_result)
+        + multiply(
             op_load_a + op_lax + op_adc + op_sbc + op_and + op_ora + op_eor
             + op_pla + op_txa + op_tya,
             new_a,
         )
-        + _multiply(op_load_x + op_inx + op_dex + op_tax + op_tsx, new_x)
-        + _multiply(op_load_y + op_iny + op_dey + op_tay, new_y)
-        + _multiply(op_txs, new_s)
-        + _multiply(op_plp, new_p)
-        + _multiply(op_cmp, cmp_result)
-        + _multiply(op_cpx, cpx_result)
-        + _multiply(op_cpy, cpy_result)
-        + _multiply(op_bit, operand)
+        + multiply(op_load_x + op_inx + op_dex + op_tax + op_tsx, new_x)
+        + multiply(op_load_y + op_iny + op_dey + op_tay, new_y)
+        + multiply(op_txs, new_s)
+        + multiply(op_plp, new_p)
+        + multiply(op_cmp, cmp_result)
+        + multiply(op_cpx, cpx_result)
+        + multiply(op_cpy, cpy_result)
+        + multiply(op_bit, operand)
     )
-    data_out = _mux(is_nmi, 0, data_ref)
+    data_out = mux(is_nmi, 0, data_ref)
     data_out = persist(data_out, name="data_out")
 
     # ── Halt ────────────────────────────────────────────────────────
     # BRK halts only if the IRQ vector is 0 (uninitialized memory).  An NMI
     # never halts, even if the interrupted byte happens to be $00 (BRK).
-    halted_now = _multiply(op_brk, _match_byte(irq_vector, 0))
-    halted_now = _multiply(halted_now, 1 - is_nmi)
+    halted_now = multiply(op_brk, match_byte(irq_vector, 0))
+    halted_now = multiply(halted_now, 1 - is_nmi)
     new_halted = current_halted + halted_now
     new_halted = persist(new_halted, name="new_halted")
 

@@ -48,13 +48,13 @@ STATE_FIELDS = (
     "in_nmi",
 )
 
-def _c_num(coeff) -> str:
+def c_num(coeff) -> str:
     if isinstance(coeff, int):
         return f"{coeff}.0"
     return repr(float(coeff))
 
 
-def _c_expr(arg, ref) -> str:
+def c_expr(arg, ref) -> str:
     """Render a compiled (n, ids, coeffs) expression as C source.
 
     ref(dim_id) returns the C lvalue for a dimension.  Term order matches
@@ -71,7 +71,7 @@ def _c_expr(arg, ref) -> str:
         elif coeff == -1:
             parts.append(f"-{r}")
         else:
-            parts.append(f"{_c_num(coeff)}*{r}")
+            parts.append(f"{c_num(coeff)}*{r}")
     return " + ".join(parts)
 
 
@@ -300,20 +300,20 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
 
         for dim in order:
             if isinstance(dim, PersistDimension):
-                emit(f'        const double d{dim.id} = {_c_expr(compile_expr(dim.expr), dref)};')
+                emit(f'        const double d{dim.id} = {c_expr(compile_expr(dim.expr), dref)};')
             else:
-                b_src = _c_expr(compile_expr(dim.b_expr), dref)
-                a_src = _c_expr(compile_expr(dim.a_expr), dref)
+                b_src = c_expr(compile_expr(dim.b_expr), dref)
+                a_src = c_expr(compile_expr(dim.a_expr), dref)
                 emit(f'        const double _b{dim.id} = {b_src};')
                 emit(f'        const double d{dim.id} = _b{dim.id} > 0.0 ? ({a_src}) * _b{dim.id} : 0.0;')
             local_ids.add(dim.id)
-        kx = _c_expr(compile_expr(lu.key_exprs_2d[0]), dref)
-        ky = _c_expr(compile_expr(lu.key_exprs_2d[1]), dref)
+        kx = c_expr(compile_expr(lu.key_exprs_2d[0]), dref)
+        ky = c_expr(compile_expr(lu.key_exprs_2d[1]), dref)
         emit(f'        const double key[2] = {{ {kx}, {ky} }};')
         for p in range(grp["nvp"]):
             for slot in range(2):
                 vi = p * 2 + slot
-                src = _c_expr(compile_expr(lu.value_exprs[vi]), dref) if vi < grp["nv"] else "0.0"
+                src = c_expr(compile_expr(lu.value_exprs[vi]), dref) if vi < grp["nv"] else "0.0"
                 emit(f'        const double val{p}_{slot} = {src};')
         if gi in spec.hull_groups:
             emit(f'        ++grp{gi}_seq;')
@@ -322,7 +322,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
                      f'grp{gi}[{p}].insert(key, val, grp{gi}_seq); }}')
         for ri in spec.grp_regs.get(gi, ()):
             reg = spec.regs[ri]
-            qx, qy = _c_num(reg["qx"]), _c_num(reg["qy"])
+            qx, qy = c_num(reg["qx"]), c_num(reg["qy"])
             # clear_key-gated tokens (ky -= 1e30) can never win a query;
             # replace-on->= reproduces the LATEST tie-break exactly.
             emit('        if (key[1] > -1.0e29) {')
@@ -383,12 +383,12 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emitted_lookups = set()
     for dim_id, op, arg in spec.rt.live_schedule:
         if op == OP_PERSIST:
-            emit(f'        const double d{dim_id} = {_c_expr(arg, sref)};')
+            emit(f'        const double d{dim_id} = {c_expr(arg, sref)};')
             step_locals.add(dim_id)
         elif op == OP_REGLU:
             a_expr, b_expr = arg
-            emit(f'        const double _b{dim_id} = {_c_expr(b_expr, sref)};')
-            emit(f'        const double d{dim_id} = _b{dim_id} > 0.0 ? ({_c_expr(a_expr, sref)}) * _b{dim_id} : 0.0;')
+            emit(f'        const double _b{dim_id} = {c_expr(b_expr, sref)};')
+            emit(f'        const double d{dim_id} = _b{dim_id} > 0.0 ? ({c_expr(a_expr, sref)}) * _b{dim_id} : 0.0;')
             step_locals.add(dim_id)
         elif op == OP_LOOKUP:
             if arg in emitted_lookups:
@@ -404,7 +404,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
                 # empty-group result (0, 0), gate-zeroed downstream.
                 m = spec.mem_lus[arg]
                 terms = m["terms"]
-                qi_src = _c_expr((len(terms), tuple(d for _c, d in terms),
+                qi_src = c_expr((len(terms), tuple(d for _c, d in terms),
                                   tuple(c for c, _d in terms)), sref)
                 emit(f'        const long long qi{arg} = iround({qi_src});')
                 emit(f'        double o{arg}_0[2] = {{0.0, 0.0}};')
@@ -422,7 +422,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
             else:
                 tb = "TieBreak::LATEST" if grp["latest"] else "TieBreak::AVERAGE"
                 qx_expr, qy_expr = spec.rt.lookup_query_exprs[arg]
-                emit(f'        const double q{arg}[2] = {{ {_c_expr(qx_expr, sref)}, {_c_expr(qy_expr, sref)} }};')
+                emit(f'        const double q{arg}[2] = {{ {c_expr(qx_expr, sref)}, {c_expr(qy_expr, sref)} }};')
                 for p in range(grp["nvp"]):
                     emit(f'        double o{arg}_{p}[2] = {{0.0, 0.0}};')
                     emit(f'        grp{gi}[{p}].query(q{arg}, {tb}, o{arg}_{p});')
@@ -568,7 +568,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     for name, expr in spec.outputs:
         var = f"score_{name.lower()}"
         score_names.append((name, var))
-        b(f'            const double {var} = {_c_expr(expr, out_ref)};')
+        b(f'            const double {var} = {c_expr(expr, out_ref)};')
     if [n for n, _ in spec.outputs] != ["STATE", "HALT"]:
         raise NotImplementedError(f"unexpected output tokens: {[n for n, _ in spec.outputs]}")
     b(f'            if ({score_names[1][1]} > {score_names[0][1]}) {{ st_halted = true; reason = "halt"; break; }}')
@@ -629,7 +629,7 @@ class Cpu6502CppRuntime:
             verbose=False,
         )
         self.compile_seconds = time.perf_counter() - build_start
-        self._kernel = module.Kernel()
+        self.kernel = module.Kernel()
         self.last_prefix_seconds = 0.0
         self.last_step_seconds = 0.0
 
@@ -639,7 +639,7 @@ class Cpu6502CppRuntime:
         if len(memory_image) != 0x10000:
             raise ValueError("memory_image must be exactly 64 KiB")
         prefix_start = time.perf_counter()
-        self._kernel.load_image(bytes(memory_image), start_pc)
+        self.kernel.load_image(bytes(memory_image), start_pc)
         self.last_prefix_seconds = time.perf_counter() - prefix_start
 
     def run(self, max_steps: int, *, stop_on_trap: bool = False,
@@ -654,43 +654,43 @@ class Cpu6502CppRuntime:
         "hit_addr"/"hit_value" (watched writes from the final step).
         """
         step_start = time.perf_counter()
-        out = self._kernel.run(max_steps, stop_on_trap, max_cycles)
+        out = self.kernel.run(max_steps, stop_on_trap, max_cycles)
         self.last_step_seconds += time.perf_counter() - step_start
         return out
 
     def watch_read(self, lo: int, hi: int):
-        self._kernel.watch_read(lo, hi)
+        self.kernel.watch_read(lo, hi)
 
     def watch_write(self, lo: int, hi: int):
-        self._kernel.watch_write(lo, hi)
+        self.kernel.watch_write(lo, hi)
 
     def set_read_lease(self, addr: int, value: int):
-        self._kernel.set_read_lease(addr, value)
+        self.kernel.set_read_lease(addr, value)
 
     def clear_read_lease(self):
-        self._kernel.clear_read_lease()
+        self.kernel.clear_read_lease()
 
     def set_nmi(self):
-        self._kernel.set_nmi()
+        self.kernel.set_nmi()
 
     def inject_write(self, addr: int, value: int):
-        self._kernel.inject_write(addr, value)
+        self.kernel.inject_write(addr, value)
 
     def read_ram(self, addr: int) -> int:
-        return self._kernel.read_ram(addr)
+        return self.kernel.read_ram(addr)
 
     def dump_ram(self) -> bytes:
-        return self._kernel.dump_ram()
+        return self.kernel.dump_ram()
 
     def set_state(self, state: dict) -> None:
-        self._kernel.set_state(
+        self.kernel.set_state(
             state["pc"], state["a"], state["x"], state["y"], state["s"], state["p"],
             state.get("ir", 0), state.get("oplo", 0), state.get("ophi", 0),
             state.get("ea", 0), state.get("data", 0),
         )
 
     def get_state(self) -> dict:
-        return self._kernel.get_state()
+        return self.kernel.get_state()
 
     # ── One-shot runs (Klaus / nestest harnesses) ───────────────────
 

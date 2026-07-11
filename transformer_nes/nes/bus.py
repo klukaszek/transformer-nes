@@ -56,7 +56,7 @@ class Device(Protocol):
     def write(self, addr: int, value: int) -> None: ...
 
 
-def _drain_stall(device) -> int:
+def drain_stall(device) -> int:
     take = getattr(device, "take_stall", None)
     return take() if take is not None else 0
 
@@ -205,14 +205,14 @@ class Bus:
         self.ram = bytearray(memory_image)
         if len(self.ram) != 0x10000:
             raise ValueError("memory_image must be exactly 64 KiB")
-        self._ranges: list[tuple[int, int, Device]] = []
+        self.ranges: list[tuple[int, int, Device]] = []
         # Base CPU cycles executed (no penalty cycles; NMI = 7 cycles;
         # device stalls included).  Matches the C++ kernel's accounting.
         self.cycles = 0
 
     def attach(self, device: Device, lo: int, hi: int) -> None:
         """Map a device over [lo, hi] (inclusive)."""
-        self._ranges.append((lo, hi, device))
+        self.ranges.append((lo, hi, device))
 
     def set_nmi(self) -> None:
         self.core.set_nmi()
@@ -241,8 +241,8 @@ class Bus:
         rebuild(self.ram)
         return True
 
-    def _device_at(self, addr: int) -> Device | None:
-        for lo, hi, device in self._ranges:
+    def device_at(self, addr: int) -> Device | None:
+        for lo, hi, device in self.ranges:
             if lo <= addr <= hi:
                 return device
         return None
@@ -259,22 +259,22 @@ class Bus:
                 self.cycles += op.cycles
             target = read_target(self.ram, self.core.pc, self.core.x, self.core.y)
             if target is not None:
-                device = self._device_at(target)
+                device = self.device_at(target)
                 if device is not None:
                     value = device.read(target) & 0xFF
                     self.core.poke(target, value)
                     self.ram[target] = value
-                    self.cycles += _drain_stall(device)
+                    self.cycles += drain_stall(device)
 
         row = self.core.step()
 
         # CPU -> device: forward watched writes, keep the mirror in sync.
         for w in row.writes:
             self.ram[w.addr] = w.value
-            device = self._device_at(w.addr)
+            device = self.device_at(w.addr)
             if device is not None:
                 device.write(w.addr, w.value)
-                self.cycles += _drain_stall(device)
+                self.cycles += drain_stall(device)
         return row
 
     def run(self, max_steps: int, *, nmi_at: set[int] | None = None) -> list[TraceRow]:
@@ -305,15 +305,15 @@ class KernelBus:
     def __init__(self, rt, memory_image, *, start_pc: int):
         self.rt = rt
         rt.load_image(memory_image, start_pc=start_pc)
-        self._ranges: list[tuple[int, int, Device]] = []
+        self.ranges: list[tuple[int, int, Device]] = []
 
     def attach(self, device: Device, lo: int, hi: int) -> None:
-        self._ranges.append((lo, hi, device))
+        self.ranges.append((lo, hi, device))
         self.rt.watch_read(lo, hi)
         self.rt.watch_write(lo, hi)
 
-    def _device_at(self, addr: int) -> Device | None:
-        for lo, hi, device in self._ranges:
+    def device_at(self, addr: int) -> Device | None:
+        for lo, hi, device in self.ranges:
             if lo <= addr <= hi:
                 return device
         return None
@@ -338,7 +338,7 @@ class KernelBus:
         ram = self.rt.dump_ram()
         self.rt.load_image(ram, start_pc=state["pc"])
         self.rt.set_state(state)
-        for lo, hi, _device in self._ranges:
+        for lo, hi, _device in self.ranges:
             self.rt.watch_read(lo, hi)
             self.rt.watch_write(lo, hi)
         return True
@@ -379,18 +379,18 @@ class KernelBus:
                 # A device write may change what a leased register reads.
                 self.rt.clear_read_lease()
             for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
-                device = self._device_at(int(addr))
+                device = self.device_at(int(addr))
                 if device is not None:
                     device.write(int(addr), int(value))
-                    cycles_done += _drain_stall(device)
+                    cycles_done += drain_stall(device)
             reason = out["reason"]
             if reason == "watch_read":
                 # Device -> CPU: place the register value on the bus, resume.
                 addr = int(out["read_addr"])
-                device = self._device_at(addr)
+                device = self.device_at(addr)
                 if device is not None:
                     value = device.read(addr) & 0xFF
-                    cycles_done += _drain_stall(device)
+                    cycles_done += drain_stall(device)
                     # Registers whose value is frozen for the rest of the
                     # span are served natively until the lease is cleared.
                     lease = getattr(device, "read_lease", None)

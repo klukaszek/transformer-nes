@@ -40,7 +40,7 @@ class ProgramEvaluator:
                 raise NotImplementedError(
                     f"lookup {lu.name!r}: only the LATEST tie-break is supported"
                 )
-        self._logs: dict[int, list] = {lu.id: [] for lu in program_graph.all_lookups}
+        self.logs: dict[int, list] = {lu.id: [] for lu in program_graph.all_lookups}
         self.dim_of_name: dict[str, Dimension] = {}
         for d in program_graph.all_dims:
             self.dim_of_name.setdefault(d.name, d)
@@ -69,14 +69,14 @@ class ProgramEvaluator:
             elif isinstance(d, PersistDimension):
                 v[d] = d.expr.evaluate(v)
             elif isinstance(d, LookUpDimension) and d.value_index == 0:
-                self._attend(d.lookup, v)
+                self.attend(d.lookup, v)
         return v
 
-    def _attend(self, lu, v: dict) -> None:
+    def attend(self, lu, v: dict) -> None:
         kx = lu.key_exprs_2d[0].evaluate(v)
         ky = lu.key_exprs_2d[1].evaluate(v)
         vals = [e.evaluate(v) for e in lu.value_exprs]
-        log = self._logs[lu.id]
+        log = self.logs[lu.id]
         log.append((kx, ky, vals))
         qx = lu.query_exprs_2d[0].evaluate(v)
         qy = lu.query_exprs_2d[1].evaluate(v)

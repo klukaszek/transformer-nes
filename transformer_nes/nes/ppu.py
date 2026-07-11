@@ -88,13 +88,13 @@ class PPU:
         if reg == 7:  # PPUDATA (buffered below $3F00, direct for palette)
             addr = self.vram_addr & 0x3FFF
             if addr >= 0x3F00:
-                value = self.palette[self._palette_index(addr)] & 0x3F
+                value = self.palette[self.palette_index(addr)] & 0x3F
                 # The buffer still loads from the nametable "underneath".
-                self.read_buffer = self._vram_read(addr - 0x1000)
+                self.read_buffer = self.vram_read(addr - 0x1000)
             else:
                 value = self.read_buffer
-                self.read_buffer = self._vram_read(addr)
-            self.vram_addr = (self.vram_addr + self._increment) & 0x3FFF
+                self.read_buffer = self.vram_read(addr)
+            self.vram_addr = (self.vram_addr + self.increment) & 0x3FFF
             return value
         return 0  # write-only registers read as open bus; model as 0
 
@@ -136,8 +136,8 @@ class PPU:
                 self.vram_addr = ((value & 0x3F) << 8) | (self.vram_addr & 0x00FF)
             self.write_latch = not self.write_latch
         elif reg == 7:  # PPUDATA
-            self._vram_write(self.vram_addr & 0x3FFF, value)
-            self.vram_addr = (self.vram_addr + self._increment) & 0x3FFF
+            self.vram_write(self.vram_addr & 0x3FFF, value)
+            self.vram_addr = (self.vram_addr + self.increment) & 0x3FFF
 
     # ── Console-side control ────────────────────────────────────────
 
@@ -169,49 +169,49 @@ class PPU:
     # ── VRAM mapping ────────────────────────────────────────────────
 
     @property
-    def _increment(self) -> int:
+    def increment(self) -> int:
         return 32 if self.ctrl & 0x04 else 1
 
-    def _nt_offset(self, addr: int) -> int:
+    def nt_offset(self, addr: int) -> int:
         a = (addr - 0x2000) & 0xFFF
         table, offset = a >> 10, a & 0x3FF
         phys = table & 1 if self.mirroring == MIRROR_VERTICAL else table >> 1
         return phys * 0x400 + offset
 
     @staticmethod
-    def _palette_index(addr: int) -> int:
+    def palette_index(addr: int) -> int:
         index = (addr - 0x3F00) & 0x1F
         if index in (0x10, 0x14, 0x18, 0x1C):  # sprite mirrors of bg entries
             index -= 0x10
         return index
 
-    def _vram_read(self, addr: int) -> int:
+    def vram_read(self, addr: int) -> int:
         addr &= 0x3FFF
         if addr < 0x2000:
             return self.chr[addr]
         if addr < 0x3F00:
-            return self.nametables[self._nt_offset(addr)]
-        return self.palette[self._palette_index(addr)]
+            return self.nametables[self.nt_offset(addr)]
+        return self.palette[self.palette_index(addr)]
 
-    def _vram_write(self, addr: int, value: int) -> None:
+    def vram_write(self, addr: int, value: int) -> None:
         addr &= 0x3FFF
         if addr < 0x2000:
             if self.chr_writable:
                 self.chr[addr] = value
         elif addr < 0x3F00:
-            self.nametables[self._nt_offset(addr)] = value
+            self.nametables[self.nt_offset(addr)] = value
         else:
-            self.palette[self._palette_index(addr)] = value
+            self.palette[self.palette_index(addr)] = value
 
     # ── Rendering ───────────────────────────────────────────────────
 
-    def _tile_cache(self) -> np.ndarray:
+    def tile_cache(self) -> np.ndarray:
         """Decode both pattern tables: (512, 8, 8) array of 2-bit pixels."""
         raw = np.frombuffer(bytes(self.chr), dtype=np.uint8).reshape(512, 2, 8, 1)
         bits = np.unpackbits(raw, axis=3)  # MSB first: bit 7 is the left pixel
         return (bits[:, 0] + 2 * bits[:, 1]).astype(np.uint8)
 
-    def _render_background(self, tiles: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def render_background(self, tiles: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Render the visible 256x240 background with coarse scroll.
 
         Returns (color indices 240x256 in NES palette space, opacity mask).
@@ -228,7 +228,7 @@ class PPU:
         canvas_pix = np.zeros((480, 512), dtype=np.uint8)   # 2-bit pattern
         canvas_pal = np.zeros((480, 512), dtype=np.uint8)   # palette select
         for logical in range(4):
-            base = self._nt_offset(0x2000 + logical * 0x400)
+            base = self.nt_offset(0x2000 + logical * 0x400)
             tile_ids = nt[base:base + 0x3C0].reshape(30, 32).astype(np.intp)
             attrs = nt[base + 0x3C0:base + 0x400].reshape(8, 8)
             pattern = tiles[bg_table + tile_ids]              # (30, 32, 8, 8)
@@ -263,8 +263,8 @@ class PPU:
         Also computes the sprite-0/background overlap scanline for the
         console's hit-event scheduling.
         """
-        tiles = self._tile_cache()
-        frame, bg_opaque = self._render_background(tiles)
+        tiles = self.tile_cache()
+        frame, bg_opaque = self.render_background(tiles)
         self.sprite0_scanline = None
         if not self.mask & 0x10:
             return frame

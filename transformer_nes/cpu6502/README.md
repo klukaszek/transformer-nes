@@ -49,7 +49,7 @@ attention:
 Each step evaluates the graph over the latest token: per-opcode one-hot
 gates decode the fetched opcode, mode gates resolve the effective address
 (indirect modes via pointer reads), ALU results are computed for every
-operation family in parallel, and `_mux` chains select the new state.  The
+operation family in parallel, and `mux` chains select the new state.  The
 run loop reads back ~22 named result dims, emits up to three WRITE tokens
 (JSR pushes two bytes, BRK three), builds the next STATE token, and stops
 when the HALT output token outscores STATE (or on a jump-to-self trap).
@@ -191,7 +191,7 @@ that only surface millions of instructions into a run.
    only for integer `b`; at `b = -0.5` it returns 0.5.  The decimal-mode
    nibble carries originally used `x - 9.5` thresholds and were wrong
    exactly when a nibble sum hit 9.
-2. **`_wrap8`/`_wrap16` have small domains.**  They subtract at most one
+2. **`wrap8`/`wrap16` have small domains.**  They subtract at most one
    modulus.  Splitting a 16-bit value into bytes must be built from values
    that are already bytes (see the JSR/BRK return-address construction).
 3. **Round half-to-even on read-back.**  Python `round` and C++

@@ -350,70 +350,70 @@ class Asm:
     """
 
     def __init__(self):
-        self._bytes: bytearray = bytearray()
+        self.buf: bytearray = bytearray()
 
-    def _append(self, *values: int) -> Asm:
+    def append(self, *values: int) -> Asm:
         for v in values:
             if not 0 <= v <= 0xFF:
                 raise ValueError(f"byte out of range: {v}")
-            self._bytes.append(v)
+            self.buf.append(v)
         return self
 
     def bytes(self) -> bytes:
-        return bytes(self._bytes)
+        return bytes(self.buf)
 
     # Load / store
     def lda_imm(self, value: int) -> Asm:
-        return self._append(0xA9, value)
+        return self.append(0xA9, value)
 
     def ldx_imm(self, value: int) -> Asm:
-        return self._append(0xA2, value)
+        return self.append(0xA2, value)
 
     def ldy_imm(self, value: int) -> Asm:
-        return self._append(0xA0, value)
+        return self.append(0xA0, value)
 
     def sta_zpg(self, addr: int) -> Asm:
-        return self._append(0x85, addr)
+        return self.append(0x85, addr)
 
     def sta_abs(self, addr: int) -> Asm:
-        return self._append(0x8D, addr & 0xFF, (addr >> 8) & 0xFF)
+        return self.append(0x8D, addr & 0xFF, (addr >> 8) & 0xFF)
 
     # Arithmetic
     def adc_imm(self, value: int) -> Asm:
-        return self._append(0x69, value)
+        return self.append(0x69, value)
 
     def sbc_imm(self, value: int) -> Asm:
-        return self._append(0xE9, value)
+        return self.append(0xE9, value)
 
     # Register inc/dec/transfer
     def inx(self) -> Asm:
-        return self._append(0xE8)
+        return self.append(0xE8)
 
     def dex(self) -> Asm:
-        return self._append(0xCA)
+        return self.append(0xCA)
 
     def tax(self) -> Asm:
-        return self._append(0xAA)
+        return self.append(0xAA)
 
     # Flow control
     def jmp_abs(self, addr: int) -> Asm:
-        return self._append(0x4C, addr & 0xFF, (addr >> 8) & 0xFF)
+        return self.append(0x4C, addr & 0xFF, (addr >> 8) & 0xFF)
 
     def bne(self, offset: int) -> Asm:
         if not -128 <= offset <= 127:
             raise ValueError(f"branch offset out of range: {offset}")
-        return self._append(0xD0, offset & 0xFF)
+        return self.append(0xD0, offset & 0xFF)
 
     def beq(self, offset: int) -> Asm:
         if not -128 <= offset <= 127:
             raise ValueError(f"branch offset out of range: {offset}")
-        return self._append(0xF0, offset & 0xFF)
+        return self.append(0xF0, offset & 0xFF)
 
     def brk(self) -> Asm:
-        return self._append(0x00)
+        return self.append(0x00)
 
     def raw(self, *values: int) -> Asm:
-        return self._append(*values)
+        return self.append(*values)
 
 
 def asm() -> Asm:

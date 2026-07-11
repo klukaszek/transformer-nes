@@ -13,7 +13,7 @@ from transformer_nes.cpu6502.trace import format_trace_row
 EXAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "examples", "tiny")
 
 
-def _example(name: str) -> bytes:
+def example(name: str) -> bytes:
     with open(os.path.join(EXAMPLES_DIR, name), "rb") as f:
         return f.read()
 
@@ -23,7 +23,7 @@ def _example(name: str) -> bytes:
 
 def test_lda_imm_sets_a_and_flags():
     cpu = reference.Cpu6502()
-    trace = cpu.run(_example("load_immediate.bin"), start_pc=0x8000, max_steps=10)
+    trace = cpu.run(example("load_immediate.bin"), start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
     assert final.a == 0x42
@@ -36,7 +36,7 @@ def test_lda_imm_sets_a_and_flags():
 
 
 def test_lda_zero_sets_z_flag():
-    trace = reference.run(_example("zero_flag.bin"), start_pc=0x8000, max_steps=10)
+    trace = reference.run(example("zero_flag.bin"), start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final.a == 0x00
     assert final.p & FLAG_Z
@@ -44,7 +44,7 @@ def test_lda_zero_sets_z_flag():
 
 
 def test_lda_negative_sets_n_flag():
-    trace = reference.run(_example("negative_flag.bin"), start_pc=0x8000, max_steps=10)
+    trace = reference.run(example("negative_flag.bin"), start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final.a == 0x80
     assert final.p & FLAG_N
@@ -56,7 +56,7 @@ def test_lda_negative_sets_n_flag():
 
 def test_sta_zpg_writes_memory():
     cpu = reference.Cpu6502()
-    trace = cpu.run(_example("store_zpg.bin"), start_pc=0x8000, max_steps=10)
+    trace = cpu.run(example("store_zpg.bin"), start_pc=0x8000, max_steps=10)
     assert cpu.memory[0x0010] == 0x37
     # The trace also contains the BRK stack pushes; check the STA write.
     sta_writes = [w for w in trace.writes() if w.addr == 0x0010]
@@ -68,7 +68,7 @@ def test_sta_zpg_writes_memory():
 
 
 def test_bne_loop_counts_down():
-    trace = reference.run(_example("branch_loop.bin"), start_pc=0x8000, max_steps=20)
+    trace = reference.run(example("branch_loop.bin"), start_pc=0x8000, max_steps=20)
     final = trace.final_state()
     assert final.x == 0x00
     assert final.p & FLAG_Z

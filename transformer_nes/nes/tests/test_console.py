@@ -22,7 +22,7 @@ EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 NESTEST_ROM = os.path.join(EXAMPLES_DIR, "nestest.nes")
 
 
-def _test_cart() -> Cartridge:
+def make_cart() -> Cartridge:
     """PRG that draws two bg tiles and a sprite-0 overlapping the first."""
     code = bytearray()
 
@@ -72,75 +72,75 @@ def _test_cart() -> Cartridge:
     return Cartridge(prg=bytes(prg), chr=b"", mirroring="vertical", mapper=0)
 
 
-def _ram(console: Console, addr: int) -> int:
-    if console._uses_kernel_bus:  # kernel or weights run loop: mirror in C++
-        return console._rt.read_ram(addr)
+def ram(console: Console, addr: int) -> int:
+    if console.uses_kernel_bus:  # kernel or weights run loop: mirror in C++
+        return console.rt.read_ram(addr)
     return console.bus.ram[addr]
 
 
-def _run_frames(backend: str, frames: int):
-    console = Console(_test_cart(), backend=backend)
+def run_frames(backend: str, frames: int):
+    console = Console(make_cart(), backend=backend)
     rendered = [console.run_frame() for _ in range(frames)]
     return console, rendered
 
 
-def _check_final_frame(console: Console, frame) -> None:
+def check_final_frame(console: Console, frame) -> None:
     assert frame[0, 0] == 0x0F                    # backdrop
     assert frame[18, 18] == 0x20                  # bg tile at row 2, col 2
     assert frame[18, 10] == 0x16                  # sprite 0 over the col-1 tile
-    assert console._sprite0_scanline == 16        # overlap begins at scanline 16
+    assert console.sprite0_scanline == 16        # overlap begins at scanline 16
     assert bytes(console.ppu.oam[0:4]) == bytes((15, 1, 0, 8))
 
 
 @pytest.mark.slow
 def test_kernel_console_runs_the_test_cart():
-    console, rendered = _run_frames("kernel", 4)
-    _check_final_frame(console, rendered[-1])
-    assert _ram(console, 0x11) == 4               # one NMI per frame
-    assert _ram(console, 0x10) > 0                # main loop ran
+    console, rendered = run_frames("kernel", 4)
+    check_final_frame(console, rendered[-1])
+    assert ram(console, 0x11) == 4               # one NMI per frame
+    assert ram(console, 0x10) > 0                # main loop ran
     assert console.cycles >= 4 * FRAME_CYCLES
     assert not console.halted
 
 
 @pytest.mark.slow
 def test_reference_console_matches_kernel_console():
-    kernel, kernel_frames = _run_frames("kernel", 4)
-    ref, ref_frames = _run_frames("reference", 4)
+    kernel, kernel_frames = run_frames("kernel", 4)
+    ref, ref_frames = run_frames("reference", 4)
     for i, (a, b) in enumerate(zip(kernel_frames, ref_frames, strict=True)):
         assert np.array_equal(a, b), f"frame {i} differs"
     assert kernel.cycles == ref.cycles
-    assert _ram(kernel, 0x10) == _ram(ref, 0x10)
-    assert _ram(kernel, 0x11) == _ram(ref, 0x11) == 4
+    assert ram(kernel, 0x10) == ram(ref, 0x10)
+    assert ram(kernel, 0x11) == ram(ref, 0x11) == 4
     assert bytes(kernel.ppu.oam) == bytes(ref.ppu.oam)
     assert bytes(kernel.ppu.nametables) == bytes(ref.ppu.nametables)
-    _check_final_frame(ref, ref_frames[-1])
+    check_final_frame(ref, ref_frames[-1])
 
 
 @pytest.mark.slow
 def test_graph_console_matches_reference_console():
-    graph, graph_frames = _run_frames("graph", 2)
-    ref, ref_frames = _run_frames("reference", 2)
+    graph, graph_frames = run_frames("graph", 2)
+    ref, ref_frames = run_frames("reference", 2)
     for i, (a, b) in enumerate(zip(graph_frames, ref_frames, strict=True)):
         assert np.array_equal(a, b), f"frame {i} differs"
     assert graph.cycles == ref.cycles
-    assert _ram(graph, 0x11) == _ram(ref, 0x11) == 2
+    assert ram(graph, 0x11) == ram(ref, 0x11) == 2
 
 
 @pytest.mark.slow
 def test_checkpoint_is_invisible():
     """Snapshot-and-rebuild must not change a single pixel, byte, or cycle."""
-    plain = Console(_test_cart(), backend="kernel", checkpoint_tokens=0)
+    plain = Console(make_cart(), backend="kernel", checkpoint_tokens=0)
     plain_frames = [plain.run_frame() for _ in range(6)]
 
-    ck = Console(_test_cart(), backend="kernel", checkpoint_tokens=1)  # every frame
+    ck = Console(make_cart(), backend="kernel", checkpoint_tokens=1)  # every frame
     ck_frames = [ck.run_frame() for _ in range(6)]
 
     assert ck.checkpoint_count == 6
     for i, (a, b) in enumerate(zip(plain_frames, ck_frames, strict=True)):
         assert np.array_equal(a, b), f"frame {i} differs"
     assert plain.cycles == ck.cycles
-    assert _ram(plain, 0x10) == _ram(ck, 0x10)
-    assert _ram(plain, 0x11) == _ram(ck, 0x11)
+    assert ram(plain, 0x10) == ram(ck, 0x10)
+    assert ram(plain, 0x11) == ram(ck, 0x11)
     assert bytes(plain.ppu.oam) == bytes(ck.ppu.oam)
     # The log actually shrank back to the RAM reseed each frame.
     assert ck.bus.log_tokens < plain.bus.log_tokens
@@ -148,17 +148,17 @@ def test_checkpoint_is_invisible():
 
 @pytest.mark.slow
 def test_checkpoint_is_invisible_on_graph_backend():
-    ref = Console(_test_cart(), backend="reference")
+    ref = Console(make_cart(), backend="reference")
     ref_frames = [ref.run_frame() for _ in range(2)]
 
-    graph = Console(_test_cart(), backend="graph", checkpoint_tokens=1)
+    graph = Console(make_cart(), backend="graph", checkpoint_tokens=1)
     graph_frames = [graph.run_frame() for _ in range(2)]
 
     assert graph.checkpoint_count == 2
     for i, (a, b) in enumerate(zip(ref_frames, graph_frames, strict=True)):
         assert np.array_equal(a, b), f"frame {i} differs"
     assert ref.cycles == graph.cycles
-    assert _ram(ref, 0x11) == _ram(graph, 0x11) == 2
+    assert ram(ref, 0x11) == ram(graph, 0x11) == 2
 
 
 @pytest.mark.slow
@@ -168,18 +168,18 @@ def test_weights_run_loop_console_matches_kernel():
     byte-for-byte and cycle-for-cycle like the kernel, both plainly and with
     a snapshot-and-rebuild checkpoint every frame (which exercises the run
     loop's dump_ram / load_image / set_state path)."""
-    kernel = Console(_test_cart(), backend="kernel", checkpoint_tokens=0)
+    kernel = Console(make_cart(), backend="kernel", checkpoint_tokens=0)
     kframes = [kernel.run_frame() for _ in range(6)]
 
-    weights = Console(_test_cart(), backend="weights", checkpoint_tokens=0)
-    assert weights._uses_kernel_bus  # the codegen engine has the run loop
+    weights = Console(make_cart(), backend="weights", checkpoint_tokens=0)
+    assert weights.uses_kernel_bus  # the codegen engine has the run loop
     wframes = [weights.run_frame() for _ in range(6)]
     for i, (a, b) in enumerate(zip(kframes, wframes, strict=True)):
         assert np.array_equal(a, b), f"frame {i} differs"
     assert kernel.cycles == weights.cycles
     assert bytes(kernel.ppu.oam) == bytes(weights.ppu.oam)
 
-    ck = Console(_test_cart(), backend="weights", checkpoint_tokens=1)
+    ck = Console(make_cart(), backend="weights", checkpoint_tokens=1)
     ckframes = [ck.run_frame() for _ in range(6)]
     assert ck.checkpoint_count == 6
     for i, (a, b) in enumerate(zip(kframes, ckframes, strict=True)):
@@ -190,10 +190,10 @@ def test_weights_run_loop_console_matches_kernel():
 @pytest.mark.slow
 def test_backend_handoff_is_invisible():
     """A mid-game handoff to another CPU backend changes nothing observable."""
-    straight = Console(_test_cart(), backend="reference")
+    straight = Console(make_cart(), backend="reference")
     straight_frames = [straight.run_frame() for _ in range(4)]
 
-    mixed = Console(_test_cart(), backend="kernel")
+    mixed = Console(make_cart(), backend="kernel")
     mixed_frames = [mixed.run_frame() for _ in range(2)]
     mixed.handoff("reference")
     mixed_frames += [mixed.run_frame() for _ in range(2)]
@@ -201,10 +201,10 @@ def test_backend_handoff_is_invisible():
     for i, (a, b) in enumerate(zip(straight_frames, mixed_frames, strict=True)):
         assert np.array_equal(a, b), f"frame {i} differs"
     assert straight.cycles == mixed.cycles
-    assert _ram(straight, 0x11) == _ram(mixed, 0x11) == 4
+    assert ram(straight, 0x11) == ram(mixed, 0x11) == 4
 
 
-def _nametable_text(console: Console) -> str:
+def nametable_text(console: Console) -> str:
     nt = console.ppu.nametables[:0x3C0]
     return "\n".join(
         "".join(chr(b) if 0x20 <= b < 0x7F else " " for b in nt[r * 32:(r + 1) * 32])
@@ -216,7 +216,7 @@ def _nametable_text(console: Console) -> str:
 def test_nestest_boots_and_passes_interactively():
     console = Console(NESTEST_ROM, backend="kernel")
     console.run(5)
-    menu = _nametable_text(console)
+    menu = nametable_text(console)
     assert "Run all tests" in menu
     assert "Start: run test" in menu
 
@@ -224,7 +224,7 @@ def test_nestest_boots_and_passes_interactively():
     console.run(2)
     console.controller.set_buttons(start=False)
     console.run(30)
-    results = _nametable_text(console)
+    results = nametable_text(console)
     assert "OK Run all tests" in results
     assert "OK Absolute,X tests" in results
     assert "Er" not in results  # nestest prints error codes as "Er ##h"

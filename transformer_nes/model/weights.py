@@ -99,7 +99,7 @@ def build_model(program_graph=None, schedule=None):
         input_tokens = pg.input_tokens
         output_tokens = pg.output_tokens
         ALL_DIMS = pg.all_dims
-        _one = pg.one
+        one = pg.one
         position = pg.position
         inv_log_pos = pg.inv_log_pos
         position_sq = pg.position_sq
@@ -209,7 +209,7 @@ def build_model(program_graph=None, schedule=None):
     internal_dims = internal_reglus | internal_lookups | internal_persists
 
     # ── Expressions for passthrough/erase Q/K ─────────────────
-    one_expr = Expression({_one: 1})
+    one_expr = Expression({one: 1})
     pos_expr = Expression({position: 1})
     erase_q2d = [pos_expr, one_expr]
     erase_k2d = [pos_expr * 2, one_expr]
@@ -364,11 +364,11 @@ def build_model(program_graph=None, schedule=None):
                 v1_sig = expr_sig(lu.value_exprs[p * 2 + 1]) if p * 2 + 1 < nv else ()
                 q_terms = {d.name: c for d, c in lu.query_exprs_2d[0].terms.items()}
                 q_terms.update(
-                    {"_qy_" + d.name: c for d, c in lu.query_exprs_2d[1].terms.items()}
+                    {"qy_" + d.name: c for d, c in lu.query_exprs_2d[1].terms.items()}
                 )
                 k_terms = {d.name: c for d, c in lu.key_exprs_2d[0].terms.items()}
                 k_terms.update(
-                    {"_ky_" + d.name: c for d, c in lu.key_exprs_2d[1].terms.items()}
+                    {"ky_" + d.name: c for d, c in lu.key_exprs_2d[1].terms.items()}
                 )
                 layer_heads[h] = {
                     "type": "lookup",

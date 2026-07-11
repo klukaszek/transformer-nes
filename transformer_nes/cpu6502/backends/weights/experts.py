@@ -85,7 +85,7 @@ def fold_step_spec(fold_result, model, tok_to_idx, info, *,
     return spec
 
 
-def _eval_over_heads(fold_result, dim, length):
+def eval_over_heads(fold_result, dim, length):
     """Evaluate a folded dim as a function of the symbolic head pc, for every
     head where the window fits without wrapping $FFFF.  The head enters the
     graph through the step-0 pc persists (state arrives via attention, so
@@ -134,7 +134,7 @@ def _eval_over_heads(fold_result, dim, length):
     return heads, np.asarray(ev(dim))
 
 
-def _decode_ops(code: bytes) -> list:
+def decode_ops(code: bytes) -> list:
     ops, off = [], 0
     while off < len(code):
         op = OPCODES[code[off]]
@@ -143,7 +143,7 @@ def _decode_ops(code: bytes) -> list:
     return ops
 
 
-def _check_first_read_only(ops, label: str) -> None:
+def check_first_read_only(ops, label: str) -> None:
     """Only the first instruction of a window may read memory: the run
     loop's shadow-read watch check covers exactly one instruction."""
     for op in ops[1:]:
@@ -154,7 +154,7 @@ def _check_first_read_only(ops, label: str) -> None:
             )
 
 
-def _const_root(fold_result, root: str, k: int, label: str) -> int:
+def const_root(fold_result, root: str, k: int, label: str) -> int:
     one = fold_result.program_graph.one
     d = fold_result.dim_of_name[f"{root}__s{k}"]
     expr = getattr(d, "expr", None)
@@ -165,18 +165,18 @@ def _const_root(fold_result, root: str, k: int, label: str) -> int:
     return int(round(expr.terms.get(one, 0.0)))
 
 
-def _check_write_free(fold_result, n_steps: int, label: str) -> None:
+def check_write_free(fold_result, n_steps: int, label: str) -> None:
     """Every step of a routed window must be write-free and non-halting
     (verified on the folded constants, not assumed from the opcode list)."""
     for k in range(n_steps):
         for store in ("is_store", "is_store2", "is_store3"):
-            if _const_root(fold_result, store, k, label) != 0:
+            if const_root(fold_result, store, k, label) != 0:
                 raise RuntimeError(f"{label} step {k}: not write-free")
-        if _const_root(fold_result, "new_halted", k, label) != 0:
+        if const_root(fold_result, "new_halted", k, label) != 0:
             raise RuntimeError(f"{label} step {k}: may halt")
 
 
-def _schedule_and_build(fold_result):
+def schedule_and_build(fold_result):
     fp = fold_result.program_graph
     sched = asap_schedule(fp.input_tokens, fp.output_tokens,
                           program_graph=fp, log=logger.debug)
@@ -235,17 +235,17 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
                 program_graph=fp, schedule=sched,
             )
         else:
-            model, _tokens, tok_to_idx, info = _schedule_and_build(r)
+            model, _tokens, tok_to_idx, info = schedule_and_build(r)
         experts.append({
             "name": f"{byte:02X}", "byte": byte, "model": model,
             "step_spec": fold_step_spec(r, model, tok_to_idx, info),
             "union_lookup_of": r.union_lookup_of,
-            "_layers": info.n_layers, "_d": info.d_model,
+            "layers": info.n_layers, "_d": info.d_model,
         })
     logger.info(
         "routed experts: %d rebuilt models, %d-%d layers, d_model %d-%d",
         len(experts),
-        min(e["_layers"] for e in experts), max(e["_layers"] for e in experts),
+        min(e["layers"] for e in experts), max(e["layers"] for e in experts),
         min(e["_d"] for e in experts), max(e["_d"] for e in experts),
     )
     return experts
@@ -264,8 +264,8 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     label = f"sequence @{head:04X}"
     pin_list = sequence_pins(head, code, OPCODES) * repeat
     n_steps = len(pin_list)
-    ops = _decode_ops(code) * repeat
-    _check_first_read_only(ops, label)
+    ops = decode_ops(code) * repeat
+    check_first_read_only(ops, label)
 
     folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
     r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
@@ -275,18 +275,18 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
             f"{label}: pins reach insert-side expressions "
             f"of {r.insert_side_hazards}"
         )
-    _check_write_free(r, n_steps, label)
+    check_write_free(r, n_steps, label)
     for k in range(n_steps - 1):
         nxt = int(pin_list[k + 1]["current_pc_lo"]) | (
             int(pin_list[k + 1]["current_pc_hi"]) << 8
         )
-        if _const_root(r, "next_pc", k, label) != nxt:
+        if const_root(r, "next_pc", k, label) != nxt:
             raise RuntimeError(
                 f"{label} step {k}: control flow leaves the window "
                 "(next_pc != the next step's pc)"
             )
 
-    model, _tokens, tok_to_idx, info = _schedule_and_build(r)
+    model, _tokens, tok_to_idx, info = schedule_and_build(r)
     cycles = sum(op.cycles for op in ops)
     return {
         "kind": "seq", "name": f"seq_{head:04X}", "head": head,
@@ -295,7 +295,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
         "step_spec": fold_step_spec(r, model, tok_to_idx, info,
                                     n_steps=n_steps),
         "union_lookup_of": r.union_lookup_of,
-        "_layers": info.n_layers, "_d": info.d_model,
+        "layers": info.n_layers, "_d": info.d_model,
     }
 
 
@@ -317,12 +317,12 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
     meta: list[dict] = []
     for sid, (name, template, repeat) in enumerate(shapes):
         label = f"shape {name}"
-        ops = _decode_ops(template)
+        ops = decode_ops(template)
         offs = [0]
         for op in ops[:-1]:
             offs.append(offs[-1] + op.length)
         checks = list(zip(offs, (op.byte for op in ops), strict=True))
-        _check_first_read_only(ops, label)
+        check_first_read_only(ops, label)
         self_target = (
             len(ops) == 1 and ops[0].operation == "jmp" and ops[0].mode == "abs"
         )
@@ -342,10 +342,10 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
                 f"{label}: pins reach insert-side expressions "
                 f"of {r.insert_side_hazards}"
             )
-        _check_write_free(r, n_steps, label)
+        check_write_free(r, n_steps, label)
         if not self_target:
             for k in range(n_steps - 1):
-                heads, got = _eval_over_heads(
+                heads, got = eval_over_heads(
                     r, r.dim_of_name[f"next_pc__s{k}"], len(template)
                 )
                 if not np.array_equal(got, heads + pc_offsets[k + 1]):
@@ -354,7 +354,7 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
                         "head + offset for every head"
                     )
 
-        model, _tokens, tok_to_idx, info = _schedule_and_build(r)
+        model, _tokens, tok_to_idx, info = schedule_and_build(r)
         ops_full = ops * repeat
         cycles = sum(op.cycles for op in ops_full)
         experts.append({
@@ -365,7 +365,7 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
             "step_spec": fold_step_spec(r, model, tok_to_idx, info,
                                         n_steps=n_steps),
             "union_lookup_of": r.union_lookup_of,
-            "_layers": info.n_layers, "_d": info.d_model,
+            "layers": info.n_layers, "_d": info.d_model,
         })
         meta.append({
             "id": sid, "name": name, "sig": [[o, b] for o, b in checks],
@@ -376,7 +376,7 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
         logger.info(
             "shape experts: %d folded, %d-%d layers, d_model %d-%d",
             len(experts),
-            min(e["_layers"] for e in experts), max(e["_layers"] for e in experts),
+            min(e["layers"] for e in experts), max(e["layers"] for e in experts),
             min(e["_d"] for e in experts), max(e["_d"] for e in experts),
         )
     return experts, meta

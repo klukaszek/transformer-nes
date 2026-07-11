@@ -40,7 +40,7 @@ class CounterDevice:
         self.log.append(("w", addr, value))
 
 
-def _image() -> bytes:
+def make_image() -> bytes:
     image = bytearray(0x10000)
     main = bytes([
         0xA2, 0x00,              # LDX #$00
@@ -69,13 +69,13 @@ def _image() -> bytes:
     return bytes(image)
 
 
-def _row_key(row):
+def row_key(row):
     s = row.state
     writes = tuple(sorted((w.addr, w.value) for w in row.writes))
     return (s.pc, s.a, s.x, s.y, s.s, s.p, s.halted, writes)
 
 
-def _run_reference(image: bytes):
+def run_reference(image: bytes):
     cpu = Cpu6502(memory=bytearray(image))
     cpu.pc = START_PC
     device = CounterDevice()
@@ -86,8 +86,8 @@ def _run_reference(image: bytes):
 
 
 def test_graph_bus_matches_reference_bus():
-    image = _image()
-    ref_rows, ref_dev, ref_bus = _run_reference(image)
+    image = make_image()
+    ref_rows, ref_dev, ref_bus = run_reference(image)
 
     rt = Cpu6502Runtime()
     rt.boot_image(list(image), start_pc=START_PC)
@@ -98,7 +98,7 @@ def test_graph_bus_matches_reference_bus():
 
     assert len(ref_rows) == len(rows) == STEPS
     for i, (a, b) in enumerate(zip(ref_rows, rows, strict=True)):
-        assert _row_key(a) == _row_key(b), f"step {i}: ref={a.state} graph={b.state}"
+        assert row_key(a) == row_key(b), f"step {i}: ref={a.state} graph={b.state}"
     assert ref_dev.log == device.log
     # Each scheduled NMI ran the handler exactly once.
     assert ref_bus.ram[0x20] == bus.ram[0x20] == len(NMI_AT)
@@ -108,8 +108,8 @@ def test_graph_bus_matches_reference_bus():
 def test_kernel_bus_matches_reference_bus():
     from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
 
-    image = _image()
-    ref_rows, ref_dev, _ref_bus = _run_reference(image)
+    image = make_image()
+    ref_rows, ref_dev, ref_bus = run_reference(image)
 
     rt = Cpu6502CppRuntime(bcd=True)
     device = CounterDevice()

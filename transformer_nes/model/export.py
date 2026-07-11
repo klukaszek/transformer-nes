@@ -26,7 +26,7 @@ from transformer_nes.model.weights import build_model
 from transformer_nes.scheduler.milp import asap_schedule
 
 
-def _csr_tensors(name: str, mat: np.ndarray, out: dict, dtype) -> None:
+def csr_tensors(name: str, mat: np.ndarray, out: dict, dtype) -> None:
     m = sp.csr_matrix(mat)
     m.sort_indices()
     out[f"{name}.data"] = m.data.astype(dtype)
@@ -66,10 +66,10 @@ def export_model(out_dir: str, *, bcd: bool = False, f64: bool = False) -> dict:
         "head": head.astype(dtype),
     }
     for li in range(info.n_layers):
-        _csr_tensors(f"L{li}.in_proj", model.attn[li].in_proj_weight, tensors, dtype)
-        _csr_tensors(f"L{li}.out_proj", model.attn[li].out_proj.weight, tensors, dtype)
-        _csr_tensors(f"L{li}.ff_in", model.ff_in[li].weight, tensors, dtype)
-        _csr_tensors(f"L{li}.ff_out", model.ff_out[li].weight, tensors, dtype)
+        csr_tensors(f"L{li}.in_proj", model.attn[li].in_proj_weight, tensors, dtype)
+        csr_tensors(f"L{li}.out_proj", model.attn[li].out_proj.weight, tensors, dtype)
+        csr_tensors(f"L{li}.ff_in", model.ff_in[li].weight, tensors, dtype)
+        csr_tensors(f"L{li}.ff_out", model.ff_out[li].weight, tensors, dtype)
 
     input_slots = {
         d.name: int(info.slot_of[d])

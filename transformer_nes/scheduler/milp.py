@@ -38,19 +38,19 @@ from transformer_nes.graph.core import (
     graph_lookups,
 )
 from transformer_nes.graph.core import (
-    inv_log_pos as _default_inv_log_pos,
+    inv_log_pos as default_inv_log_pos,
 )
 from transformer_nes.graph.core import (
-    position as _default_position,
+    position as default_position,
 )
 from transformer_nes.graph.core import (
-    position_sq as _default_position_sq,
+    position_sq as default_position_sq,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _build_graph(all_dims=None, all_lookups=None, ilp=None):
+def build_graph(all_dims=None, all_lookups=None, ilp=None):
     """Build dependency graph from dim/lookup lists.
 
     Args:
@@ -63,7 +63,7 @@ def _build_graph(all_dims=None, all_lookups=None, ilp=None):
     if all_lookups is None:
         all_lookups = graph_lookups
     if ilp is None:
-        ilp = _default_inv_log_pos
+        ilp = default_inv_log_pos
     inputs = [d for d in all_dims if isinstance(d, InputDimension)]
     reglus = [d for d in all_dims if isinstance(d, ReGLUDimension)]
     persists = [d for d in all_dims if isinstance(d, PersistDimension)]
@@ -78,18 +78,18 @@ def _build_graph(all_dims=None, all_lookups=None, ilp=None):
     for lu in lookups:
         produced[lu] = set(lu.dims)
 
-    def _edeps(expr):
+    def edeps(expr):
         return set(expr.terms.keys()) if isinstance(expr, Expression) else set()
 
     deps_cache = {}
     for r in reglus:
-        deps_cache[r] = _edeps(r.a_expr) | _edeps(r.b_expr)
+        deps_cache[r] = edeps(r.a_expr) | edeps(r.b_expr)
     for p in persists:
-        deps_cache[p] = _edeps(p.expr)
+        deps_cache[p] = edeps(p.expr)
     for lu in lookups:
         d = set()
         for expr in lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs:
-            d |= _edeps(expr)
+            d |= edeps(expr)
         d.add(ilp)
         deps_cache[lu] = d
 
@@ -134,7 +134,7 @@ def _build_graph(all_dims=None, all_lookups=None, ilp=None):
     )
 
 
-def _min_layers(ops, op_deps):
+def min_layers(ops, op_deps):
     """Critical path length with phase parity (ASAP without tight constraints)."""
     phase, remaining = {}, set(ops)
     while remaining:
@@ -156,7 +156,7 @@ def _min_layers(ops, op_deps):
     return max(phase.values()) // 4 + 1
 
 
-def _all_result_dims(graph):
+def all_result_dims(graph):
     """All dimensions in the graph (inputs + produced)."""
     dims = list(graph["inputs"])
     dim_set = set(dims)
@@ -168,7 +168,7 @@ def _all_result_dims(graph):
     return dims
 
 
-def _layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, ilp, psq):
+def layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, ilp, psq):
     """Turn a phase assignment into layers, birth/death, and alive sets.
 
     Shared by the MILP extraction and the ASAP scheduler; the phase parity
@@ -217,7 +217,7 @@ def _layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, i
         elif d in dim_birth:
             dim_death[d] = dim_birth[d]
 
-    def _alive_at(c):
+    def alive_at(c):
         return frozenset(
             d
             for d in all_dims
@@ -228,12 +228,12 @@ def _layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, i
     for L in range(num_layers):
         for sp in (1, 3):
             c = 4 * L + sp
-            alive_after[c] = _alive_at(c)
+            alive_after[c] = alive_at(c)
 
     return num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after
 
 
-def _legal_phases(lo, hi, op):
+def legal_phases(lo, hi, op):
     """Phases of op's parity within [lo, hi]."""
     if isinstance(op, LookUp):
         start, step = lo + (-lo) % 4, 4
@@ -261,15 +261,15 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
     dependency window (ties -> latest, which also shortens lifetimes),
     spreading persists and ReGLUs across the critical path's slack.
     """
-    _log = log or logger.info
+    log = log or logger.info
 
     if program_graph is not None:
         pg = program_graph
         pos, ilp, psq = pg.position, pg.inv_log_pos, pg.position_sq
-        graph = _build_graph(pg.all_dims, pg.all_lookups, ilp)
+        graph = build_graph(pg.all_dims, pg.all_lookups, ilp)
     else:
-        pos, ilp, psq = _default_position, _default_inv_log_pos, _default_position_sq
-        graph = _build_graph()
+        pos, ilp, psq = default_position, default_inv_log_pos, default_position_sq
+        graph = build_graph()
 
     ops = graph["ops"]
     op_deps = graph["op_deps"]
@@ -279,14 +279,14 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
             "asap_schedule does not honor same-layer constraints of "
             "average-tiebreak lookups; use milp_schedule"
         )
-    all_dims = _all_result_dims(graph)
+    all_dims = all_result_dims(graph)
 
     output_dims = set()
     for expr in output_tokens.values():
         if isinstance(expr, Expression):
             output_dims |= set(expr.terms.keys())
 
-    # ASAP with phase parity (the same rule _min_layers uses).  Iterate in
+    # ASAP with phase parity (the same rule min_layers uses).  Iterate in
     # stable ops order, not set order: the schedule (and therefore the
     # constructed weights) must be deterministic across processes.
     asap, remaining = {}, set(ops)
@@ -297,7 +297,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
             if op not in remaining or any(p not in asap for p in op_deps[op]):
                 continue
             lo = max((asap[p] for p in op_deps[op]), default=-1) + 1
-            asap[op] = next(iter(_legal_phases(lo, lo + 3, op)))
+            asap[op] = next(iter(legal_phases(lo, lo + 3, op)))
             topo_order.append(op)
             remaining.discard(op)
             progress = True
@@ -316,7 +316,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
             kids = [pa[c] for c in children.get(op, ()) if c in pa]
             hi = (min(kids) - 1) if kids else max_phase
             hi = max(hi, asap[op])
-            candidates = list(_legal_phases(asap[op], hi, op)) or [asap[op]]
+            candidates = list(legal_phases(asap[op], hi, op)) or [asap[op]]
             best = min(candidates, key=lambda p: (load[p], -p))
             pa[op] = best
             load[best] += 1
@@ -346,7 +346,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
                 lo = max((pa[d] for d in op_deps[p] if d in pa), default=-1) + 1
                 kids = [pa[c] for c in children.get(p, ()) if c in pa]
                 hi = (min(kids) - 1) if kids else max_phase
-                candidates = list(_legal_phases(lo, max(hi, lo), p)) or [cur]
+                candidates = list(legal_phases(lo, max(hi, lo), p)) or [cur]
 
                 def hygiene_cost(ph, p=p):
                     if ph % 4 != 1:
@@ -368,7 +368,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
                         p1_layers[d][best // 4] += 1
 
     (num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after) = (
-        _layers_and_liveness(
+        layers_and_liveness(
             pa, all_dims, graph["dim_to_op"], graph["consumers"], output_dims, pos, ilp, psq
         )
     )
@@ -376,7 +376,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
     busiest = max(
         (len(p1) + len(f) + len(p2) for _, p1, f, p2 in std_layers), default=0
     )
-    _log(
+    log(
         f"{'Balanced' if balance else 'ASAP'} schedule: {len(ops)} ops, "
         f"{num_layers} layers, max alive width {max_dep}, busiest layer {busiest} ops"
     )
@@ -412,19 +412,19 @@ def milp_schedule(
             usually with width_bound set to the balanced-ASAP d_model.
         width_bound: optional cap on d_model (2 * D_half <= width_bound).
     """
-    _log = log or print
+    log = log or print
 
     if program_graph is not None:
         pg = program_graph
         pos = pg.position
         ilp = pg.inv_log_pos
         psq = pg.position_sq
-        graph = _build_graph(pg.all_dims, pg.all_lookups, ilp)
+        graph = build_graph(pg.all_dims, pg.all_lookups, ilp)
     else:
-        pos = _default_position
-        ilp = _default_inv_log_pos
-        psq = _default_position_sq
-        graph = _build_graph()
+        pos = default_position
+        ilp = default_inv_log_pos
+        psq = default_position_sq
+        graph = build_graph()
     ops = graph["ops"]
     od = graph["op_deps"]
     tt = graph.get("tight_to", {})
@@ -432,16 +432,16 @@ def milp_schedule(
     consumers = graph["consumers"]
     dim_to_op = graph["dim_to_op"]
 
-    all_dims = _all_result_dims(graph)
+    all_dims = all_result_dims(graph)
 
     output_dims = set()
     for expr in output_tokens.values():
         if isinstance(expr, Expression):
             output_dims |= set(expr.terms.keys())
 
-    N = max_layers or _min_layers(ops, od)
+    N = max_layers or min_layers(ops, od)
     P = 4 * N
-    _log(f"MILP: {len(ops)} ops, {len(all_dims)} dims, {N} layers, {P} phases")
+    log(f"MILP: {len(ops)} ops, {len(all_dims)} dims, {N} layers, {P} phases")
 
     # ── MILP ──────────────────────────────────────────────────────
     prob = LpProblem("schedule", LpMinimize)
@@ -691,7 +691,7 @@ def milp_schedule(
         raise ValueError(f"unknown objective {objective!r}")
 
     # ── Solve ─────────────────────────────────────────────────────
-    _log("Solving MILP...")
+    log("Solving MILP...")
     try:
         from pulp import HiGHS
 
@@ -707,7 +707,7 @@ def milp_schedule(
 
     opt_D_half = int(round(value(D_half)))
     opt_D = 2 * opt_D_half
-    _log(f"MILP optimal d_model: {opt_D}")
+    log(f"MILP optimal d_model: {opt_D}")
 
     # ── Extract assignment & build layers ──────────────────────────
     pa = {}
@@ -722,14 +722,14 @@ def milp_schedule(
             pa[op] = 4 * layer + 1 + 2 * is_p2
 
     (num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after) = (
-        _layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, ilp, psq)
+        layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims, pos, ilp, psq)
     )
 
     # ── Linear width at persist boundaries ────────────────────────
     dim_col = {d: i for i, d in enumerate(all_dims)}
     n_dims = len(all_dims)
 
-    def _expr_vec(expr):
+    def expr_vec(expr):
         v = np.zeros(n_dims)
         if isinstance(expr, Expression):
             for dim, coeff in expr.terms.items():
@@ -740,14 +740,14 @@ def milp_schedule(
     op_vecs = {}
     for op in ops:
         if isinstance(op, PersistDimension):
-            op_vecs[op] = [_expr_vec(op.expr)]
+            op_vecs[op] = [expr_vec(op.expr)]
         elif isinstance(op, ReGLUDimension):
-            op_vecs[op] = [_expr_vec(op.a_expr), _expr_vec(op.b_expr)]
+            op_vecs[op] = [expr_vec(op.a_expr), expr_vec(op.b_expr)]
         elif isinstance(op, LookUp):
             op_vecs[op] = [
-                _expr_vec(e) for e in op.query_exprs_2d + op.key_exprs_2d + op.value_exprs
+                expr_vec(e) for e in op.query_exprs_2d + op.key_exprs_2d + op.value_exprs
             ]
-    out_vecs = [_expr_vec(e) for e in output_tokens.values()]
+    out_vecs = [expr_vec(e) for e in output_tokens.values()]
 
     lin_widths = {}
     for c in sorted(alive_after):
@@ -772,40 +772,40 @@ def milp_schedule(
             lin_widths[c] = 0
 
     # ── Expanded lin width (persists → base expressions) ──────────
-    _expand_cache = {}
+    expand_cache = {}
 
-    def _expand_dim(dim):
-        if dim in _expand_cache:
-            return _expand_cache[dim]
+    def expand_dim(dim):
+        if dim in expand_cache:
+            return expand_cache[dim]
         if isinstance(dim, PersistDimension):
             v = np.zeros(n_dims)
             for d, c in dim.expr.terms.items():
-                v += c * _expand_dim(d)
+                v += c * expand_dim(d)
         else:
             v = np.zeros(n_dims)
             if dim in dim_col:
                 v[dim_col[dim]] = 1.0
-        _expand_cache[dim] = v
+        expand_cache[dim] = v
         return v
 
-    def _expr_vec_expanded(expr):
+    def expr_vec_expanded(expr):
         v = np.zeros(n_dims)
         if isinstance(expr, Expression):
             for dim, coeff in expr.terms.items():
-                v += coeff * _expand_dim(dim)
+                v += coeff * expand_dim(dim)
         return v
 
     op_vecs_exp = {}
     for op in ops:
         if isinstance(op, PersistDimension):
-            op_vecs_exp[op] = [_expr_vec_expanded(op.expr)]
+            op_vecs_exp[op] = [expr_vec_expanded(op.expr)]
         elif isinstance(op, ReGLUDimension):
-            op_vecs_exp[op] = [_expr_vec_expanded(op.a_expr), _expr_vec_expanded(op.b_expr)]
+            op_vecs_exp[op] = [expr_vec_expanded(op.a_expr), expr_vec_expanded(op.b_expr)]
         elif isinstance(op, LookUp):
             op_vecs_exp[op] = [
-                _expr_vec_expanded(e) for e in op.query_exprs_2d + op.key_exprs_2d + op.value_exprs
+                expr_vec_expanded(e) for e in op.query_exprs_2d + op.key_exprs_2d + op.value_exprs
             ]
-    out_vecs_exp = [_expr_vec_expanded(e) for e in output_tokens.values()]
+    out_vecs_exp = [expr_vec_expanded(e) for e in output_tokens.values()]
 
     exp_lin_widths = {}
     for c in sorted(alive_after):
@@ -833,7 +833,7 @@ def milp_schedule(
     max_dep = max((len(s) for s in alive_after.values()), default=0)
     max_lin = max(lin_widths.values(), default=0)
     max_exp_lin = max(exp_lin_widths.values(), default=0)
-    _log(
+    log(
         f"\nSchedule: {num_layers} layers, d_model={opt_D}, "
         f"max_dep={max_dep}, max_lin={max_lin}, max_exp_lin={max_exp_lin}"
     )
@@ -847,7 +847,7 @@ def milp_schedule(
         dw3 = len(alive_after.get(c3, set()))
         lw3 = lin_widths.get(c3, 0)
         ew3 = exp_lin_widths.get(c3, 0)
-        _log(
+        log(
             f"  L{L}: A[{len(attn)}] P1[{len(p1)}] F[{len(ffn)}] P2[{len(p2)}]  "
             f"after_attn={dw1}/{lw1}/{ew1} after_ffn={dw3}/{lw3}/{ew3}"
         )
@@ -855,10 +855,10 @@ def milp_schedule(
     for L in range(num_layers - 1):
         c = 4 * L + 3
         names = sorted(d.name for d in alive_after.get(c, set()))
-        _log(f"  Cut L{L}/L{L + 1} ({len(names)}): {names}")
+        log(f"  Cut L{L}/L{L + 1} ({len(names)}): {names}")
 
     # ── Write plan.yaml ───────────────────────────────────────────
-    _write_plan(
+    write_plan(
         "plan.yaml",
         std_layers,
         num_layers,
@@ -870,7 +870,7 @@ def milp_schedule(
         produced,
         max_phase,
     )
-    _log("Schedule written to plan.yaml")
+    log("Schedule written to plan.yaml")
 
     return dict(
         phase_assign=pa,
@@ -890,11 +890,11 @@ class _InlineList(list):
     pass
 
 
-def _compact_representer(dumper, data):
+def compact_representer(dumper, data):
     return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True)
 
 
-def _write_plan(
+def write_plan(
     path,
     std_layers,
     num_layers,
@@ -909,7 +909,7 @@ def _write_plan(
     """Write schedule to plan.yaml for inspection."""
     import yaml
 
-    yaml.add_representer(_InlineList, _compact_representer)
+    yaml.add_representer(_InlineList, compact_representer)
 
     plan = {
         "summary": {

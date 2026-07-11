@@ -51,13 +51,13 @@ CODE_FILES = (
     "cpu6502/backends/weights/experts.py",
     "cpu6502/backends/weights/runner.py",
 )
-_code_digest_cache: str | None = None
+code_digest_cache: str | None = None
 
 
-def _code_digest() -> str:
-    global _code_digest_cache
-    if _code_digest_cache is not None:
-        return _code_digest_cache
+def code_digest() -> str:
+    global code_digest_cache
+    if code_digest_cache is not None:
+        return code_digest_cache
     pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     paths = []
     for d in CODE_DIRS:
@@ -73,19 +73,19 @@ def _code_digest() -> str:
         h.update(os.path.relpath(p, pkg).encode())
         with open(p, "rb") as fh:
             h.update(fh.read())
-    _code_digest_cache = h.hexdigest()
-    return _code_digest_cache
+    code_digest_cache = h.hexdigest()
+    return code_digest_cache
 
 
 def engine_config_key(*, bcd: bool, expert_bytes, extra: str = "") -> str:
     """Cache key for a built engine, computable without folding or emitting:
     the config plus a digest of every source file that shapes the emission."""
     tag = ",".join(f"{int(b):02X}" for b in expert_bytes)
-    raw = f"{_code_digest()}|bcd={int(bcd)}|experts={tag}|{extra}"
+    raw = f"{code_digest()}|bcd={int(bcd)}|experts={tag}|{extra}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
-def _manifest_read() -> dict:
+def manifest_read() -> dict:
     try:
         with open(MANIFEST_PATH) as f:
             return json.load(f)
@@ -93,8 +93,8 @@ def _manifest_read() -> dict:
         return {}
 
 
-def _manifest_put(key: str, entry: dict) -> None:
-    manifest = _manifest_read()
+def manifest_put(key: str, entry: dict) -> None:
+    manifest = manifest_read()
     manifest[key] = entry
     os.makedirs(CACHE_DIR, exist_ok=True)
     tmp = MANIFEST_PATH + ".tmp"
@@ -106,7 +106,7 @@ def _manifest_put(key: str, entry: dict) -> None:
 FUNC_RE = re.compile(r"^    void ((?:layer_|step_core)\w*)\((.*)\) \{$")
 
 
-def _shard_source(source: str, struct_name: str, n_shards: int) -> tuple[str, list[str]]:
+def shard_source(source: str, struct_name: str, n_shards: int) -> tuple[str, list[str]]:
     """Split the single-TU engine into a header + n_shards bodies so ninja
     compiles them in parallel.  The heavy member functions (layer_*,
     step_core*) become out-of-class definitions, greedily balanced by line
@@ -154,7 +154,7 @@ def _shard_source(source: str, struct_name: str, n_shards: int) -> tuple[str, li
     return "\n".join(header) + "\n", ["\n".join(s) + "\n" for s in shards]
 
 
-def _load_module(
+def load_module(
     name: str, digest: str, sources: list[str]
 ) -> tuple[object, float]:
     """Load a cached extension or compile it from ``sources``."""
@@ -185,13 +185,13 @@ def _load_module(
     return module, time.perf_counter() - build_start
 
 
-def _load_engine_module(digest: str) -> tuple[object, float]:
+def load_engine_module(digest: str) -> tuple[object, float]:
     shard_glob = sorted(
         f for f in os.listdir(CACHE_DIR)
         if f.startswith(f"engine_{digest}_s") and f.endswith(".cpp")
     )
     sources = [os.path.join(CACHE_DIR, path) for path in shard_glob]
-    return _load_module(f"weights_gen_{digest}", digest, sources)
+    return load_module(f"weights_gen_{digest}", digest, sources)
 
 
 def seqmod_config_key(*, core_digest: str, bcd: bool, windows) -> str:
@@ -199,19 +199,19 @@ def seqmod_config_key(*, core_digest: str, bcd: bool, windows) -> str:
     header the module compiles against; the code digest covers fold/emission
     changes that alter the module without altering the core's source."""
     tag = ",".join(f"{h:04X}:{bytes(c).hex()}x{r}" for h, c, r in windows)
-    raw = f"{_code_digest()}|core={core_digest}|bcd={int(bcd)}|seq={tag}"
+    raw = f"{code_digest()}|core={core_digest}|bcd={int(bcd)}|seq={tag}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
-def _load_seqmod_module(digest: str) -> tuple[object, float]:
-    return _load_module(
+def load_seqmod_module(digest: str) -> tuple[object, float]:
+    return load_module(
         f"seqmod_gen_{digest}",
         digest,
         [os.path.join(CACHE_DIR, f"seqmod_{digest}.cpp")],
     )
 
 
-def _lit_d(value: float) -> str:
+def lit_d(value: float) -> str:
     """A float64 value as an exact C++ hexfloat literal."""
     f = float(value)
     if f == int(f) and abs(f) < 2**53:
@@ -219,7 +219,7 @@ def _lit_d(value: float) -> str:
     return f.hex()
 
 
-def _join(terms) -> str:
+def join(terms) -> str:
     if not terms:
         return ""
     sign, first = terms[0]
@@ -229,7 +229,7 @@ def _join(terms) -> str:
     return out
 
 
-def _expr_dbl(indices, data, ref) -> str:
+def expr_dbl(indices, data, ref) -> str:
     """One CSR row as a float64 expression (hull-bound Q/K/V rows)."""
     terms = []
     for idx, c in zip(indices, data, strict=True):
@@ -239,11 +239,11 @@ def _expr_dbl(indices, data, ref) -> str:
         elif c == -1.0:
             terms.append(("-", ref(idx)))
         else:
-            terms.append(("+", f"{_lit_d(c)}*{ref(idx)}"))
-    return _join(terms) or "0.0"
+            terms.append(("+", f"{lit_d(c)}*{ref(idx)}"))
+    return join(terms) or "0.0"
 
 
-def _expr_int(indices, data, ref, where: str) -> str:
+def expr_int(indices, data, ref, where: str) -> str:
     """One CSR row as an exact fixed-point integer expression.
 
     Integer coefficients only, except +-0.5 (four fused direct-map
@@ -270,21 +270,21 @@ def _expr_int(indices, data, ref, where: str) -> str:
                 f"{where}: coefficient {c} is not representable in the "
                 "exact int32 emission"
             )
-    return _join(terms) or "0"
+    return join(terms) or "0"
 
 
-def _row(csr, r):
+def row(csr, r):
     lo, hi = csr.indptr[r], csr.indptr[r + 1]
     return csr.indices[lo:hi], csr.data[lo:hi]
 
 
-def _csr(array) -> sp.csr_matrix:
+def csr(array) -> sp.csr_matrix:
     m = sp.csr_matrix(array)
     m.sort_indices()
     return m
 
 
-def _zero_columns(m: sp.csr_matrix, cols) -> sp.csr_matrix:
+def zero_columns(m: sp.csr_matrix, cols) -> sp.csr_matrix:
     out = m.tolil()
     for c in cols:
         out[:, c] = 0
@@ -294,7 +294,7 @@ def _zero_columns(m: sp.csr_matrix, cols) -> sp.csr_matrix:
     return out
 
 
-def _compose(outer: sp.csr_matrix, cols, inner_rows: sp.csr_matrix) -> sp.csr_matrix:
+def compose(outer: sp.csr_matrix, cols, inner_rows: sp.csr_matrix) -> sp.csr_matrix:
     """outer[:, cols] @ inner_rows, like the engine's direct-map fusion.
 
     Duplicate contributions merge in float64 and exact zeros are dropped,
@@ -306,7 +306,7 @@ def _compose(outer: sp.csr_matrix, cols, inner_rows: sp.csr_matrix) -> sp.csr_ma
     return direct
 
 
-def _check_ffn_kinds(model, layer_idx):
+def check_ffn_kinds(model, layer_idx):
     """Validate the fusion contract behind ffn_kinds == 2.
 
     Kind-2 (linear passthrough/erase) neurons are folded into a direct
@@ -548,7 +548,7 @@ PYBIND_STEP_METHODS = """\
 SEQ_MAX_K = 32
 
 
-def _assemble_seq_module(lines, body, experts, core_digest, elem,
+def assemble_seq_module(lines, body, experts, core_digest, elem,
                          n_seen, emit_step_core) -> tuple[str, int, bool]:
     """Assemble the per-ROM sequence-module TU from the emitted expert
     bodies: a SEQMOD_T struct compiled against the core's generated header,
@@ -699,10 +699,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         return f"pf[{i}]" if i <= 2 else f"({inv_scale}*(double)x[{i}])"
 
     def row_int(csr_m, r, ref, where):
-        return _expr_int(*_row(csr_m, r), ref, where)
+        return expr_int(*row(csr_m, r), ref, where)
 
     def row_raw(indices, data, ref, where):
-        return _expr_int(indices, data, ref, where)
+        return expr_int(indices, data, ref, where)
 
     def plan_model(mdl, label, union_lookup_of=None):
         """Per-layer emission plans for one model.
@@ -722,11 +722,11 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         nh = mdl.attn[0].num_heads
         plans: list[dict] = []
         for li in range(len(mdl.attn)):
-            _check_ffn_kinds(mdl, li)
-            ip = _csr(mdl.attn[li].in_proj_weight)
-            op = _csr(mdl.attn[li].out_proj.weight)
-            fi = _csr(mdl.ff_in[li].weight)
-            fo = _csr(mdl.ff_out[li].weight)
+            check_ffn_kinds(mdl, li)
+            ip = csr(mdl.attn[li].in_proj_weight)
+            op = csr(mdl.attn[li].out_proj.weight)
+            fi = csr(mdl.ff_in[li].weight)
+            fo = csr(mdl.ff_out[li].weight)
             ffn = fo.shape[1]
             kinds = mdl.head_kinds[li]
             ffn_kinds = mdl.ffn_kinds[li]
@@ -766,8 +766,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             # Structural passthrough/erase fusion: fold kind-2 heads and
             # neurons into direct D->D residual maps (no hull/ReGLU needed).
             pt_cols = [2 * h + c for h in passthrough for c in range(2)]
-            attn_direct = _compose(op, pt_cols, ip[[2 * dm + c for c in pt_cols], :])
-            op_kept = _zero_columns(op, pt_cols)
+            attn_direct = compose(op, pt_cols, ip[[2 * dm + c for c in pt_cols], :])
+            op_kept = zero_columns(op, pt_cols)
 
             lookup_cols = {2 * h + c for h in lookup for c in range(2)}
             for c in np.unique(op_kept.indices):
@@ -778,8 +778,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     )
 
             pt_j = [j for j in range(ffn) if ffn_kinds[j] == 2]
-            ffn_direct = _compose(fo, pt_j, fi[[ffn + j for j in pt_j], :])
-            fo_kept = _zero_columns(fo, pt_j)
+            ffn_direct = compose(fo, pt_j, fi[[ffn + j for j in pt_j], :])
+            fo_kept = zero_columns(fo, pt_j)
             live = sorted(int(j) for j in np.unique(fo_kept.indices))
 
             # Per-head emission blocks (each self-contained: it defines
@@ -794,8 +794,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 # Eligibility decisions live in model/classify.py, shared
                 # with the C++ kernel so the two engines cannot drift.
                 # Position features occupy slots 0-2: banned in queries.
-                q0_idx, q0_dat = _row(ip, 2 * h)
-                q1_idx, q1_dat = _row(ip, 2 * h + 1)
+                q0_idx, q0_dat = row(ip, 2 * h)
+                q1_idx, q1_dat = row(ip, 2 * h + 1)
                 qx_terms = list(zip(q0_dat, q0_idx, strict=True))
                 qy_terms = list(zip(q1_dat, q1_idx, strict=True))
                 mem_terms = None
@@ -823,8 +823,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                         # license: qx == qy > 0 makes the score a positive
                         # multiple of kx + ky, and the clear gate an exact
                         # zero test -- no f64 in the fold or the compare.
-                        k0_idx, k0_dat = _row(ip, dm + 2 * h)
-                        k1_idx, k1_dat = _row(ip, dm + 2 * h + 1)
+                        k0_idx, k0_dat = row(ip, dm + 2 * h)
+                        k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
                         reg_score = integer_score_terms(
                             reg_q[0], reg_q[1],
                             list(zip(k0_dat, k0_idx, strict=True)),
@@ -835,9 +835,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                             reg_q = None
                     if reg_q is not None:
                         try:
-                            v0_i = _expr_int(*_row(ip, 2 * dm + 2 * h),
+                            v0_i = expr_int(*row(ip, 2 * dm + 2 * h),
                                              xref, f"{label} L{li} reg v0")
-                            v1_i = _expr_int(*_row(ip, 2 * dm + 2 * h + 1),
+                            v1_i = expr_int(*row(ip, 2 * dm + 2 * h + 1),
                                              xref, f"{label} L{li} reg v1")
                         except RuntimeError:
                             reg_q = None
@@ -848,10 +848,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     # structure. Nearest address wins and equal-distance ties
                     # use the latest write. The hull remains empty by design.
                     g = mem_groups[h]
-                    qi_expr = _expr_int([i for _c, i in mem_terms],
+                    qi_expr = expr_int([i for _c, i in mem_terms],
                                         [c for c, _i in mem_terms],
                                         xref, f"{label} L{li} mem query")
-                    k1_idx, k1_dat = _row(ip, dm + 2 * h + 1)
+                    k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
                     guard = integer_score_terms(
                         1.0, 1.0, [],
                         list(zip(k1_dat, k1_idx, strict=True)),
@@ -870,7 +870,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                         b.append(f"                if ({live_cond})")
                     else:
                         uses_pf.add(True)
-                        k1 = _expr_dbl(*_row(ip, dm + 2 * h + 1), dref)
+                        k1 = expr_dbl(*row(ip, dm + 2 * h + 1), dref)
                         b.append(f"                const double kyg = {k1};")
                         b.append("                if (kyg > -1.0e29)")
                     b.append('                    throw std::runtime_error('
@@ -908,7 +908,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                                 f"has no union register (lookup {lu_id} pair {pair})"
                             )
                     score_terms, gate_ids = reg_score
-                    s_expr = _expr_int(
+                    s_expr = expr_int(
                         [i for _c, i in score_terms],
                         [c for c, _i in score_terms],
                         xref, f"{label} L{li} reg score",
@@ -943,12 +943,12 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                         mem_fallback_hulls.append(hid)
                     # Q/K/V straight to double: the hull resolves in double
                     # anyway, and only these rows may read position features.
-                    q0 = _expr_dbl(*_row(ip, 2 * h), dref)
-                    q1 = _expr_dbl(*_row(ip, 2 * h + 1), dref)
-                    k0 = _expr_dbl(*_row(ip, dm + 2 * h), dref)
-                    k1 = _expr_dbl(*_row(ip, dm + 2 * h + 1), dref)
-                    v0 = _expr_dbl(*_row(ip, 2 * dm + 2 * h), dref)
-                    v1 = _expr_dbl(*_row(ip, 2 * dm + 2 * h + 1), dref)
+                    q0 = expr_dbl(*row(ip, 2 * h), dref)
+                    q1 = expr_dbl(*row(ip, 2 * h + 1), dref)
+                    k0 = expr_dbl(*row(ip, dm + 2 * h), dref)
+                    k1 = expr_dbl(*row(ip, dm + 2 * h + 1), dref)
+                    v0 = expr_dbl(*row(ip, 2 * dm + 2 * h), dref)
+                    v1 = expr_dbl(*row(ip, 2 * dm + 2 * h + 1), dref)
                     b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
                     b.append("        {")
                     b.append(f"            if (hull_seen[{hid}] != seq) {{")
@@ -990,7 +990,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             opkept: list[tuple[int, list[int], list[float]]] = []
             for r in range(dm):
                 if op_kept.indptr[r + 1] > op_kept.indptr[r]:
-                    idxs, dat = _row(op_kept, r)
+                    idxs, dat = row(op_kept, r)
                     opkept.append((r, [int(c) for c in idxs], list(dat)))
             ad_apply = [f"        x[{r}] += ad{r};" for r in ad_rows]
 
@@ -1013,7 +1013,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             fokept: list[tuple[int, list[int], list[float]]] = []
             for r in range(dm):
                 if fo_kept.indptr[r + 1] > fo_kept.indptr[r]:
-                    idxs, dat = _row(fo_kept, r)
+                    idxs, dat = row(fo_kept, r)
                     fokept.append((r, [int(c) for c in idxs], list(dat)))
             fd_apply = [f"        x[{r}] += fd{r};" for r in fd_rows]
 
@@ -1160,9 +1160,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 emit(f"        out[{off + 13}] = 0;")
         last = 21 * (len(step_outs) - 1)
         emit(f"        const long long halt_logit = "
-             f"{_expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
+             f"{expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
         emit(f"        const long long state_logit = "
-             f"{_expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
+             f"{expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
         emit(f"        out[{last + 13}] = halt_logit > state_logit ? 1 : 0;")
         emit("        // Advance the architectural state (inputs are fully")
         emit("        // consumed by the embed above before this update).")
@@ -1177,7 +1177,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("    }")
 
     if seq_mode:
-        return _assemble_seq_module(
+        return assemble_seq_module(
             lines, body, experts, seq_module_core, elem,
             len(hull_tiebreak), emit_step_core,
         )
@@ -1441,28 +1441,28 @@ class GeneratedWeightsEngine:
         hpp_path = os.path.join(CACHE_DIR, f"engine_{digest}.hpp")
         if not os.path.exists(hpp_path):
             n_shards = max(1, min((os.cpu_count() or 4) - 2, 12))
-            header, shards = _shard_source(source, f"Engine_{digest}", n_shards)
+            header, shards = shard_source(source, f"Engine_{digest}", n_shards)
             for k, body in enumerate(shards):
                 with open(os.path.join(CACHE_DIR, f"engine_{digest}_s{k}.cpp"),
                           "w") as f:
                     f.write(f'#include "engine_{digest}.hpp"\n\n{body}')
             with open(hpp_path, "w") as f:
                 f.write(header)
-        module, self.compile_seconds = _load_engine_module(digest)
+        module, self.compile_seconds = load_engine_module(digest)
         if cache_key is not None:
-            _manifest_put(cache_key, {
+            manifest_put(cache_key, {
                 "digest": digest, "n_experts": self.n_experts,
                 "n_memory_heads": self.n_memory_heads,
                 "has_machine_step": self.has_machine_step,
                 "shapes": self.shapes_meta,
             })
-        self._bind(module)
+        self.bind(module)
 
     @classmethod
     def from_cache(cls, cache_key: str) -> GeneratedWeightsEngine | None:
         """Load an engine by config key alone, skipping the expert folds and
         the source emission entirely; None on any miss."""
-        entry = _manifest_read().get(cache_key)
+        entry = manifest_read().get(cache_key)
         if entry is None:
             return None
         if not os.path.exists(
@@ -1475,42 +1475,42 @@ class GeneratedWeightsEngine:
         self.n_memory_heads = entry["n_memory_heads"]
         self.has_machine_step = entry["has_machine_step"]
         self.shapes_meta = entry.get("shapes") or []
-        module, self.compile_seconds = _load_engine_module(entry["digest"])
-        self._bind(module)
+        module, self.compile_seconds = load_engine_module(entry["digest"])
+        self.bind(module)
         return self
 
-    def _bind(self, module) -> None:
-        self._engine = module.Engine()
+    def bind(self, module) -> None:
+        self.engine = module.Engine()
         # The run loop is emitted under the same condition as machine_step.
         self.has_run_loop = self.has_machine_step
         if self.has_machine_step:
             # Bound methods exposed directly: the hot loops call them with no
             # wrapper frame in between.
-            self.machine_step = self._engine.machine_step
-            self.run = self._engine.run
-            self.set_run_state = self._engine.set_run_state
-            self.get_run_state = self._engine.get_run_state
-            self.watch_read = self._engine.watch_read
-            self.watch_write = self._engine.watch_write
-            self.clear_watches = self._engine.clear_watches
-            self.set_read_lease = self._engine.set_read_lease
-            self.clear_read_lease = self._engine.clear_read_lease
-            self.set_nmi = self._engine.set_nmi
-            self.engine_inject_write = self._engine.inject_write
-            self.read_ram = self._engine.read_ram
-            self.dump_ram = self._engine.dump_ram
-            self.attach_seq = self._engine.attach_seq
-            self.detach_seq = self._engine.detach_seq
-            self.add_window = self._engine.add_window
-            self.clear_windows = self._engine.clear_windows
-            self.jit_hot = self._engine.jit_hot
-            self.window_shape = self._engine.window_shape
+            self.machine_step = self.engine.machine_step
+            self.run = self.engine.run
+            self.set_run_state = self.engine.set_run_state
+            self.get_run_state = self.engine.get_run_state
+            self.watch_read = self.engine.watch_read
+            self.watch_write = self.engine.watch_write
+            self.clear_watches = self.engine.clear_watches
+            self.set_read_lease = self.engine.set_read_lease
+            self.clear_read_lease = self.engine.clear_read_lease
+            self.set_nmi = self.engine.set_nmi
+            self.engine_inject_write = self.engine.inject_write
+            self.read_ram = self.engine.read_ram
+            self.dump_ram = self.engine.dump_ram
+            self.attach_seq = self.engine.attach_seq
+            self.detach_seq = self.engine.detach_seq
+            self.add_window = self.engine.add_window
+            self.clear_windows = self.engine.clear_windows
+            self.jit_hot = self.engine.jit_hot
+            self.window_shape = self.engine.window_shape
 
     def reset(self):
-        self._engine.reset()
+        self.engine.reset()
 
     def forward(self, x: np.ndarray) -> None:
-        self._engine.forward_token(x)
+        self.engine.forward_token(x)
 
     @property
     def supports_direct_writes(self) -> bool:
@@ -1522,7 +1522,7 @@ class GeneratedWeightsEngine:
                 "model has no memory-tagged lookup heads; a direct WRITE would "
                 "be silently lost -- use a full WRITE-token forward instead"
             )
-        self._engine.insert_write(addr, value, pos)
+        self.engine.insert_write(addr, value, pos)
 
 
 class SequenceModule:
@@ -1547,19 +1547,19 @@ class SequenceModule:
         if not os.path.exists(path):
             with open(path, "w") as f:
                 f.write(source)
-        module, self.compile_seconds = _load_seqmod_module(digest)
+        module, self.compile_seconds = load_seqmod_module(digest)
         if cache_key is not None:
-            _manifest_put(cache_key, {
+            manifest_put(cache_key, {
                 "kind": "seqmod", "digest": digest,
                 "core": core_digest, "n_windows": len(experts),
             })
-        self._bind(module)
+        self.bind(module)
 
     @classmethod
     def from_cache(cls, cache_key: str, *, core_digest: str) -> SequenceModule | None:
         """Load a module by config key alone, skipping the sequence folds
         and the emission entirely; None on any miss."""
-        entry = _manifest_read().get(cache_key)
+        entry = manifest_read().get(cache_key)
         if (
             entry is None
             or entry.get("kind") != "seqmod"
@@ -1572,17 +1572,17 @@ class SequenceModule:
         self = cls.__new__(cls)
         self.core_digest = core_digest
         self.digest = entry["digest"]
-        module, self.compile_seconds = _load_seqmod_module(entry["digest"])
-        self._bind(module)
+        module, self.compile_seconds = load_seqmod_module(entry["digest"])
+        self.bind(module)
         return self
 
-    def _bind(self, module) -> None:
+    def bind(self, module) -> None:
         if module.core_name != f"Engine_{self.core_digest}":
             raise RuntimeError(
                 f"sequence module was compiled against {module.core_name}, "
                 f"not Engine_{self.core_digest}"
             )
         self.max_k = int(module.max_k)
-        self._mod = module.SeqModule()
+        self.mod = module.SeqModule()
         self.fn_ptr = int(module.SeqModule.fn_ptr())
-        self.ctx_ptr = int(self._mod.ctx_ptr())
+        self.ctx_ptr = int(self.mod.ctx_ptr())

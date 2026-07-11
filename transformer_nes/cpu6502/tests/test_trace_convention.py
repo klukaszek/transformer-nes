@@ -19,7 +19,7 @@ from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
 from transformer_nes.cpu6502.backends.reference import Cpu6502
 
 
-def _assert_full_trace_match(image, start_pc, max_steps, *, bcd):
+def assert_full_trace_match(image, start_pc, max_steps, *, bcd):
     rt = Cpu6502CppRuntime(bcd=bcd)
     out = rt.run_image_arrays(bytes(image), start_pc=start_pc, max_steps=max_steps)
     ref = Cpu6502(memory=bytearray(image), bcd_enabled=bcd)
@@ -40,7 +40,7 @@ def _assert_full_trace_match(image, start_pc, max_steps, *, bcd):
 def test_nestest_trace_fields_match_reference():
     from transformer_nes.nes.examples.nestest import START_PC, load_image
 
-    n = _assert_full_trace_match(load_image(), START_PC, 8991, bcd=False)
+    n = assert_full_trace_match(load_image(), START_PC, 8991, bcd=False)
     assert n == 8991
 
 
@@ -48,4 +48,4 @@ def test_nestest_trace_fields_match_reference():
 def test_klaus_prefix_trace_fields_match_reference():
     from transformer_nes.cpu6502.examples.klaus.harness import START_PC, load_image
 
-    _assert_full_trace_match(load_image(), START_PC, 200_000, bcd=True)
+    assert_full_trace_match(load_image(), START_PC, 200_000, bcd=True)

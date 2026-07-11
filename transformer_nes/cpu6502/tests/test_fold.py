@@ -42,7 +42,7 @@ from transformer_nes.graph.fold import (
     sequence_pins,
     sequence_shape_pins,
 )
-from transformer_nes.scheduler.milp import _build_graph, _min_layers
+from transformer_nes.scheduler.milp import build_graph, min_layers
 
 # Opcodes exercised by weights_runner.verify_program, chosen to cover the
 # distinct machinery: zero-page store (write channel), zero-page load
@@ -64,13 +64,13 @@ def folder(union_pg):
     return GraphFolder(union_pg, root_names=RUNTIME_READ_DIMS)
 
 
-def _depth(fold_result):
+def depth(fold_result):
     pg = fold_result.program_graph
-    g = _build_graph(pg.all_dims, pg.all_lookups, pg.inv_log_pos)
-    return _min_layers(g["ops"], g["op_deps"]) if g["ops"] else 0
+    g = build_graph(pg.all_dims, pg.all_lookups, pg.inv_log_pos)
+    return min_layers(g["ops"], g["op_deps"]) if g["ops"] else 0
 
 
-def _graph_counts(pg):
+def graph_counts(pg):
     reglus = persists = terms = 0
     lookups = set()
     for dim in pg.all_dims:
@@ -102,11 +102,11 @@ def test_unpinned_fold_metrics_match_materialized_graph(union_pg, union_fold):
     r = union_fold
     assert r.insert_side_hazards == ()
     assert r.folded_roots == ()
-    assert (r.n_reglus, r.n_persists, r.n_lookups, r.n_terms) == _graph_counts(
+    assert (r.n_reglus, r.n_persists, r.n_lookups, r.n_terms) == graph_counts(
         r.program_graph
     )
-    graph = _build_graph(union_pg.all_dims, union_pg.all_lookups, union_pg.inv_log_pos)
-    assert _depth(r) <= _min_layers(graph["ops"], graph["op_deps"])
+    graph = build_graph(union_pg.all_dims, union_pg.all_lookups, union_pg.inv_log_pos)
+    assert depth(r) <= min_layers(graph["ops"], graph["op_deps"])
 
 
 @pytest.mark.parametrize("byte", [0x4C, 0xAD, 0x29, 0xF0])
@@ -121,7 +121,7 @@ def test_opcode_fold_is_materially_smaller(folder, union_fold, byte):
     for name in RUNTIME_READ_DIMS:
         assert name in r.dim_of_name, f"readout {name} missing from fold"
     assert r.n_terms <= base.n_terms * 0.30
-    assert _depth(r) < _depth(base) * 0.5
+    assert depth(r) < depth(base) * 0.5
 
     # The default fold additionally pins the fetched byte (the router
     # predicate ram[pc] == byte): the PC fetch read and decode residue fold
@@ -135,7 +135,7 @@ def test_opcode_fold_is_materially_smaller(folder, union_fold, byte):
 # ── Semantic shadow receipt ──────────────────────────────────────────
 
 
-def _boot_tokens(image):
+def boot_tokens(image):
     tokens = [("boot", {
         "start_pc_lo": VERIFY_START & 0xFF,
         "start_pc_hi": (VERIFY_START >> 8) & 0xFF,
@@ -150,11 +150,11 @@ def _boot_tokens(image):
     return tokens
 
 
-def _read_all(ev, v):
+def read_all(ev, v):
     return {name: int(round(ev.read(v, name))) for name in RUNTIME_READ_DIMS}
 
 
-def _writes_of(reads):
+def writes_of(reads):
     writes = set()
     for store, addr, value in (
         ("is_store", "write_addr_out", "write_value_out"),
@@ -175,7 +175,7 @@ def union_run(union_pg):
     against."""
     ev = ProgramEvaluator(union_pg)
     image = verify_program()
-    tokens = _boot_tokens(image)
+    tokens = boot_tokens(image)
     for _, inputs in tokens:
         ev.step(inputs)
 
@@ -209,8 +209,8 @@ def union_run(union_pg):
             "in_data": st["data"], "in_halted": 0, "in_nmi": 0,
         }
         v = ev.step(inputs)
-        reads = _read_all(ev, v)
-        writes = _writes_of(reads)
+        reads = read_all(ev, v)
+        writes = writes_of(reads)
 
         # The union graph must match the oracle on the architectural fields
         # (same contract as klaus.lockstep_arrays_vs_reference).
@@ -257,7 +257,7 @@ POLL_HEAD = 0x0400
 SPIN_HEAD = 0x0408
 
 
-def _poll_program():
+def poll_program():
     """LDA $0700 / AND #$40 / BEQ -7 poll loop, then NOP and a JMP spin."""
     image = bytearray(0x10000)
     image[POLL_HEAD:POLL_HEAD + 11] = bytes([
@@ -275,7 +275,7 @@ def poll_run(union_pg):
     """Drive the union over the poll program (three loop iterations, a flag
     write flipping the poll, then the fall-through into the JMP spin)."""
     ev = ProgramEvaluator(union_pg)
-    image = _poll_program()
+    image = poll_program()
     tokens = [("boot", {
         "start_pc_lo": POLL_HEAD & 0xFF, "start_pc_hi": POLL_HEAD >> 8,
         "is_start": 1,
@@ -319,8 +319,8 @@ def poll_run(union_pg):
             "in_data": st["data"], "in_halted": 0, "in_nmi": 0,
         }
         v = ev.step(inputs)
-        reads = _read_all(ev, v)
-        assert not _writes_of(reads), "the poll program must be write-free"
+        reads = read_all(ev, v)
+        assert not writes_of(reads), "the poll program must be write-free"
         tokens.append(("state", inputs))
         steps.append({"reads": reads, "pc": st["pc"]})
         st.update(
@@ -417,7 +417,7 @@ def test_folded_expert_shadows_union(folder, union_run, byte):
         expected = next(step_iter)
         if expected["opcode"] != byte:
             continue
-        reads = _read_all(ev, v)
+        reads = read_all(ev, v)
         assert reads == expected["reads"], f"routed step diverged for {byte:02X}"
         assert state_expr.evaluate(v) > halt_expr.evaluate(v)
         matched += 1
@@ -432,7 +432,7 @@ SHAPE_HEADS = {
 }
 
 
-def _shape_program():
+def shape_program():
     """Two instantiations of each shape: the DEX/BNE delay at an in-page
     head and at $04FF (its BNE sits at $0500 -- the pc carry gadget fires),
     then two poll trios with different operands."""
@@ -459,7 +459,7 @@ def shape_run(union_pg):
     """Union walk over the shape program: both delay loops (taken + exit),
     both polls (three spins, a flag flip, the fall-through)."""
     ev = ProgramEvaluator(union_pg)
-    image = _shape_program()
+    image = shape_program()
     start = 0x047E
     tokens = [("boot", {"start_pc_lo": start & 0xFF, "start_pc_hi": start >> 8,
                         "is_start": 1})]
@@ -502,7 +502,7 @@ def shape_run(union_pg):
             "in_data": st["data"], "in_halted": 0, "in_nmi": 0,
         }
         v = ev.step(inputs)
-        reads = _read_all(ev, v)
+        reads = read_all(ev, v)
         row = ref.step()
         s = row.state
         got = (reads["current_pc"] & 0xFFFF, reads["new_a"] & 0xFF,

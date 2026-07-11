@@ -48,7 +48,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from transformer_nes.graph import core as _graph
+from transformer_nes.graph import core as graph
 from transformer_nes.graph.core import (
     Dimension,
     Expression,
@@ -62,7 +62,7 @@ from transformer_nes.graph.core import (
 )
 
 
-def _const_of(expr: Expression, one: Dimension) -> float | None:
+def const_of(expr: Expression, one: Dimension) -> float | None:
     """The float value if expr is constant (only ``one`` terms), else None."""
     for d in expr.terms:
         if d is not one:
@@ -70,7 +70,7 @@ def _const_of(expr: Expression, one: Dimension) -> float | None:
     return expr.terms.get(one, 0.0)
 
 
-def _subst(expr: Expression, val: dict) -> Expression:
+def subst(expr: Expression, val: dict) -> Expression:
     """Substitute folded dims; the result references only base (kept) dims."""
     out = Expression()
     for d, c in expr.terms.items():
@@ -117,17 +117,17 @@ class GraphFolder:
     def __init__(self, program_graph: ProgramGraph, root_names=()):
         self.pg = program_graph
         self.root_names = tuple(root_names)
-        self._by_name: dict[str, Dimension] = {}
+        self.by_name: dict[str, Dimension] = {}
         for d in program_graph.all_dims:
-            self._by_name.setdefault(d.name, d)
+            self.by_name.setdefault(d.name, d)
         for name in self.root_names:
-            if name not in self._by_name:
+            if name not in self.by_name:
                 raise KeyError(f"root dim {name!r} not in the graph")
-        self._hazard_cache: dict[frozenset[str], set] = {}
+        self.hazard_cache: dict[frozenset[str], set] = {}
 
     # ── Partial evaluation ───────────────────────────────────────────
 
-    def _partial_eval(self, pins: dict[str, float], frozen: frozenset = frozenset()):
+    def partial_eval(self, pins: dict[str, float], frozen: frozenset = frozenset()):
         pg = self.pg
         one = pg.one
         val: dict = {one: Expression({one: 1.0})}
@@ -141,10 +141,10 @@ class GraphFolder:
                 val[d] = Expression({one: float(pins[d.name])})
                 continue
             if isinstance(d, ReGLUDimension):
-                a = _subst(d.a_expr, val)
-                b = _subst(d.b_expr, val)
-                bc = _const_of(b, one)
-                ac = _const_of(a, one)
+                a = subst(d.a_expr, val)
+                b = subst(d.b_expr, val)
+                bc = const_of(b, one)
+                ac = const_of(a, one)
                 if (bc is not None and bc <= 0) or (ac is not None and ac == 0):
                     val[d] = Expression()
                 elif bc is not None and ac is not None:
@@ -156,8 +156,8 @@ class GraphFolder:
                 else:
                     folded[d] = (a, b)
             elif isinstance(d, PersistDimension):
-                e = _subst(d.expr, val)
-                c = _const_of(e, one)
+                e = subst(d.expr, val)
+                c = const_of(e, one)
                 if c is not None:
                     val[d] = Expression({one: c})
                 else:
@@ -165,20 +165,20 @@ class GraphFolder:
         lookup_exprs: dict = {}
         for lu in pg.all_lookups:
             lookup_exprs[lu] = {
-                "query": [_subst(e, val) for e in lu.query_exprs_2d],
-                "key": [_subst(e, val) for e in lu.key_exprs_2d],
-                "values": [_subst(e, val) for e in lu.value_exprs],
+                "query": [subst(e, val) for e in lu.query_exprs_2d],
+                "key": [subst(e, val) for e in lu.key_exprs_2d],
+                "values": [subst(e, val) for e in lu.value_exprs],
             }
         return val, folded, lookup_exprs
 
     # ── Shared-state hazard: pins reaching insert-side expressions ───
 
-    def _insert_hazards(self, pin_names: frozenset[str]) -> set:
+    def insert_hazards(self, pin_names: frozenset[str]) -> set:
         """Union LookUps whose key/value expressions transitively read a
         pinnable gate.  Over-approximate on purpose (reachability over the
         *unfolded* union exprs, queries of upstream lookups included): a
         flagged lookup needs an explicit safety argument, not silence."""
-        cached = self._hazard_cache.get(pin_names)
+        cached = self.hazard_cache.get(pin_names)
         if cached is not None:
             return cached
         reaches: dict = {}
@@ -210,7 +210,7 @@ class GraphFolder:
                 for t in e.terms
             )
         }
-        self._hazard_cache[pin_names] = hazards
+        self.hazard_cache[pin_names] = hazards
         return hazards
 
     # ── Fold ──────────────────────────────────────────────────────────
@@ -218,18 +218,18 @@ class GraphFolder:
     def fold(self, pins: dict[str, float], label: str = "") -> FoldResult:
         pg = self.pg
         pins = dict(pins)
-        val, folded, lookup_exprs = self._partial_eval(pins)
-        hazards = self._insert_hazards(frozenset(pins))
+        val, folded, lookup_exprs = self.partial_eval(pins)
+        hazards = self.insert_hazards(frozenset(pins))
 
         # Folded output-token expressions (they seed liveness and become the
         # new graph's output tokens).  Root dims are exempt from the output
         # substitution: a folded-away root is re-materialized below as a
         # named persist, and the output tokens must reference that persist
         # (keeping it alive to the final layer), not its inlined expansion.
-        root_dims = [self._by_name[n] for n in self.root_names]
+        root_dims = [self.by_name[n] for n in self.root_names]
         val_out = {d: v for d, v in val.items() if d not in set(root_dims)}
         fout = {
-            name: _subst(expr, val_out)
+            name: subst(expr, val_out)
             for name, expr in pg.output_tokens.items()
             if isinstance(expr, Expression)
         }
@@ -270,10 +270,10 @@ class GraphFolder:
         # ── Materialize the new graph ─────────────────────────────────
         reset_graph()
         sub: dict = {
-            pg.one: Expression({_graph.one: 1}),
-            pg.position: Expression({_graph.position: 1}),
-            pg.inv_log_pos: Expression({_graph.inv_log_pos: 1}),
-            pg.position_sq: Expression({_graph.position_sq: 1}),
+            pg.one: Expression({graph.one: 1}),
+            pg.position: Expression({graph.position: 1}),
+            pg.inv_log_pos: Expression({graph.inv_log_pos: 1}),
+            pg.position_sq: Expression({graph.position_sq: 1}),
         }
         for d in pg.all_dims:
             if isinstance(d, InputDimension) and d not in sub:
@@ -411,21 +411,21 @@ class GraphFolder:
         pg = self.pg
         one = pg.one
         n_steps = len(pin_list)
-        root_dims = [self._by_name[n] for n in self.root_names]
+        root_dims = [self.by_name[n] for n in self.root_names]
         feedback = dict(feedback)
         for out in feedback.values():
             if isinstance(out, (int, float)):
                 continue  # constant feedback (e.g. the always-1 U flag)
             out_name = out[0] if isinstance(out, tuple) else out
-            if out_name not in self._by_name:
+            if out_name not in self.by_name:
                 raise KeyError(f"feedback output {out_name!r} not in the graph")
 
         reset_graph()
         base_sub: dict = {
-            pg.one: Expression({_graph.one: 1}),
-            pg.position: Expression({_graph.position: 1}),
-            pg.inv_log_pos: Expression({_graph.inv_log_pos: 1}),
-            pg.position_sq: Expression({_graph.position_sq: 1}),
+            pg.one: Expression({graph.one: 1}),
+            pg.position: Expression({graph.position: 1}),
+            pg.inv_log_pos: Expression({graph.inv_log_pos: 1}),
+            pg.position_sq: Expression({graph.position_sq: 1}),
         }
         for d in pg.all_dims:
             if isinstance(d, InputDimension) and d not in base_sub:
@@ -477,23 +477,23 @@ class GraphFolder:
             for name, v in pins.items():
                 all_pins[f"s{k}:{name}"] = v
 
-            val, folded, lookup_exprs = self._partial_eval(pins, frozenset(frozen))
+            val, folded, lookup_exprs = self.partial_eval(pins, frozenset(frozen))
             insert_side_hazards |= {
                 lu.name or f"lookup_{lu.id}"
-                for lu in self._insert_hazards(frozenset(pins))
+                for lu in self.insert_hazards(frozenset(pins))
             }
 
             # Liveness seeds: this step's roots, the outputs the next step
             # feeds on, and (final step) the graph's output tokens.
             fb_dims = [
-                self._by_name[o[0] if isinstance(o, tuple) else o]
+                self.by_name[o[0] if isinstance(o, tuple) else o]
                 for o in feedback.values() if not isinstance(o, (int, float))
             ] if k + 1 < n_steps else []
             fout = {}
             if k + 1 == n_steps:
                 val_out = {d: v for d, v in val.items() if d not in set(root_dims)}
                 fout = {
-                    name: _subst(expr, val_out)
+                    name: subst(expr, val_out)
                     for name, expr in pg.output_tokens.items()
                     if isinstance(expr, Expression)
                 }
@@ -541,7 +541,7 @@ class GraphFolder:
             for in_name in frozen:
                 if in_name in unbound or in_name in pc_names:
                     continue
-                sub[self._by_name[in_name]] = fb_expr[feedback[in_name]]
+                sub[self.by_name[in_name]] = fb_expr[feedback[in_name]]
             if pc_offsets is not None and k > 0:
                 # Shape fold: pc(k) = head + offset, byte-split with one
                 # stepglu carry (exact on integer bytes).  No $FFFF wrap by
@@ -553,11 +553,11 @@ class GraphFolder:
                 if off == 0:
                     lo_e, hi_e = lo0, hi0
                 else:
-                    carry = stepglu(1, lo0 + Expression({_graph.one: off - 256}))
-                    lo_e = lo0 + Expression({_graph.one: float(off)}) + carry * -256.0
+                    carry = stepglu(1, lo0 + Expression({graph.one: off - 256}))
+                    lo_e = lo0 + Expression({graph.one: float(off)}) + carry * -256.0
                     hi_e = hi0 + carry
-                sub[self._by_name["current_pc_lo"]] = lo_e
-                sub[self._by_name["current_pc_hi"]] = hi_e
+                sub[self.by_name["current_pc_lo"]] = lo_e
+                sub[self.by_name["current_pc_hi"]] = hi_e
 
             def tr(expr: Expression, *, sub=sub, val=val, k=k) -> Expression:
                 out = Expression()
@@ -631,7 +631,7 @@ class GraphFolder:
 
             if pc_offsets is not None and k == 0:
                 pc_exprs = tuple(
-                    tr(Expression({self._by_name[n]: 1})) for n in pc_names
+                    tr(Expression({self.by_name[n]: 1})) for n in pc_names
                 )
 
             fb_const, fb_expr = {}, {}
@@ -639,9 +639,9 @@ class GraphFolder:
                 if isinstance(out, (int, float)):
                     continue
                 out_name = out[0] if isinstance(out, tuple) else out
-                d = self._by_name[out_name]
+                d = self.by_name[out_name]
                 src = val.get(d, Expression({d: 1}))
-                c = _const_of(src, one)
+                c = const_of(src, one)
                 if c is not None:
                     fb_const[out_name] = c
                 else:

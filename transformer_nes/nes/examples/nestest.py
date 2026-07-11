@@ -59,7 +59,7 @@ def load_log(log_path: str = NESTEST_LOG) -> list[tuple[int, int, int, int, int,
     return rows
 
 
-def _new_cpu(image: bytearray) -> Cpu6502:
+def new_cpu(image: bytearray) -> Cpu6502:
     cpu = Cpu6502(memory=bytearray(image), bcd_enabled=False)
     cpu.pc = START_PC
     return cpu
@@ -70,7 +70,7 @@ def run_reference(image: bytearray, log_rows) -> tuple[bool, int, float]:
 
     Returns (passed, lines_matched, elapsed_seconds).
     """
-    cpu = _new_cpu(image)
+    cpu = new_cpu(image)
     start = time.perf_counter()
     for i, (pc, a, x, y, p, s) in enumerate(log_rows):
         got = (cpu.pc, cpu.a, cpu.x, cpu.y, cpu.p, cpu.s)
@@ -107,7 +107,7 @@ def run_graph(image: bytearray, log_rows, *, max_steps: int) -> tuple[bool, int,
     graph_trace = rt.run_image(bytes(image), start_pc=START_PC, max_steps=max_steps)
     run_elapsed = time.perf_counter() - run_start
 
-    ref = _new_cpu(image)
+    ref = new_cpu(image)
     for i, row in enumerate(graph_trace):
         ref_row = ref.step()
         s1, s2 = ref_row.state, row.state
@@ -139,7 +139,7 @@ def run_cpp(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, floa
     rt = Cpu6502CppRuntime(bcd=False)
     build_elapsed = time.perf_counter() - build_start
     out = rt.run_image_arrays(bytes(image), start_pc=START_PC, max_steps=max_steps)
-    matched, steps = lockstep_arrays_vs_reference(_new_cpu(image), out)
+    matched, steps = lockstep_arrays_vs_reference(new_cpu(image), out)
     return matched, steps, build_elapsed, rt.last_step_seconds
 
 
@@ -160,7 +160,7 @@ def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, 
         run_elapsed = time.perf_counter() - run_start
         from transformer_nes.cpu6502.examples.klaus.harness import lockstep_arrays_vs_reference
 
-        ref = _new_cpu(image)
+        ref = new_cpu(image)
         matched, n = lockstep_arrays_vs_reference(ref, out)
         return matched, n, build_elapsed, run_elapsed, mode
 
@@ -168,7 +168,7 @@ def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, 
     trace = machine.run_image(bytes(image), start_pc=START_PC, max_steps=max_steps)
     run_elapsed = time.perf_counter() - run_start
 
-    ref = _new_cpu(image)
+    ref = new_cpu(image)
     for i, row in enumerate(trace):
         ref_row = ref.step()
         s1, s2 = ref_row.state, row.state

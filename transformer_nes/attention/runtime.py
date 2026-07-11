@@ -17,26 +17,26 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_hull_ext = None
+hull_ext = None
 
 
 def load_hull_ext():
     """Compile (once) and return the pybind11 hull extension, or None."""
-    global _hull_ext
-    if _hull_ext is not None:
-        return _hull_ext
+    global hull_ext
+    if hull_ext is not None:
+        return hull_ext
     try:
         from torch.utils.cpp_extension import load
 
         root = os.path.dirname(os.path.abspath(__file__))
-        _hull_ext = load(
+        hull_ext = load(
             name="hull_ext",
             sources=[os.path.join(root, "hull_ext.cpp")],
             extra_cflags=["-O3", "-std=c++17"],
             extra_include_paths=[root],
             verbose=False,
         )
-        return _hull_ext
+        return hull_ext
     except Exception as e:
         logger.warning("Could not load hull extension: %s", e)
         return None
@@ -59,9 +59,9 @@ class HullAttention:
             self.cache.set_tiebreak(0, head, latest)
         self.seq = -1
         # Reusable insert buffers (the cache copies data on insert).
-        self._keys_buf = np.zeros((self.num_value_pairs, 2))
-        self._values_buf = np.zeros((self.num_value_pairs, 2))
-        self._values_flat = self._values_buf.reshape(-1)
+        self.keys_buf = np.zeros((self.num_value_pairs, 2))
+        self.values_buf = np.zeros((self.num_value_pairs, 2))
+        self.values_flat = self.values_buf.reshape(-1)
 
     def clear(self):
         self.cache.clear()
@@ -69,9 +69,9 @@ class HullAttention:
 
     def insert_raw(self, kx, ky, raw_vals):
         """Insert a precomputed key and value list, reusing scratch buffers."""
-        keys = self._keys_buf
+        keys = self.keys_buf
         keys[:, 0] = kx
         keys[:, 1] = ky
-        self._values_flat[: self.nv] = raw_vals
+        self.values_flat[: self.nv] = raw_vals
         self.seq += 1
-        self.cache.insert(0, keys, self._values_buf, self.seq)
+        self.cache.insert(0, keys, self.values_buf, self.seq)
