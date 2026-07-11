@@ -5,7 +5,7 @@ Levers that took the 6502 weights transformer from 0.13 instr/s to
 transfer to future targets (other CPUs, WASM, batched fleets).  Each
 entry: the lever, the receipt here, and what it needs to transfer.
 Session-by-session history lives in [ROADMAP.md](ROADMAP.md); design
-details in [transformer_vm/cpu6502/README.md](transformer_vm/cpu6502/README.md).
+details in [transformer_nes/cpu6502/README.md](transformer_nes/cpu6502/README.md).
 
 ## Preconditions
 

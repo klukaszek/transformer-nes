@@ -1,5 +1,5 @@
 [project]
-name = "transformer-vm"
+name = "transformer-nes"
 version = "0.1.0"
 description = "A MOS 6502 CPU expressed as an analytically-constructed transformer computation graph"
 requires-python = ">=3.11"
@@ -18,11 +18,6 @@ dependencies = [
     "torch>=2.10.0",
 ]
 
-[project.urls]
-Homepage = "https://github.com/Percepta-Core/transformer-vm"
-Repository = "https://github.com/Percepta-Core/transformer-vm"
-Issues = "https://github.com/Percepta-Core/transformer-vm/issues"
-
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
@@ -32,22 +27,22 @@ dev = [
 ]
 
 [project.scripts]
-6502-reference = "transformer_vm.cpu6502.reference:main"
-6502-eval = "transformer_vm.cpu6502.cli:main"
-6502-klaus = "transformer_vm.cpu6502.klaus:main"
-6502-nestest = "transformer_vm.nes.nestest:main"
-6502-transformer = "transformer_vm.cpu6502.weights_runner:main"
-nes-run = "transformer_vm.nes.console:main"
+6502-reference = "transformer_nes.cpu6502.reference:main"
+6502-eval = "transformer_nes.cpu6502.cli:main"
+6502-klaus = "transformer_nes.cpu6502.klaus:main"
+6502-nestest = "transformer_nes.nes.nestest:main"
+6502-transformer = "transformer_nes.cpu6502.weights_runner:main"
+nes-run = "transformer_nes.nes.console:main"
 
 [build-system]
 requires = ["setuptools>=82.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["transformer_vm*"]
+include = ["transformer_nes*"]
 
 [tool.setuptools.package-data]
-"transformer_vm" = [
+"transformer_nes" = [
     "attention/hull2d_cht.h",
     "attention/hull_ext.cpp",
     "attention/CMakeLists.txt",
@@ -64,10 +59,10 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 ignore = ["E501"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["transformer_vm"]
+known-first-party = ["transformer_nes"]
 
 [tool.pytest.ini_options]
-testpaths = ["transformer_vm/cpu6502/tests", "transformer_vm/nes/tests"]
+testpaths = ["transformer_nes/cpu6502/tests", "transformer_nes/nes/tests"]
 addopts = "-v --tb=short"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",

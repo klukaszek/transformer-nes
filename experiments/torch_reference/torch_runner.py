@@ -1,6 +1,6 @@
 """Standalone PyTorch runner for the exported 6502 transformer.
 
-Deliberately imports NOTHING from transformer_vm: the artifact
+Deliberately imports NOTHING from transformer_nes: the artifact
 (weights.safetensors + machine.json) plus the semantics below are the
 whole system.  Execution is genuine transformer inference in float64 --
 sparse matmuls of the analytic weights, hardmax attention with the

@@ -2,7 +2,7 @@
 
 Status snapshot and prioritized next steps.  Written 2026-07-06 as the
 handoff point for fresh working sessions; the design details live in
-[`transformer_vm/cpu6502/README.md`](transformer_vm/cpu6502/README.md);
+[`transformer_nes/cpu6502/README.md`](transformer_nes/cpu6502/README.md);
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
@@ -125,6 +125,31 @@ in priority order — the lockstep chain is the safety net for all of it:
 7. **PPU to C++** — unlocks the native SDL/Sokol app; do it as the
    console layer's part of the refactor, not before.
 
+## Recorded decision: package rename + module placement (2026-07-11)
+
+The package is **transformer_nes** (was transformer_vm); distribution name
+transformer-nes.  Receipt: 85 tests green post-rename; the emitted C++
+contains no package names, so the digest-addressed compiled artifacts were
+reused (one refold/emission per config, zero recompiles).  GitHub URLs in
+pyproject still point at Percepta-Core/transformer-vm until the repo is
+renamed.
+
+Module placement, decided while answering "why isn't weights_runner in
+model/": the architecture is three rings — target-agnostic core (graph/,
+attention/, scheduler/), THE MACHINE (cpu6502/ + model/, coupled through
+run_protocol and the step spec), and the console (nes/).  weights_runner
+stays in cpu6502/ because it is a machine BACKEND (peer of reference/
+evaluator/kernel, same machine protocol); model/ holds the graph→weights→
+engine mechanisms.  The one acknowledged wart: engine_gen imports
+cpu6502/run_protocol (and hashes cpu6502 files into its cache key), so
+model/ is not truly target-agnostic — accepted rather than hidden behind
+parameter injection; the emitted engine IS the 6502 machine protocol.
+Backend roles, restated: reference = oracle, evaluator = the graph's
+definitional semantics and the kernel's frontend, kernel = the graph at
+speed + the independent twin for frame-identity receipts, weights = the
+product.  None are deletable; the chain is the writeup's credibility
+spine.
+
 ## Recorded decision: retire f64 (CLOSED 2026-07-11)
 
 Both items landed: (2) the recency term left the construction on
@@ -155,7 +180,7 @@ runtime).  Two items, receipts = the full lockstep chain:
 ## 2026-07-10 standard-ML artifact — safetensors + standalone PyTorch runner
 
 The weights are now a portable artifact.  `model/export.py`
-(`python -m transformer_vm.model.export OUT_DIR`) writes
+(`python -m transformer_nes.model.export OUT_DIR`) writes
 **weights.safetensors** -- per-matrix CSR (dense would be ~11 GB;
 sparse is ~4 MB) plus tok/head dense -- and **machine.json** (input
 slot map, readout slots, output-head rows, dims, and a prose spec of
@@ -175,7 +200,7 @@ position features stay f64 (pos^2 outgrows f32 integers past ~4096).
 
 `experiments/torch_reference/torch_runner.py` is the proof of
 portability: a ~200-line standalone runner importing ONLY
-torch/numpy/json/safetensors (nothing from transformer_vm) that
+torch/numpy/json/safetensors (nothing from transformer_nes) that
 re-implements the semantics from the JSON -- fused Q/K/V (2 dims per
 head), per-layer append-only K/V logs, **hardmax attention with exact
 ties won by the latest token** (`flip + argmax`), ReGLU FFN, residual,
@@ -1874,6 +1899,6 @@ uv run 6502-nestest --runner both              # golden log: reference + graph +
 uv run 6502-nestest --runner weights           # full nestest through the generated int32 engine, ~0.1 s
 uv run 6502-klaus --runner weights --graph-steps 30646177  # full weights receipt
 uv run 6502-transformer --steps 30
-uv run nes-run transformer_vm/nes/examples/smb.nes --frames 61 \
+uv run nes-run transformer_nes/nes/examples/smb.nes --frames 61 \
     --warmup-frames 60 --backend weights --out frame.ppm
 ```
