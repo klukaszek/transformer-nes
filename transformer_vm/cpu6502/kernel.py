@@ -174,6 +174,79 @@ class _KernelSpec:
         self.trace_ids = {name: rt.dim_id_by_name[name] for name in _RUNTIME_READ_DIMS}
         self.outputs = rt._indexed_outputs  # [(name, expr)] in score order
 
+        # ── O(1) attention-state classification (mirrors engine_gen) ──
+        # Memory lookups whose query is a positive scalar multiple of
+        # [local_address, 1] and whose values are exactly (byte_value, addr)
+        # are served by the exact nearest-written-address structure; LATEST
+        # lookups with constant [qx, qy] queries by running-argmax registers
+        # folded at insert time.  Anything else keeps its hull -- correctness
+        # never rests on the classification, only speed.
+        one_id = rt._one.id
+        pos_ids = {rt._position.id, rt._position_sq.id, rt._inv_log_pos.id}
+
+        def const_q(cq):
+            n, ids, coeffs = cq
+            if n == 0:
+                return 0.0
+            if n == 1 and ids[0] == one_id:
+                return float(coeffs[0])
+            return None
+
+        self.mem_lus: dict[int, dict] = {}
+        self.regs: list[dict] = []
+        self.lu_reg: dict[int, int] = {}
+        reg_of: dict[tuple, int] = {}
+        self.hull_groups: set[int] = set()
+        mem_ids = {lu.id for lu in rt._memory_read_lus}
+        for lu in rt.all_lookups:
+            gi = self.lu_group[lu.id]
+            grp = self.groups[gi]
+            qx_c, qy_c = rt._lookup_query_exprs[lu.id]
+            if lu.id in mem_ids:
+                mg = getattr(lu, "memory_group", None)
+                qy = const_q(qy_c)
+                ok = (
+                    mg is not None and grp["nvp"] == 1
+                    and lu.tie_break == "latest"
+                    and qy is not None and qy > 0.0
+                    and {d.name: c for d, c in lu.value_exprs[0].terms.items()}
+                    == {"byte_value": 1}
+                    and {d.name: c for d, c in lu.value_exprs[1].terms.items()}
+                    == {"addr_lo": 1, "addr_hi": 256}
+                )
+                terms = []
+                if ok:
+                    n, ids, coeffs = qx_c
+                    for did, c in zip(ids, coeffs, strict=True):
+                        r = c / qy
+                        if did in pos_ids or abs(r - round(r)) > 1e-9 or abs(r) >= 2**24:
+                            ok = False
+                            break
+                        terms.append((int(round(r)), did))
+                if ok:
+                    self.mem_lus[lu.id] = {"g": int(mg), "terms": terms}
+                else:
+                    self.hull_groups.add(gi)
+                continue
+            qx, qy = const_q(qx_c), const_q(qy_c)
+            if grp["latest"] and qx is not None and qy is not None:
+                key = (gi, qx, qy)
+                ri = reg_of.get(key)
+                if ri is None:
+                    ri = reg_of[key] = len(self.regs)
+                    self.regs.append({"gi": gi, "qx": qx, "qy": qy,
+                                      "nv": grp["nvp"] * 2})
+                self.lu_reg[lu.id] = ri
+            else:
+                self.hull_groups.add(gi)
+
+        self.grp_regs: dict[int, list[int]] = {}
+        for ri, reg in enumerate(self.regs):
+            self.grp_regs.setdefault(reg["gi"], []).append(ri)
+        # Groups whose insert function is still needed: hull readers plus
+        # register folds.  Fully structure-served memory groups drop out.
+        self.live_groups = self.hull_groups | set(self.grp_regs)
+
 
 def generate_cpp(rt: Cpu6502Runtime) -> str:
     spec = _KernelSpec(rt)
@@ -209,15 +282,81 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
 
     # ── Members ────────────────────────────────────────────────────
     for gi, grp in enumerate(spec.groups):
-        emit(f'    HardAttentionHead grp{gi}[{grp["nvp"]}];')
-        emit(f'    int grp{gi}_seq = -1;')
+        if gi in spec.hull_groups:
+            emit(f'    HardAttentionHead grp{gi}[{grp["nvp"]}];')
+            emit(f'    int grp{gi}_seq = -1;')
     emit('    double g[NDIMS] = {0};')
     emit('    std::vector<int> g_set;')
     emit('')
+    emit('    // Exact nearest-written-address structure serving the memory')
+    emit('    // lookups (identical to the weights engine: the grouped parabola')
+    emit('    // score is maximized by the nearest written address, recency')
+    emit('    // breaking equidistant ties toward the later write).  O(1) in')
+    emit('    // the token log; insert_write is three stores, not hull inserts.')
+    emit('    int mem_val[16][4096];')
+    emit('    long long mem_seq[16][4096];')
+    emit('    unsigned long long mem_bits[16][64];')
+    emit('')
+    emit('    void mem_query(const int g_, const long long q, double out[2]) const {')
+    emit('        const unsigned long long* bits = mem_bits[g_];')
+    emit('        if (q >= 0 && q <= 4095 && (bits[q >> 6] >> (q & 63)) & 1ULL) {')
+    emit('            out[0] = (double)mem_val[g_][q];')
+    emit('            out[1] = (double)(((long long)g_ << 12) + q);')
+    emit('            return;')
+    emit('        }')
+    emit('        long long below = -1, above = -1;')
+    emit('        if (q >= 0) {')
+    emit('            const long long start = q < 4095 ? q : 4095;')
+    emit('            int w = (int)(start >> 6);')
+    emit('            unsigned long long m = bits[w] & (~0ULL >> (63 - (start & 63)));')
+    emit('            while (true) {')
+    emit('                if (m) { below = ((long long)w << 6) + (63 - __builtin_clzll(m)); break; }')
+    emit('                if (--w < 0) break;')
+    emit('                m = bits[w];')
+    emit('            }')
+    emit('        }')
+    emit('        if (q <= 4095) {')
+    emit('            const long long start = q > 0 ? q : 0;')
+    emit('            int w = (int)(start >> 6);')
+    emit('            unsigned long long m = bits[w] & (~0ULL << (start & 63));')
+    emit('            while (true) {')
+    emit('                if (m) { above = ((long long)w << 6) + __builtin_ctzll(m); break; }')
+    emit('                if (++w > 63) break;')
+    emit('                m = bits[w];')
+    emit('            }')
+    emit('        }')
+    emit('        long long win;')
+    emit('        if (below < 0 && above < 0) { out[0] = 0.0; out[1] = 0.0; return; }')
+    emit('        else if (below < 0) win = above;')
+    emit('        else if (above < 0) win = below;')
+    emit('        else {')
+    emit('            const long long db = q - below, da = above - q;')
+    emit('            if (db < da) win = below;')
+    emit('            else if (da < db) win = above;')
+    emit('            else win = mem_seq[g_][below] > mem_seq[g_][above] ? below : above;')
+    emit('        }')
+    emit('        out[0] = (double)mem_val[g_][win];')
+    emit('        out[1] = (double)(((long long)g_ << 12) + win);')
+    emit('    }')
+    emit('')
+    if spec.regs:
+        emit('    // Running-argmax registers for constant-query LATEST lookups')
+        emit('    // (start/state): the score of each token is a fixed function of')
+        emit('    // its key, so the argmax folds at insert time and a query is a')
+        emit('    // register read.  The state log stops growing per instruction.')
+        for ri, reg in enumerate(spec.regs):
+            emit(f'    double reg{ri}_s; double reg{ri}_v[{reg["nv"]}]; '
+                 f'bool reg{ri}_any = false;')
+        emit('')
     emit('    void reset() {')
     for gi, grp in enumerate(spec.groups):
-        emit(f'        for (int h = 0; h < {grp["nvp"]}; ++h) grp{gi}[h].clear();')
-        emit(f'        grp{gi}_seq = -1;')
+        if gi in spec.hull_groups:
+            emit(f'        for (int h = 0; h < {grp["nvp"]}; ++h) grp{gi}[h].clear();')
+            emit(f'        grp{gi}_seq = -1;')
+    emit('        for (int g_ = 0; g_ < 16; ++g_)')
+    emit('            for (int w = 0; w < 64; ++w) mem_bits[g_][w] = 0ULL;')
+    for ri in range(len(spec.regs)):
+        emit(f'        reg{ri}_any = false;')
     emit('        for (int id : g_set) g[id] = 0.0;')
     emit('        g_set.clear();')
     emit('    }')
@@ -234,8 +373,13 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('    }')
 
     # ── Per-group insert functions ─────────────────────────────────
+    # Emitted only for groups something still reads through: hull readers
+    # and register folds.  Fully structure-served memory groups drop out
+    # (insert_write updates the structure directly from (addr, value)).
     compile_expr = Cpu6502Runtime._compile_expr
     for gi, grp in enumerate(spec.groups):
+        if gi not in spec.live_groups:
+            continue
         lu = grp["rep"]
         order, input_ids = grp["plan"]
         emit('')
@@ -257,14 +401,29 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
         kx = _c_expr(compile_expr(lu.key_exprs_2d[0]), dref)
         ky = _c_expr(compile_expr(lu.key_exprs_2d[1]), dref)
         emit(f'        const double key[2] = {{ {kx}, {ky} }};')
-        emit(f'        ++grp{gi}_seq;')
-        emit('        double val[2];')
         for p in range(grp["nvp"]):
             for slot in range(2):
                 vi = p * 2 + slot
                 src = _c_expr(compile_expr(lu.value_exprs[vi]), dref) if vi < grp["nv"] else "0.0"
-                emit(f'        val[{slot}] = {src};')
-            emit(f'        grp{gi}[{p}].insert(key, val, grp{gi}_seq);')
+                emit(f'        const double val{p}_{slot} = {src};')
+        if gi in spec.hull_groups:
+            emit(f'        ++grp{gi}_seq;')
+            for p in range(grp["nvp"]):
+                emit(f'        {{ const double val[2] = {{ val{p}_0, val{p}_1 }}; '
+                     f'grp{gi}[{p}].insert(key, val, grp{gi}_seq); }}')
+        for ri in spec.grp_regs.get(gi, ()):
+            reg = spec.regs[ri]
+            qx, qy = _c_num(reg["qx"]), _c_num(reg["qy"])
+            # clear_key-gated tokens (ky -= 1e30) can never win a query;
+            # replace-on->= reproduces the LATEST tie-break exactly.
+            emit('        if (key[1] > -1.0e29) {')
+            emit(f'            const double s_{ri} = {qx}*key[0] + {qy}*key[1];')
+            emit(f'            if (!reg{ri}_any || s_{ri} >= reg{ri}_s) {{')
+            emit(f'                reg{ri}_any = true; reg{ri}_s = s_{ri};')
+            for k in range(reg["nv"]):
+                emit(f'                reg{ri}_v[{k}] = val{k // 2}_{k % 2};')
+            emit('            }')
+            emit('        }')
         emit('    }')
 
     # ── Token builders ─────────────────────────────────────────────
@@ -278,13 +437,19 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('    }')
     emit('')
     emit('    void insert_write(int addr, int value, double pos) {')
-    emit('        new_token(pos);')
-    emit(f'        setg({spec.write_ids["byte_value"]}, (double)value);')
-    emit(f'        setg({spec.write_ids["is_memory_write"]}, 1.0);')
-    emit(f'        setg({spec.write_ids["addr_lo"]}, (double)(addr & 0xFF));')
-    emit(f'        setg({spec.write_ids["addr_hi"]}, (double)((addr >> 8) & 0xFF));')
-    for gi in spec.memory_groups:
-        emit(f'        grp{gi}_insert();')
+    emit('        const int wg = (addr >> 12) & 0xF, wl = addr & 0xFFF;')
+    emit('        mem_val[wg][wl] = value & 0xFF;')
+    emit('        mem_seq[wg][wl] = (long long)pos;')
+    emit('        mem_bits[wg][wl >> 6] |= 1ULL << (wl & 63);')
+    hull_mem = [gi for gi in spec.memory_groups if gi in spec.live_groups]
+    if hull_mem:
+        emit('        new_token(pos);')
+        emit(f'        setg({spec.write_ids["byte_value"]}, (double)value);')
+        emit(f'        setg({spec.write_ids["is_memory_write"]}, 1.0);')
+        emit(f'        setg({spec.write_ids["addr_lo"]}, (double)(addr & 0xFF));')
+        emit(f'        setg({spec.write_ids["addr_hi"]}, (double)((addr >> 8) & 0xFF));')
+        for gi in hull_mem:
+            emit(f'        grp{gi}_insert();')
     emit('    }')
     emit('')
     state_args = ", ".join(f"double {name}" for name in _STATE_FIELDS[1:])
@@ -323,16 +488,38 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
             lu = spec.rt.lookup_by_id[arg]
             gi = spec.lu_group[arg]
             grp = spec.groups[gi]
-            tb = "TieBreak::LATEST" if grp["latest"] else "TieBreak::AVERAGE"
-            qx_expr, qy_expr = spec.rt._lookup_query_exprs[arg]
-            emit(f'        const double q{arg}[2] = {{ {_c_expr(qx_expr, sref)}, {_c_expr(qy_expr, sref)} }};')
             dim_ids = spec.rt._lookup_dim_ids[arg]
-            for p in range(grp["nvp"]):
-                emit(f'        double o{arg}_{p}[2] = {{0.0, 0.0}};')
-                emit(f'        grp{gi}[{p}].query(q{arg}, {tb}, o{arg}_{p});')
-            for k, did in enumerate(dim_ids):
-                emit(f'        const double d{did} = o{arg}_{k // 2}[{k % 2}];')
-                step_locals.add(did)
+            if arg in spec.mem_lus:
+                # Group-dispatch fusion + exact structure: the query is the
+                # local address for this 4 KiB group; out of range means the
+                # empty-group result (0, 0), gate-zeroed downstream.
+                m = spec.mem_lus[arg]
+                terms = m["terms"]
+                qi_src = _c_expr((len(terms), tuple(d for _c, d in terms),
+                                  tuple(c for c, _d in terms)), sref)
+                emit(f'        const long long qi{arg} = iround({qi_src});')
+                emit(f'        double o{arg}_0[2] = {{0.0, 0.0}};')
+                emit(f'        if ((unsigned long long)qi{arg} >> 12 == 0) '
+                     f'mem_query({m["g"]}, qi{arg}, o{arg}_0);')
+                for k, did in enumerate(dim_ids):
+                    emit(f'        const double d{did} = o{arg}_0[{k % 2}];')
+                    step_locals.add(did)
+            elif arg in spec.lu_reg:
+                ri = spec.lu_reg[arg]
+                for k, did in enumerate(dim_ids):
+                    emit(f'        const double d{did} = '
+                         f'reg{ri}_any ? reg{ri}_v[{k}] : 0.0;')
+                    step_locals.add(did)
+            else:
+                tb = "TieBreak::LATEST" if grp["latest"] else "TieBreak::AVERAGE"
+                qx_expr, qy_expr = spec.rt._lookup_query_exprs[arg]
+                emit(f'        const double q{arg}[2] = {{ {_c_expr(qx_expr, sref)}, {_c_expr(qy_expr, sref)} }};')
+                for p in range(grp["nvp"]):
+                    emit(f'        double o{arg}_{p}[2] = {{0.0, 0.0}};')
+                    emit(f'        grp{gi}[{p}].query(q{arg}, {tb}, o{arg}_{p});')
+                for k, did in enumerate(dim_ids):
+                    emit(f'        const double d{did} = o{arg}_{k // 2}[{k % 2}];')
+                    step_locals.add(did)
     for dim_id in spec.rt._external_store_ids:
         emit(f'        v[{dim_id}] = d{dim_id};')
     emit('    }')

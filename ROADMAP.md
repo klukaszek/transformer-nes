@@ -31,6 +31,36 @@ backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## 2026-07-10 kernel O(1) attention state — the hull-log growth, fixed
+
+The "C++ problem" from the START HERE list, closed by porting the
+weights engine's proven design back into `kernel.py` (the emission
+mirror of engine_gen's classification):
+
+- **Memory lookups** (all 112, over the 16 4-KiB groups) are served by
+  the exact nearest-written-address structure: `insert_write` becomes
+  three stores + a bit set instead of 16 hull-chain inserts, and each
+  read is ONE O(1) query behind the group-dispatch check (`qi >> 12 ==
+  0`) instead of 16 hull queries — the kernel never had that fusion.
+- **Constant-query LATEST lookups** (start, state) fold into
+  running-argmax registers at insert time; the state hull log stops
+  growing per instruction entirely.  No hull group survives: the
+  kernel's attention state is now O(1) in the token log, like the
+  weights engine.  Eligibility is checked at generation (query a
+  positive scalar multiple of [local_address, 1], values exactly
+  (byte_value, addr), integer coefficients, LATEST); anything failing
+  keeps its hull — classification is a speed decision, never a
+  correctness one.
+
+Receipts: 80 tests green (kernel⇔evaluator lockstep, MMIO trace
+identity across backends, console pixel identity), ruff clean; full
+nestest MATCHED 0.012 s; **full Klaus PASSED 30,646,177 steps in
+38.9 s (788K steps/s, was ~48 s)**; **SMB on the kernel: 18.6 →
+73.5 fps (13.6 ms/frame, 4.0x)** — the graph oracle now runs the
+console comfortably past realtime, and every frame-compare receipt
+gets ~4x cheaper on its kernel side.  Frames byte-identical kernel vs
+weights 120/120, unchanged.
+
 ## 2026-07-10 profile-guided JIT — runtime window discovery, landed
 
 The recorded JIT idea, built on the two dispatch substrates.  The run
