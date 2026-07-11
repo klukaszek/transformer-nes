@@ -15,9 +15,24 @@ PPU's runtime nametable arrangement, MMC1 encoding: 0/1 single-screen,
 
 from __future__ import annotations
 
+import logging
+
 from transformer_nes.nes.cartridge import MIRROR_VERTICAL, Cartridge
 
+logger = logging.getLogger(__name__)
+
+BANK8 = 0x2000
 BANK16 = 0x4000
+
+
+def inject_region(mapper, base: int, data: bytes) -> None:
+    """Bank-switch injection: bulk native call when the backend has one."""
+    if mapper.poke_region is not None:
+        mapper.poke_region(base, data)
+    else:
+        poke = mapper.poke
+        for i, byte in enumerate(data):
+            poke(base + i, byte)
 
 
 class Nrom:
@@ -58,6 +73,7 @@ class Mmc1:
         self.prg_reg = 0
         self.shift = 0x10
         self.poke = None           # set by the console per backend
+        self.poke_region = None    # bulk variant (native on the engines)
         self.on_mirroring = None   # set by the console (PPU hook)
 
     # ── Mapping ─────────────────────────────────────────────────────
@@ -117,10 +133,101 @@ class Mmc1:
             self.on_mirroring(self.control & 3)
 
     def load_bank(self, base: int, bank: int) -> None:
-        data = self.prg[bank * BANK16:(bank + 1) * BANK16]
-        poke = self.poke
-        for i, byte in enumerate(data):
-            poke(base + i, byte)
+        inject_region(self, base, self.prg[bank * BANK16:(bank + 1) * BANK16])
+
+
+class Mmc3:
+    """Mapper 4 (TxROM): 8 KiB PRG banks + 2/1 KiB CHR banks.
+
+    The scanline IRQ counter is accepted but NOT delivered yet -- the
+    machine model has NMI delivery only.  Games that gate a raster split
+    on it (SMB3's status bar) run with that split missing.
+    """
+
+    banked = True
+
+    def __init__(self, cart: Cartridge):
+        if len(cart.prg) % BANK8 or not cart.prg:
+            raise ValueError("MMC3 PRG size must be a multiple of 8 KiB")
+        self.prg = cart.prg
+        self.n_banks = len(cart.prg) // BANK8
+        self.chr_rom = bool(cart.chr)
+        self.n_chr = max(len(cart.chr) // 0x400, 1)
+        self.bank_select = 0
+        self.regs = [0, 2, 4, 5, 6, 7, 0, 1]  # R0-R7
+        self.irq_latch = 0
+        self.irq_enabled = False
+        self.irq_warned = False
+        self.poke = None            # set by the console per backend
+        self.poke_region = None     # bulk variant (native on the engines)
+        self.on_mirroring = None    # set by the console (PPU hook)
+        self.set_chr_banks = None   # set by the console (PPU hook)
+
+    # ── Mapping ─────────────────────────────────────────────────────
+
+    def prg_banks(self) -> tuple[int, int, int, int]:
+        """8 KiB banks at $8000/$A000/$C000/$E000 under the current mode."""
+        r6, r7 = self.regs[6] % self.n_banks, self.regs[7] % self.n_banks
+        second_last, last = self.n_banks - 2, self.n_banks - 1
+        if self.bank_select & 0x40:
+            return second_last, r7, r6, last
+        return r6, r7, second_last, last
+
+    def chr_banks(self) -> list[int]:
+        """Eight 1 KiB slot banks under the current A12 inversion."""
+        r, n = self.regs, self.n_chr
+        two = [(r[0] & 0xFE) % n, ((r[0] & 0xFE) | 1) % n,
+               (r[1] & 0xFE) % n, ((r[1] & 0xFE) | 1) % n]
+        one = [r[2] % n, r[3] % n, r[4] % n, r[5] % n]
+        return one + two if self.bank_select & 0x80 else two + one
+
+    def rom_byte(self, addr: int) -> int:
+        bank = self.prg_banks()[(addr - 0x8000) >> 13]
+        return self.prg[bank * BANK8 + (addr & 0x1FFF)]
+
+    def cpu_image(self) -> bytes:
+        image = bytearray(0x10000)
+        for i, bank in enumerate(self.prg_banks()):
+            base = 0x8000 + i * BANK8
+            image[base:base + BANK8] = self.prg[bank * BANK8:(bank + 1) * BANK8]
+        return bytes(image)
+
+    # ── Device protocol ─────────────────────────────────────────────
+
+    def read(self, addr: int) -> int:
+        raise RuntimeError("mapper range is attached write-only")
+
+    def write(self, addr: int, value: int) -> None:
+        old_prg = self.prg_banks()
+        reg = addr & 0xE001
+        if reg == 0x8000:
+            self.bank_select = value
+        elif reg == 0x8001:
+            self.regs[self.bank_select & 7] = value
+        elif reg == 0xA000:
+            self.on_mirroring(3 if value & 1 else 2)
+        elif reg == 0xC000:
+            self.irq_latch = value
+        elif reg == 0xE000:
+            self.irq_enabled = False
+        elif reg == 0xE001:
+            self.irq_enabled = True
+            if not self.irq_warned:
+                logger.warning("MMC3 scanline IRQ enabled by the game; "
+                               "IRQ delivery is not implemented yet")
+                self.irq_warned = True
+        # $A001 (PRG RAM protect) and $C001 (IRQ reload) need no action.
+        new_prg = self.prg_banks()
+        for i, (old, new) in enumerate(zip(old_prg, new_prg, strict=True)):
+            if old != new:
+                self.load_bank(0x8000 + i * BANK8, new)
+        if self.chr_rom and reg in (0x8000, 0x8001):
+            self.set_chr_banks(self.chr_banks())
+        # The store landed in machine memory before the pause: repair it.
+        self.poke(addr, self.rom_byte(addr))
+
+    def load_bank(self, base: int, bank: int) -> None:
+        inject_region(self, base, self.prg[bank * BANK8:(bank + 1) * BANK8])
 
 
 def make_mapper(cart: Cartridge):
@@ -128,4 +235,7 @@ def make_mapper(cart: Cartridge):
         return Nrom(cart)
     if cart.mapper == 1:
         return Mmc1(cart)
-    raise NotImplementedError(f"mapper {cart.mapper} not supported (NROM, MMC1)")
+    if cart.mapper == 4:
+        return Mmc3(cart)
+    raise NotImplementedError(
+        f"mapper {cart.mapper} not supported (NROM, MMC1, MMC3)")

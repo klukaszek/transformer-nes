@@ -328,6 +328,13 @@ class Cpu6502TransformerMachine:
     def inject_write(self, addr: int, value: int):
         self.insert_write(addr & 0xFFFF, value & 0xFF)
 
+    def inject_region(self, base: int, data: bytes):
+        """Bulk injection (mapper bank switches): one native call."""
+        base &= 0xFFFF
+        self.ram[base:base + len(data)] = data
+        self.engine.inject_region(base, bytes(data))
+        self.pos += len(data)
+
     def insert_write(self, addr: int, value: int):
         addr &= 0xFFFF
         value &= 0xFF

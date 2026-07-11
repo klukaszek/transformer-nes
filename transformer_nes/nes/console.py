@@ -142,6 +142,7 @@ class Console:
                 self.rt.set_state(state)
             self.read_cpu = self.rt.read_ram
             self.poke_cpu = self.rt.inject_write
+            self.poke_region = self.rt.inject_region
             self.uses_kernel_bus = True
             return
         if backend == "weights":
@@ -163,6 +164,7 @@ class Console:
                 machine.set_state(state)
             self.read_cpu = machine.read_ram
             self.poke_cpu = machine.inject_write
+            self.poke_region = machine.inject_region
             self.uses_kernel_bus = True
             return
         if backend == "reference":
@@ -191,6 +193,11 @@ class Console:
             self.bus.ram[addr & 0xFFFF] = value & 0xFF
         self.poke_cpu = poke
 
+        def poke_region(base: int, data: bytes) -> None:
+            for i, byte in enumerate(data):
+                poke(base + i, byte)
+        self.poke_region = poke_region
+
     def attach_devices(self):
         self.bus.attach(self.ppu, 0x2000, 0x3FFF)     # registers + mirrors
         self.bus.attach(self.dma, 0x4014, 0x4014)
@@ -199,7 +206,11 @@ class Console:
             # Registers live in ROM space; reads there must stay native.
             self.bus.attach(self.mapper, 0x8000, 0xFFFF, writes_only=True)
             self.mapper.poke = self.poke_cpu
+            self.mapper.poke_region = self.poke_region
             self.mapper.on_mirroring = self.set_mirroring
+            if getattr(self.mapper, "chr_rom", False):
+                self.mapper.set_chr_banks = self.ppu.set_chr_banks
+                self.ppu.set_chr_banks(self.mapper.chr_banks())
 
     def set_mirroring(self, mode: int) -> None:
         self.ppu.mirroring = mode

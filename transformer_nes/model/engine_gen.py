@@ -499,6 +499,14 @@ RUN_LOOP = "\n\n".join((
     """\
     void inject_write(int addr, int value) { insert_write(addr & 0xFFFF, value & 0xFF, seq + 1); }
 
+    // Bulk injection (mapper bank switches): one call per region instead
+    // of one Python call per byte.
+    void inject_region(int base, py::bytes data) {
+        const std::string d = data;
+        for (size_t i = 0; i < d.size(); ++i)
+            insert_write((base + (int)i) & 0xFFFF, (unsigned char)d[i], seq + 1);
+    }
+
     void set_run_state(int pc, int a, int x, int y, int s, int p,
                        int ir, int oplo, int ophi, int ea, int data, int halted) {
         st_pc = pc & 0xFFFF; st_a = a & 0xFF; st_x = x & 0xFF; st_y = y & 0xFF;
@@ -532,6 +540,7 @@ PYBIND_STEP_METHODS = """\
         .def("clear_read_lease", &ENGINE_T::clear_read_lease)
         .def("set_nmi", &ENGINE_T::set_nmi)
         .def("inject_write", &ENGINE_T::inject_write)
+        .def("inject_region", &ENGINE_T::inject_region)
         .def("read_ram", &ENGINE_T::read_ram)
         .def("dump_ram", &ENGINE_T::dump_ram)
         .def("set_run_state", &ENGINE_T::set_run_state)
@@ -1499,6 +1508,14 @@ class GeneratedWeightsEngine:
                 "be silently lost -- use a full WRITE-token forward instead"
             )
         self.engine.insert_write(addr, value, pos)
+
+    def inject_region(self, base: int, data: bytes) -> None:
+        if self.n_memory_heads == 0:
+            raise RuntimeError(
+                "model has no memory-tagged lookup heads; a direct WRITE would "
+                "be silently lost -- use a full WRITE-token forward instead"
+            )
+        self.engine.inject_region(base, data)
 
 
 class SequenceModule:

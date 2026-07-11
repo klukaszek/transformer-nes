@@ -21,8 +21,48 @@ default).  **The native app landed 2026-07-11** (log below): a Sokol
 window over the console frame loop — SMB is playable on a keyboard
 through the transformer weights, and getting it playable forced the
 PPU's real scroll model (loopy t + the sprite-0 split, same log).
-Next up: **mappers** (MMC1 for Final Fantasy, MMC3 for SMB3 — the
-cartridge is NROM-only today), then the APU + sokol_audio for sound.
+**Mappers landed same day** (log below): MMC1 (Final Fantasy plays)
+and MMC3 (SMB3 runs at 5.2 ms/frame through the weights) — but MMC3's
+scanline IRQ is NOT delivered yet, so SMB3's bottom status bar renders
+garbage.  Next up: **IRQ delivery in the machine model** (the graph
+has NMI only; IRQ = same interrupt sequence with the $FFFE vector and
+I-flag gating, paced by the console like the sprite-0 hit), then the
+APU + sokol_audio for sound.
+
+## 2026-07-11 mappers — MMC1 + MMC3, banked ROMs on every backend
+
+The cartridge stops being NROM-only.  The design constraint: the
+machines boot from a flat 64 KiB image and run natively, so PRG bank
+switching must rewrite machine memory at runtime.  Mapper registers
+are writes into ROM space, served by a **write-only bus watch** on
+$8000-$FFFF (`attach(..., writes_only=True)` on both buses — a read
+watch there would pause on every ROM table read).  The run loop
+applies a store before pausing, so the handler repairs the clobbered
+PRG byte, then injects any bank change; `nes/mappers.py` owns the
+protocols, the console wires per-backend hooks (poke/poke_region/
+mirroring/CHR banks) after every boot and handoff.
+
+- **MMC1** (serial shift register): PRG modes (32K / fix-first /
+  fix-last), mirroring incl. single-screen (the PPU's nametable
+  arrangement is runtime-switchable now), CHR-RAM carts only so far.
+  Receipt: Final Fantasy boots, runs, and is playable in the app.
+- **MMC3**: 8K PRG banks both modes, 2K/1K CHR banks via the PPU's new
+  eight-slot CHR window (`set_chr_banks`; full CHR ROM of any size
+  lives behind it), $A000 mirroring.  The scanline IRQ counter is
+  accepted but NOT delivered — the machine model has NMI only — so
+  SMB3's status-bar raster split renders garbage (warned once at
+  runtime).  IRQ delivery is the recorded next step.
+- **inject_region** (both generated engines + kernel): a bank switch
+  was 8-16K Python→C++ `inject_write` calls (~1.1 ms each switch);
+  SMB3 switches ~5x/frame and measured 21.3 ms/frame on the kernel.
+  One native bulk call now: kernel 16.5 ms/frame, **weights 5.2
+  ms/frame — SMB3 through the transformer at 60 fps with 3x headroom**
+  (the token log still grows 8K/switch; the checkpoint reseed absorbs
+  it, ~8 per 240 frames).
+
+Receipts: 93 tests green (7 new mapper-protocol tests: MMC1 serial/
+modes/reset/repair, MMC3 modes/CHR arrangement/mirroring); FF and SMB3
+run 240+ frames on kernel and weights without halting; SMB unchanged.
 
 ## 2026-07-11 native app + PPU scroll model — SMB is playable
 

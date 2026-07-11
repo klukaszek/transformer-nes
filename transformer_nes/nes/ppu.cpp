@@ -13,11 +13,15 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace py = pybind11;
 
 struct PPU {
-    uint8_t chr[0x2000];
+    // Full CHR data (ROM of any 1 KiB-multiple size, or 8 KiB CHR RAM);
+    // the PPU's $0000-$1FFF window maps through eight 1 KiB bank slots.
+    std::vector<uint8_t> chr;
+    int chr_bank[8];
     bool chr_writable;
     // Nametable arrangement, runtime-switchable by mappers (MMC1
     // encoding): 0/1 single-screen low/high, 2 vertical, 3 horizontal.
@@ -51,8 +55,9 @@ struct PPU {
 
     PPU(py::bytes chr_data, bool writable, bool vertical) {
         std::string c = chr_data;
-        std::memset(chr, 0, sizeof(chr));
-        std::memcpy(chr, c.data(), c.size() < sizeof(chr) ? c.size() : sizeof(chr));
+        chr.assign(c.begin(), c.end());
+        if (chr.size() < 0x2000) chr.resize(0x2000, 0);
+        for (int i = 0; i < 8; ++i) chr_bank[i] = i * 0x400;
         chr_writable = writable;
         mirroring = vertical ? 2 : 3;
         std::memset(nametables, 0, sizeof(nametables));
@@ -84,9 +89,19 @@ struct PPU {
         return phys * 0x400 + offset;
     }
 
+    int chr_at(int addr) const {
+        return chr[chr_bank[(addr >> 10) & 7] + (addr & 0x3FF)];
+    }
+
+    void set_chr_banks(const std::vector<int>& banks_1k) {
+        if (banks_1k.size() != 8) throw std::runtime_error("expected 8 CHR banks");
+        const int n = (int)(chr.size() >> 10);
+        for (int i = 0; i < 8; ++i) chr_bank[i] = (banks_1k[i] % n) * 0x400;
+    }
+
     int vram_read(int addr) const {
         addr &= 0x3FFF;
-        if (addr < 0x2000) return chr[addr];
+        if (addr < 0x2000) return chr_at(addr);
         if (addr < 0x3F00) return nametables[nt_offset(addr)];
         return palette[palette_index(addr)];
     }
@@ -94,7 +109,8 @@ struct PPU {
     void vram_write(int addr, int value) {
         addr &= 0x3FFF;
         if (addr < 0x2000) {
-            if (chr_writable) chr[addr] = (uint8_t)value;
+            if (chr_writable)
+                chr[chr_bank[(addr >> 10) & 7] + (addr & 0x3FF)] = (uint8_t)value;
         } else if (addr < 0x3F00) {
             nametables[nt_offset(addr)] = (uint8_t)value;
         } else {
@@ -200,8 +216,8 @@ struct PPU {
 
     int tile_pixel(int tile, int row, int col) const {
         const int base = tile * 16 + row;
-        const int b0 = (chr[base] >> (7 - col)) & 1;
-        const int b1 = (chr[base + 8] >> (7 - col)) & 1;
+        const int b0 = (chr_at(base) >> (7 - col)) & 1;
+        const int b1 = (chr_at(base + 8) >> (7 - col)) & 1;
         return b0 | (b1 << 1);
     }
 
@@ -336,6 +352,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("read_lease", &PPU::read_lease)
         .def("vram_read", &PPU::vram_read)
         .def("vram_write", &PPU::vram_write)
+        .def("set_chr_banks", &PPU::set_chr_banks)
         .def_static("palette_index", &PPU::palette_index)
         .def("begin_vblank", &PPU::begin_vblank)
         .def("end_vblank", &PPU::end_vblank)

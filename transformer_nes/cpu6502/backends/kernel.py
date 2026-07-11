@@ -474,6 +474,13 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        insert_write(addr, value, pos); pos += 1.0;')
     emit('    }')
     emit('')
+    emit('    // Bulk injection (mapper bank switches): one call per region.')
+    emit('    void inject_region(int base, py::bytes data) {')
+    emit('        const std::string d = data;')
+    emit('        for (size_t i = 0; i < d.size(); ++i)')
+    emit('            inject_write(base + (int)i, (unsigned char)d[i]);')
+    emit('    }')
+    emit('')
     emit('    py::dict get_state() {')
     emit('        py::dict st;')
     emit('        st["pc"] = st_pc; st["a"] = st_a; st["x"] = st_x; st["y"] = st_y;')
@@ -586,6 +593,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        .def("clear_read_lease", &KERNEL_T::clear_read_lease)')
     emit('        .def("set_nmi", &KERNEL_T::set_nmi)')
     emit('        .def("inject_write", &KERNEL_T::inject_write)')
+    emit('        .def("inject_region", &KERNEL_T::inject_region)')
     emit('        .def("read_ram", &KERNEL_T::read_ram)')
     emit('        .def("dump_ram", &KERNEL_T::dump_ram)')
     emit('        .def("set_state", &KERNEL_T::set_state)')
@@ -666,6 +674,9 @@ class Cpu6502CppRuntime:
 
     def inject_write(self, addr: int, value: int):
         self.kernel.inject_write(addr, value)
+
+    def inject_region(self, base: int, data: bytes):
+        self.kernel.inject_region(base, data)
 
     def read_ram(self, addr: int) -> int:
         return self.kernel.read_ram(addr)
