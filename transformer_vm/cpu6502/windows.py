@@ -73,6 +73,23 @@ def match_shape_windows(image, shapes_meta, *, limit: int = 512):
     return out
 
 
+def match_shape_at(read, pc: int, shapes_meta) -> int | None:
+    """Anchored shape match at one pc through a byte-read callable.  Closure
+    to head is not required (the caller argues profitability; dispatch is
+    correct for straight-line matches too), except the JMP self-spin, whose
+    dispatch predicate demands operand == head."""
+    for meta in shapes_meta:
+        length = int(meta["length"])
+        if pc + length > 0x10000:
+            continue
+        if any(read(pc + off) != byte for off, byte in meta["sig"]):
+            continue
+        if meta["close"] == "jmp" and read(pc + 1) | (read(pc + 2) << 8) != pc:
+            continue
+        return int(meta["id"])
+    return None
+
+
 def scan_sequence_windows(image, *, spin_repeat: int = 4, limit: int = 16):
     """Find closed, write-free micro-loops eligible for sequence experts."""
     data = bytes(image)

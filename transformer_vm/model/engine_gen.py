@@ -37,6 +37,7 @@ _CODE_FILES = (
     "cpu6502/reference.py",
     "cpu6502/run_protocol.py",
     "cpu6502/windows.py",
+    "cpu6502/experts.py",
     "cpu6502/weights_runner.py",
 )
 _code_digest_cache: str | None = None

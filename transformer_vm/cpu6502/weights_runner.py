@@ -15,15 +15,21 @@ import numpy as np
 
 from transformer_vm.cpu6502 import reference
 from transformer_vm.cpu6502.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
-from transformer_vm.cpu6502.spec import OPCODES, READS_MEMORY
+from transformer_vm.cpu6502.experts import (
+    build_opcode_experts,
+    build_sequence_expert,
+    build_shape_experts,
+    head_row,
+    step_spec_base,
+)
+from transformer_vm.cpu6502.spec import OPCODES
 from transformer_vm.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_vm.cpu6502.windows import (
-    BRANCH_OPERATIONS,
     SHAPE_LIBRARY,
+    match_shape_at,
     match_shape_windows,
 )
 from transformer_vm.graph.core import ProgramGraph
-from transformer_vm.graph.fold import GraphFolder, opcode_pins
 from transformer_vm.model.weights import add_position_encoding, build_model
 from transformer_vm.scheduler.milp import asap_schedule
 
@@ -33,55 +39,6 @@ logger = logging.getLogger(__name__)
 # routing is workload-independent (no game-derived tuning set).  NMI steps and
 # any opcode outside a narrowed set fall back to the exact union step.
 DEFAULT_EXPERT_OPCODES = tuple(sorted(OPCODES))
-
-
-def _eval_over_heads(fold_result, dim, length):
-    """Evaluate a folded dim as a function of the symbolic head pc, for every
-    head where the window fits without wrapping $FFFF.  The head enters the
-    graph through the step-0 pc persists (state arrives via attention, so
-    raw inputs never carry it); evaluation cuts there and raises if the
-    value depends on anything else -- the straight-line license needs
-    next_pc to be a pure function of pc."""
-    from transformer_vm.graph.core import (
-        InputDimension,
-        LookUpDimension,
-        PersistDimension,
-        ReGLUDimension,
-    )
-
-    heads = np.arange(0x10000 - length + 1, dtype=np.float64)
-    memo: dict = {
-        fold_result.dim_of_name["current_pc_lo__s0"]: heads % 256.0,
-        fold_result.dim_of_name["current_pc_hi__s0"]: heads // 256.0,
-    }
-
-    def ev(d):
-        r = memo.get(d)
-        if r is not None:
-            return r
-        if isinstance(d, InputDimension):
-            if d.name != "one":
-                raise RuntimeError(f"depends on input {d.name!r}")
-            r = np.float64(1.0)
-        elif isinstance(d, ReGLUDimension):
-            a, b = np.asarray(evx(d.a_expr)), np.asarray(evx(d.b_expr))
-            r = np.where(b > 0.0, a * b, 0.0)
-        elif isinstance(d, PersistDimension):
-            r = evx(d.expr)
-        elif isinstance(d, LookUpDimension):
-            raise RuntimeError("depends on a memory lookup")
-        else:
-            raise RuntimeError(f"unsupported dim {d.name!r}")
-        memo[d] = r
-        return r
-
-    def evx(e):
-        acc = np.float64(0.0)
-        for d, c in e.terms.items():
-            acc = acc + ev(d) * c
-        return acc
-
-    return heads, np.asarray(ev(dim))
 
 
 class Cpu6502TransformerMachine:
@@ -142,9 +99,6 @@ class Cpu6502TransformerMachine:
         # exact fixed-point int32 residual.  The grouped memory lookup keeps
         # K-side address scores below 2^24, so float32 Q/K rounding still
         # distinguishes adjacent high addresses.
-        self._state_head_cols, self._state_head_vals = self._head_row(self._state_row)
-        self._halt_head_cols, self._halt_head_vals = self._head_row(self._halt_row)
-
         from transformer_vm.model.engine_gen import (
             GeneratedWeightsEngine,
             engine_config_key,
@@ -182,11 +136,14 @@ class Cpu6502TransformerMachine:
             if self._engine is not None:
                 logger.info("engine cache hit (%d experts)", self._engine.n_experts)
         if self._engine is None:
-            experts = []
             shapes_meta: list[dict] = []
-            experts = self._build_expert_models(expert_opcodes)
+            experts = build_opcode_experts(
+                self._pg, expert_opcodes,
+                schedule=self._expert_schedule,
+                milp_seconds=self._expert_milp_seconds,
+            )
             if shapes:
-                shape_experts, shapes_meta = self._build_shape_experts(shapes)
+                shape_experts, shapes_meta = build_shape_experts(self._pg, shapes)
                 experts.extend(shape_experts)
             self._engine = GeneratedWeightsEngine(
                 self.model, step_spec=self._step_spec(),
@@ -246,117 +203,6 @@ class Cpu6502TransformerMachine:
         self._engine.forward(x)  # in place, whole stack
         return x
 
-    def _build_expert_models(self, opcodes) -> list[dict]:
-        """Rebuilt per-opcode expert models for the opcode-routed engine.
-
-        For each expert opcode, the union graph is partially evaluated with
-        the decode one-hot gates pinned (is_op_<byte>=1, every other
-        is_op_*=0, is_nmi=0 -- exactly what the hard router supplies), and
-        the *folded* graph (graph/fold.py) is scheduled and weight-compiled
-        into its own transformer.  Unlike the earlier in-place pruning of
-        the union model, a mux whose gate folds to 1 really disappears here
-        -- its linear map inlines into consumers -- which is the measured
-        0.29x -> ~0.2x terms gap.
-
-        Safety is checked, not assumed: the fold refuses lookups whose
-        insert-side expressions can reach a pin (shared attention state must
-        be pin-independent), and engine_gen refuses any expert head whose
-        classification (memory structure / running-argmax register, resolved
-        by lookup provenance) disagrees with the union's.  Correctness rests
-        on ram[pc] == the graph's fetched opcode; the lockstep chain (every
-        opcode swept through its expert by nestest and Klaus) is the receipt.
-        """
-        opcodes = [int(b) for b in (opcodes or []) if int(b) in OPCODES]
-        if not opcodes:
-            return []
-
-        folder = GraphFolder(self._pg, root_names=_RUNTIME_READ_DIMS)
-        experts = []
-        for byte in opcodes:
-            r = folder.fold(opcode_pins(byte, OPCODES), label=f"{byte:02X}")
-            if r.insert_side_hazards:
-                raise RuntimeError(
-                    f"expert {byte:02X}: decode pins reach insert-side "
-                    f"expressions of {r.insert_side_hazards}; shared attention "
-                    "state would diverge"
-                )
-            fp = r.program_graph
-            if self._expert_schedule == "milp":
-                # Exact-width schedule: tractable at expert scale (the union
-                # formulation blowup was size-driven); at the time limit the
-                # solver's best incumbent is used -- feasible, just unproven.
-                from transformer_vm.scheduler.milp import milp_schedule
-
-                t0 = time.perf_counter()
-                # The engine is nnz-bound, so the objective is the schedule's
-                # hygiene cost (passthrough persistence), capped at the
-                # balanced-ASAP width the default path would have used.
-                asap = asap_schedule(fp.input_tokens, fp.output_tokens,
-                                     program_graph=fp, log=logger.debug)
-                _m, _t, _ti, ainfo = build_model(program_graph=fp, schedule=asap)
-                sched = milp_schedule(fp.input_tokens, fp.output_tokens,
-                                      program_graph=fp, log=logger.debug,
-                                      time_limit=self._expert_milp_seconds,
-                                      objective="hygiene",
-                                      width_bound=ainfo.d_model)
-                logger.info("expert %02X: hygiene MILP in %.0fs",
-                            byte, time.perf_counter() - t0)
-            else:
-                sched = asap_schedule(fp.input_tokens, fp.output_tokens,
-                                      program_graph=fp, log=logger.debug)
-            model, _tokens, tok_to_idx, info = build_model(
-                program_graph=fp, schedule=sched,
-            )
-            experts.append({
-                "name": f"{byte:02X}", "byte": byte, "model": model,
-                "step_spec": self._expert_step_spec(r, model, tok_to_idx, info),
-                "union_lookup_of": r.union_lookup_of,
-                "_layers": info.n_layers, "_d": info.d_model,
-            })
-        logger.info(
-            "routed experts: %d rebuilt models, %d-%d layers, d_model %d-%d "
-            "(union: %d layers, d_model %d)",
-            len(experts),
-            min(e["_layers"] for e in experts), max(e["_layers"] for e in experts),
-            min(e["_d"] for e in experts), max(e["_d"] for e in experts),
-            self.n_layers, self.d_model,
-        )
-        return experts
-
-    def _expert_step_spec(self, fold_result, model, tok_to_idx, info) -> dict:
-        """The generated-step slot map for one expert model: same shape as
-        _step_spec, resolved through the fold's name map and the expert's
-        own schedule/slot assignment."""
-
-        def s(name):
-            return info.slot_of[fold_result.dim_of_name[name]]
-
-        def head_row(row):
-            w = model.head.weight[row]
-            cols = np.nonzero(w)[0]
-            return ([int(c) for c in cols], [float(w[c]) for c in cols])
-
-        return {
-            "inputs": {
-                "is_state": s("is_state"),
-                "pc_lo": s("in_pc_lo"), "pc_hi": s("in_pc_hi"),
-                "a": s("in_a"), "x": s("in_x"), "y": s("in_y"), "s": s("in_s"),
-                "ir": s("in_ir"), "oplo": s("in_oplo"), "ophi": s("in_ophi"),
-                "ea_lo": s("in_ea_lo"), "ea_hi": s("in_ea_hi"),
-                "data": s("in_data"), "halted": s("in_halted"),
-                "nmi": s("in_nmi"),
-            },
-            "p_flags": [
-                (s("in_p_c"), reference.FLAG_C), (s("in_p_z"), reference.FLAG_Z),
-                (s("in_p_i"), reference.FLAG_I), (s("in_p_d"), reference.FLAG_D),
-                (s("in_p_b"), reference.FLAG_B), (s("in_p_u"), reference.FLAG_U),
-                (s("in_p_v"), reference.FLAG_V), (s("in_p_n"), reference.FLAG_N),
-            ],
-            "outputs": {name: s(name) for name in _RUNTIME_READ_DIMS},
-            "halt_head": head_row(tok_to_idx["HALT"]),
-            "state_head": head_row(tok_to_idx["STATE"]),
-        }
-
     def _attach_sequence_module(self, windows, *, bcd: bool) -> None:
         """Compile-or-load the per-ROM sequence module and attach its window
         dispatch to the core engine.  A new ROM's window set costs one small
@@ -376,7 +222,7 @@ class Cpu6502TransformerMachine:
                 # The scanner proposes shapes; the fold's license checks
                 # arbitrate.  A rejected window only loses its fast path.
                 try:
-                    experts.append(self._build_sequence_expert(*w))
+                    experts.append(build_sequence_expert(self._pg, *w))
                 except RuntimeError as e:
                     logger.info("sequence window skipped: %s", e)
             if not experts:
@@ -389,202 +235,6 @@ class Cpu6502TransformerMachine:
             logger.info("sequence module cache hit (max window %d steps)", mod.max_k)
         self._seq_module = mod
         self._engine.attach_seq(mod.fn_ptr, mod.ctx_ptr)
-
-    def _build_sequence_expert(self, head: int, code: bytes, repeat: int) -> dict:
-        """One sequence expert: a K-instruction window folded as ONE forward.
-
-        The router guarantees pc == head, the window's bytes, no pending NMI,
-        and a remaining step/cycle budget covering the whole window, so the
-        fold pins all of it.  The license is checked, not assumed: every step
-        must be write-free and non-halting (folded constants), control flow
-        inside the window must be straight-line (folded next_pc == the next
-        step's pinned pc), and only the first instruction may read memory
-        (the run loop's shadow-read watch check covers just that one).
-        """
-        from transformer_vm.graph.fold import SEQUENCE_FEEDBACK, sequence_pins
-
-        pin_list = sequence_pins(head, code, OPCODES) * repeat
-        n_steps = len(pin_list)
-        ops, off = [], 0
-        while off < len(code):
-            op = OPCODES[code[off]]
-            ops.append(op)
-            off += op.length
-        ops = ops * repeat
-        for op in ops[1:]:
-            if op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm"):
-                raise RuntimeError(
-                    f"sequence @{head:04X}: {op.mnemonic} reads memory past "
-                    "the shadow-watch check (only the first instruction may)"
-                )
-
-        folder = GraphFolder(self._pg, root_names=_RUNTIME_READ_DIMS)
-        label = f"seq_{head:04X}"
-        r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK, label=label)
-        if r.insert_side_hazards:
-            raise RuntimeError(
-                f"sequence @{head:04X}: pins reach insert-side expressions "
-                f"of {r.insert_side_hazards}"
-            )
-
-        one = r.program_graph.one
-
-        def const_root(name, k):
-            d = r.dim_of_name[f"{name}__s{k}"]
-            expr = getattr(d, "expr", None)
-            if expr is None or any(t is not one for t in expr.terms):
-                raise RuntimeError(
-                    f"sequence @{head:04X} step {k}: {name} did not fold "
-                    "to a constant"
-                )
-            return int(round(expr.terms.get(one, 0.0)))
-
-        for k in range(n_steps):
-            for store in ("is_store", "is_store2", "is_store3"):
-                if const_root(store, k) != 0:
-                    raise RuntimeError(
-                        f"sequence @{head:04X} step {k}: not write-free"
-                    )
-            if const_root("new_halted", k) != 0:
-                raise RuntimeError(f"sequence @{head:04X} step {k}: may halt")
-            if k + 1 < n_steps:
-                nxt = int(pin_list[k + 1]["current_pc_lo"]) | (
-                    int(pin_list[k + 1]["current_pc_hi"]) << 8
-                )
-                if const_root("next_pc", k) != nxt:
-                    raise RuntimeError(
-                        f"sequence @{head:04X} step {k}: control flow leaves "
-                        "the window (next_pc != the next step's pc)"
-                    )
-
-        fp = r.program_graph
-        sched = asap_schedule(fp.input_tokens, fp.output_tokens,
-                              program_graph=fp, log=logger.debug)
-        model, _tokens, tok_to_idx, info = build_model(
-            program_graph=fp, schedule=sched,
-        )
-        cycles = sum(op.cycles for op in ops)
-        return {
-            "kind": "seq", "name": label, "head": head, "window": bytes(code),
-            "n_steps": n_steps, "cycles": cycles,
-            "cycles_prefix": cycles - ops[-1].cycles, "model": model,
-            "step_spec": self._sequence_step_spec(r, model, tok_to_idx, info),
-            "union_lookup_of": r.union_lookup_of,
-            "_layers": info.n_layers, "_d": info.d_model,
-        }
-
-    def _build_shape_experts(self, shapes) -> tuple[list[dict], list[dict]]:
-        """Canonical shape experts for the runtime window table.
-
-        Each shape folds ONCE with pc and every operand byte symbolic
-        (fold_sequence pc_offsets); the license is checked, not assumed:
-        only the first instruction may read memory (spec), every step is
-        write-free and non-halting (folded constants), and each interior
-        step's next_pc equals head + offset -- verified EXHAUSTIVELY over
-        every head the window fits at, which is possible exactly because
-        the folded expression may depend on nothing but the pc bytes.
-        The JMP self-spin's closure is a dispatch property instead (the
-        router compares the operand bytes to the head).  A library shape
-        that fails its license is a hard error: the library is code.
-        """
-        from transformer_vm.graph.fold import (
-            SEQUENCE_FEEDBACK,
-            sequence_shape_pins,
-        )
-
-        folder = GraphFolder(self._pg, root_names=_RUNTIME_READ_DIMS)
-        experts: list[dict] = []
-        meta: list[dict] = []
-        for sid, (name, template, repeat) in enumerate(shapes):
-            ops, checks, off = [], [], 0
-            while off < len(template):
-                op = OPCODES[template[off]]
-                ops.append(op)
-                checks.append((off, op.byte))
-                off += op.length
-            for op in ops[1:]:
-                if op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm"):
-                    raise RuntimeError(
-                        f"shape {name}: {op.mnemonic} reads memory past the "
-                        "shadow-watch check (only the first instruction may)"
-                    )
-            self_target = (
-                len(ops) == 1 and ops[0].operation == "jmp" and ops[0].mode == "abs"
-            )
-            if repeat > 1 and not self_target:
-                raise RuntimeError(f"shape {name}: only a JMP self-spin may repeat")
-            if not self_target and ops[-1].operation not in BRANCH_OPERATIONS:
-                raise RuntimeError(f"shape {name}: window must close via its last op")
-
-            pins, offsets = sequence_shape_pins(template, OPCODES)
-            pin_list = pins * repeat
-            pc_offsets = offsets * repeat
-            n_steps = len(pin_list)
-            r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
-                                     label=f"shape_{name}", pc_offsets=pc_offsets)
-            if r.insert_side_hazards:
-                raise RuntimeError(
-                    f"shape {name}: pins reach insert-side expressions "
-                    f"of {r.insert_side_hazards}"
-                )
-
-            one = r.program_graph.one
-
-            def const_root(root, k, *, r=r, one=one, name=name):
-                d = r.dim_of_name[f"{root}__s{k}"]
-                expr = getattr(d, "expr", None)
-                if expr is None or any(t is not one for t in expr.terms):
-                    raise RuntimeError(
-                        f"shape {name} step {k}: {root} did not fold constant"
-                    )
-                return int(round(expr.terms.get(one, 0.0)))
-
-            for k in range(n_steps):
-                for store in ("is_store", "is_store2", "is_store3"):
-                    if const_root(store, k) != 0:
-                        raise RuntimeError(f"shape {name} step {k}: not write-free")
-                if const_root("new_halted", k) != 0:
-                    raise RuntimeError(f"shape {name} step {k}: may halt")
-                if k + 1 < n_steps and not self_target:
-                    heads, got = _eval_over_heads(
-                        r, r.dim_of_name[f"next_pc__s{k}"], len(template)
-                    )
-                    if not np.array_equal(got, heads + pc_offsets[k + 1]):
-                        raise RuntimeError(
-                            f"shape {name} step {k}: interior next_pc is not "
-                            "head + offset for every head"
-                        )
-
-            fp = r.program_graph
-            sched = asap_schedule(fp.input_tokens, fp.output_tokens,
-                                  program_graph=fp, log=logger.debug)
-            model, _tokens, tok_to_idx, info = build_model(
-                program_graph=fp, schedule=sched,
-            )
-            ops_full = ops * repeat
-            cycles = sum(op.cycles for op in ops_full)
-            experts.append({
-                "kind": "shape", "name": f"shape_{name}", "shape_id": sid,
-                "opcode_checks": checks, "length": len(template),
-                "self_target": self_target, "n_steps": n_steps,
-                "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
-                "step_spec": self._sequence_step_spec(r, model, tok_to_idx, info),
-                "union_lookup_of": r.union_lookup_of,
-                "_layers": info.n_layers, "_d": info.d_model,
-            })
-            meta.append({
-                "id": sid, "name": name, "sig": [[o, b] for o, b in checks],
-                "length": len(template), "repeat": repeat,
-                "close": "jmp" if self_target else "branch",
-            })
-        if experts:
-            logger.info(
-                "shape experts: %d folded, %d-%d layers, d_model %d-%d",
-                len(experts),
-                min(e["_layers"] for e in experts), max(e["_layers"] for e in experts),
-                min(e["_d"] for e in experts), max(e["_d"] for e in experts),
-            )
-        return experts, meta
 
     def _populate_shape_windows(self) -> None:
         """Fill the engine's runtime window table from the current RAM image
@@ -599,28 +249,11 @@ class Cpu6502TransformerMachine:
         for sid, head in match_shape_windows(self._ram, meta):
             self._engine.add_window(sid, head)
 
-    def _match_shape_at(self, pc: int) -> int | None:
-        """Anchored shape match at one hot pc against the ENGINE's live RAM
-        (the native run loop's writes never reach the Python mirror -- a
-        runtime-copied loop exists only engine-side).  Closure is not
-        required (hotness already argued profitability; dispatch is correct
-        for straight-line matches too), except the JMP self-spin, whose
-        dispatch predicate demands operand == head."""
-        rd = self._engine.read_ram
-        for m in self._engine.shapes_meta:
-            length = int(m["length"])
-            if pc + length > 0x10000:
-                continue
-            if any(rd(pc + off) != b for off, b in m["sig"]):
-                continue
-            if m["close"] == "jmp" and rd(pc + 1) | (rd(pc + 2) << 8) != pc:
-                continue
-            return int(m["id"])
-        return None
-
     def _jit_tick(self) -> None:
         """Periodic JIT poll after a native run: table-add any hot fallback
-        pc whose bytes match a library shape."""
+        pc whose bytes match a library shape, read from the ENGINE's live RAM
+        (the native run loop's writes never reach the Python mirror -- a
+        runtime-copied loop exists only engine-side)."""
         meta = getattr(self._engine, "shapes_meta", None) or []
         if not meta:
             return
@@ -631,80 +264,22 @@ class Cpu6502TransformerMachine:
             pc = int(pc)
             if pc in self._jit_rejected:
                 continue
-            sid = self._match_shape_at(pc)
+            sid = match_shape_at(self._engine.read_ram, pc, meta)
             if sid is None:
                 self._jit_rejected.add(pc)
             else:
                 self._engine.add_window(sid, pc)
-                logger.info("jit window: %s at %04X",
-                            self._engine.shapes_meta[sid]["name"], pc)
-
-    def _sequence_step_spec(self, fold_result, model, tok_to_idx, info) -> dict:
-        """The _expert_step_spec shape, with one outputs map per step."""
-
-        def s(name):
-            return info.slot_of[fold_result.dim_of_name[name]]
-
-        def head_row(row):
-            w = model.head.weight[row]
-            cols = np.nonzero(w)[0]
-            return ([int(c) for c in cols], [float(w[c]) for c in cols])
-
-        return {
-            "inputs": {
-                "is_state": s("is_state"),
-                "pc_lo": s("in_pc_lo"), "pc_hi": s("in_pc_hi"),
-                "a": s("in_a"), "x": s("in_x"), "y": s("in_y"), "s": s("in_s"),
-                "ir": s("in_ir"), "oplo": s("in_oplo"), "ophi": s("in_ophi"),
-                "ea_lo": s("in_ea_lo"), "ea_hi": s("in_ea_hi"),
-                "data": s("in_data"), "halted": s("in_halted"),
-                "nmi": s("in_nmi"),
-            },
-            "p_flags": [
-                (s("in_p_c"), reference.FLAG_C), (s("in_p_z"), reference.FLAG_Z),
-                (s("in_p_i"), reference.FLAG_I), (s("in_p_d"), reference.FLAG_D),
-                (s("in_p_b"), reference.FLAG_B), (s("in_p_u"), reference.FLAG_U),
-                (s("in_p_v"), reference.FLAG_V), (s("in_p_n"), reference.FLAG_N),
-            ],
-            "step_outputs": [
-                {name: s(f"{name}__s{k}") for name in _RUNTIME_READ_DIMS}
-                for k in range(fold_result.n_steps)
-            ],
-            "halt_head": head_row(tok_to_idx["HALT"]),
-            "state_head": head_row(tok_to_idx["STATE"]),
-        }
+                logger.info("jit window: %s at %04X", meta[sid]["name"], pc)
 
     def _step_spec(self) -> dict:
         """Slot map for the generated C++ machine_step (engine_gen.py)."""
-        rt = self.rt
-        s = lambda dim: self.slot_of[dim]  # noqa: E731
-        return {
-            "inputs": {
-                "is_state": s(rt.is_state),
-                "pc_lo": s(rt.in_pc_lo), "pc_hi": s(rt.in_pc_hi),
-                "a": s(rt.in_a), "x": s(rt.in_x), "y": s(rt.in_y), "s": s(rt.in_s),
-                "ir": s(rt.in_ir), "oplo": s(rt.in_oplo), "ophi": s(rt.in_ophi),
-                "ea_lo": s(rt.in_ea_lo), "ea_hi": s(rt.in_ea_hi),
-                "data": s(rt.in_data), "halted": s(rt.in_halted),
-                "nmi": s(rt.in_nmi),
-            },
-            "p_flags": [
-                (s(rt.in_p_c), reference.FLAG_C), (s(rt.in_p_z), reference.FLAG_Z),
-                (s(rt.in_p_i), reference.FLAG_I), (s(rt.in_p_d), reference.FLAG_D),
-                (s(rt.in_p_b), reference.FLAG_B), (s(rt.in_p_u), reference.FLAG_U),
-                (s(rt.in_p_v), reference.FLAG_V), (s(rt.in_p_n), reference.FLAG_N),
-            ],
-            "outputs": dict(self._read_slots),
-            "halt_head": (self._halt_head_cols.tolist(),
-                          self._halt_head_vals.tolist()),
-            "state_head": (self._state_head_cols.tolist(),
-                           self._state_head_vals.tolist()),
-        }
-
-    def _head_row(self, row: int) -> tuple[np.ndarray, np.ndarray]:
-        w = self.model.head.weight[row]
-        cols = np.nonzero(w)[0].astype(np.int32)
-        return cols, w[cols].astype(np.float32, copy=False)
+        spec = step_spec_base(
+            lambda name: self.slot_of[self._dim_by_name[name]]
+        )
+        spec["outputs"] = dict(self._read_slots)
+        spec["halt_head"] = head_row(self.model, self._halt_row)
+        spec["state_head"] = head_row(self.model, self._state_row)
+        return spec
 
     # ── Machine protocol (mirrors evaluator.Cpu6502Runtime, so the NES
     # bus's GraphCore adapter can drive this machine unchanged) ──────
