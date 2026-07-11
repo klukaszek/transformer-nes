@@ -55,9 +55,15 @@ def export_model(out_dir: str, *, bcd: bool = False, f64: bool = False) -> dict:
     # certified exact for this construction; --f64 ships the theorem-free
     # exact-constructed coefficients instead (see the precision prose).
     dtype = np.float64 if f64 else np.float32
+    # The READOUT head row is scheduling scaffolding (1e-6 keep-alive
+    # coefficients, ignored at prediction time -- only the STATE and HALT
+    # rows compete); zeroed so every exported coefficient is an integer
+    # or +-0.5.
+    head = model.head.weight.copy()
+    head[tok_to_idx["READOUT"]] = 0.0
     tensors: dict[str, np.ndarray] = {
         "tok": model.tok.weight.astype(dtype),
-        "head": model.head.weight.astype(dtype),
+        "head": head.astype(dtype),
     }
     for li in range(info.n_layers):
         _csr_tensors(f"L{li}.in_proj", model.attn[li].in_proj_weight, tensors, dtype)
@@ -85,18 +91,19 @@ def export_model(out_dir: str, *, bcd: bool = False, f64: bool = False) -> dict:
             "act = gate > 0 ? gate*value : 0, x += ff_out @ act.  No "
             "normalization.  Position features are added at slots 0..2 of "
             "the embedding: pos, 1/ln(2) - 1/ln(pos+2), pos^2.  Readouts "
-            "round half-to-even.  Precision contract: f32 STORAGE and f32 "
-            "residual/FFN arithmetic are exact for this construction "
-            "(certified: residual values are dyadic rationals < 2^24, and "
-            "grouped keys keep f32 weight rounding below attention score "
-            "gaps).  Attention SCORE arithmetic must NOT be f32: near a "
-            "group's top addresses |ky| ~ 2^24 where the f32 ulp is 2 and "
-            "score gaps are 1 -- resolve scores in f64, or on GPU use the "
-            "exact integer route: the integer part of every score fits "
-            "i32 and the fractional recency term's only job is the LATEST "
-            "tie-break, which a positional argmax scan performs exactly.  "
-            "The three position features must stay f64 (pos^2 exceeds "
-            "f32's exact-integer range past pos ~ 4096)."
+            "round half-to-even.  Precision contract: EVERY coefficient "
+            "is an integer or +-0.5 (verifiable by inspection -- the "
+            "recency score term was retired; ties are broken by the "
+            "LATEST rule alone), so storage is exact in any dtype with "
+            "24 mantissa bits and every attention score is an "
+            "integer-coefficient function of integer inputs -- no "
+            "irrational arithmetic anywhere.  Memory-lookup scores stay "
+            "below 2^24 (i32/f32-exact).  The state/start lookups key on "
+            "position (scores in pos and pos^2): compute them in integer "
+            "arithmetic (i64), or sidestep them entirely with a running "
+            "argmax / positional-latest implementation as the reference "
+            "engines do -- f32 score arithmetic there is exact only "
+            "below pos ~ 4096."
         ),
         "dtype": "float64" if f64 else "float32",
         "bcd": bcd,

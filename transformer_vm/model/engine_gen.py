@@ -1640,8 +1640,11 @@ def generate_source(model, step_spec: dict | None = None,
         emit("        const int local_i = addr - group * 4096;")
         emit("        const float local = (float)local_i;")
         emit("        const float kx_f = 2.0f * local;")
-        emit("        const float inv_log_pos = (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
-        emit(f"        const float ky_f = -local * local + {_lit(LATEST_ALPHA)} * inv_log_pos;")
+        if LATEST_ALPHA:
+            emit("        const float inv_log_pos = (float)(1.0 / std::log(2.0) - 1.0 / std::log((double)pos + 2.0));")
+            emit(f"        const float ky_f = -local * local + {_lit(LATEST_ALPHA)} * inv_log_pos;")
+        else:
+            emit("        const float ky_f = -local * local;")
         emit("        const double key[2] = {(double)kx_f, (double)ky_f};")
         emit("        const double val[2] = {(double)(value & 0xFF), (double)(addr & 0xFFFF)};")
         emit(f"        static const int offs[17] = {{{', '.join(map(str, hull_offs))}}};")

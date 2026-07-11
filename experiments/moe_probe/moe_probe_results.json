@@ -4,7 +4,7 @@
   "reglus": 5326,
   "persists": 3570,
   "lookups": 113,
-  "terms": 29704,
+  "terms": 29591,
   "depth": 74,
   "const_roots": [
    "one"
@@ -15,7 +15,7 @@
   "reglus": 622,
   "persists": 398,
   "lookups": 35,
-  "terms": 3378,
+  "terms": 3343,
   "depth": 9,
   "const_roots": [
    "fetched_operand_lo",
@@ -33,7 +33,7 @@
    "reglus": 824,
    "persists": 494,
    "lookups": 49,
-   "terms": 4278,
+   "terms": 4229,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -54,7 +54,7 @@
    "reglus": 824,
    "persists": 493,
    "lookups": 49,
-   "terms": 4275,
+   "terms": 4226,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -75,7 +75,7 @@
    "reglus": 828,
    "persists": 495,
    "lookups": 49,
-   "terms": 4297,
+   "terms": 4248,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -96,7 +96,7 @@
    "reglus": 1044,
    "persists": 608,
    "lookups": 65,
-   "terms": 5635,
+   "terms": 5570,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -116,7 +116,7 @@
    "reglus": 1048,
    "persists": 610,
    "lookups": 65,
-   "terms": 5657,
+   "terms": 5592,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -136,7 +136,7 @@
    "reglus": 1048,
    "persists": 610,
    "lookups": 65,
-   "terms": 5657,
+   "terms": 5592,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -156,7 +156,7 @@
    "reglus": 1484,
    "persists": 834,
    "lookups": 97,
-   "terms": 7676,
+   "terms": 7579,
    "depth": 11,
    "const_roots": [
     "fetched_operand_hi",
@@ -177,7 +177,7 @@
    "reglus": 1484,
    "persists": 834,
    "lookups": 97,
-   "terms": 7680,
+   "terms": 7583,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -198,7 +198,7 @@
    "reglus": 824,
    "persists": 494,
    "lookups": 49,
-   "terms": 4278,
+   "terms": 4229,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -219,7 +219,7 @@
    "reglus": 824,
    "persists": 493,
    "lookups": 49,
-   "terms": 4275,
+   "terms": 4226,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -240,7 +240,7 @@
    "reglus": 828,
    "persists": 495,
    "lookups": 49,
-   "terms": 4297,
+   "terms": 4248,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -261,7 +261,7 @@
    "reglus": 1044,
    "persists": 608,
    "lookups": 65,
-   "terms": 5635,
+   "terms": 5570,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -281,7 +281,7 @@
    "reglus": 1048,
    "persists": 610,
    "lookups": 65,
-   "terms": 5657,
+   "terms": 5592,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -301,7 +301,7 @@
    "reglus": 824,
    "persists": 494,
    "lookups": 49,
-   "terms": 4278,
+   "terms": 4229,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -322,7 +322,7 @@
    "reglus": 824,
    "persists": 493,
    "lookups": 49,
-   "terms": 4275,
+   "terms": 4226,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -343,7 +343,7 @@
    "reglus": 828,
    "persists": 495,
    "lookups": 49,
-   "terms": 4297,
+   "terms": 4248,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -364,7 +364,7 @@
    "reglus": 1044,
    "persists": 608,
    "lookups": 65,
-   "terms": 5635,
+   "terms": 5570,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -384,7 +384,7 @@
    "reglus": 1048,
    "persists": 610,
    "lookups": 65,
-   "terms": 5657,
+   "terms": 5592,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -404,7 +404,7 @@
    "reglus": 604,
    "persists": 380,
    "lookups": 33,
-   "terms": 3257,
+   "terms": 3224,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -423,7 +423,7 @@
    "reglus": 608,
    "persists": 382,
    "lookups": 33,
-   "terms": 3279,
+   "terms": 3246,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -442,7 +442,7 @@
    "reglus": 824,
    "persists": 495,
    "lookups": 49,
-   "terms": 4617,
+   "terms": 4568,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -460,7 +460,7 @@
    "reglus": 828,
    "persists": 497,
    "lookups": 49,
-   "terms": 4639,
+   "terms": 4590,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -478,7 +478,7 @@
    "reglus": 828,
    "persists": 497,
    "lookups": 49,
-   "terms": 4639,
+   "terms": 4590,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -496,7 +496,7 @@
    "reglus": 1264,
    "persists": 721,
    "lookups": 81,
-   "terms": 6658,
+   "terms": 6577,
    "depth": 11,
    "const_roots": [
     "fetched_operand_hi",
@@ -515,7 +515,7 @@
    "reglus": 1264,
    "persists": 721,
    "lookups": 81,
-   "terms": 6662,
+   "terms": 6581,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -534,7 +534,7 @@
    "reglus": 604,
    "persists": 380,
    "lookups": 33,
-   "terms": 3257,
+   "terms": 3224,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -553,7 +553,7 @@
    "reglus": 608,
    "persists": 382,
    "lookups": 33,
-   "terms": 3279,
+   "terms": 3246,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -572,7 +572,7 @@
    "reglus": 824,
    "persists": 495,
    "lookups": 49,
-   "terms": 4617,
+   "terms": 4568,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -590,7 +590,7 @@
    "reglus": 604,
    "persists": 380,
    "lookups": 33,
-   "terms": 3257,
+   "terms": 3224,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -609,7 +609,7 @@
    "reglus": 608,
    "persists": 382,
    "lookups": 33,
-   "terms": 3279,
+   "terms": 3246,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -628,7 +628,7 @@
    "reglus": 824,
    "persists": 495,
    "lookups": 49,
-   "terms": 4617,
+   "terms": 4568,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -646,7 +646,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -669,7 +669,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -692,7 +692,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -715,7 +715,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -738,7 +738,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -761,7 +761,7 @@
    "reglus": 384,
    "persists": 260,
    "lookups": 17,
-   "terms": 1895,
+   "terms": 1878,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -784,7 +784,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -805,7 +805,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1922,
+   "terms": 1905,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -826,7 +826,7 @@
    "reglus": 608,
    "persists": 381,
    "lookups": 33,
-   "terms": 2939,
+   "terms": 2906,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -849,7 +849,7 @@
    "reglus": 2644,
    "persists": 1923,
    "lookups": 33,
-   "terms": 12628,
+   "terms": 12595,
    "depth": 11,
    "const_roots": [
     "fetched_operand_lo",
@@ -872,7 +872,7 @@
    "reglus": 842,
    "persists": 505,
    "lookups": 49,
-   "terms": 4375,
+   "terms": 4326,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -893,7 +893,7 @@
    "reglus": 842,
    "persists": 504,
    "lookups": 49,
-   "terms": 4372,
+   "terms": 4323,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -914,7 +914,7 @@
    "reglus": 846,
    "persists": 506,
    "lookups": 49,
-   "terms": 4394,
+   "terms": 4345,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -935,7 +935,7 @@
    "reglus": 1062,
    "persists": 619,
    "lookups": 65,
-   "terms": 5732,
+   "terms": 5667,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -955,7 +955,7 @@
    "reglus": 1066,
    "persists": 621,
    "lookups": 65,
-   "terms": 5754,
+   "terms": 5689,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -975,7 +975,7 @@
    "reglus": 1066,
    "persists": 621,
    "lookups": 65,
-   "terms": 5754,
+   "terms": 5689,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -995,7 +995,7 @@
    "reglus": 1502,
    "persists": 845,
    "lookups": 97,
-   "terms": 7773,
+   "terms": 7676,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1016,7 +1016,7 @@
    "reglus": 1502,
    "persists": 845,
    "lookups": 97,
-   "terms": 7777,
+   "terms": 7680,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1037,7 +1037,7 @@
    "reglus": 842,
    "persists": 505,
    "lookups": 49,
-   "terms": 4376,
+   "terms": 4327,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1058,7 +1058,7 @@
    "reglus": 842,
    "persists": 504,
    "lookups": 49,
-   "terms": 4373,
+   "terms": 4324,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1079,7 +1079,7 @@
    "reglus": 846,
    "persists": 506,
    "lookups": 49,
-   "terms": 4395,
+   "terms": 4346,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1100,7 +1100,7 @@
    "reglus": 1062,
    "persists": 619,
    "lookups": 65,
-   "terms": 5733,
+   "terms": 5668,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -1120,7 +1120,7 @@
    "reglus": 1066,
    "persists": 621,
    "lookups": 65,
-   "terms": 5755,
+   "terms": 5690,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -1140,7 +1140,7 @@
    "reglus": 1066,
    "persists": 621,
    "lookups": 65,
-   "terms": 5755,
+   "terms": 5690,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -1160,7 +1160,7 @@
    "reglus": 1502,
    "persists": 845,
    "lookups": 97,
-   "terms": 7774,
+   "terms": 7677,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1181,7 +1181,7 @@
    "reglus": 1502,
    "persists": 845,
    "lookups": 97,
-   "terms": 7778,
+   "terms": 7681,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1202,7 +1202,7 @@
    "reglus": 832,
    "persists": 494,
    "lookups": 49,
-   "terms": 4324,
+   "terms": 4275,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1223,7 +1223,7 @@
    "reglus": 832,
    "persists": 493,
    "lookups": 49,
-   "terms": 4321,
+   "terms": 4272,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1244,7 +1244,7 @@
    "reglus": 836,
    "persists": 495,
    "lookups": 49,
-   "terms": 4343,
+   "terms": 4294,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1265,7 +1265,7 @@
    "reglus": 1052,
    "persists": 608,
    "lookups": 65,
-   "terms": 5681,
+   "terms": 5616,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -1285,7 +1285,7 @@
    "reglus": 1056,
    "persists": 610,
    "lookups": 65,
-   "terms": 5703,
+   "terms": 5638,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -1305,7 +1305,7 @@
    "reglus": 1056,
    "persists": 610,
    "lookups": 65,
-   "terms": 5703,
+   "terms": 5638,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -1325,7 +1325,7 @@
    "reglus": 1492,
    "persists": 834,
    "lookups": 97,
-   "terms": 7722,
+   "terms": 7625,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1346,7 +1346,7 @@
    "reglus": 1492,
    "persists": 834,
    "lookups": 97,
-   "terms": 7726,
+   "terms": 7629,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1367,7 +1367,7 @@
    "reglus": 832,
    "persists": 494,
    "lookups": 49,
-   "terms": 4324,
+   "terms": 4275,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1388,7 +1388,7 @@
    "reglus": 832,
    "persists": 493,
    "lookups": 49,
-   "terms": 4321,
+   "terms": 4272,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1409,7 +1409,7 @@
    "reglus": 1052,
    "persists": 608,
    "lookups": 65,
-   "terms": 5681,
+   "terms": 5616,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -1429,7 +1429,7 @@
    "reglus": 832,
    "persists": 494,
    "lookups": 49,
-   "terms": 4324,
+   "terms": 4275,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1450,7 +1450,7 @@
    "reglus": 832,
    "persists": 493,
    "lookups": 49,
-   "terms": 4321,
+   "terms": 4272,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -1471,7 +1471,7 @@
    "reglus": 1052,
    "persists": 608,
    "lookups": 65,
-   "terms": 5681,
+   "terms": 5616,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -1491,7 +1491,7 @@
    "reglus": 872,
    "persists": 535,
    "lookups": 49,
-   "terms": 4588,
+   "terms": 4539,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1512,7 +1512,7 @@
    "reglus": 872,
    "persists": 534,
    "lookups": 49,
-   "terms": 4585,
+   "terms": 4536,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1533,7 +1533,7 @@
    "reglus": 876,
    "persists": 536,
    "lookups": 49,
-   "terms": 4607,
+   "terms": 4558,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1554,7 +1554,7 @@
    "reglus": 1092,
    "persists": 649,
    "lookups": 65,
-   "terms": 5945,
+   "terms": 5880,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -1574,7 +1574,7 @@
    "reglus": 1096,
    "persists": 651,
    "lookups": 65,
-   "terms": 5967,
+   "terms": 5902,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -1594,7 +1594,7 @@
    "reglus": 1096,
    "persists": 651,
    "lookups": 65,
-   "terms": 5967,
+   "terms": 5902,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -1614,7 +1614,7 @@
    "reglus": 1532,
    "persists": 875,
    "lookups": 97,
-   "terms": 7986,
+   "terms": 7889,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1635,7 +1635,7 @@
    "reglus": 1532,
    "persists": 875,
    "lookups": 97,
-   "terms": 7990,
+   "terms": 7893,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1656,7 +1656,7 @@
    "reglus": 872,
    "persists": 535,
    "lookups": 49,
-   "terms": 4604,
+   "terms": 4555,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1677,7 +1677,7 @@
    "reglus": 872,
    "persists": 534,
    "lookups": 49,
-   "terms": 4601,
+   "terms": 4552,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1698,7 +1698,7 @@
    "reglus": 876,
    "persists": 536,
    "lookups": 49,
-   "terms": 4623,
+   "terms": 4574,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1719,7 +1719,7 @@
    "reglus": 1092,
    "persists": 649,
    "lookups": 65,
-   "terms": 5961,
+   "terms": 5896,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -1739,7 +1739,7 @@
    "reglus": 1096,
    "persists": 651,
    "lookups": 65,
-   "terms": 5983,
+   "terms": 5918,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -1759,7 +1759,7 @@
    "reglus": 1096,
    "persists": 651,
    "lookups": 65,
-   "terms": 5983,
+   "terms": 5918,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -1779,7 +1779,7 @@
    "reglus": 1532,
    "persists": 875,
    "lookups": 97,
-   "terms": 8002,
+   "terms": 7905,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1800,7 +1800,7 @@
    "reglus": 1532,
    "persists": 875,
    "lookups": 97,
-   "terms": 8006,
+   "terms": 7909,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1821,7 +1821,7 @@
    "reglus": 872,
    "persists": 535,
    "lookups": 49,
-   "terms": 4604,
+   "terms": 4555,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1842,7 +1842,7 @@
    "reglus": 872,
    "persists": 534,
    "lookups": 49,
-   "terms": 4601,
+   "terms": 4552,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1863,7 +1863,7 @@
    "reglus": 876,
    "persists": 536,
    "lookups": 49,
-   "terms": 4623,
+   "terms": 4574,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1884,7 +1884,7 @@
    "reglus": 1092,
    "persists": 649,
    "lookups": 65,
-   "terms": 5961,
+   "terms": 5896,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -1904,7 +1904,7 @@
    "reglus": 1096,
    "persists": 651,
    "lookups": 65,
-   "terms": 5983,
+   "terms": 5918,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -1924,7 +1924,7 @@
    "reglus": 1096,
    "persists": 651,
    "lookups": 65,
-   "terms": 5983,
+   "terms": 5918,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -1944,7 +1944,7 @@
    "reglus": 1532,
    "persists": 875,
    "lookups": 97,
-   "terms": 8002,
+   "terms": 7905,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1965,7 +1965,7 @@
    "reglus": 1532,
    "persists": 875,
    "lookups": 97,
-   "terms": 8006,
+   "terms": 7909,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -1986,7 +1986,7 @@
    "reglus": 870,
    "persists": 532,
    "lookups": 49,
-   "terms": 4576,
+   "terms": 4527,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -2007,7 +2007,7 @@
    "reglus": 1090,
    "persists": 647,
    "lookups": 65,
-   "terms": 5936,
+   "terms": 5871,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -2027,7 +2027,7 @@
    "reglus": 404,
    "persists": 281,
    "lookups": 18,
-   "terms": 1999,
+   "terms": 1981,
    "depth": 12,
    "const_roots": [
     "fetched_operand_lo",
@@ -2049,7 +2049,7 @@
    "reglus": 832,
    "persists": 502,
    "lookups": 49,
-   "terms": 4315,
+   "terms": 4266,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2068,7 +2068,7 @@
    "reglus": 836,
    "persists": 504,
    "lookups": 49,
-   "terms": 4337,
+   "terms": 4288,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2087,7 +2087,7 @@
    "reglus": 1052,
    "persists": 617,
    "lookups": 65,
-   "terms": 5675,
+   "terms": 5610,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -2105,7 +2105,7 @@
    "reglus": 1056,
    "persists": 619,
    "lookups": 65,
-   "terms": 5697,
+   "terms": 5632,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -2123,7 +2123,7 @@
    "reglus": 414,
    "persists": 294,
    "lookups": 18,
-   "terms": 2096,
+   "terms": 2078,
    "depth": 19,
    "const_roots": [
     "fetched_operand_lo",
@@ -2145,7 +2145,7 @@
    "reglus": 842,
    "persists": 515,
    "lookups": 49,
-   "terms": 4412,
+   "terms": 4363,
    "depth": 20,
    "const_roots": [
     "fetched_operand_hi",
@@ -2164,7 +2164,7 @@
    "reglus": 846,
    "persists": 517,
    "lookups": 49,
-   "terms": 4434,
+   "terms": 4385,
    "depth": 20,
    "const_roots": [
     "fetched_operand_hi",
@@ -2183,7 +2183,7 @@
    "reglus": 1062,
    "persists": 630,
    "lookups": 65,
-   "terms": 5772,
+   "terms": 5707,
    "depth": 20,
    "const_roots": [
     "is_store",
@@ -2201,7 +2201,7 @@
    "reglus": 1066,
    "persists": 632,
    "lookups": 65,
-   "terms": 5794,
+   "terms": 5729,
    "depth": 20,
    "const_roots": [
     "is_store",
@@ -2219,7 +2219,7 @@
    "reglus": 404,
    "persists": 281,
    "lookups": 18,
-   "terms": 2007,
+   "terms": 1989,
    "depth": 12,
    "const_roots": [
     "fetched_operand_lo",
@@ -2241,7 +2241,7 @@
    "reglus": 832,
    "persists": 502,
    "lookups": 49,
-   "terms": 4323,
+   "terms": 4274,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2260,7 +2260,7 @@
    "reglus": 836,
    "persists": 504,
    "lookups": 49,
-   "terms": 4345,
+   "terms": 4296,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2279,7 +2279,7 @@
    "reglus": 1052,
    "persists": 617,
    "lookups": 65,
-   "terms": 5683,
+   "terms": 5618,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -2297,7 +2297,7 @@
    "reglus": 1056,
    "persists": 619,
    "lookups": 65,
-   "terms": 5705,
+   "terms": 5640,
    "depth": 13,
    "const_roots": [
     "is_store",
@@ -2315,7 +2315,7 @@
    "reglus": 414,
    "persists": 294,
    "lookups": 18,
-   "terms": 2097,
+   "terms": 2079,
    "depth": 19,
    "const_roots": [
     "fetched_operand_lo",
@@ -2337,7 +2337,7 @@
    "reglus": 842,
    "persists": 515,
    "lookups": 49,
-   "terms": 4413,
+   "terms": 4364,
    "depth": 20,
    "const_roots": [
     "fetched_operand_hi",
@@ -2356,7 +2356,7 @@
    "reglus": 846,
    "persists": 517,
    "lookups": 49,
-   "terms": 4435,
+   "terms": 4386,
    "depth": 20,
    "const_roots": [
     "fetched_operand_hi",
@@ -2375,7 +2375,7 @@
    "reglus": 1062,
    "persists": 630,
    "lookups": 65,
-   "terms": 5773,
+   "terms": 5708,
    "depth": 20,
    "const_roots": [
     "is_store",
@@ -2393,7 +2393,7 @@
    "reglus": 1066,
    "persists": 632,
    "lookups": 65,
-   "terms": 5795,
+   "terms": 5730,
    "depth": 20,
    "const_roots": [
     "is_store",
@@ -2411,7 +2411,7 @@
    "reglus": 828,
    "persists": 500,
    "lookups": 49,
-   "terms": 4306,
+   "terms": 4257,
    "depth": 12,
    "const_roots": [
     "fetched_operand_hi",
@@ -2430,7 +2430,7 @@
    "reglus": 832,
    "persists": 502,
    "lookups": 49,
-   "terms": 4328,
+   "terms": 4279,
    "depth": 12,
    "const_roots": [
     "fetched_operand_hi",
@@ -2449,7 +2449,7 @@
    "reglus": 1048,
    "persists": 615,
    "lookups": 65,
-   "terms": 5666,
+   "terms": 5601,
    "depth": 12,
    "const_roots": [
     "is_store",
@@ -2467,7 +2467,7 @@
    "reglus": 1052,
    "persists": 617,
    "lookups": 65,
-   "terms": 5688,
+   "terms": 5623,
    "depth": 12,
    "const_roots": [
     "is_store",
@@ -2485,7 +2485,7 @@
    "reglus": 828,
    "persists": 500,
    "lookups": 49,
-   "terms": 4305,
+   "terms": 4256,
    "depth": 12,
    "const_roots": [
     "fetched_operand_hi",
@@ -2504,7 +2504,7 @@
    "reglus": 832,
    "persists": 502,
    "lookups": 49,
-   "terms": 4327,
+   "terms": 4278,
    "depth": 12,
    "const_roots": [
     "fetched_operand_hi",
@@ -2523,7 +2523,7 @@
    "reglus": 1048,
    "persists": 615,
    "lookups": 65,
-   "terms": 5665,
+   "terms": 5600,
    "depth": 12,
    "const_roots": [
     "is_store",
@@ -2541,7 +2541,7 @@
    "reglus": 1052,
    "persists": 617,
    "lookups": 65,
-   "terms": 5687,
+   "terms": 5622,
    "depth": 12,
    "const_roots": [
     "is_store",
@@ -2559,7 +2559,7 @@
    "reglus": 392,
    "persists": 268,
    "lookups": 17,
-   "terms": 1936,
+   "terms": 1919,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -2582,7 +2582,7 @@
    "reglus": 392,
    "persists": 268,
    "lookups": 17,
-   "terms": 1936,
+   "terms": 1919,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -2605,7 +2605,7 @@
    "reglus": 392,
    "persists": 268,
    "lookups": 17,
-   "terms": 1935,
+   "terms": 1918,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -2628,7 +2628,7 @@
    "reglus": 392,
    "persists": 268,
    "lookups": 17,
-   "terms": 1935,
+   "terms": 1918,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -2651,7 +2651,7 @@
    "reglus": 822,
    "persists": 490,
    "lookups": 49,
-   "terms": 4609,
+   "terms": 4560,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -2672,7 +2672,7 @@
    "reglus": 1262,
    "persists": 717,
    "lookups": 81,
-   "terms": 6645,
+   "terms": 6564,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -2693,7 +2693,7 @@
    "reglus": 830,
    "persists": 500,
    "lookups": 49,
-   "terms": 4659,
+   "terms": 4610,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -2712,7 +2712,7 @@
    "reglus": 826,
    "persists": 490,
    "lookups": 49,
-   "terms": 3945,
+   "terms": 3896,
    "depth": 10,
    "const_roots": [
     "fetched_operand_lo",
@@ -2736,7 +2736,7 @@
    "reglus": 3082,
    "persists": 2151,
    "lookups": 65,
-   "terms": 14658,
+   "terms": 14593,
    "depth": 11,
    "const_roots": [
     "fetched_operand_lo",
@@ -2760,7 +2760,7 @@
    "reglus": 416,
    "persists": 286,
    "lookups": 19,
-   "terms": 2062,
+   "terms": 2043,
    "depth": 11,
    "const_roots": [
     "fetched_operand_lo",
@@ -2782,7 +2782,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3270,
+   "terms": 3237,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2804,7 +2804,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3269,
+   "terms": 3236,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2826,7 +2826,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3270,
+   "terms": 3237,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2848,7 +2848,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3269,
+   "terms": 3236,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2870,7 +2870,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3270,
+   "terms": 3237,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2892,7 +2892,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3269,
+   "terms": 3236,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2914,7 +2914,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3270,
+   "terms": 3237,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2936,7 +2936,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3269,
+   "terms": 3236,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -2958,7 +2958,7 @@
    "reglus": 382,
    "persists": 254,
    "lookups": 17,
-   "terms": 1881,
+   "terms": 1864,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -2982,7 +2982,7 @@
    "reglus": 382,
    "persists": 254,
    "lookups": 17,
-   "terms": 1881,
+   "terms": 1864,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3006,7 +3006,7 @@
    "reglus": 382,
    "persists": 258,
    "lookups": 17,
-   "terms": 1887,
+   "terms": 1870,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3030,7 +3030,7 @@
    "reglus": 382,
    "persists": 258,
    "lookups": 17,
-   "terms": 1888,
+   "terms": 1871,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3054,7 +3054,7 @@
    "reglus": 382,
    "persists": 259,
    "lookups": 17,
-   "terms": 1888,
+   "terms": 1871,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3078,7 +3078,7 @@
    "reglus": 382,
    "persists": 258,
    "lookups": 17,
-   "terms": 1887,
+   "terms": 1870,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3102,7 +3102,7 @@
    "reglus": 382,
    "persists": 258,
    "lookups": 17,
-   "terms": 1888,
+   "terms": 1871,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3126,7 +3126,7 @@
    "reglus": 382,
    "persists": 257,
    "lookups": 17,
-   "terms": 1885,
+   "terms": 1868,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3150,7 +3150,7 @@
    "reglus": 382,
    "persists": 257,
    "lookups": 17,
-   "terms": 1885,
+   "terms": 1868,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3174,7 +3174,7 @@
    "reglus": 382,
    "persists": 257,
    "lookups": 17,
-   "terms": 1885,
+   "terms": 1868,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3198,7 +3198,7 @@
    "reglus": 382,
    "persists": 257,
    "lookups": 17,
-   "terms": 1885,
+   "terms": 1868,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3222,7 +3222,7 @@
    "reglus": 382,
    "persists": 257,
    "lookups": 17,
-   "terms": 1885,
+   "terms": 1868,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3246,7 +3246,7 @@
    "reglus": 382,
    "persists": 257,
    "lookups": 17,
-   "terms": 1885,
+   "terms": 1868,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3270,7 +3270,7 @@
    "reglus": 382,
    "persists": 257,
    "lookups": 17,
-   "terms": 1885,
+   "terms": 1868,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -3294,7 +3294,7 @@
    "reglus": 602,
    "persists": 374,
    "lookups": 33,
-   "terms": 3246,
+   "terms": 3213,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -3316,7 +3316,7 @@
    "reglus": 602,
    "persists": 374,
    "lookups": 33,
-   "terms": 3246,
+   "terms": 3213,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -3338,7 +3338,7 @@
    "reglus": 602,
    "persists": 374,
    "lookups": 33,
-   "terms": 3246,
+   "terms": 3213,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -3360,7 +3360,7 @@
    "reglus": 602,
    "persists": 374,
    "lookups": 33,
-   "terms": 3246,
+   "terms": 3213,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -3382,7 +3382,7 @@
    "reglus": 606,
    "persists": 376,
    "lookups": 33,
-   "terms": 3268,
+   "terms": 3235,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -3404,7 +3404,7 @@
    "reglus": 606,
    "persists": 376,
    "lookups": 33,
-   "terms": 3268,
+   "terms": 3235,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -3426,7 +3426,7 @@
    "reglus": 606,
    "persists": 376,
    "lookups": 33,
-   "terms": 3268,
+   "terms": 3235,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -3448,7 +3448,7 @@
    "reglus": 606,
    "persists": 376,
    "lookups": 33,
-   "terms": 3268,
+   "terms": 3235,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -3470,7 +3470,7 @@
    "reglus": 606,
    "persists": 376,
    "lookups": 33,
-   "terms": 3268,
+   "terms": 3235,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -3492,7 +3492,7 @@
    "reglus": 606,
    "persists": 376,
    "lookups": 33,
-   "terms": 3268,
+   "terms": 3235,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -3514,7 +3514,7 @@
    "reglus": 822,
    "persists": 489,
    "lookups": 49,
-   "terms": 4606,
+   "terms": 4557,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -3535,7 +3535,7 @@
    "reglus": 826,
    "persists": 491,
    "lookups": 49,
-   "terms": 4628,
+   "terms": 4579,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -3556,7 +3556,7 @@
    "reglus": 826,
    "persists": 491,
    "lookups": 49,
-   "terms": 4628,
+   "terms": 4579,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -3577,7 +3577,7 @@
    "reglus": 826,
    "persists": 491,
    "lookups": 49,
-   "terms": 4628,
+   "terms": 4579,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -3598,7 +3598,7 @@
    "reglus": 826,
    "persists": 491,
    "lookups": 49,
-   "terms": 4628,
+   "terms": 4579,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -3619,7 +3619,7 @@
    "reglus": 826,
    "persists": 491,
    "lookups": 49,
-   "terms": 4628,
+   "terms": 4579,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -3640,7 +3640,7 @@
    "reglus": 826,
    "persists": 491,
    "lookups": 49,
-   "terms": 4628,
+   "terms": 4579,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -3661,7 +3661,7 @@
    "reglus": 824,
    "persists": 494,
    "lookups": 49,
-   "terms": 4278,
+   "terms": 4229,
    "depth": 9,
    "const_roots": [
     "fetched_operand_hi",
@@ -3682,7 +3682,7 @@
    "reglus": 828,
    "persists": 496,
    "lookups": 49,
-   "terms": 4300,
+   "terms": 4251,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -3703,7 +3703,7 @@
    "reglus": 1044,
    "persists": 609,
    "lookups": 65,
-   "terms": 5638,
+   "terms": 5573,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -3723,7 +3723,7 @@
    "reglus": 1048,
    "persists": 611,
    "lookups": 65,
-   "terms": 5660,
+   "terms": 5595,
    "depth": 10,
    "const_roots": [
     "is_store",
@@ -3743,7 +3743,7 @@
    "reglus": 1484,
    "persists": 835,
    "lookups": 97,
-   "terms": 7679,
+   "terms": 7582,
    "depth": 11,
    "const_roots": [
     "fetched_operand_hi",
@@ -3764,7 +3764,7 @@
    "reglus": 1484,
    "persists": 835,
    "lookups": 97,
-   "terms": 7683,
+   "terms": 7586,
    "depth": 10,
    "const_roots": [
     "fetched_operand_hi",
@@ -3785,7 +3785,7 @@
    "reglus": 652,
    "persists": 421,
    "lookups": 33,
-   "terms": 3567,
+   "terms": 3534,
    "depth": 12,
    "const_roots": [
     "fetched_operand_hi",
@@ -3804,7 +3804,7 @@
    "reglus": 656,
    "persists": 423,
    "lookups": 33,
-   "terms": 3589,
+   "terms": 3556,
    "depth": 12,
    "const_roots": [
     "fetched_operand_hi",
@@ -3823,7 +3823,7 @@
    "reglus": 872,
    "persists": 536,
    "lookups": 49,
-   "terms": 4927,
+   "terms": 4878,
    "depth": 12,
    "const_roots": [
     "is_store",
@@ -3841,7 +3841,7 @@
    "reglus": 1312,
    "persists": 762,
    "lookups": 81,
-   "terms": 6968,
+   "terms": 6887,
    "depth": 12,
    "const_roots": [
     "fetched_operand_hi",
@@ -3860,7 +3860,7 @@
    "reglus": 842,
    "persists": 505,
    "lookups": 49,
-   "terms": 4376,
+   "terms": 4327,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -3881,7 +3881,7 @@
    "reglus": 836,
    "persists": 499,
    "lookups": 49,
-   "terms": 4365,
+   "terms": 4316,
    "depth": 14,
    "const_roots": [
     "fetched_operand_hi",
@@ -3900,7 +3900,7 @@
    "reglus": 840,
    "persists": 501,
    "lookups": 49,
-   "terms": 4387,
+   "terms": 4338,
    "depth": 14,
    "const_roots": [
     "fetched_operand_hi",
@@ -3919,7 +3919,7 @@
    "reglus": 1056,
    "persists": 614,
    "lookups": 65,
-   "terms": 5725,
+   "terms": 5660,
    "depth": 14,
    "const_roots": [
     "is_store",
@@ -3937,7 +3937,7 @@
    "reglus": 1060,
    "persists": 616,
    "lookups": 65,
-   "terms": 5747,
+   "terms": 5682,
    "depth": 14,
    "const_roots": [
     "is_store",
@@ -3955,7 +3955,7 @@
    "reglus": 1060,
    "persists": 616,
    "lookups": 65,
-   "terms": 5747,
+   "terms": 5682,
    "depth": 14,
    "const_roots": [
     "is_store",
@@ -3973,7 +3973,7 @@
    "reglus": 1496,
    "persists": 840,
    "lookups": 97,
-   "terms": 7766,
+   "terms": 7669,
    "depth": 14,
    "const_roots": [
     "fetched_operand_hi",
@@ -3992,7 +3992,7 @@
    "reglus": 1496,
    "persists": 840,
    "lookups": 97,
-   "terms": 7770,
+   "terms": 7673,
    "depth": 14,
    "const_roots": [
     "fetched_operand_hi",
@@ -4011,7 +4011,7 @@
    "reglus": 846,
    "persists": 510,
    "lookups": 49,
-   "terms": 4409,
+   "terms": 4360,
    "depth": 14,
    "const_roots": [
     "fetched_operand_hi",
@@ -4030,7 +4030,7 @@
    "reglus": 850,
    "persists": 512,
    "lookups": 49,
-   "terms": 4431,
+   "terms": 4382,
    "depth": 14,
    "const_roots": [
     "fetched_operand_hi",
@@ -4049,7 +4049,7 @@
    "reglus": 1066,
    "persists": 625,
    "lookups": 65,
-   "terms": 5769,
+   "terms": 5704,
    "depth": 14,
    "const_roots": [
     "is_store",
@@ -4067,7 +4067,7 @@
    "reglus": 1070,
    "persists": 627,
    "lookups": 65,
-   "terms": 5791,
+   "terms": 5726,
    "depth": 14,
    "const_roots": [
     "is_store",
@@ -4085,7 +4085,7 @@
    "reglus": 1070,
    "persists": 627,
    "lookups": 65,
-   "terms": 5791,
+   "terms": 5726,
    "depth": 14,
    "const_roots": [
     "is_store",
@@ -4103,7 +4103,7 @@
    "reglus": 1506,
    "persists": 851,
    "lookups": 97,
-   "terms": 7810,
+   "terms": 7713,
    "depth": 14,
    "const_roots": [
     "fetched_operand_hi",
@@ -4122,7 +4122,7 @@
    "reglus": 1506,
    "persists": 851,
    "lookups": 97,
-   "terms": 7814,
+   "terms": 7717,
    "depth": 14,
    "const_roots": [
     "fetched_operand_hi",
@@ -4141,7 +4141,7 @@
    "reglus": 876,
    "persists": 539,
    "lookups": 49,
-   "terms": 4623,
+   "terms": 4574,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -4160,7 +4160,7 @@
    "reglus": 880,
    "persists": 541,
    "lookups": 49,
-   "terms": 4645,
+   "terms": 4596,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -4179,7 +4179,7 @@
    "reglus": 1096,
    "persists": 654,
    "lookups": 65,
-   "terms": 5983,
+   "terms": 5918,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -4197,7 +4197,7 @@
    "reglus": 1100,
    "persists": 656,
    "lookups": 65,
-   "terms": 6005,
+   "terms": 5940,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -4215,7 +4215,7 @@
    "reglus": 1100,
    "persists": 656,
    "lookups": 65,
-   "terms": 6005,
+   "terms": 5940,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -4233,7 +4233,7 @@
    "reglus": 1536,
    "persists": 880,
    "lookups": 97,
-   "terms": 8024,
+   "terms": 7927,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -4252,7 +4252,7 @@
    "reglus": 1536,
    "persists": 880,
    "lookups": 97,
-   "terms": 8028,
+   "terms": 7931,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -4271,7 +4271,7 @@
    "reglus": 878,
    "persists": 540,
    "lookups": 49,
-   "terms": 4622,
+   "terms": 4573,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -4290,7 +4290,7 @@
    "reglus": 882,
    "persists": 542,
    "lookups": 49,
-   "terms": 4644,
+   "terms": 4595,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -4309,7 +4309,7 @@
    "reglus": 1098,
    "persists": 655,
    "lookups": 65,
-   "terms": 5982,
+   "terms": 5917,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -4327,7 +4327,7 @@
    "reglus": 1102,
    "persists": 657,
    "lookups": 65,
-   "terms": 6004,
+   "terms": 5939,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -4345,7 +4345,7 @@
    "reglus": 1102,
    "persists": 657,
    "lookups": 65,
-   "terms": 6004,
+   "terms": 5939,
    "depth": 19,
    "const_roots": [
     "is_store",
@@ -4363,7 +4363,7 @@
    "reglus": 1538,
    "persists": 881,
    "lookups": 97,
-   "terms": 8023,
+   "terms": 7926,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -4382,7 +4382,7 @@
    "reglus": 1538,
    "persists": 881,
    "lookups": 97,
-   "terms": 8027,
+   "terms": 7930,
    "depth": 19,
    "const_roots": [
     "fetched_operand_hi",
@@ -4401,7 +4401,7 @@
    "reglus": 872,
    "persists": 538,
    "lookups": 49,
-   "terms": 4604,
+   "terms": 4555,
    "depth": 20,
    "const_roots": [
     "fetched_operand_hi",
@@ -4420,7 +4420,7 @@
    "reglus": 876,
    "persists": 540,
    "lookups": 49,
-   "terms": 4626,
+   "terms": 4577,
    "depth": 20,
    "const_roots": [
     "fetched_operand_hi",
@@ -4439,7 +4439,7 @@
    "reglus": 1092,
    "persists": 653,
    "lookups": 65,
-   "terms": 5964,
+   "terms": 5899,
    "depth": 20,
    "const_roots": [
     "is_store",
@@ -4457,7 +4457,7 @@
    "reglus": 1096,
    "persists": 655,
    "lookups": 65,
-   "terms": 5986,
+   "terms": 5921,
    "depth": 20,
    "const_roots": [
     "is_store",
@@ -4475,7 +4475,7 @@
    "reglus": 1096,
    "persists": 655,
    "lookups": 65,
-   "terms": 5986,
+   "terms": 5921,
    "depth": 20,
    "const_roots": [
     "is_store",
@@ -4493,7 +4493,7 @@
    "reglus": 1532,
    "persists": 879,
    "lookups": 97,
-   "terms": 8005,
+   "terms": 7908,
    "depth": 20,
    "const_roots": [
     "fetched_operand_hi",
@@ -4512,7 +4512,7 @@
    "reglus": 1532,
    "persists": 879,
    "lookups": 97,
-   "terms": 8009,
+   "terms": 7912,
    "depth": 20,
    "const_roots": [
     "fetched_operand_hi",
@@ -4531,7 +4531,7 @@
    "reglus": 858,
    "persists": 525,
    "lookups": 49,
-   "terms": 4498,
+   "terms": 4449,
    "depth": 22,
    "const_roots": [
     "fetched_operand_hi",
@@ -4550,7 +4550,7 @@
    "reglus": 862,
    "persists": 527,
    "lookups": 49,
-   "terms": 4520,
+   "terms": 4471,
    "depth": 22,
    "const_roots": [
     "fetched_operand_hi",
@@ -4569,7 +4569,7 @@
    "reglus": 1078,
    "persists": 640,
    "lookups": 65,
-   "terms": 5858,
+   "terms": 5793,
    "depth": 22,
    "const_roots": [
     "is_store",
@@ -4587,7 +4587,7 @@
    "reglus": 1082,
    "persists": 642,
    "lookups": 65,
-   "terms": 5880,
+   "terms": 5815,
    "depth": 22,
    "const_roots": [
     "is_store",
@@ -4605,7 +4605,7 @@
    "reglus": 1082,
    "persists": 642,
    "lookups": 65,
-   "terms": 5880,
+   "terms": 5815,
    "depth": 22,
    "const_roots": [
     "is_store",
@@ -4623,7 +4623,7 @@
    "reglus": 1518,
    "persists": 866,
    "lookups": 97,
-   "terms": 7899,
+   "terms": 7802,
    "depth": 22,
    "const_roots": [
     "fetched_operand_hi",
@@ -4642,7 +4642,7 @@
    "reglus": 1518,
    "persists": 866,
    "lookups": 97,
-   "terms": 7903,
+   "terms": 7806,
    "depth": 22,
    "const_roots": [
     "fetched_operand_hi",
@@ -4663,7 +4663,7 @@
    "reglus": 1566,
    "persists": 887,
    "lookups": 97,
-   "terms": 8177,
+   "terms": 8080,
    "depth": 36,
    "const_roots": [
     "is_store",
@@ -4680,7 +4680,7 @@
    "reglus": 1096,
    "persists": 638,
    "lookups": 65,
-   "terms": 5926,
+   "terms": 5861,
    "depth": 29,
    "const_roots": [
     "is_store",
@@ -4697,7 +4697,7 @@
    "reglus": 1096,
    "persists": 638,
    "lookups": 65,
-   "terms": 5926,
+   "terms": 5861,
    "depth": 29,
    "const_roots": [
     "is_store",
@@ -4714,7 +4714,7 @@
    "reglus": 1334,
    "persists": 769,
    "lookups": 81,
-   "terms": 7072,
+   "terms": 6991,
    "depth": 26,
    "const_roots": [
     "is_store2",
@@ -4728,7 +4728,7 @@
    "reglus": 854,
    "persists": 513,
    "lookups": 49,
-   "terms": 4765,
+   "terms": 4716,
    "depth": 18,
    "const_roots": [
     "is_store2",
@@ -4742,7 +4742,7 @@
    "reglus": 854,
    "persists": 513,
    "lookups": 49,
-   "terms": 4765,
+   "terms": 4716,
    "depth": 18,
    "const_roots": [
     "is_store2",
@@ -4756,7 +4756,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -4776,7 +4776,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -4796,7 +4796,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -4816,7 +4816,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -4836,7 +4836,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -4856,7 +4856,7 @@
    "reglus": 384,
    "persists": 260,
    "lookups": 17,
-   "terms": 1895,
+   "terms": 1878,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -4876,7 +4876,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1919,
+   "terms": 1902,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -4894,7 +4894,7 @@
    "reglus": 388,
    "persists": 266,
    "lookups": 17,
-   "terms": 1922,
+   "terms": 1905,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -4912,7 +4912,7 @@
    "reglus": 608,
    "persists": 381,
    "lookups": 33,
-   "terms": 2939,
+   "terms": 2906,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -4932,7 +4932,7 @@
    "reglus": 2644,
    "persists": 1923,
    "lookups": 33,
-   "terms": 12628,
+   "terms": 12595,
    "depth": 11,
    "const_roots": [
     "fetched_operand_lo",
@@ -4952,7 +4952,7 @@
    "reglus": 1590,
    "persists": 899,
    "lookups": 97,
-   "terms": 8350,
+   "terms": 8253,
    "depth": 38,
    "const_roots": [
     "is_store",
@@ -4969,7 +4969,7 @@
    "reglus": 1594,
    "persists": 902,
    "lookups": 97,
-   "terms": 8388,
+   "terms": 8291,
    "depth": 38,
    "const_roots": [
     "is_store",
@@ -4986,7 +4986,7 @@
    "reglus": 1572,
    "persists": 888,
    "lookups": 97,
-   "terms": 8221,
+   "terms": 8124,
    "depth": 35,
    "const_roots": [
     "is_store",
@@ -5003,7 +5003,7 @@
    "reglus": 1082,
    "persists": 625,
    "lookups": 65,
-   "terms": 5830,
+   "terms": 5765,
    "depth": 26,
    "const_roots": [
     "is_store",
@@ -5020,7 +5020,7 @@
    "reglus": 1082,
    "persists": 625,
    "lookups": 65,
-   "terms": 5830,
+   "terms": 5765,
    "depth": 26,
    "const_roots": [
     "is_store",
@@ -5037,7 +5037,7 @@
    "reglus": 1614,
    "persists": 928,
    "lookups": 97,
-   "terms": 8487,
+   "terms": 8390,
    "depth": 45,
    "const_roots": [
     "is_store",
@@ -5054,7 +5054,7 @@
    "reglus": 1614,
    "persists": 928,
    "lookups": 97,
-   "terms": 8503,
+   "terms": 8406,
    "depth": 45,
    "const_roots": [
     "is_store",
@@ -5071,7 +5071,7 @@
    "reglus": 1614,
    "persists": 928,
    "lookups": 97,
-   "terms": 8503,
+   "terms": 8406,
    "depth": 45,
    "const_roots": [
     "is_store",
@@ -5088,7 +5088,7 @@
    "reglus": 1114,
    "persists": 657,
    "lookups": 65,
-   "terms": 6037,
+   "terms": 5972,
    "depth": 33,
    "const_roots": [
     "is_store",
@@ -5105,7 +5105,7 @@
    "reglus": 1112,
    "persists": 649,
    "lookups": 65,
-   "terms": 6035,
+   "terms": 5970,
    "depth": 29,
    "const_roots": [
     "is_store2",
@@ -5119,7 +5119,7 @@
    "reglus": 1122,
    "persists": 662,
    "lookups": 65,
-   "terms": 6128,
+   "terms": 6063,
    "depth": 37,
    "const_roots": [
     "is_store2",
@@ -5133,7 +5133,7 @@
    "reglus": 1112,
    "persists": 649,
    "lookups": 65,
-   "terms": 6045,
+   "terms": 5980,
    "depth": 29,
    "const_roots": [
     "is_store2",
@@ -5147,7 +5147,7 @@
    "reglus": 1122,
    "persists": 662,
    "lookups": 65,
-   "terms": 6129,
+   "terms": 6064,
    "depth": 37,
    "const_roots": [
     "is_store2",
@@ -5161,7 +5161,7 @@
    "reglus": 1098,
    "persists": 640,
    "lookups": 65,
-   "terms": 5945,
+   "terms": 5880,
    "depth": 29,
    "const_roots": [
     "is_store2",
@@ -5175,7 +5175,7 @@
    "reglus": 1098,
    "persists": 640,
    "lookups": 65,
-   "terms": 5944,
+   "terms": 5879,
    "depth": 29,
    "const_roots": [
     "is_store2",
@@ -5189,7 +5189,7 @@
    "reglus": 392,
    "persists": 268,
    "lookups": 17,
-   "terms": 1936,
+   "terms": 1919,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5209,7 +5209,7 @@
    "reglus": 392,
    "persists": 268,
    "lookups": 17,
-   "terms": 1936,
+   "terms": 1919,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5229,7 +5229,7 @@
    "reglus": 392,
    "persists": 268,
    "lookups": 17,
-   "terms": 1935,
+   "terms": 1918,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5249,7 +5249,7 @@
    "reglus": 392,
    "persists": 268,
    "lookups": 17,
-   "terms": 1935,
+   "terms": 1918,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5269,7 +5269,7 @@
    "reglus": 1286,
    "persists": 728,
    "lookups": 81,
-   "terms": 6748,
+   "terms": 6667,
    "depth": 23,
    "const_roots": [
     "data_out",
@@ -5287,7 +5287,7 @@
    "reglus": 830,
    "persists": 500,
    "lookups": 49,
-   "terms": 4659,
+   "terms": 4610,
    "depth": 10,
    "const_roots": [
     "data_out",
@@ -5303,7 +5303,7 @@
    "reglus": 826,
    "persists": 490,
    "lookups": 49,
-   "terms": 3945,
+   "terms": 3896,
    "depth": 10,
    "const_roots": [
     "fetched_operand_lo",
@@ -5324,7 +5324,7 @@
    "reglus": 3082,
    "persists": 2151,
    "lookups": 65,
-   "terms": 14658,
+   "terms": 14593,
    "depth": 11,
    "const_roots": [
     "fetched_operand_lo",
@@ -5345,7 +5345,7 @@
    "reglus": 416,
    "persists": 286,
    "lookups": 19,
-   "terms": 2062,
+   "terms": 2043,
    "depth": 11,
    "const_roots": [
     "fetched_operand_lo",
@@ -5364,7 +5364,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3270,
+   "terms": 3237,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -5383,7 +5383,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3269,
+   "terms": 3236,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -5402,7 +5402,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3270,
+   "terms": 3237,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -5421,7 +5421,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3269,
+   "terms": 3236,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -5440,7 +5440,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3270,
+   "terms": 3237,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -5459,7 +5459,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3269,
+   "terms": 3236,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -5478,7 +5478,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3270,
+   "terms": 3237,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -5497,7 +5497,7 @@
    "reglus": 606,
    "persists": 380,
    "lookups": 33,
-   "terms": 3269,
+   "terms": 3236,
    "depth": 13,
    "const_roots": [
     "fetched_operand_hi",
@@ -5516,7 +5516,7 @@
    "reglus": 382,
    "persists": 254,
    "lookups": 17,
-   "terms": 1881,
+   "terms": 1864,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5537,7 +5537,7 @@
    "reglus": 382,
    "persists": 254,
    "lookups": 17,
-   "terms": 1881,
+   "terms": 1864,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5558,7 +5558,7 @@
    "reglus": 382,
    "persists": 258,
    "lookups": 17,
-   "terms": 1887,
+   "terms": 1870,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5579,7 +5579,7 @@
    "reglus": 382,
    "persists": 258,
    "lookups": 17,
-   "terms": 1888,
+   "terms": 1871,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5600,7 +5600,7 @@
    "reglus": 382,
    "persists": 259,
    "lookups": 17,
-   "terms": 1888,
+   "terms": 1871,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5621,7 +5621,7 @@
    "reglus": 382,
    "persists": 258,
    "lookups": 17,
-   "terms": 1887,
+   "terms": 1870,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5642,7 +5642,7 @@
    "reglus": 382,
    "persists": 258,
    "lookups": 17,
-   "terms": 1888,
+   "terms": 1871,
    "depth": 9,
    "const_roots": [
     "fetched_operand_lo",
@@ -5663,7 +5663,7 @@
    "reglus": 940,
    "persists": 576,
    "lookups": 49,
-   "terms": 5186,
+   "terms": 5137,
    "depth": 18,
    "const_roots": [
     "data_out",
@@ -5681,7 +5681,7 @@
    "reglus": 1554,
    "persists": 877,
    "lookups": 97,
-   "terms": 8087,
+   "terms": 7990,
    "depth": 36,
    "const_roots": [
     "is_store",
@@ -5698,7 +5698,7 @@
    "reglus": 1354,
    "persists": 788,
    "lookups": 81,
-   "terms": 7176,
+   "terms": 7095,
    "depth": 24,
    "const_roots": [
     "is_store2",
@@ -5712,7 +5712,7 @@
    "reglus": 1572,
    "persists": 889,
    "lookups": 97,
-   "terms": 8253,
+   "terms": 8156,
    "depth": 36,
    "const_roots": [
     "is_store2",
@@ -5726,7 +5726,7 @@
    "reglus": 1590,
    "persists": 900,
    "lookups": 97,
-   "terms": 8367,
+   "terms": 8270,
    "depth": 39,
    "const_roots": [
     "is_store2",
@@ -5740,7 +5740,7 @@
    "reglus": 1616,
    "persists": 929,
    "lookups": 97,
-   "terms": 8545,
+   "terms": 8448,
    "depth": 45,
    "const_roots": [
     "is_store2",
@@ -5754,7 +5754,7 @@
    "reglus": 1618,
    "persists": 930,
    "lookups": 97,
-   "terms": 8545,
+   "terms": 8448,
    "depth": 45,
    "const_roots": [
     "is_store2",
@@ -5768,7 +5768,7 @@
    "reglus": 1612,
    "persists": 928,
    "lookups": 97,
-   "terms": 8524,
+   "terms": 8427,
    "depth": 44,
    "const_roots": [
     "is_store2",
@@ -5782,7 +5782,7 @@
    "reglus": 1602,
    "persists": 915,
    "lookups": 97,
-   "terms": 8453,
+   "terms": 8356,
    "depth": 47,
    "const_roots": [
     "is_store2",

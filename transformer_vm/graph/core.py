@@ -170,7 +170,11 @@ position = InputDimension("position")
 inv_log_pos = InputDimension("inv_log_pos")
 position_sq = InputDimension("position_sq")
 
-LATEST_ALPHA = 0.3  # tie-break weight favoring more recent tokens in hardmax attention
+# Retired to 0 (2026-07-10): recency scoring only ever broke exact ties,
+# which TieBreak::LATEST resolves positionally; with the term gone every
+# weight coefficient is an integer, +-0.5, or a clear sentinel -- exact in
+# any dtype with 24 mantissa bits.
+LATEST_ALPHA = 0.0
 
 
 class PersistDimension(Dimension):
@@ -309,7 +313,7 @@ def _to_2d_key(k, clear_key_expr=None, tie_break="latest"):
                 _clear_key_cache[ck_key] = persist(clear_key_expr)
             clear = _clear_key_cache[ck_key]
         ky = ky - clear * BIG
-    if tie_break == "latest":
+    if tie_break == "latest" and LATEST_ALPHA:
         ky = ky + Expression({inv_log_pos: LATEST_ALPHA})
     elif tie_break == "average":
         ky = Expression({one: 1})
