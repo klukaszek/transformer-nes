@@ -17,7 +17,15 @@ build/
 # C++ build output
 transformer
 _kernel_cache/
+_engine_cache/
+_ppu_cache/
+_app_cache/
+
+# Vendored deps are fetched by vendor/install_deps.sh
+vendor/sokol/
+vendor/imgui/
 
 # Commercial ROMs stay local (test ROMs like nestest are tracked)
-transformer_vm/nes/examples/smb.nes
-_engine_cache/
+transformer_nes/nes/examples/smb.nes
+transformer_nes/nes/examples/smb3.nes
+transformer_nes/nes/examples/ff.nes

@@ -17,8 +17,63 @@ native run-loop protocol for both generated engines), and the console
 `nes/examples/nestest.py`).  The weights forward is integer end-to-end
 (full Klaus decimal record: 89.0 s, 344K steps/s).  The PPU is native
 (`nes/ppu.cpp`, pixel-identical to the Python reference, the console
-default).  Next up: **the native app** — a Sokol frontend (decision log
-below) with video, sound, and controls over the existing backends.
+default).  **The native app landed 2026-07-11** (log below): a Sokol
+window over the console frame loop — SMB is playable on a keyboard
+through the transformer weights, and getting it playable forced the
+PPU's real scroll model (loopy t + the sprite-0 split, same log).
+Next up: **mappers** (MMC1 for Final Fantasy, MMC3 for SMB3 — the
+cartridge is NROM-only today), then the APU + sokol_audio for sound.
+
+## 2026-07-11 native app + PPU scroll model — SMB is playable
+
+Two landings, verified by play: SMB through the transformer weights on
+a real keyboard, world 1-1 cleared into 1-2.
+
+- **The Sokol frontend.**  `vendor/install_deps.sh` pins sokol
+  (3743ea6, 2026-07-08) plus Dear ImGui v1.92.8 (vendored now for the
+  future debug overlay; not yet compiled in).  `nes/app.cpp` is one
+  Objective-C++ TU (`SOKOL_IMPL`, Metal, `SOKOL_NO_ENTRY`),
+  digest-cached like the PPU: window + keyboard + one nearest-filtered
+  textured quad, NES-rate pacing by accumulator against
+  sapp_frame_duration (burst cap 4 frames), letterboxed viewport.
+  Python stays the orchestrator, per the recorded decision:
+  `python -m transformer_nes.nes.app ROM [--backend weights] [--scale N]
+  [--frames N] [--debug]` — each display frame calls back into
+  Console.run_frame with the controller bitmask (bit i =
+  console.BUTTONS[i]; arrows = d-pad, X/Z = A/B, Enter = Start, RShift
+  = Select, Esc = quit).  macOS gotcha, recorded in app.py: quitting
+  goes through [NSApp terminate:], so the PROCESS EXITS INSIDE
+  sapp_run — a quit_cb invoked from the sokol cleanup callback (GIL
+  still held) is the last Python to execute on every quit path; the
+  run stats log from there.  Receipt: interactive SMB at 60 fps with
+  emulation at 4.5 ms/frame — 221 fps of headroom through the weights.
+
+- **The PPU scroll model** — the documented "no mid-frame scroll"
+  approximation, cashed in the moment a game scrolled.  Symptoms: the
+  HUD scrolled with the camera; at the camera's 256-pixel page
+  crossing every backend froze for good (backend-identical, so a
+  console-layer defect by construction).  Root cause, pinned by a
+  $2000/$2005/$2006 write log at the crossing: SMB's NMI leaves $2000
+  holding mirror|incr32 (nametable 1 after the crossing) and relies on
+  its closing $2006=$0000 pair + $2005 0,0 to reset the frame-start
+  scroll — on real silicon those share the loopy-t register, which our
+  separate scroll_x/scroll_y model didn't capture.  So the frame
+  rendered from nametable 1, the status bar vanished, sprite-0
+  detection returned None, the console never raised the hit, and SMB
+  spun forever in its NMI at the $8150 sprite-0 poll with NMI disabled
+  (ctrl=$15) — a permanent wedge.  Fix, two halves in ppu.cpp: (1)
+  **loopy t + fine_x** — $2000/$2005/$2006 update one shared
+  scroll/nametable state and rendering derives from it; (2) the
+  **sprite-0 split render** — end_vblank latches the span-start scroll
+  state, rows through the hit line render from the latch, rows below
+  from the live registers (identical states collapse to the old single
+  pass, and the direct-render path with no end_vblank is untouched).
+  One scene test now resets $2006 before rendering, as real games do.
+  Receipts: 86 tests green (nestest PPM byte-identical — the loopy
+  model changes nothing for well-behaved scroll writers); scripted SMB
+  with a stall-triggered jump driver crosses the page boundary and
+  keeps going (camera 506+, sprite-0 stable at scanline 30 every
+  frame); played through 1-1 into 1-2 interactively.
 
 **Previous snapshot (2026-07-10, 350 fps + universal shapes):** SMB gameplay
 through the transformer weights runs at **~333 fps (3.0 ms/frame)**
@@ -156,7 +211,7 @@ in priority order — the lockstep chain is the safety net for all of it:
    60 frames of the real nestest ROM produced a byte-identical PPM
    (63.8 fps on the kernel backend).  Post-deletion the suite pins the
    native renderer with concrete pixel/priority/sprite-0 assertions.
-   The native frontend (decision log below) is what remains of this item.
+   The native frontend landed same day (log above) — this item is done.
 
 ## Recorded decision: Sokol over SDL3 for the native app (2026-07-11)
 
@@ -172,7 +227,9 @@ loop hosting the existing backends — the PPU is already native
 decision is whether the app embeds Python for orchestration (cheapest:
 the console layer already paces frames) or the engines grow a C ABI for
 a fully Python-free binary.  Start with the embedded/orchestrated form;
-measure; only then consider the C ABI.
+measure; only then consider the C ABI.  **Landed 2026-07-11 in the
+orchestrated form** (log above) — 4.5 ms/frame of emulation against the
+16.6 ms frame budget leaves no case for the C ABI yet.
 
 ## Recorded decision: package rename + module placement (2026-07-11)
 

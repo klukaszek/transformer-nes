@@ -128,6 +128,11 @@ def test_render_sprites_priority_flips_and_sprite0():
     for value in (17, 2, 0x20, 40):   # sprite 2: behind the background
         ppu.write(0x2004, value)
 
+    # $2006 writes share the scroll state (loopy t), so reset the address
+    # before rendering, exactly as real games do after VRAM streaming.
+    ppu.write(0x2006, 0x00)
+    ppu.write(0x2006, 0x00)
+
     ppu.write(0x2001, 0x18)  # rendering on
     frame = np.asarray(ppu.render_frame())
     assert frame.shape == (240, 256)

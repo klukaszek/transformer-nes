@@ -6,13 +6,20 @@ content digest, exactly like the generated engines.  It was ported from a
 Python reference and proven pixel-identical before that reference was
 deleted (receipts in ROADMAP.md, 2026-07-11: register tests on both,
 byte-identical scene renders across four ctrl modes, frame/cycle identity
-over console runs, and a byte-identical nestest PPM).
+over console runs, and a byte-identical nestest PPM).  The scroll model
+was upgraded after the port (same day, receipts in ROADMAP.md): $2000/
+$2005/$2006 share one scroll/nametable state (loopy t + fine x), and the
+renderer models mid-frame scroll as one sprite-0 split -- rows above the
+hit use the scroll state latched at end_vblank (the visible span's
+start), rows below use the live registers.  SMB's status-bar split, and
+its NMI-time $2006/$2005 scroll reset, depend on both.
 
 Frame-level approximations (documented, revisit when a game needs them):
 base-cycle frame pacing, sprite-0 hit raised at its scanline's cycle
-offset from bg/sprite overlap of the *rendered* frame, sprite-overflow
-flag always 0, no mid-frame scroll/bank changes (no raster effects), no
-left-edge masking, no color emphasis/greyscale.
+offset from bg/sprite overlap of the *span-start-state* rendered frame,
+sprite-overflow flag always 0, one scroll split per frame (at the
+sprite-0 hit only -- no timer/IRQ raster effects), sprites drawn with
+render-time ctrl, no left-edge masking, no color emphasis/greyscale.
 """
 
 from __future__ import annotations

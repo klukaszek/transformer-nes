@@ -1,8 +1,10 @@
 // Native frame-level NES PPU (2C02).  Registers $2000-$2007 behind the
 // MMIO bus, VRAM/OAM, and a frame-at-once renderer; ported from a Python
 // reference and proven pixel-identical before that reference was deleted
-// (receipts in ROADMAP.md, 2026-07-11).  Plain fixed silicon -- nothing
-// here is model-generated -- compiled once and cached by content digest.
+// (receipts in ROADMAP.md, 2026-07-11), then upgraded same day with the
+// shared loopy-t scroll state and the sprite-0 split render (see ppu.py's
+// docstring for the model).  Plain fixed silicon -- nothing here is
+// model-generated -- compiled once and cached by content digest.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -23,13 +25,27 @@ struct PPU {
     uint8_t oam[0x100];
 
     int ctrl = 0, mask = 0, oam_addr = 0;
-    int scroll_x = 0, scroll_y = 0, vram_addr = 0;
+    int vram_addr = 0;
+    // Shared scroll/address state (loopy t + fine x): $2000 sets its
+    // nametable bits, $2005 its scroll bits, $2006 overwrites it as an
+    // address -- so an address-then-scroll reset sequence really does
+    // reset the nametable, which frame-start rendering depends on.
+    int t_addr = 0, fine_x = 0;
     bool write_latch = false;
     int read_buffer = 0;
 
     bool vblank = false, sprite0_hit = false, nmi_edge = false;
     int sprite0_scanline = -1;  // -1: none
     bool bg_opaque[240][256];
+
+    // Scroll state as of the visible span's start (latched at end_vblank):
+    // rows above the sprite-0 hit render from these, rows below from the
+    // live registers -- the sprite-0 split (status bar + scrolled field).
+    int frame_ctrl = 0, frame_t_addr = 0, frame_fine_x = 0;
+    bool frame_latch_valid = false;
+
+    int scroll_px_x() const { return ((t_addr & 0x1F) << 3) | fine_x; }
+    int scroll_px_y() const { return (((t_addr >> 5) & 0x1F) << 3) | ((t_addr >> 12) & 7); }
 
     PPU(py::bytes chr_data, bool writable, bool vertical) {
         std::string c = chr_data;
@@ -115,6 +131,7 @@ struct PPU {
         if (reg == 0) {  // PPUCTRL
             const bool rising = (value & 0x80) && !(ctrl & 0x80);
             ctrl = value;
+            t_addr = (t_addr & ~0x0C00) | ((value & 3) << 10);
             if (rising && vblank) nmi_edge = true;
         } else if (reg == 1) {  // PPUMASK
             mask = value;
@@ -124,12 +141,20 @@ struct PPU {
             oam[oam_addr] = (uint8_t)value;
             oam_addr = (oam_addr + 1) & 0xFF;
         } else if (reg == 5) {  // PPUSCROLL (x then y)
-            if (write_latch) scroll_y = value;
-            else scroll_x = value;
+            if (write_latch) {
+                t_addr = (t_addr & ~0x73E0) | ((value & 7) << 12) | ((value >> 3) << 5);
+            } else {
+                fine_x = value & 7;
+                t_addr = (t_addr & ~0x001F) | (value >> 3);
+            }
             write_latch = !write_latch;
-        } else if (reg == 6) {  // PPUADDR (high then low, shared latch)
-            if (write_latch) vram_addr = ((vram_addr & 0x3F00) | value) & 0x3FFF;
-            else vram_addr = ((value & 0x3F) << 8) | (vram_addr & 0x00FF);
+        } else if (reg == 6) {  // PPUADDR (high then low, shared latch + t)
+            if (write_latch) {
+                t_addr = (t_addr & 0x7F00) | value;
+                vram_addr = t_addr & 0x3FFF;
+            } else {
+                t_addr = (t_addr & 0x00FF) | ((value & 0x3F) << 8);
+            }
             write_latch = !write_latch;
         } else if (reg == 7) {  // PPUDATA
             vram_write(vram_addr & 0x3FFF, value);
@@ -142,7 +167,14 @@ struct PPU {
     bool nmi_enabled() const { return (ctrl & 0x80) != 0; }
     bool rendering_enabled() const { return (mask & 0x18) != 0; }
     void begin_vblank() { vblank = true; }
-    void end_vblank() { vblank = false; sprite0_hit = false; }
+    void end_vblank() {
+        vblank = false;
+        sprite0_hit = false;
+        frame_ctrl = ctrl;
+        frame_t_addr = t_addr;
+        frame_fine_x = fine_x;
+        frame_latch_valid = true;
+    }
 
     bool take_nmi_edge() {
         const bool edge = nmi_edge;
@@ -165,6 +197,61 @@ struct PPU {
         return b0 | (b1 << 1);
     }
 
+    void render_bg_rows(uint8_t* frame, const uint8_t* pal, uint8_t backdrop,
+                        int bctrl, int bt_addr, int bfine_x, int y0, int y1) {
+        const int bg_table = (bctrl & 0x10) ? 256 : 0;
+        const int px_x = ((bt_addr & 0x1F) << 3) | bfine_x;
+        const int px_y = (((bt_addr >> 5) & 0x1F) << 3) | ((bt_addr >> 12) & 7);
+        const int sx = (px_x + ((bt_addr >> 10) & 1) * 256) % 512;
+        const int sy = (px_y + ((bt_addr >> 11) & 1) * 240) % 480;
+        for (int y = y0; y < y1; ++y) {
+            const int cy = (y + sy) % 480;
+            const int ly = cy % 240, quad_y = cy / 240;
+            for (int x = 0; x < 256; ++x) {
+                const int cx = (x + sx) % 512;
+                const int lx = cx % 256, quad_x = cx / 256;
+                const int base = nt_offset(0x2000 + (quad_y * 2 + quad_x) * 0x400);
+                const int trow = ly >> 3, tcol = lx >> 3;
+                const int tile = nametables[base + trow * 32 + tcol];
+                const int pix = tile_pixel(bg_table + tile, ly & 7, lx & 7);
+                const uint8_t attr =
+                    nametables[base + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2)];
+                const int shift = ((trow % 4) / 2) * 4 + ((tcol % 4) / 2) * 2;
+                const int palsel = (attr >> shift) & 3;
+                frame[y * 256 + x] = pix ? pal[palsel * 4 + pix] : backdrop;
+                bg_opaque[y][x] = pix != 0;
+            }
+        }
+    }
+
+    // First scanline where an opaque sprite-0 pixel overlaps opaque bg.
+    int detect_sprite0() const {
+        const bool tall = (ctrl & 0x20) != 0;
+        const int y = oam[0], tile = oam[1], attr = oam[2], x = oam[3];
+        const int top = y + 1;
+        if (top >= 240) return -1;
+        const int h = tall ? 16 : 8;
+        const int rows = (240 - top) < h ? (240 - top) : h;
+        const int cols = (256 - x) < 8 ? (256 - x) : 8;
+        for (int r = 0; r < rows; ++r) {
+            const int src_r = (attr & 0x80) ? (h - 1 - r) : r;
+            int t, prow;
+            if (tall) {
+                t = (tile & 1) * 256 + (tile & 0xFE) + (src_r >> 3);
+                prow = src_r & 7;
+            } else {
+                t = ((ctrl & 0x08) ? 256 : 0) + tile;
+                prow = src_r;
+            }
+            for (int c = 0; c < cols; ++c) {
+                const int src_c = (attr & 0x40) ? (7 - c) : c;
+                if (tile_pixel(t, prow, src_c) && bg_opaque[top + r][x + c])
+                    return top + r;
+            }
+        }
+        return -1;
+    }
+
     py::array_t<uint8_t> render_frame() {
         auto out = py::array_t<uint8_t>({240, 256});
         uint8_t* frame = out.mutable_data();
@@ -173,35 +260,30 @@ struct PPU {
         for (int i = 0; i < 0x20; ++i) pal[i] = palette[i] & 0x3F;
         const uint8_t backdrop = pal[0];
 
+        // Rows above the sprite-0 hit render from the visible-span-start
+        // scroll state, rows below from the live (post-hit-write) state.
+        const int top_ctrl = frame_latch_valid ? frame_ctrl : ctrl;
+        const int top_t = frame_latch_valid ? frame_t_addr : t_addr;
+        const int top_fx = frame_latch_valid ? frame_fine_x : fine_x;
+        const bool split = (top_ctrl & 0x10) != (ctrl & 0x10)
+            || (top_t & 0x7FFF) != (t_addr & 0x7FFF) || top_fx != fine_x;
+
         if (!(mask & 0x08)) {
             std::memset(frame, backdrop, 240 * 256);
             std::memset(bg_opaque, 0, sizeof(bg_opaque));
         } else {
-            const int bg_table = (ctrl & 0x10) ? 256 : 0;
-            const int sx = (scroll_x + (ctrl & 1) * 256) % 512;
-            const int sy = (scroll_y + ((ctrl >> 1) & 1) * 240) % 480;
-            for (int y = 0; y < 240; ++y) {
-                const int cy = (y + sy) % 480;
-                const int ly = cy % 240, quad_y = cy / 240;
-                for (int x = 0; x < 256; ++x) {
-                    const int cx = (x + sx) % 512;
-                    const int lx = cx % 256, quad_x = cx / 256;
-                    const int base = nt_offset(0x2000 + (quad_y * 2 + quad_x) * 0x400);
-                    const int trow = ly >> 3, tcol = lx >> 3;
-                    const int tile = nametables[base + trow * 32 + tcol];
-                    const int pix = tile_pixel(bg_table + tile, ly & 7, lx & 7);
-                    const uint8_t attr =
-                        nametables[base + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2)];
-                    const int shift = ((trow % 4) / 2) * 4 + ((tcol % 4) / 2) * 2;
-                    const int palsel = (attr >> shift) & 3;
-                    frame[y * 256 + x] = pix ? pal[palsel * 4 + pix] : backdrop;
-                    bg_opaque[y][x] = pix != 0;
-                }
-            }
+            render_bg_rows(frame, pal, backdrop, top_ctrl, top_t, top_fx, 0, 240);
         }
 
         sprite0_scanline = -1;
         if (!(mask & 0x10)) return out;
+
+        sprite0_scanline = detect_sprite0();
+        if (split && (mask & 0x08) && sprite0_scanline >= 0
+            && sprite0_scanline + 1 < 240) {
+            render_bg_rows(frame, pal, backdrop, ctrl, t_addr, fine_x,
+                           sprite0_scanline + 1, 240);
+        }
 
         const bool tall = (ctrl & 0x20) != 0;
         // Draw from sprite 63 down so lower-index sprites win overlaps.
@@ -227,9 +309,6 @@ struct PPU {
                 for (int c = 0; c < cols; ++c) {
                     const int src_c = (attr & 0x40) ? (7 - c) : c;
                     const int pix = tile_pixel(t, prow, src_c);
-                    if (i == 0 && pix && bg_opaque[top + r][x + c]
-                        && sprite0_scanline < 0)
-                        sprite0_scanline = top + r;
                     if (!pix) continue;
                     if ((attr & 0x20) && bg_opaque[top + r][x + c])
                         continue;  // behind background
@@ -260,13 +339,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("ctrl", &PPU::ctrl)
         .def_readwrite("mask", &PPU::mask)
         .def_readwrite("oam_addr", &PPU::oam_addr)
-        .def_readwrite("scroll_x", &PPU::scroll_x)
-        .def_readwrite("scroll_y", &PPU::scroll_y)
+        .def_property_readonly("scroll_x", &PPU::scroll_px_x)
+        .def_property_readonly("scroll_y", &PPU::scroll_px_y)
+        .def_readwrite("t_addr", &PPU::t_addr)
+        .def_readwrite("fine_x", &PPU::fine_x)
         .def_readwrite("vram_addr", &PPU::vram_addr)
         .def_readwrite("write_latch", &PPU::write_latch)
         .def_readwrite("read_buffer", &PPU::read_buffer)
         .def_readwrite("vblank", &PPU::vblank)
         .def_readwrite("sprite0_hit", &PPU::sprite0_hit)
+        .def_readwrite("frame_ctrl", &PPU::frame_ctrl)
+        .def_readwrite("frame_t_addr", &PPU::frame_t_addr)
+        .def_readwrite("frame_fine_x", &PPU::frame_fine_x)
+        .def_readwrite("frame_latch_valid", &PPU::frame_latch_valid)
         .def_property_readonly("sprite0_scanline", [](PPU& p) -> std::optional<int> {
             if (p.sprite0_scanline < 0) return std::nullopt;
             return p.sprite0_scanline;
