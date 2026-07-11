@@ -35,11 +35,22 @@ performance numbers in the older sections below are historical.
 
 The weights are now a portable artifact.  `model/export.py`
 (`python -m transformer_vm.model.export OUT_DIR`) writes
-**weights.safetensors** -- per-matrix CSR, float64 values for exactness
-(dense would be ~11 GB; sparse is **4.2 MB**) plus tok/head dense --
-and **machine.json** (input slot map, readout slots, output-head rows,
-dims, and a prose spec of the execution semantics).  The union model
-only: experts/shapes/engines are execution strategies, not the model.
+**weights.safetensors** -- per-matrix CSR (dense would be ~11 GB;
+sparse is ~4 MB) plus tok/head dense -- and **machine.json** (input
+slot map, readout slots, output-head rows, dims, and a prose spec of
+the execution semantics INCLUDING the precision contract).  The union
+model only: experts/shapes/engines are execution strategies, not the
+model.  **Storage dtype defaults to f32** (loads on every GPU; WebGPU
+has no f64) -- certified exact for this construction and receipt-
+verified: the f32 round-trip perturbs 2,005 non-dyadic coefficients
+(0.3·ilp hull-key terms) yet locksteps the oracle exactly; `--f64`
+ships the theorem-free exact-constructed coefficients.  The contract's
+sharp edges, recorded in the metadata: attention SCORES must not be
+f32 (|ky| ~ 2^24 at a group's top addresses where the f32 ulp is 2 and
+gaps are 1) -- resolve in f64, or on GPU use the exact integer route
+(integer score part fits i32; the fractional recency term only breaks
+ties, which a positional argmax scan does exactly); and the three
+position features stay f64 (pos^2 outgrows f32 integers past ~4096).
 
 `experiments/torch_reference/torch_runner.py` is the proof of
 portability: a ~200-line standalone runner importing ONLY

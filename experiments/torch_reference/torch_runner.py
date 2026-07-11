@@ -52,10 +52,13 @@ class TorchMachine:
         self.readout = m["readout_slots"]
 
         def csr(name, shape):
+            # Storage may be f32 (the GPU-portable default) or f64; this
+            # reference runner always executes in f64 -- the artifact's
+            # precision contract lives in meta["format"].
             return torch.sparse_csr_tensor(
                 torch.from_numpy(t[f"{name}.indptr"].astype(np.int64)),
                 torch.from_numpy(t[f"{name}.indices"].astype(np.int64)),
-                torch.from_numpy(t[f"{name}.data"]),
+                torch.from_numpy(t[f"{name}.data"].astype(np.float64)),
                 size=shape,
             )
 
@@ -69,7 +72,7 @@ class TorchMachine:
             }
             for li in range(self.n_layers)
         ]
-        head = torch.from_numpy(t["head"])
+        head = torch.from_numpy(t["head"].astype(np.float64))
         self.state_head = head[m["state_row"]]
         self.halt_head = head[m["halt_row"]]
         self.reset()

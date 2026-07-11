@@ -26,15 +26,15 @@ from transformer_vm.model.weights import build_model
 from transformer_vm.scheduler.milp import asap_schedule
 
 
-def _csr_tensors(name: str, mat: np.ndarray, out: dict) -> None:
+def _csr_tensors(name: str, mat: np.ndarray, out: dict, dtype) -> None:
     m = sp.csr_matrix(mat)
     m.sort_indices()
-    out[f"{name}.data"] = m.data.astype(np.float64)
+    out[f"{name}.data"] = m.data.astype(dtype)
     out[f"{name}.indices"] = m.indices.astype(np.int32)
     out[f"{name}.indptr"] = m.indptr.astype(np.int32)
 
 
-def export_model(out_dir: str, *, bcd: bool = False) -> dict:
+def export_model(out_dir: str, *, bcd: bool = False, f64: bool = False) -> dict:
     """Build the union model and write the artifact; returns the metadata."""
     import os
 
@@ -51,15 +51,19 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
     sched = asap_schedule(pg.input_tokens, pg.output_tokens, program_graph=pg)
     model, _tokens, tok_to_idx, info = build_model(program_graph=pg, schedule=sched)
 
+    # f32 is the default: it loads on every GPU (WebGPU has no f64) and is
+    # certified exact for this construction; --f64 ships the theorem-free
+    # exact-constructed coefficients instead (see the precision prose).
+    dtype = np.float64 if f64 else np.float32
     tensors: dict[str, np.ndarray] = {
-        "tok": model.tok.weight.astype(np.float64),
-        "head": model.head.weight.astype(np.float64),
+        "tok": model.tok.weight.astype(dtype),
+        "head": model.head.weight.astype(dtype),
     }
     for li in range(info.n_layers):
-        _csr_tensors(f"L{li}.in_proj", model.attn[li].in_proj_weight, tensors)
-        _csr_tensors(f"L{li}.out_proj", model.attn[li].out_proj.weight, tensors)
-        _csr_tensors(f"L{li}.ff_in", model.ff_in[li].weight, tensors)
-        _csr_tensors(f"L{li}.ff_out", model.ff_out[li].weight, tensors)
+        _csr_tensors(f"L{li}.in_proj", model.attn[li].in_proj_weight, tensors, dtype)
+        _csr_tensors(f"L{li}.out_proj", model.attn[li].out_proj.weight, tensors, dtype)
+        _csr_tensors(f"L{li}.ff_in", model.ff_in[li].weight, tensors, dtype)
+        _csr_tensors(f"L{li}.ff_out", model.ff_out[li].weight, tensors, dtype)
 
     input_slots = {
         d.name: int(info.slot_of[d])
@@ -81,13 +85,20 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
             "act = gate > 0 ? gate*value : 0, x += ff_out @ act.  No "
             "normalization.  Position features are added at slots 0..2 of "
             "the embedding: pos, 1/ln(2) - 1/ln(pos+2), pos^2.  Readouts "
-            "round half-to-even.  Precision: values are exact in float64; "
-            "float32 weights/residuals are also exact for THIS construction "
+            "round half-to-even.  Precision contract: f32 STORAGE and f32 "
+            "residual/FFN arithmetic are exact for this construction "
             "(certified: residual values are dyadic rationals < 2^24, and "
-            "grouped keys keep attention score gaps above f32 rounding), "
-            "but the three position features must stay float64 -- pos^2 "
-            "exceeds f32's exact-integer range past pos ~ 4096."
+            "grouped keys keep f32 weight rounding below attention score "
+            "gaps).  Attention SCORE arithmetic must NOT be f32: near a "
+            "group's top addresses |ky| ~ 2^24 where the f32 ulp is 2 and "
+            "score gaps are 1 -- resolve scores in f64, or on GPU use the "
+            "exact integer route: the integer part of every score fits "
+            "i32 and the fractional recency term's only job is the LATEST "
+            "tie-break, which a positional argmax scan performs exactly.  "
+            "The three position features must stay f64 (pos^2 exceeds "
+            "f32's exact-integer range past pos ~ 4096)."
         ),
+        "dtype": "float64" if f64 else "float32",
         "bcd": bcd,
         "d_model": int(info.d_model),
         "n_layers": int(info.n_layers),
@@ -114,9 +125,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out_dir")
     parser.add_argument("--bcd", action="store_true")
+    parser.add_argument("--f64", action="store_true",
+                        help="store the exact constructed coefficients "
+                             "(default f32 is certified exact but GPU-portable)")
     args = parser.parse_args()
     t0 = time.perf_counter()
-    meta = export_model(args.out_dir, bcd=args.bcd)
+    meta = export_model(args.out_dir, bcd=args.bcd, f64=args.f64)
     print(
         f"exported d_model={meta['d_model']} n_layers={meta['n_layers']} "
         f"to {args.out_dir} in {time.perf_counter() - t0:.1f}s"
