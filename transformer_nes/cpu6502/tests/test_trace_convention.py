@@ -46,6 +46,6 @@ def test_nestest_trace_fields_match_reference():
 
 @pytest.mark.slow
 def test_klaus_prefix_trace_fields_match_reference():
-    from transformer_nes.cpu6502.examples.klaus.klaus import START_PC, load_image
+    from transformer_nes.cpu6502.examples.klaus.harness import START_PC, load_image
 
     _assert_full_trace_match(load_image(), START_PC, 200_000, bcd=True)

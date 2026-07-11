@@ -147,7 +147,7 @@ engine mechanisms.  Landed same day: the four backends moved into
 weights backend's support modules nested under `backends/weights/`
 (runner, experts, windows) so backends/ holds the four machines plus only
 the shared run_protocol.  The harnesses moved next to their assets:
-`cpu6502/examples/klaus/klaus.py` and `nes/examples/nestest.py`.  The
+`cpu6502/examples/klaus/harness.py` and `nes/examples/nestest.py`.  The
 cpu6502/ top level is now just the ISA: spec, interpreter, trace.  The one acknowledged wart: engine_gen imports
 cpu6502/run_protocol (and hashes cpu6502 files into its cache key), so
 model/ is not truly target-agnostic — accepted rather than hidden behind

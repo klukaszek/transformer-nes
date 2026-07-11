@@ -133,7 +133,7 @@ def run_graph(image: bytearray, log_rows, *, max_steps: int) -> tuple[bool, int,
 def run_cpp(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float]:
     """Run the C++ kernel in lockstep with the reference core (2A03 mode)."""
     from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
-    from transformer_nes.cpu6502.examples.klaus.klaus import lockstep_arrays_vs_reference
+    from transformer_nes.cpu6502.examples.klaus.harness import lockstep_arrays_vs_reference
 
     build_start = time.perf_counter()
     rt = Cpu6502CppRuntime(bcd=False)
@@ -158,7 +158,7 @@ def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, 
         run_start = time.perf_counter()
         out = machine.run_image_arrays(bytes(image), start_pc=START_PC, max_steps=max_steps)
         run_elapsed = time.perf_counter() - run_start
-        from transformer_nes.cpu6502.examples.klaus.klaus import lockstep_arrays_vs_reference
+        from transformer_nes.cpu6502.examples.klaus.harness import lockstep_arrays_vs_reference
 
         ref = _new_cpu(image)
         matched, n = lockstep_arrays_vs_reference(ref, out)

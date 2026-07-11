@@ -25,7 +25,7 @@ package one-way.
 | `backends/weights/runner.py` | The transformer machine: construction, engine-cache orchestration, machine protocol, JIT window discovery |
 | `backends/weights/experts.py` | Fold-and-build expert models (per-opcode, sequence, shape) with their dispatch licenses |
 | `backends/weights/windows.py` | ROM-independent shape library, window scanning, and shape matching |
-| `examples/klaus/klaus.py` | Klaus Dormann functional-test harness (`6502-klaus`), next to its binary |
+| `examples/klaus/harness.py` | Klaus Dormann functional-test harness (`6502-klaus`), next to its binary |
 
 The nestest harness (`6502-nestest`, Nintendulator golden-log comparison)
 lives in `transformer_nes/nes/examples/nestest.py` — nestest.nes is an NES
@@ -61,7 +61,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `kernel.py` (generated C++) | ~790K | Same semantics at NES-relevant speed |
-| `weights_runner.py` (real transformer) | ~344K (full Klaus, incl. the lockstep reference) | The thesis: actual hardmax-attention + ReGLU transformer weights |
+| `weights/runner.py` (real transformer) | ~344K (full Klaus, incl. the lockstep reference) | The thesis: actual hardmax-attention + ReGLU transformer weights |
 
 The evaluator and the C++ kernel are **bit-identical**: the kernel emits
 the evaluator's schedule as the same IEEE double operations in the same
@@ -73,7 +73,7 @@ either serving returns the identical winner.
 
 ### The transformer itself
 
-`weights_runner.py` (`6502-transformer`) closes the loop on the project's
+`backends/weights/` (`6502-transformer`) closes the loop on the project's
 premise: the graph is scheduled onto layers and compiled by
 `model/weights.py` into actual transformer weight matrices
 (`WeightModel` — d_model=1766, 74 layers, 883 attention heads),
