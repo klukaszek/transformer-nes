@@ -638,6 +638,7 @@ _RUN_LOOP = """\
             }
             const bool was_nmi = nmi_pending;
             const int prev_pc = st_pc;
+            ++fallback_count[prev_pc];  // JIT profile: per-instruction steps only
             step_core(o);  // updates st_*, applies writes to ram + memory
             t_pc.push_back((int)o[0]); t_a.push_back((int)o[1]);
             t_x.push_back((int)o[2]); t_y.push_back((int)o[3]);
@@ -693,6 +694,25 @@ _RUN_LOOP = """\
         return out;
     }
 
+    // ── JIT profile counter ──────────────────────────────────
+    // The run loop counts every per-instruction (fallback) step by pc;
+    // jit_hot reports pcs past the CUMULATIVE threshold that have no
+    // window yet, rearming only those (a rejected pc re-reports after
+    // re-heating; the Python side's rejected set filters it cheaply).
+    unsigned int fallback_count[65536];
+
+    py::array_t<int> jit_hot(long min_count) {
+        std::vector<int> hot;
+        for (int pc = 0; pc < 65536; ++pc)
+            if ((long)fallback_count[pc] >= min_count && !shape_of_pc[pc]) {
+                hot.push_back(pc);
+                fallback_count[pc] = 0;
+            }
+        return py::array_t<int>((py::ssize_t)hot.size(), hot.data());
+    }
+
+    int window_shape(int pc) { return shape_of_pc[pc & 0xFFFF]; }
+
     // ── Machine API (mirrors the C++ kernel) ─────────────────
     void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
     void watch_write(int lo, int hi) { wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
@@ -743,7 +763,9 @@ _PYBIND_STEP_METHODS = """\
         .def("attach_seq", &ENGINE_T::attach_seq)
         .def("detach_seq", &ENGINE_T::detach_seq)
         .def("add_window", &ENGINE_T::add_window)
-        .def("clear_windows", &ENGINE_T::clear_windows)"""
+        .def("clear_windows", &ENGINE_T::clear_windows)
+        .def("jit_hot", &ENGINE_T::jit_hot)
+        .def("window_shape", &ENGINE_T::window_shape)"""
 
 
 # Core-side seq_out capacity; keep in sync with SEQ_MAX_K in _SEQ_HOOK.
@@ -1556,6 +1578,7 @@ def generate_source(model, step_spec: dict | None = None,
     if has_run:
         emit("        for (int i = 0; i < 65536; ++i) ram[i] = 0;")
         emit("        std::memset(shape_of_pc, 0, sizeof(shape_of_pc));")
+        emit("        std::memset(fallback_count, 0, sizeof(fallback_count));")
         emit("        st_pc = 0; st_a = st_x = st_y = 0; st_s = 0xFD; st_p = 0x24;")
         emit("        st_ir = st_oplo = st_ophi = st_ea = st_data = 0;")
         emit("        st_halted = false; nmi_pending = false; resume_read_skip = false;")
@@ -1857,6 +1880,8 @@ class GeneratedWeightsEngine:
             self.detach_seq = self._engine.detach_seq
             self.add_window = self._engine.add_window
             self.clear_windows = self._engine.clear_windows
+            self.jit_hot = self._engine.jit_hot
+            self.window_shape = self._engine.window_shape
 
     def reset(self):
         self._engine.reset()

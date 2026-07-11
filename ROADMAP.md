@@ -31,6 +31,42 @@ backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## 2026-07-10 profile-guided JIT — runtime window discovery, landed
+
+The recorded JIT idea, built on the two dispatch substrates.  The run
+loop counts every per-instruction (fallback) step by pc (one array
+increment); `jit_hot(min_count)` reports pcs past the CUMULATIVE
+threshold that have no window yet, rearming only those.  The runner
+polls every `jit_interval` native run() returns and matches each hot
+pc against the shape library ANCHORED at that pc -- hotness replaces
+loop-closure as the profitability filter (dispatch is correct for
+straight-line matches by construction), except the JMP self-spin whose
+dispatch predicate demands operand == head.  Matched pcs go straight
+into the window table; misses land in a rejected set cleared at
+boot/reseed.  This discovers what the boot scan cannot see: **code the
+program copies into RAM at runtime**, plus hot straight-line idioms.
+
+Two bugs found by the receipt test: (1) zeroing ALL counters at each
+poll meant no pc could ever accumulate past the threshold between
+polls -- counts are cumulative now, only reported pcs rearm; (2) the
+matcher first read `self._ram`, but the native run loop's writes never
+reach the Python mirror -- a runtime-copied loop exists only
+engine-side, so the matcher reads engine RAM (`read_ram`).
+
+Receipts: 80 tests green, ruff clean; `test_jit_discovers_runtime_
+window` -- a program that STAs a DEX/BNE/JMP-self loop into $0300 and
+jumps there gets its window added mid-run (boot scan provably missed
+it) with the trace byte-identical to the per-instruction machine
+across the hot-swap; full suite unchanged; **fallback-path cost of the
+counter: none** (LDA abs;JMP 0.370-0.372 µs/step vs the 0.377 record).
+SMB fps read 286-317 in this session's trials vs 331-335 earlier --
+attributed to bench-session thermals, since the step-time microbench
+is unchanged; re-measure cold for the canonical number.  Remaining JIT
+tier (recorded, not started): background *pinned-module* builds for
+hot windows -- fold/compile a per-ROM module off-thread and attach_seq
+when ready, upgrading shape-tier windows (~0.2 µs/instr) to pinned
+(~0.07) without pausing the run.
+
 ## 2026-07-10 shape-expert engine — any ROM, zero per-ROM compile, landed
 
 The canonical shape folds (below) are now in the engine.  A curated

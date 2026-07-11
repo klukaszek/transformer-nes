@@ -221,6 +221,8 @@ class Cpu6502TransformerMachine:
                  expert_opcodes=DEFAULT_EXPERT_OPCODES,
                  sequence_windows=(),
                  shape_library=SHAPE_LIBRARY,
+                 jit_interval: int = 256,
+                 jit_min_count: int = 512,
                  expert_schedule: str = "asap",
                  expert_milp_seconds: int = 900):
         # Build the graph (and keep the evaluator's dim handles; its Python
@@ -338,6 +340,16 @@ class Cpu6502TransformerMachine:
         self._cpp_step = getattr(self._engine, "has_machine_step", False)
         if self._cpp_step:
             self._step_out = np.empty(21, dtype=np.int64)
+
+        # Profile-guided JIT: every jit_interval native run() returns, pcs
+        # with >= jit_min_count fallback steps since the last poll are
+        # matched against the shape library at their live RAM bytes --
+        # discovering windows the boot scan could not see (code copied to
+        # RAM at runtime, hot straight-line idioms).
+        self._jit_interval = int(jit_interval)
+        self._jit_min_count = int(jit_min_count)
+        self._jit_calls = 0
+        self._jit_rejected: set[int] = set()
 
         self.pos = 0
         self._trace_len = 0
@@ -717,6 +729,8 @@ class Cpu6502TransformerMachine:
         """Fill the engine's runtime window table from the current RAM image
         (called at every boot/reseed; dispatch re-verifies bytes live, so a
         stale entry is only a missed fast path)."""
+        self._jit_calls = 0
+        self._jit_rejected.clear()
         meta = getattr(self._engine, "shapes_meta", None) or []
         if not (meta and self._cpp_step
                 and getattr(self._engine, "has_run_loop", False)):
@@ -724,6 +738,46 @@ class Cpu6502TransformerMachine:
         self._engine.clear_windows()
         for sid, head in match_shape_windows(self._ram, meta):
             self._engine.add_window(sid, head)
+
+    def _match_shape_at(self, pc: int) -> int | None:
+        """Anchored shape match at one hot pc against the ENGINE's live RAM
+        (the native run loop's writes never reach the Python mirror -- a
+        runtime-copied loop exists only engine-side).  Closure is not
+        required (hotness already argued profitability; dispatch is correct
+        for straight-line matches too), except the JMP self-spin, whose
+        dispatch predicate demands operand == head."""
+        rd = self._engine.read_ram
+        for m in self._engine.shapes_meta:
+            length = int(m["length"])
+            if pc + length > 0x10000:
+                continue
+            if any(rd(pc + off) != b for off, b in m["sig"]):
+                continue
+            if m["close"] == "jmp" and rd(pc + 1) | (rd(pc + 2) << 8) != pc:
+                continue
+            return int(m["id"])
+        return None
+
+    def _jit_tick(self) -> None:
+        """Periodic JIT poll after a native run: table-add any hot fallback
+        pc whose bytes match a library shape."""
+        meta = getattr(self._engine, "shapes_meta", None) or []
+        if not meta:
+            return
+        self._jit_calls += 1
+        if self._jit_calls % self._jit_interval:
+            return
+        for pc in self._engine.jit_hot(self._jit_min_count):
+            pc = int(pc)
+            if pc in self._jit_rejected:
+                continue
+            sid = self._match_shape_at(pc)
+            if sid is None:
+                self._jit_rejected.add(pc)
+            else:
+                self._engine.add_window(sid, pc)
+                logger.info("jit window: %s at %04X",
+                            self._engine.shapes_meta[sid]["name"], pc)
 
     def _sequence_step_spec(self, fold_result, model, tok_to_idx, info) -> dict:
         """The _expert_step_spec shape, with one outputs map per step."""
@@ -1104,6 +1158,7 @@ class Cpu6502TransformerMachine:
         (no reboot), pausing on halt/trap/watch/cycle budget."""
         out = self._engine.run(max_steps, stop_on_trap, max_cycles)
         self._pull_run_state()
+        self._jit_tick()
         return out
 
     def watch_read(self, lo: int, hi: int) -> None:

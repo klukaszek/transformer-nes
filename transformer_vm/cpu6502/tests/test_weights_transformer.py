@@ -231,3 +231,46 @@ def test_sequence_experts_match_per_step():
             assert np.array_equal(traces[0][k], t[k]), f"{k} diverged"
     for pc in (0x0408, 0x040B, 0x0410):
         assert pc in traces[0]["pc"], f"never reached {pc:04X}"
+
+
+@pytest.mark.slow
+def test_jit_discovers_runtime_window():
+    """The JIT counter must discover a loop the program WRITES INTO RAM at
+    runtime (invisible to the boot scan), add it to the window table
+    mid-run, and leave the trace byte-identical to the per-instruction
+    machine across the hot-swap."""
+    import numpy as np
+
+    image = bytearray(0x10000)
+    # Copy "DEX / BNE -3 / JMP $0303 (self)" to $0300, set X, jump there.
+    code = bytes([0xCA, 0xD0, 0xFD, 0x4C, 0x03, 0x03])
+    prog = bytearray()
+    for i, b in enumerate(code):
+        prog += bytes([0xA9, b, 0x8D, i, 0x03])   # LDA #b / STA $030i
+    prog += bytes([0xA2, 0xFF,                    # LDX #$FF
+                   0x4C, 0x00, 0x03])             # JMP $0300
+    image[0x0400:0x0400 + len(prog)] = prog
+
+    fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
+              "ea", "data", "halted")
+    traces = []
+    for cfg in ({"jit_interval": 1, "jit_min_count": 64},
+                {"shape_library": ()}):
+        m = Cpu6502TransformerMachine(bcd=False, **cfg)
+        m.load_image(bytes(image), start_pc=0x0400)
+        if "shape_library" not in cfg:
+            # The loop does not exist at boot; only the JIT can find it.
+            assert m._engine.window_shape(0x0300) == 0
+        chunks = []
+        done = 0
+        while done < 800:
+            out = m.run(97)  # odd budgets: boundaries land mid-window
+            assert len(out["pc"]), out["reason"]
+            chunks.append(out)
+            done += len(out["pc"])
+        traces.append({k: np.concatenate([c[k] for c in chunks]) for k in fields})
+        if "shape_library" not in cfg:
+            assert m._engine.window_shape(0x0300) != 0, "JIT never added the window"
+    n = min(len(traces[0]["pc"]), len(traces[1]["pc"]))
+    for k in fields:
+        assert np.array_equal(traces[0][k][:n], traces[1][k][:n]), f"{k} diverged"
