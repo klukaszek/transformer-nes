@@ -37,7 +37,7 @@ import time
 import numpy as np
 
 from transformer_nes.attention.runtime import HullAttention, load_hull_ext
-from transformer_nes.cpu6502 import reference
+from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.interpreter import build as build_6502_graph
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_nes.graph.core import (

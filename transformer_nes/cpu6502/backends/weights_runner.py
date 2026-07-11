@@ -13,22 +13,22 @@ import time
 
 import numpy as np
 
-from transformer_nes.cpu6502 import reference
-from transformer_nes.cpu6502.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
-from transformer_nes.cpu6502.experts import (
+from transformer_nes.cpu6502.backends import reference
+from transformer_nes.cpu6502.backends.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
+from transformer_nes.cpu6502.backends.experts import (
     build_opcode_experts,
     build_sequence_expert,
     build_shape_experts,
     head_row,
     step_spec_base,
 )
-from transformer_nes.cpu6502.spec import OPCODES
-from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
-from transformer_nes.cpu6502.windows import (
+from transformer_nes.cpu6502.backends.windows import (
     SHAPE_LIBRARY,
     match_shape_at,
     match_shape_windows,
 )
+from transformer_nes.cpu6502.spec import OPCODES
+from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_nes.graph.core import ProgramGraph
 from transformer_nes.model.weights import add_position_encoding, build_model
 from transformer_nes.scheduler.milp import asap_schedule

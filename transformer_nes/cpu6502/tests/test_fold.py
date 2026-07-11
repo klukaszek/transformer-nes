@@ -22,11 +22,11 @@ its depth and term counts are measured directly from the graph under test.
 
 import pytest
 
-from transformer_nes.cpu6502 import reference
-from transformer_nes.cpu6502.evaluator import _RUNTIME_READ_DIMS
+from transformer_nes.cpu6502.backends import reference
+from transformer_nes.cpu6502.backends.evaluator import _RUNTIME_READ_DIMS
+from transformer_nes.cpu6502.backends.weights_runner import VERIFY_START, verify_program
 from transformer_nes.cpu6502.interpreter import build
 from transformer_nes.cpu6502.spec import OPCODES
-from transformer_nes.cpu6502.weights_runner import VERIFY_START, verify_program
 from transformer_nes.graph.core import (
     LookUpDimension,
     PersistDimension,

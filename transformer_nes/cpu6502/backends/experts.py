@@ -13,10 +13,10 @@ import time
 
 import numpy as np
 
-from transformer_nes.cpu6502 import reference
-from transformer_nes.cpu6502.evaluator import _RUNTIME_READ_DIMS
+from transformer_nes.cpu6502.backends import reference
+from transformer_nes.cpu6502.backends.evaluator import _RUNTIME_READ_DIMS
+from transformer_nes.cpu6502.backends.windows import BRANCH_OPERATIONS
 from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
-from transformer_nes.cpu6502.windows import BRANCH_OPERATIONS
 from transformer_nes.graph.fold import (
     SEQUENCE_FEEDBACK,
     GraphFolder,

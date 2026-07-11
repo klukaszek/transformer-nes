@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-from transformer_nes.cpu6502.evaluator import run_program
+from transformer_nes.cpu6502.backends.evaluator import run_program
 
 
 def main() -> None:

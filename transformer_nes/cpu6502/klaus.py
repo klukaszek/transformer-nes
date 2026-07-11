@@ -19,7 +19,7 @@ import logging
 import os
 import time
 
-from transformer_nes.cpu6502.reference import Cpu6502
+from transformer_nes.cpu6502.backends.reference import Cpu6502
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ def run_graph(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float,
     Every step is compared against the reference core.  Returns
     (matched, steps_executed, build_seconds, prefix_seconds, run_seconds).
     """
-    from transformer_nes.cpu6502.evaluator import Cpu6502Runtime
+    from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
 
     build_start = time.perf_counter()
     rt = Cpu6502Runtime()
@@ -132,7 +132,7 @@ def lockstep_arrays_vs_reference(ref: Cpu6502, out: dict) -> tuple[bool, int]:
 
 def run_cpp(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float, float]:
     """Lockstep the C++ kernel against the reference for max_steps."""
-    from transformer_nes.cpu6502.kernel import Cpu6502CppRuntime
+    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
 
     build_start = time.perf_counter()
     rt = Cpu6502CppRuntime(bcd=True)
@@ -152,7 +152,7 @@ def run_weights(image: bytes, *, max_steps: int,
     Klaus at full length (30.6M instructions) is out of reach at
     transformer speeds; this verifies a prefix, like the graph runner.
     """
-    from transformer_nes.cpu6502.weights_runner import Cpu6502TransformerMachine
+    from transformer_nes.cpu6502.backends.weights_runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(
@@ -214,7 +214,7 @@ def run_weights(image: bytes, *, max_steps: int,
 
 def run_cpp_full(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float]:
     """Run the entire suite on the C++ kernel until the success trap."""
-    from transformer_nes.cpu6502.kernel import Cpu6502CppRuntime
+    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
 
     build_start = time.perf_counter()
     rt = Cpu6502CppRuntime(bcd=True)

@@ -131,7 +131,7 @@ class Console:
         self.backend = backend
         self._uses_kernel_bus = False
         if backend == "kernel":
-            from transformer_nes.cpu6502.kernel import Cpu6502CppRuntime
+            from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
 
             self._rt = Cpu6502CppRuntime(bcd=False)
             self.bus = KernelBus(self._rt, image, start_pc=start_pc)
@@ -144,8 +144,8 @@ class Console:
             # The real transformer through its generated C++ run loop:
             # KernelBus drives it natively (MMIO pauses back to Python), the
             # same protocol as the kernel.
-            from transformer_nes.cpu6502.weights_runner import Cpu6502TransformerMachine
-            from transformer_nes.cpu6502.windows import scan_sequence_windows
+            from transformer_nes.cpu6502.backends.weights_runner import Cpu6502TransformerMachine
+            from transformer_nes.cpu6502.backends.windows import scan_sequence_windows
 
             machine = Cpu6502TransformerMachine(
                 bcd=False, checkpoint_tokens=None,
@@ -161,7 +161,7 @@ class Console:
             self._uses_kernel_bus = True
             return
         if backend == "reference":
-            from transformer_nes.cpu6502.reference import Cpu6502
+            from transformer_nes.cpu6502.backends.reference import Cpu6502
 
             cpu = Cpu6502(memory=bytearray(image), bcd_enabled=False)
             cpu.pc = start_pc
@@ -171,7 +171,7 @@ class Console:
                 )
             core = ReferenceCore(cpu)
         elif backend == "graph":
-            from transformer_nes.cpu6502.evaluator import Cpu6502Runtime
+            from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
 
             rt = Cpu6502Runtime(bcd=False)
             rt.boot_image(list(image), start_pc=start_pc, state=state)

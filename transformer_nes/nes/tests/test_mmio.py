@@ -14,8 +14,8 @@ from collections import defaultdict
 
 import pytest
 
-from transformer_nes.cpu6502.evaluator import Cpu6502Runtime
-from transformer_nes.cpu6502.reference import Cpu6502
+from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
+from transformer_nes.cpu6502.backends.reference import Cpu6502
 from transformer_nes.nes.bus import Bus, GraphCore, KernelBus, ReferenceCore
 
 DEVICE_LO, DEVICE_HI = 0xD000, 0xD00F
@@ -106,7 +106,7 @@ def test_graph_bus_matches_reference_bus():
 
 @pytest.mark.slow
 def test_kernel_bus_matches_reference_bus():
-    from transformer_nes.cpu6502.kernel import Cpu6502CppRuntime
+    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
 
     image = _image()
     ref_rows, ref_dev, _ref_bus = _run_reference(image)

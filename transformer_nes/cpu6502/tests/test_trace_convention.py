@@ -15,8 +15,8 @@ mode, BRK/RTI, stack wrap).
 
 import pytest
 
-from transformer_nes.cpu6502.kernel import Cpu6502CppRuntime
-from transformer_nes.cpu6502.reference import Cpu6502
+from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
+from transformer_nes.cpu6502.backends.reference import Cpu6502
 
 
 def _assert_full_trace_match(image, start_pc, max_steps, *, bcd):

@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from transformer_nes.cpu6502 import reference
-from transformer_nes.cpu6502.weights_runner import (
+from transformer_nes.cpu6502.backends import reference
+from transformer_nes.cpu6502.backends.weights_runner import (
     VERIFY_START,
     Cpu6502TransformerMachine,
     verify_program,
@@ -167,7 +167,7 @@ def test_sequence_experts_match_per_step():
     fall-through, the spin, and chunk boundaries landing mid-window."""
     import numpy as np
 
-    from transformer_nes.cpu6502.windows import (
+    from transformer_nes.cpu6502.backends.windows import (
         match_shape_windows,
         scan_sequence_windows,
     )

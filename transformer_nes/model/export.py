@@ -20,7 +20,7 @@ import time
 import numpy as np
 import scipy.sparse as sp
 
-from transformer_nes.cpu6502.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
+from transformer_nes.cpu6502.backends.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.graph.core import InputDimension, ProgramGraph
 from transformer_nes.model.weights import build_model
 from transformer_nes.scheduler.milp import asap_schedule

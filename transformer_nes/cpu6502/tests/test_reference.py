@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from transformer_nes.cpu6502 import reference
+from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.spec import FLAG_C, FLAG_N, FLAG_Z, asm
 from transformer_nes.cpu6502.trace import format_trace_row
 

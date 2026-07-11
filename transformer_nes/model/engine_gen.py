@@ -19,7 +19,7 @@ import time
 import numpy as np
 import scipy.sparse as sp
 
-from transformer_nes.cpu6502.run_protocol import (
+from transformer_nes.cpu6502.backends.run_protocol import (
     IN_RANGES_CPP,
     MACHINE_API_CPP,
     SHADOW_READ_TARGET_CPP,
@@ -44,12 +44,12 @@ _MANIFEST_PATH = os.path.join(_CACHE_DIR, "manifest.json")
 _CODE_DIRS = ("graph", "scheduler", "model", "attention")
 _CODE_FILES = (
     "cpu6502/spec.py",
-    "cpu6502/evaluator.py",
-    "cpu6502/reference.py",
-    "cpu6502/run_protocol.py",
-    "cpu6502/windows.py",
-    "cpu6502/experts.py",
-    "cpu6502/weights_runner.py",
+    "cpu6502/backends/evaluator.py",
+    "cpu6502/backends/reference.py",
+    "cpu6502/backends/run_protocol.py",
+    "cpu6502/backends/windows.py",
+    "cpu6502/backends/experts.py",
+    "cpu6502/backends/weights_runner.py",
 )
 _code_digest_cache: str | None = None
 

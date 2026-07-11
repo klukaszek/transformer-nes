@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from transformer_nes.cpu6502.evaluator import Cpu6502Runtime
+from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
 
 PROGRAMS = {
     "jsr_rts": bytes([0x20, 0x06, 0x80, 0x00, 0xEA, 0xEA, 0xA9, 0x42, 0x60]),
@@ -18,7 +18,7 @@ PROGRAMS = {
 
 @pytest.mark.slow
 def test_cpp_kernel_matches_python_graph():
-    from transformer_nes.cpu6502.kernel import Cpu6502CppRuntime
+    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
 
     cpp = Cpu6502CppRuntime(bcd=True)
     for name, program in PROGRAMS.items():

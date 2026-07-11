@@ -9,13 +9,14 @@ targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 **START HERE (2026-07-11, refactor complete):** the structural refactor
 plan below is DONE through item 6 — the codebase now splits cleanly into
 the model (graph → schedule → weights; `model/classify.py` holds every
-attention-serving license), the engines (`model/engine_gen.py` +
-`cpu6502/kernel.py`, sharing one native run-loop protocol from
-`cpu6502/run_protocol.py`), expert construction (`cpu6502/experts.py`),
-window policy (`cpu6502/windows.py`), and the machine/console layers.
-The weights forward is integer end-to-end (full Klaus decimal record:
-89.0 s, 344K steps/s).  Next up: **the native app** — PPU to C++ (plan
-item 7) plus an SDL3/Sokol frontend with video, sound, and controls.
+attention-serving license), the machine backends (`cpu6502/backends/`:
+reference, evaluator, kernel, weights_runner, plus their support modules —
+`run_protocol.py` emits the one native run-loop protocol for both
+generated engines, `experts.py` builds the fold experts, `windows.py`
+owns window policy), and the machine/console layers.  The weights forward
+is integer end-to-end (full Klaus decimal record: 89.0 s, 344K steps/s).
+Next up: **the native app** — PPU to C++ (plan item 7) plus an SDL3/Sokol
+frontend with video, sound, and controls.
 
 **Previous snapshot (2026-07-10, 350 fps + universal shapes):** SMB gameplay
 through the transformer weights runs at **~333 fps (3.0 ms/frame)**
@@ -140,7 +141,10 @@ attention/, scheduler/), THE MACHINE (cpu6502/ + model/, coupled through
 run_protocol and the step spec), and the console (nes/).  weights_runner
 stays in cpu6502/ because it is a machine BACKEND (peer of reference/
 evaluator/kernel, same machine protocol); model/ holds the graph→weights→
-engine mechanisms.  The one acknowledged wart: engine_gen imports
+engine mechanisms.  Landed same day: the four backends and their support
+modules (run_protocol, experts, windows) moved into `cpu6502/backends/`,
+with `_kernel_cache/` following kernel.py; cpu6502/ top level is now just
+the ISA (spec, interpreter, trace) and the Klaus harness.  The one acknowledged wart: engine_gen imports
 cpu6502/run_protocol (and hashes cpu6502 files into its cache key), so
 model/ is not truly target-agnostic — accepted rather than hidden behind
 parameter injection; the emitted engine IS the 6502 machine protocol.

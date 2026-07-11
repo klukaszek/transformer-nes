@@ -17,14 +17,14 @@ import hashlib
 import os
 import time
 
-from transformer_nes.cpu6502.evaluator import (
+from transformer_nes.cpu6502.backends.evaluator import (
     _OP_LOOKUP,
     _OP_PERSIST,
     _OP_REGLU,
     _RUNTIME_READ_DIMS,
     Cpu6502Runtime,
 )
-from transformer_nes.cpu6502.run_protocol import (
+from transformer_nes.cpu6502.backends.run_protocol import (
     IN_RANGES_CPP,
     MACHINE_API_CPP,
     SHADOW_READ_TARGET_CPP,
@@ -36,7 +36,8 @@ from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRo
 from transformer_nes.graph.core import PersistDimension
 from transformer_nes.model.classify import memory_query, register_query
 
-_ATTENTION_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "attention")
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_ATTENTION_DIR = os.path.join(_PKG_DIR, "attention")
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_kernel_cache")
 
 # STATE-token override fields, in the order the C++ insert_state() takes them.

@@ -16,7 +16,7 @@ import logging
 import os
 import time
 
-from transformer_nes.cpu6502.reference import Cpu6502
+from transformer_nes.cpu6502.backends.reference import Cpu6502
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +97,7 @@ def run_graph(image: bytearray, log_rows, *, max_steps: int) -> tuple[bool, int,
     The reference is the oracle here; it is itself validated against the
     golden log by run_reference.  Returns (matched, steps, build_s, run_s).
     """
-    from transformer_nes.cpu6502.evaluator import Cpu6502Runtime
+    from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
 
     build_start = time.perf_counter()
     rt = Cpu6502Runtime(bcd=False)
@@ -132,7 +132,7 @@ def run_graph(image: bytearray, log_rows, *, max_steps: int) -> tuple[bool, int,
 
 def run_cpp(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float]:
     """Run the C++ kernel in lockstep with the reference core (2A03 mode)."""
-    from transformer_nes.cpu6502.kernel import Cpu6502CppRuntime
+    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
     from transformer_nes.cpu6502.klaus import lockstep_arrays_vs_reference
 
     build_start = time.perf_counter()
@@ -145,7 +145,7 @@ def run_cpp(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, floa
 
 def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float, str]:
     """Run the real weights-based transformer in lockstep with the reference."""
-    from transformer_nes.cpu6502.weights_runner import Cpu6502TransformerMachine
+    from transformer_nes.cpu6502.backends.weights_runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(bcd=False)
