@@ -24,9 +24,49 @@ PPU's real scroll model (loopy t + the sprite-0 split, same log).
 **Mappers landed same day** (log below): MMC1 (Final Fantasy plays)
 and MMC3 with the scanline IRQ delivered through the machine model
 (log above) — **SMB3 is fully playable** at 5.2 ms/frame through the
-weights, HUD and all.  Next up: the **APU + sokol_audio** for sound;
-more mappers (MMC2/4 latch CHR — Punch-Out!!/Fire Emblem; MMC5 far
-later) as wanted.
+weights, HUD and all.  **The APU landed 2026-07-11** (log above): native
+audio through sokol_audio, sound across multiple games (pulse/triangle/
+noise; DMC stubbed).  Next up: the **DMC channel** (SMB's percussion),
+the frame/DMC IRQ onto the CPU line if a game needs it, and more mappers
+(MMC2/4 latch CHR — Punch-Out!!/Fire Emblem; MMC5 far later) as wanted.
+
+## 2026-07-11 APU — native audio, sound across games
+
+The last console subsystem, built in the PPU's mold: `nes/apu.cpp` is
+fixed silicon (register file $4000-$4017, the channels, a frame
+sequencer, a per-frame sample generator with the 2A03's nonlinear DAC +
+a one-pole DC blocker), `nes/apu.py` is the digest-caching loader, and
+the console attaches it as a bus device and calls `end_frame(cycles)`
+once per frame to pull that frame's mono float samples.  The app pushes
+them to `sokol_audio` (push mode, mono, AudioToolbox) from the frame
+callback -- sokol's own audio thread drains the ring buffer, so no GIL
+or audio-thread hazard.
+
+MMIO layout worked out with no bus changes: the Controller was already
+"port 1 only" ($4017 reads returned open-bus $40), so the APU took
+$4000-$4013, $4015, and $4017 with zero range conflicts (controller
+narrowed to $4016).
+
+Channels: pulse x2 (duty, envelope, sweep, length), triangle (linear
+counter + length), noise (envelope, LFSR, length) -- essentially all NES
+music.  Frame sequencer 4/5-step with the NTSC trigger cycles; the frame
+IRQ flag is readable at $4015 (read-clear) but deliberately NOT driven
+onto the CPU IRQ line (the frame-batch model can't time it precisely,
+and most games inhibit it at boot).  DMC (sample) channel stubbed:
+registers accepted, no output/DMA/IRQ.
+
+Frame-level approximation, documented: register writes take effect at
+their instant but a frame's samples generate in one end-of-frame batch,
+so once-per-frame (NMI) music -- the overwhelming majority -- is exact
+while a rapid intra-frame sweep resolves at frame granularity.
+
+Receipts: 7 new APU tests (A440 tone within 5 Hz + DC-centered, length
+counter silences / halt sustains / $4015 disable, $4015 status +
+frame-IRQ read-clear, IRQ inhibit); 36 nes tests green (attaching the
+APU left frame identity and nestest byte-identical -- it drives no CPU
+state); user-confirmed audio across multiple games.  Next: wire the DMC
+(SMB's percussion is DMC PCM) and, if a game needs it, the frame/DMC
+IRQ onto the CPU line.
 
 ## 2026-07-11 IRQ through the machine model + the PPU's v register — SMB3 fully playable
 

@@ -19,6 +19,7 @@
 #include "sokol_gfx.h"
 #include "sokol_glue.h"
 #include "sokol_log.h"
+#include "sokol_audio.h"
 
 namespace py = pybind11;
 
@@ -236,6 +237,26 @@ static void app_event(const sapp_event* e) {
     }
 }
 
+// Open the audio device (push mode, mono) and return the actual sample
+// rate, which the console's APU must match.  Safe to call before the
+// window opens -- sokol_audio is independent of sokol_app.
+static int audio_setup(void) {
+    saudio_desc desc{};
+    desc.sample_rate = 44100;
+    desc.num_channels = 1;
+    desc.logger.func = slog_func;
+    saudio_setup(&desc);
+    return saudio_isvalid() ? saudio_sample_rate() : 0;
+}
+
+// Push one frame's mono samples into the audio buffer; sokol's own audio
+// thread drains them (saudio_push is internally locked).
+static void push_audio(py::array_t<float, py::array::c_style | py::array::forcecast> samples) {
+    if (saudio_isvalid() && samples.size() > 0) {
+        saudio_push(samples.data(), (int)samples.size());
+    }
+}
+
 // On macOS quitting goes through [NSApp terminate:], which exits the
 // process inside sapp_run -- the caller of run() never resumes.  The
 // quit callback, invoked here (GIL still held, same thread), is the
@@ -248,6 +269,7 @@ static void app_cleanup(void) {
             e.discard_as_unraisable("nes app quit callback");
         }
     }
+    saudio_shutdown();
     sg_shutdown();
 }
 
@@ -283,4 +305,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("quit_cb") = py::none(),
           "Open the window and drive frame_cb(buttons) until quit; on macOS "
           "the process exits inside run, with quit_cb the last Python to run.");
+    m.def("audio_setup", &audio_setup,
+          "Open the audio device (mono push mode); returns the sample rate.");
+    m.def("push_audio", &push_audio, py::arg("samples"),
+          "Push a frame's mono float samples to the audio buffer.");
 }

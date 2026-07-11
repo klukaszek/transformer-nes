@@ -28,8 +28,9 @@ APP_CPP = os.path.join(NES_DIR, "app.cpp")
 SOKOL_DIR = os.path.normpath(os.path.join(NES_DIR, "..", "..", "vendor", "sokol"))
 CACHE_DIR = os.path.join(NES_DIR, "_app_cache")
 
-SOKOL_HEADERS = ("sokol_app.h", "sokol_gfx.h", "sokol_glue.h", "sokol_log.h")
-MACOS_FRAMEWORKS = ("Cocoa", "QuartzCore", "Metal", "MetalKit")
+SOKOL_HEADERS = ("sokol_app.h", "sokol_gfx.h", "sokol_glue.h", "sokol_log.h",
+                 "sokol_audio.h")
+MACOS_FRAMEWORKS = ("Cocoa", "QuartzCore", "Metal", "MetalKit", "AudioToolbox")
 
 app_module = None
 
@@ -131,6 +132,8 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
         frame = console.run_frame()
         elapsed = time.perf_counter() - start
         emu_seconds += elapsed
+        if console.last_audio is not None:
+            module.push_audio(console.last_audio)
         if elapsed > 0.1:
             logger.warning(
                 "slow frame %d: %.0f ms (checkpoints=%d, log=%s tokens)",
@@ -167,9 +170,15 @@ def main() -> None:
                         format="%(message)s")
 
     build_start = time.perf_counter()
-    console = Console(args.rom, backend=args.backend)
-    load_app_module()
-    logger.info("machine + app build %.2fs", time.perf_counter() - build_start)
+    module = load_app_module()
+    # Open the audio device first so the APU is built at the device's real
+    # sample rate (0 = audio unavailable; the console still runs silently).
+    rate = module.audio_setup()
+    console = Console(args.rom, backend=args.backend,
+                      sample_rate=float(rate) if rate else 44100.0)
+    logger.info("machine + app build %.2fs (audio %s)",
+                time.perf_counter() - build_start,
+                f"{rate} Hz" if rate else "unavailable")
 
     logger.info("keys: arrows = d-pad, X = A, Z = B, Enter = Start, "
                 "Tab = Select, Esc = quit")

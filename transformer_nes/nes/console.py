@@ -23,6 +23,7 @@ import argparse
 import logging
 import time
 
+from transformer_nes.nes.apu import make_apu
 from transformer_nes.nes.bus import Bus, GraphCore, KernelBus, ReferenceCore
 from transformer_nes.nes.cartridge import Cartridge
 from transformer_nes.nes.mappers import make_mapper
@@ -99,11 +100,12 @@ class Console:
     """The NES: a 6502 machine backend + PPU + input over the MMIO bus."""
 
     def __init__(self, cart: Cartridge | str, *, backend: str = "kernel",
-                 checkpoint_tokens: int = 2_000_000):
+                 checkpoint_tokens: int = 2_000_000, sample_rate: float = 44100.0):
         if isinstance(cart, str):
             cart = Cartridge.load(cart)
         self.cart = cart
         self.ppu = make_ppu(cart)
+        self.apu = make_apu(sample_rate)
         self.controller = Controller()
         self.mapper = make_mapper(cart)
         image = self.mapper.cpu_image()
@@ -118,6 +120,7 @@ class Console:
         self.halted = False
         self.frame_base = 0
         self.sprite0_scanline: int | None = None
+        self.last_audio = None      # this frame's APU samples (float32 mono)
         # Snapshot-and-rebuild: once the append-only token log passes this
         # many tokens, it is reseeded from the RAM mirror at the next frame
         # boundary (a quiet point: no pending NMI or read pause).  Keeps
@@ -200,8 +203,11 @@ class Console:
 
     def attach_devices(self):
         self.bus.attach(self.ppu, 0x2000, 0x3FFF)     # registers + mirrors
-        self.bus.attach(self.dma, 0x4014, 0x4014)
-        self.bus.attach(self.controller, 0x4016, 0x4017)
+        self.bus.attach(self.dma, 0x4014, 0x4014)     # OAM DMA
+        self.bus.attach(self.apu, 0x4000, 0x4013)     # channel registers
+        self.bus.attach(self.apu, 0x4015, 0x4015)     # status / enables
+        self.bus.attach(self.controller, 0x4016, 0x4016)  # controller 1 (port 1)
+        self.bus.attach(self.apu, 0x4017, 0x4017)     # frame counter (read: open bus)
         if self.mapper.banked:
             # Registers live in ROM space; reads there must stay native.
             self.bus.attach(self.mapper, 0x8000, 0xFFFF, writes_only=True)
@@ -335,6 +341,13 @@ class Console:
 
         self.frame_base += FRAME_CYCLES
         self.frame_index += 1
+
+        # Audio for the frame just executed (includes this frame's NMI
+        # music writes).  The APU frame IRQ flag is readable at $4015 but
+        # is deliberately not driven onto the CPU IRQ line (the frame-batch
+        # model can't time it precisely; games that need it are rare and
+        # most inhibit it at boot).
+        self.last_audio = self.apu.end_frame(FRAME_CYCLES)
 
         if (
             self.checkpoint_tokens

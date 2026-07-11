@@ -19,6 +19,7 @@ transformer
 _kernel_cache/
 _engine_cache/
 _ppu_cache/
+_apu_cache/
 _app_cache/
 
 # Vendored deps are fetched by vendor/install_deps.sh
