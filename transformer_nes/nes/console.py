@@ -96,6 +96,86 @@ class OamDma:
         return stall
 
 
+# Register-journal entry kinds (debugging: dumped by app.py's F1).
+J_PPU_WRITE = 0
+J_PPU_STATUS_READ = 1
+J_MAPPER_WRITE = 2
+J_MAPPER_STATUS_READ = 3
+J_EVENT = 4  # value: 0 sprite0, 1 irq delivery, 2 nmi
+
+# run_frame phases for journal entries.
+PHASE_VISIBLE = 0      # frame start through the last mid-frame event
+PHASE_POST_EVENT = 1   # after a sprite-0 / IRQ event, still visible
+PHASE_VBLANK = 2
+
+
+class RegJournal:
+    """Rolling log of device register traffic, the ground truth for
+    debugging mid-frame raster state (order is exact: every entry is a
+    serviced bus pause)."""
+
+    def __init__(self, cap: int = 200_000):
+        self.entries: list[tuple[int, int, int, int, int, int, int]] = []
+        self.cap = cap
+
+    def add(self, frame: int, phase: int, kind: int, addr: int, value: int,
+            v_addr: int = -1, latch: int = -1) -> None:
+        if len(self.entries) >= self.cap:
+            del self.entries[:self.cap // 4]
+        self.entries.append((frame, phase, kind, addr, value, v_addr, latch))
+
+
+class JournaledPpu:
+    """Bus shim over the PPU recording $2000-$2007 traffic with the
+    write-time loopy state."""
+
+    def __init__(self, ppu, journal: RegJournal, console: Console):
+        self.ppu = ppu
+        self.journal = journal
+        self.console = console
+
+    def read(self, addr: int) -> int:
+        value = self.ppu.read(addr)
+        if ((addr - 0x2000) & 7) == 2:
+            self.journal.add(self.console.frame_index, self.console.journal_phase,
+                             J_PPU_STATUS_READ, 0x2002, value,
+                             self.ppu.vram_addr, int(self.ppu.write_latch))
+        return value
+
+    def read_lease(self, addr: int):
+        return self.ppu.read_lease(addr)
+
+    def write(self, addr: int, value: int) -> None:
+        reg = (addr - 0x2000) & 7
+        if reg != 3 and reg != 4:  # OAM traffic is bulky and never raster state
+            self.journal.add(self.console.frame_index, self.console.journal_phase,
+                             J_PPU_WRITE, 0x2000 + reg, value,
+                             self.ppu.vram_addr, int(self.ppu.write_latch))
+        self.ppu.write(addr, value)
+
+
+class JournaledMapper:
+    """Bus shim over a mapper recording configuration-register traffic."""
+
+    def __init__(self, mapper, journal: RegJournal, console: Console):
+        self.mapper = mapper
+        self.journal = journal
+        self.console = console
+
+    def read(self, addr: int) -> int:
+        value = self.mapper.read(addr)
+        if addr == 0x5204:
+            self.journal.add(self.console.frame_index, self.console.journal_phase,
+                             J_MAPPER_STATUS_READ, addr, value)
+        return value
+
+    def write(self, addr: int, value: int) -> None:
+        if 0x5100 <= addr <= 0x52FF:
+            self.journal.add(self.console.frame_index, self.console.journal_phase,
+                             J_MAPPER_WRITE, addr, value)
+        self.mapper.write(addr, value)
+
+
 class Console:
     """The NES: a 6502 machine backend + PPU + input over the MMIO bus."""
 
@@ -108,6 +188,8 @@ class Console:
         self.apu = make_apu(sample_rate)
         self.controller = Controller()
         self.mapper = make_mapper(cart)
+        self.journal = RegJournal()
+        self.journal_phase = PHASE_VISIBLE
         image = self.mapper.cpu_image()
         reset_vector = image[0xFFFC] | (image[0xFFFD] << 8)
 
@@ -203,15 +285,19 @@ class Console:
         self.poke_region = poke_region
 
     def attach_devices(self):
-        self.bus.attach(self.ppu, 0x2000, 0x3FFF)     # registers + mirrors
+        ppu_dev = JournaledPpu(self.ppu, self.journal, self)
+        self.bus.attach(ppu_dev, 0x2000, 0x3FFF)      # registers + mirrors
         self.bus.attach(self.dma, 0x4014, 0x4014)     # OAM DMA
         self.bus.attach(self.apu, 0x4000, 0x4013)     # channel registers
         self.bus.attach(self.apu, 0x4015, 0x4015)     # status / enables
         self.bus.attach(self.controller, 0x4016, 0x4016)  # controller 1 (port 1)
         self.bus.attach(self.apu, 0x4017, 0x4017)     # frame counter (read: open bus)
         if self.mapper.banked:
+            mapper_dev = JournaledMapper(self.mapper, self.journal, self)
+            for lo, hi in getattr(self.mapper, "register_ranges", ()):
+                self.bus.attach(mapper_dev, lo, hi)
             # Registers live in ROM space; reads there must stay native.
-            self.bus.attach(self.mapper, 0x8000, 0xFFFF, writes_only=True)
+            self.bus.attach(mapper_dev, 0x8000, 0xFFFF, writes_only=True)
             self.mapper.poke = self.poke_cpu
             self.mapper.poke_region = self.poke_region
             self.mapper.on_mirroring = self.set_mirroring
@@ -221,6 +307,19 @@ class Console:
             elif hasattr(self.mapper, "mmc4_banks"):
                 self.mapper.set_mmc4_banks = self.ppu.set_mmc4_banks
                 self.ppu.set_mmc4_banks(self.mapper.mmc4_banks())
+            elif hasattr(self.mapper, "set_mmc5_state"):
+                self.mapper.set_mmc5_state = self.ppu.set_mmc5_state
+                self.mapper.set_mmc5_exram = self.ppu.set_mmc5_exram
+                self.mapper.set_mmc5_chr = self.ppu.set_mmc5_chr
+                self.ppu.set_mmc5_state(
+                    self.mapper.exram_mode, self.mapper.nametable_map,
+                    self.mapper.fill_tile, self.mapper.fill_color,
+                    self.mapper.chr_upper,
+                )
+                for i, value in enumerate(self.mapper.exram):
+                    if value:
+                        self.ppu.set_mmc5_exram(i, value)
+                self.mapper.sync_mmc5_chr()
             elif getattr(self.mapper, "chr_rom", False):
                 self.mapper.set_chr_banks = self.ppu.set_chr_banks
                 self.ppu.set_chr_banks(self.mapper.chr_banks())
@@ -325,32 +424,62 @@ class Console:
         # Visible portion, split by mid-frame events: the sprite-0 hit and
         # the mapper's scanline IRQ (which also marks the render split).
         # Each PPU status transition invalidates any $2002 read lease.
-        events = []
-        if self.sprite0_scanline is not None and self.ppu.rendering_enabled:
-            events.append((self.sprite0_scanline, "sprite0"))
-        irq_line = self.mapper.irq_scanline()
-        if irq_line is not None and self.ppu.rendering_enabled:
-            events.append((irq_line, "irq"))
-        for scanline, kind in sorted(events):
+        self.journal_phase = PHASE_VISIBLE
+        # The event list is dynamic: an IRQ handler may re-arm its target
+        # for a SECOND IRQ later in the same frame (CV3 chains one at the
+        # HUD seam and one a line below doing the real raster switch), so
+        # re-poll the mapper after every delivery.  IRQ lines must strictly
+        # increase within a frame; sprite-0 fires at most once.
+        fired_sprite0 = False
+        last_irq_line = -1
+        for _ in range(8):  # safety cap on mid-frame events
+            candidates = []
+            if (not fired_sprite0 and self.sprite0_scanline is not None
+                    and self.ppu.rendering_enabled):
+                candidates.append((self.sprite0_scanline, "sprite0"))
+            irq_line = self.mapper.irq_scanline()
+            if (irq_line is not None and irq_line > last_irq_line
+                    and self.ppu.rendering_enabled):
+                candidates.append((irq_line, "irq"))
+            if not candidates:
+                break
+            scanline, kind = sorted(candidates)[0]
             cycle = base + int((scanline + 1) * CYCLES_PER_SCANLINE)
             self.run_until(min(cycle, base + VBLANK_START_CYCLES))
             self.bus.clear_read_lease()
+            self.journal_phase = PHASE_POST_EVENT
             if kind == "sprite0":
+                fired_sprite0 = True
+                self.journal.add(self.frame_index, PHASE_POST_EVENT,
+                                 J_EVENT, scanline, 0)
                 self.ppu.sprite0_hit = True
+                continue
+            last_irq_line = scanline
             # Re-validate the IRQ at delivery: the game may have disabled
             # rendering (the counter only clocks while rendering) or
             # disarmed the IRQ ($E000) since the frame started.
-            elif self.ppu.rendering_enabled and self.mapper.irq_scanline() == scanline:
+            if self.ppu.rendering_enabled and self.mapper.irq_scanline() == scanline:
+                self.journal.add(self.frame_index, PHASE_POST_EVENT,
+                                 J_EVENT, scanline, 1)
                 self.ppu.mark_split(scanline)
+                if hasattr(self.mapper, "irq_pending"):
+                    self.mapper.irq_pending = True
                 self.set_irq("mapper")
+                # Run the handler now (a couple of scanlines is ample):
+                # a re-armed same-frame target is invisible until the
+                # handler's $5203 write has actually executed.
+                self.run_until(min(cycle + int(2 * CYCLES_PER_SCANLINE),
+                                   base + VBLANK_START_CYCLES))
         self.run_until(base + VBLANK_START_CYCLES)
         self.bus.clear_read_lease()
 
         frame = self.ppu.render_frame()
         self.sprite0_scanline = self.ppu.sprite0_scanline
 
+        self.journal_phase = PHASE_VBLANK
         self.ppu.begin_vblank()
         if self.ppu.nmi_enabled:
+            self.journal.add(self.frame_index, PHASE_VBLANK, J_EVENT, 241, 2)
             self.set_nmi()
         self.run_until(base + FRAME_CYCLES)
         self.bus.clear_read_lease()

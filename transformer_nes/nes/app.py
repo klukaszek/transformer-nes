@@ -71,12 +71,16 @@ def debug_dump(console: Console) -> None:
     ppu = console.ppu
     n = console.frame_index
     path = os.path.join(DUMP_DIR, f"dump_{n:06d}.npz")
-    cpu = console.snapshot()[1]
+    # Render first, then snapshot: the state (banks, scroll, ExRAM) then
+    # reflects the frame we save, not the one before it.
+    frame = np.asarray(console.run_frame())
+    ram, cpu = console.snapshot()
     state = {
         "pc": f"{int(cpu['pc']):04X}", "p": f"{int(cpu['p']):02X}",
         "i_flag": bool(int(cpu["p"]) & 4),
         "live_ctrl": ppu.ctrl, "live_mask": ppu.mask,
         "live_mirroring": ppu.mirroring, "live_t": ppu.t_addr,
+        "live_v": ppu.vram_addr, "live_latch": int(ppu.write_latch),
         "live_fine_x": ppu.fine_x, "live_banks": list(ppu.chr_banks),
         "frame_ctrl": ppu.frame_ctrl, "frame_mask": ppu.frame_mask,
         "frame_mirroring": ppu.frame_mirroring, "frame_t": ppu.frame_t_addr,
@@ -94,17 +98,49 @@ def debug_dump(console: Console) -> None:
         state.update(prg_banks=list(console.mapper.prg_banks()),
                      mapper_chr=list(console.mapper.mmc4_banks()),
                      mapper_latches=list(ppu.chr_latches))
-    if console.mapper.irq_scanline() is not None:
-        state.update(irq_scanline=console.mapper.irq_scanline(),
-                     irq_enabled=console.mapper.irq_enabled,
-                     irq_latch=console.mapper.irq_latch,
-                     prg_banks=list(console.mapper.prg_banks()),
-                     mapper_chr=list(console.mapper.chr_banks()))
+    mapper = console.mapper
+    if mapper.irq_scanline() is not None:
+        state.update(irq_scanline=mapper.irq_scanline(),
+                     irq_enabled=mapper.irq_enabled,
+                     irq_latch=getattr(mapper, "irq_latch",
+                                       getattr(mapper, "irq_target", -1)),
+                     prg_banks=list(mapper.prg_banks()),
+                     mapper_chr=list(mapper.chr_banks()))
+    if hasattr(mapper, "prg_ram_slots"):  # MMC5
+        state.update(prg_banks=list(mapper.prg_banks()),
+                     prg_ram_slots=[int(x) for x in mapper.prg_ram_slots()],
+                     prg_mode=mapper.prg_mode, chr_mode=mapper.chr_mode,
+                     exram_mode=mapper.exram_mode,
+                     nametable_map=mapper.nametable_map,
+                     chr_regs=list(mapper.chr_regs), chr_upper=mapper.chr_upper,
+                     mapper_chr=list(mapper.chr_banks()),
+                     bg_chr=list(mapper.background_chr_banks()),
+                     split_bg_chr=list(ppu.mmc5_split_bg()),
+                     split_sp_chr=list(ppu.mmc5_split_sprite()),
+                     irq_target=mapper.irq_target,
+                     irq_enabled=mapper.irq_enabled,
+                     irq_pending=int(mapper.irq_pending))
+    extra = {}
+    if hasattr(mapper, "prg_ram_slots"):  # MMC5: ExRAM feeds nametable/attr
+        # The PPU-side ExRAM holds nametable/attr data written via $2007;
+        # the mapper's copy only sees CPU $5C00 writes.
+        extra["ppu_exram"] = np.asarray(ppu.mmc5_exram(), dtype=np.uint8)
+        extra["exram"] = np.frombuffer(bytes(mapper.exram), dtype=np.uint8)
+        extra["prg_ram"] = np.frombuffer(bytes(mapper.prg_ram), dtype=np.uint8)
+        state["ppu_exram_mode"] = ppu.mmc5_exram_mode()
     np.savez(path,
-             frame=np.asarray(console.run_frame()),
+             frame=frame,
              nametables=np.frombuffer(bytes(ppu.nametables), dtype=np.uint8),
              palette=np.frombuffer(bytes(ppu.palette), dtype=np.uint8),
              oam=np.frombuffer(bytes(ppu.oam), dtype=np.uint8),
+             # Full machine snapshot + register journal: enough to resurrect
+             # the console offline and replay the recent write history.
+             ram=np.frombuffer(ram, dtype=np.uint8),
+             cpu_state=np.array([int(cpu[k]) for k in
+                                 ("pc", "a", "x", "y", "s", "p")],
+                                dtype=np.int64),
+             reg_journal=np.array(console.journal.entries, dtype=np.int32),
+             **extra,
              **{k: np.asarray(v) for k, v in state.items()})
     logger.info("debug dump: %s | %s", path,
                 " ".join(f"{k}={v}" for k, v in state.items()))

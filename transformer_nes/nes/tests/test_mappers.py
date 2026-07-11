@@ -165,3 +165,93 @@ def test_mmc4_prg_chr_and_mirroring():
     mapper.write(0xF000, 0)
     mapper.write(0xF000, 1)
     assert events[-2:] == [2, 3]
+
+
+def test_mmc5_castlevania_banking_multiplier_and_irq():
+    cart = Cartridge(prg=prg_of(32, BANK8), chr=bytes(0x20000),
+                     mirroring="horizontal", mapper=5)
+    mapper = make_mapper(cart)
+    memory, events = wired(mapper)
+    chr_sets = []
+    mapper.set_chr_banks = lambda banks: chr_sets.append(banks)
+    mapper.write(0x5100, 2)
+    mapper.write(0x5115, 0x98)
+    mapper.write(0x5116, 0x9E)
+    assert mapper.prg_banks() == (24, 25, 30, 127)
+    assert memory[0x8000] == 24 and memory[0xC000] == 30
+    mapper.write(0x5101, 3)
+    mapper.write(0x5127, 12)
+    assert chr_sets[-1][-1] == 12
+    mapper.write(0x5128, 9)
+    assert mapper.background_chr_banks()[0] == 9
+    mapper.write(0x5105, 0x44)
+    assert events[-1] == 0x44
+    mapper.write(0x5205, 13)
+    mapper.write(0x5206, 17)
+    assert mapper.read(0x5205) == 221
+    assert mapper.read(0x5206) == 0
+    mapper.write(0x5203, 42)
+    mapper.write(0x5204, 0x80)
+    assert mapper.irq_scanline() == 42
+
+
+def test_mmc5_chr_registers_hold_banks_of_the_selected_size():
+    cart = Cartridge(prg=prg_of(8, BANK8), chr=bytes(0x40000),
+                     mirroring="horizontal", mapper=5)
+    mapper = make_mapper(cart)
+    wired(mapper)
+    mapper.write(0x5101, 1)                    # 4 KiB banks
+    mapper.write(0x5123, 3)
+    mapper.write(0x5127, 5)
+    mapper.write(0x512B, 7)
+    assert mapper.chr_banks() == [12, 13, 14, 15, 20, 21, 22, 23]
+    assert mapper.background_chr_banks() == [28, 29, 30, 31] * 2
+    mapper.write(0x5101, 2)                    # 2 KiB banks
+    mapper.write(0x5121, 9)
+    assert mapper.chr_banks()[:2] == [18, 19]
+    mapper.write(0x5101, 0)                    # 8 KiB banks
+    mapper.write(0x5127, 3)
+    assert mapper.chr_banks() == list(range(24, 32))
+
+
+def test_mmc5_banked_prg_ram_requires_unlock_sequence():
+    cart = Cartridge(prg=prg_of(8, BANK8), chr=bytes(0x2000),
+                     mirroring="horizontal", mapper=5)
+    mapper = make_mapper(cart)
+    wired(mapper)
+    mapper.write(0x5113, 3)
+    mapper.write(0x6000, 0x55)
+    assert mapper.read(0x6000) == 0
+    mapper.write(0x5102, 2)
+    mapper.write(0x5103, 1)
+    mapper.write(0x6000, 0x55)
+    assert mapper.read(0x6000) == 0x55
+    mapper.write(0x5113, 2)
+    assert mapper.read(0x6000) == 0
+    mapper.write(0x5113, 3)
+    assert mapper.read(0x6000) == 0x55
+
+
+def test_mmc5_prg_ram_window_maps_into_cpu_space():
+    cart = Cartridge(prg=prg_of(8, BANK8), chr=bytes(0x2000),
+                     mirroring="horizontal", mapper=5)
+    mapper = make_mapper(cart)
+    memory, _ = wired(mapper)
+    # 8 KiB windows (prg_mode 3), unlock PRG-RAM writes.
+    mapper.write(0x5100, 3)
+    mapper.write(0x5102, 2)
+    mapper.write(0x5103, 1)
+    # $5114 bit 7 clear -> $8000 window maps PRG-RAM bank 1, initially zero.
+    mapper.write(0x5114, 0x01)
+    assert memory[0x8000] == 0
+    mapper.write(0x8000, 0x42)
+    assert memory[0x8000] == 0x42 and mapper.read(0x8000) == 0x42
+    # Switch the window to ROM bank 2, then back: RAM contents persist.
+    mapper.write(0x5114, 0x82)
+    assert memory[0x8000] == 2 and mapper.read(0x8000) == 2
+    mapper.write(0x5114, 0x01)
+    assert memory[0x8000] == 0x42
+    # Re-locking write protection repairs stray writes instead of storing.
+    mapper.write(0x5103, 0)
+    mapper.write(0x8000, 0x99)
+    assert memory[0x8000] == 0x42 and mapper.read(0x8000) == 0x42

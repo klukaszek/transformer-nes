@@ -29,7 +29,50 @@ completion is recorded below: native audio through sokol_audio, all five
 channels including sampled percussion, and frame/DMC IRQs on the shared
 CPU line. **MMC2 and MMC4 landed in the follow-ups below**: latch-driven
 CHR is now a shared PPU interface with mapper-specific header-only silicon.
-Next up: MMC5 as its own larger console-subsystem arc.
+**MMC5 is underway** (first native slice below) as its own larger
+console-subsystem arc.
+
+## 2026-07-11 MMC5 PRG-RAM into $8000-$DFFF
+
+The `$5114-$5116` PRG windows now honor their bit-7 ROM/RAM select: with
+the bit clear a window maps a PRG-RAM bank (low bits, same 64 KiB space as
+the `$6000` window) instead of ROM; `$5117`/`$E000` stays ROM. A per-mode
+slot→source table drives which register feeds each 8 KiB slot, so RAM
+windows compose with all four PRG banking modes. Injection identity is now
+`(bank, is_ram)` per slot: switching a window ROM↔RAM or changing its RAM
+bank re-injects the right region into the CPU image, and stray writes to a
+locked RAM window are repaired from RAM rather than ROM. Writes still gate
+on the `$5102/$5103` unlock. Receipt: `$8000` RAM store, ROM/RAM toggle
+with RAM persistence, and lock-time repair. 52 NES tests green, Ruff clean.
+
+Still deliberately pending for full MMC5 coverage: vertical split, precise
+repeated-IRQ/in-frame timing, and the two pulse + PCM expansion-audio
+channels.
+
+Castlevania's raster split is itself chained: four visible IRQs at
+41/42/52/53 create the HUD, a one-line transition, an intentional blank
+separator, a new `$2006/$2005` playfield origin, and restored live CHR.
+The singleton `mid_*` state discarded the first three captures, allowing
+temporary `$7F` banks to leak beneath the HUD and applying upward-scroll
+state to the wrong rows. The PPU now keeps ordered raster snapshots;
+frame-start, every intermediate band, and final live state retain their
+own loopy registers, `$5105` map, and MMC5 background/sprite CHR windows.
+
+## 2026-07-11 MMC5 foundation — Castlevania III reaches its title
+
+Mapper 5 now has all four PRG and CHR banking modes, `$5100-$5130`
+configuration/bank registers, ExRAM CPU access, scanline IRQ registers,
+and the 8×8 multiplier. `mmc5.h` owns the native PPU-side substitutions:
+four independent `$5105` nametable sources, ExRAM and fill-mode tile/
+attribute data, plus independent sprite/background CHR windows used by
+8×16 mode. Castlevania III runs continuously and reaches a recognizable,
+correctly composed title scene; before native ExRAM/fill it rendered only
+a sparse border, and before independent CHR views its title patterns were
+garbled.
+
+Extended-attribute mode now supplies per-tile palette and 4 KiB CHR
+selection from ExRAM, and the fixed `$6000-$7FFF` PRG-RAM window supports
+bank selection plus the `$5102/$5103` write-unlock sequence.
 
 ## 2026-07-11 MMC4 — FxROM completion + native latch interface
 

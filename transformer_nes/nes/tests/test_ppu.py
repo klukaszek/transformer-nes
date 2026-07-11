@@ -70,6 +70,134 @@ def test_mmc4_low_pattern_latch_responds_on_every_tile_row():
     assert ppu.vram_read(0x0000) == 2
 
 
+def test_mmc5_exram_and_fill_nametable_substitution():
+    ppu = make_ppu()
+    # Table 0 = ExRAM, table 1 = fill, tables 2/3 = CIRAM 0.
+    ppu.set_mmc5_state(0, 0x0E, 0x37, 2, 0)
+    ppu.set_mmc5_exram(5, 0xA4)
+    assert ppu.vram_read(0x2005) == 0xA4
+    assert ppu.vram_read(0x2400) == 0x37
+    assert ppu.vram_read(0x27C0) == 0xAA
+
+
+def test_mmc5_chr_banks_latch_at_irq_split():
+    """MMC5 swaps CHR at a mid-frame IRQ split like scroll: rows above the
+    split render from the frame-start windows, rows below from live."""
+    ppu = make_ppu()
+    ppu.set_mmc5_state(0, 0, 0, 0, 0)     # MMC5 active, all CIRAM0, exram off
+    ppu.set_chr_banks(list(range(8)))     # identity, so vram writes hit banks
+    for r in range(8):
+        ppu.vram_write(0x0400 + r, 0xFF)      # phys bank 1, tile 0 plane 0: pix 1
+        ppu.vram_write(0x0808 + r, 0xFF)      # phys bank 2, tile 0 plane 1: pix 2
+    ppu.vram_write(0x3F01, 0x11)
+    ppu.vram_write(0x3F02, 0x22)
+    ppu.mask = 0x0A                        # background + leftmost column
+    ppu.ctrl = 0x20                        # 8x16: background uses $5128-$512B
+    ppu.set_mmc5_chr([0] * 8, [1] * 8)     # above the split -> bank 1
+    ppu.end_vblank()                       # latch the frame-start windows
+    ppu.set_mmc5_chr([0] * 8, [3] * 8)     # chained IRQ's temporary blank bank
+    ppu.mark_split(100)
+    ppu.set_mmc5_chr([0] * 8, [2] * 8)     # below the split -> bank 2
+
+    frame = np.asarray(ppu.render_frame())
+    assert frame[10][0] == 0x11            # frozen bank 1 above the split
+    assert frame[200][0] == 0x22           # live bank 2 below the split
+    assert ppu.mmc5_split_bg()[0] == 3     # IRQ snapshot stays distinct
+
+
+def test_mmc5_chained_irqs_preserve_each_raster_band():
+    ppu = make_ppu()
+    ppu.set_mmc5_state(0, 0, 0, 0, 0)
+    ppu.set_chr_banks(list(range(8)))
+    for row in range(8):
+        ppu.vram_write(0x0400 + row, 0xFF)       # bank 1 -> pixel 1
+        ppu.vram_write(0x0808 + row, 0xFF)       # bank 2 -> pixel 2
+        ppu.vram_write(0x0C00 + row, 0xFF)       # bank 3 -> pixel 3
+        ppu.vram_write(0x0C08 + row, 0xFF)
+    ppu.vram_write(0x3F01, 0x11)
+    ppu.vram_write(0x3F02, 0x12)
+    ppu.vram_write(0x3F03, 0x13)
+    ppu.mask = 0x0A
+    ppu.ctrl = 0x20
+    ppu.set_mmc5_chr([0] * 8, [1] * 8)
+    ppu.end_vblank()
+    ppu.mark_split(41)                       # frame bank 1 through line 41
+    ppu.set_mmc5_chr([0] * 8, [2] * 8)
+    ppu.mark_split(42)                       # bank 2 on line 42
+    ppu.set_mmc5_chr([0] * 8, [3] * 8)
+    ppu.mark_split(52)                       # bank 3 on lines 43..52
+    ppu.set_mmc5_chr([0] * 8, [4] * 8)       # live below line 52
+
+    frame = np.asarray(ppu.render_frame())
+    assert frame[20, 0] == 0x11
+    assert frame[42, 0] == 0x12
+    assert frame[50, 0] == 0x13
+    assert frame[100, 0] == 0
+
+
+def test_mmc5_v_reload_scrolls_relative_to_moving_irq_boundary():
+    ppu = make_ppu()
+    ppu.set_mmc5_state(0, 0x44, 0, 0, 0)
+    ppu.set_chr_banks(list(range(8)))
+    for row in range(8):
+        ppu.vram_write(0x0410 + row, 0xFF)  # tile 1 -> pixel 1
+        ppu.vram_write(0x0428 + row, 0xFF)  # tile 2 -> pixel 2
+    for col in range(32):
+        ppu.vram_write(0x2800 + col, 1)
+        ppu.vram_write(0x2820 + col, 2)
+    ppu.vram_write(0x3F01, 0x11)
+    ppu.vram_write(0x3F02, 0x22)
+    ppu.mask = 0x0A
+    ppu.ctrl = 0x20
+    ppu.set_mmc5_chr([0] * 8, [1] * 8)
+    ppu.end_vblank()
+    ppu.vram_addr = 0x2000
+    ppu.mark_split(41)
+    ppu.mark_split(42)
+    ppu.mark_split(46)                    # moving camera boundary
+    ppu.t_addr = 0x2800
+    ppu.vram_addr = 0x2800                # handler reloads v
+    ppu.mark_split(53)                    # next IRQ observes the new v
+
+    frame = np.asarray(ppu.render_frame())
+    assert frame[47, 0] == 0x11            # v=$2800 starts at the boundary
+    assert frame[55, 0] == 0x22            # relative advance reaches row 1
+
+
+def test_mmc5_nametable_substitution_survives_mid_frame_map_change():
+    """A band's latched $5105 map must keep decoding ExRAM/fill sources
+    even after the live map changes (CV3 rewrites $5105 mid-frame)."""
+    ppu = make_ppu()
+    for r in range(8):
+        ppu.vram_write(0x0010 + r, 0xFF)   # tile 1 plane 0: pix 1
+    ppu.vram_write(0x3F01, 0x15)
+    ppu.mask = 0x0A
+    ppu.set_mmc5_state(0, 0xFF, 1, 0, 0)   # all four tables = fill tile 1
+    ppu.end_vblank()                       # latch the span map
+    ppu.set_mmc5_state(0, 0x00, 1, 0, 0)   # live map now all CIRAM 0
+    frame = np.asarray(ppu.render_frame())
+    assert frame[100][100] == 0x15         # fill tile still renders above
+
+
+def test_mmc5_8x8_sprites_render_background_from_sprite_set():
+    """In 8x8 sprite mode $5128-$512B are ignored; background fetches use
+    the $5120-$5127 set."""
+    ppu = make_ppu()
+    ppu.set_mmc5_state(0, 0, 0, 0, 0)
+    ppu.set_chr_banks(list(range(8)))
+    for r in range(8):
+        ppu.vram_write(0x0400 + r, 0xFF)   # phys bank 1, tile 0: pix 1
+        ppu.vram_write(0x0808 + r, 0xFF)   # phys bank 2, tile 0: pix 2
+    ppu.vram_write(0x3F01, 0x11)
+    ppu.vram_write(0x3F02, 0x22)
+    ppu.mask = 0x0A
+    ppu.ctrl = 0x00                        # 8x8 sprites
+    ppu.set_mmc5_chr([1] * 8, [2] * 8)
+    ppu.end_vblank()
+    frame = np.asarray(ppu.render_frame())
+    assert frame[10][0] == 0x11            # sprite set, not the ignored bg set
+
+
 def test_status_read_clears_vblank_and_latch():
     ppu = make_ppu()
     ppu.begin_vblank()

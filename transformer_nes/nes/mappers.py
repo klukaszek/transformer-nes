@@ -370,6 +370,218 @@ class Mmc4(Mapper):
         self.poke(addr, self.rom_byte(addr))
 
 
+class Mmc5(Mapper):
+    """Mapper 5 (ExROM), initially covering Castlevania III's core path."""
+
+    banked = True
+    register_ranges = ((0x5000, 0x7FFF),)
+    # Source register feeding each 8 KiB slot per prg_mode.  $5117 (index 3)
+    # is always ROM; the others map PRG-RAM when their bit 7 is clear.
+    PRG_SLOT_SOURCE = {0: (3, 3, 3, 3), 1: (1, 1, 3, 3),
+                       2: (1, 1, 2, 3), 3: (0, 1, 2, 3)}
+
+    def __init__(self, cart: Cartridge):
+        if len(cart.prg) % BANK8 or not cart.prg or len(cart.chr) % 0x400:
+            raise ValueError("MMC5 requires 8 KiB PRG and 1 KiB CHR bank alignment")
+        self.prg, self.n_banks = cart.prg, len(cart.prg) // BANK8
+        self.n_chr = max(len(cart.chr) // 0x400, 1)
+        self.chr_rom = bool(cart.chr)
+        self.prg_mode, self.chr_mode = 3, 3
+        self.prg_regs = [0x80, 0x80, 0x80, 0xFF]
+        self.chr_regs = list(range(8)) + [0, 1, 2, 3]
+        self.chr_upper = 0
+        self.irq_target = 0
+        self.irq_enabled = False
+        self.irq_pending = False
+        self.mul_a = self.mul_b = 0xFF
+        self.exram = bytearray(0x400)
+        self.prg_ram = bytearray(0x10000)
+        self.prg_ram_bank = 0
+        self.ram_protect1 = self.ram_protect2 = 0
+        self.exram_mode = 0
+        self.nametable_map = 0
+        self.fill_tile = 0
+        self.fill_color = 0
+        self.poke = self.poke_region = self.on_mirroring = None
+        self.set_chr_banks = self.on_irq_ack = None
+        self.set_mmc5_state = self.set_mmc5_exram = None
+        self.set_mmc5_chr = None
+
+    def prg_banks(self) -> tuple[int, int, int, int]:
+        r = [x & 0x7F for x in self.prg_regs]
+        if self.prg_mode == 0:
+            b = r[3] & ~3
+            return b, b + 1, b + 2, b + 3
+        if self.prg_mode == 1:
+            a, b = r[1] & ~1, r[3] & ~1
+            return a, a + 1, b, b + 1
+        if self.prg_mode == 2:
+            a = r[1] & ~1
+            return a, a + 1, r[2], r[3]
+        return tuple(r)  # type: ignore[return-value]
+
+    def chr_banks(self) -> list[int]:
+        """Sprite-set 1 KiB slots.  Register values are bank numbers in the
+        size selected by $5101 (unlike MMC3's fixed 1 KiB indexing)."""
+        n = self.n_chr
+        r = [(self.chr_upper << 8) | x for x in self.chr_regs[:8]]
+        if self.chr_mode == 0:
+            return [(r[7] * 8 + i) % n for i in range(8)]
+        if self.chr_mode == 1:
+            out = []
+            for b in (r[3] * 4, r[7] * 4):
+                out.extend((b + i) % n for i in range(4))
+            return out
+        if self.chr_mode == 2:
+            out = []
+            for j in (1, 3, 5, 7):
+                b = r[j] * 2
+                out.extend((b % n, (b + 1) % n))
+            return out
+        return [x % n for x in r]
+
+    def background_chr_banks(self) -> list[int]:
+        n = self.n_chr
+        r = [(self.chr_upper << 8) | x for x in self.chr_regs[8:12]]
+        if self.chr_mode == 0:
+            return [(r[3] * 8 + i) % n for i in range(8)]
+        if self.chr_mode == 1:
+            out = []
+            for b in (r[3] * 4, r[3] * 4):
+                out.extend((b + i) % n for i in range(4))
+            return out
+        if self.chr_mode == 2:
+            out = []
+            for j in (1, 3, 1, 3):
+                b = r[j] * 2
+                out.extend((b % n, (b + 1) % n))
+            return out
+        return [r[i & 3] % n for i in range(8)]
+
+    def sync_mmc5_chr(self) -> None:
+        if self.set_mmc5_chr:
+            self.set_mmc5_chr(self.chr_banks(), self.background_chr_banks())
+
+    def ram_writable(self) -> bool:
+        return self.ram_protect1 == 2 and self.ram_protect2 == 1
+
+    def prg_ram_slots(self) -> tuple[bool, bool, bool, bool]:
+        src = self.PRG_SLOT_SOURCE[self.prg_mode]
+        return tuple(j != 3 and not self.prg_regs[j] & 0x80 for j in src)  # type: ignore[return-value]
+
+    def prg_layout(self) -> tuple[tuple[int, bool], ...]:
+        """Per-slot (bank, is_ram) -- the injection identity of each window."""
+        return tuple(zip(self.prg_banks(), self.prg_ram_slots(), strict=True))
+
+    def prg_slot_region(self, i: int) -> bytes:
+        bank, is_ram = self.prg_layout()[i]
+        if is_ram:
+            base = (bank & 7) * BANK8
+            return bytes(self.prg_ram[base:base + BANK8])
+        base = (bank % self.n_banks) * BANK8
+        return self.prg[base:base + BANK8]
+
+    def rom_byte(self, addr: int) -> int:
+        bank, is_ram = self.prg_layout()[(addr - 0x8000) >> 13]
+        if is_ram:
+            return self.prg_ram[(bank & 7) * BANK8 + (addr & 0x1FFF)]
+        return self.prg[(bank % self.n_banks) * BANK8 + (addr & 0x1FFF)]
+
+    def cpu_image(self) -> bytes:
+        image = bytearray(0x10000)
+        for i in range(4):
+            image[0x8000 + i * BANK8:0xA000 + i * BANK8] = self.prg_slot_region(i)
+        return bytes(image)
+
+    def irq_scanline(self) -> int | None:
+        return self.irq_target if self.irq_enabled and self.irq_target else None
+
+    def read(self, addr: int) -> int:
+        if 0x6000 <= addr <= 0x7FFF:
+            return self.prg_ram[(self.prg_ram_bank & 7) * BANK8 + (addr & 0x1FFF)]
+        if addr >= 0x8000:
+            return self.rom_byte(addr)
+        if addr == 0x5204:
+            value = (0x80 if self.irq_pending else 0) | 0x40
+            self.irq_pending = False
+            if self.on_irq_ack:
+                self.on_irq_ack()
+            return value
+        if addr == 0x5205:
+            return (self.mul_a * self.mul_b) & 0xFF
+        if addr == 0x5206:
+            return (self.mul_a * self.mul_b) >> 8
+        if 0x5C00 <= addr <= 0x5FFF:
+            return self.exram[addr - 0x5C00]
+        return 0
+
+    def write(self, addr: int, value: int) -> None:
+        value &= 0xFF
+        old = self.prg_layout()
+        if addr == 0x5100:
+            self.prg_mode = value & 3
+        elif addr == 0x5101:
+            self.chr_mode = value & 3
+        elif addr == 0x5102:
+            self.ram_protect1 = value & 3
+        elif addr == 0x5103:
+            self.ram_protect2 = value & 3
+        elif addr == 0x5104:
+            self.exram_mode = value & 3
+        elif addr == 0x5105:
+            self.nametable_map = value
+            self.on_mirroring(value)
+        elif addr == 0x5106:
+            self.fill_tile = value
+        elif addr == 0x5107:
+            self.fill_color = value & 3
+        elif addr == 0x5113:
+            self.prg_ram_bank = value & 7
+        elif 0x5114 <= addr <= 0x5117:
+            self.prg_regs[addr - 0x5114] = value
+        elif 0x5120 <= addr <= 0x512B:
+            self.chr_regs[addr - 0x5120] = value
+            if self.set_chr_banks:
+                self.set_chr_banks(self.chr_banks())
+            self.sync_mmc5_chr()
+        elif addr == 0x5130:
+            self.chr_upper = value & 3
+            if self.set_chr_banks:
+                self.set_chr_banks(self.chr_banks())
+            self.sync_mmc5_chr()
+        elif addr == 0x5203:
+            self.irq_target = value
+        elif addr == 0x5204:
+            self.irq_enabled = bool(value & 0x80)
+        elif addr == 0x5205:
+            self.mul_a = value
+        elif addr == 0x5206:
+            self.mul_b = value
+        elif 0x5C00 <= addr <= 0x5FFF:
+            self.exram[addr - 0x5C00] = value
+            if self.set_mmc5_exram:
+                self.set_mmc5_exram(addr - 0x5C00, value)
+        elif 0x6000 <= addr <= 0x7FFF and self.ram_writable():
+            offset = (self.prg_ram_bank & 7) * BANK8 + (addr & 0x1FFF)
+            self.prg_ram[offset] = value
+        if ((0x5104 <= addr <= 0x5107 or addr == 0x5130)
+                and self.set_mmc5_state):
+            self.set_mmc5_state(self.exram_mode, self.nametable_map,
+                                self.fill_tile, self.fill_color, self.chr_upper)
+        new = self.prg_layout()
+        for i, (a, b) in enumerate(zip(old, new, strict=True)):
+            if a != b:
+                inject_region(self, 0x8000 + i * BANK8, self.prg_slot_region(i))
+        if addr >= 0x8000:
+            i = (addr - 0x8000) >> 13
+            bank, is_ram = new[i]
+            if is_ram and self.ram_writable():
+                self.prg_ram[(bank & 7) * BANK8 + (addr & 0x1FFF)] = value
+                self.poke(addr, value)
+            else:
+                self.poke(addr, self.rom_byte(addr))
+
+
 def make_mapper(cart: Cartridge):
     if cart.mapper == 0:
         return Nrom(cart)
@@ -381,5 +593,7 @@ def make_mapper(cart: Cartridge):
         return Mmc3(cart)
     if cart.mapper == 10:
         return Mmc4(cart)
+    if cart.mapper == 5:
+        return Mmc5(cart)
     raise NotImplementedError(
-        f"mapper {cart.mapper} not supported (NROM, MMC1, MMC2, MMC3, MMC4)")
+        f"mapper {cart.mapper} not supported (NROM, MMC1, MMC2, MMC3, MMC4, MMC5)")

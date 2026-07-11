@@ -19,6 +19,7 @@
 
 #include "mmc2.h"
 #include "mmc4.h"
+#include "mmc5.h"
 
 namespace py = pybind11;
 
@@ -28,6 +29,7 @@ struct PPU {
     std::vector<uint8_t> chr;
     int chr_bank[8];
     std::unique_ptr<ChrLatchMapper> chr_latch;
+    Mmc5Ppu mmc5;
     bool chr_writable;
     // Nametable arrangement, runtime-switchable by mappers (MMC1
     // encoding): 0/1 single-screen low/high, 2 vertical, 3 horizontal.
@@ -69,6 +71,12 @@ struct PPU {
     int mid_t_addr = 0, mid_fine_x = 0, mid_v_addr = 0;
     int mid_chr_bank[8];
 
+    struct RasterSplit {
+        int line, ctrl, mask, mirroring, t_addr, fine_x, v_addr;
+        int chr_banks[8], mmc5_bg[8], mmc5_sprite[8];
+    };
+    std::vector<RasterSplit> raster_splits;
+
     void mark_split(int scanline) {
         mid_scanline = scanline;
         mid_ctrl = ctrl;
@@ -78,6 +86,17 @@ struct PPU {
         mid_fine_x = fine_x;
         mid_v_addr = vram_addr;
         std::memcpy(mid_chr_bank, chr_bank, sizeof(chr_bank));
+        RasterSplit split{scanline, ctrl, mask, mirroring, t_addr,
+                          fine_x, vram_addr, {}, {}, {}};
+        std::memcpy(split.chr_banks, chr_bank, sizeof(chr_bank));
+        if (mmc5.active()) {
+            mmc5.snapshot();
+            std::memcpy(split.mmc5_bg, mmc5.background_banks(),
+                        sizeof(split.mmc5_bg));
+            std::memcpy(split.mmc5_sprite, mmc5.sprite_banks(),
+                        sizeof(split.mmc5_sprite));
+        }
+        raster_splits.push_back(split);
     }
 
     // Everything a background row depends on: pattern/enable/edge bits,
@@ -147,7 +166,57 @@ struct PPU {
         return phys * 0x400 + offset;
     }
 
-    int nt_offset(int addr) const { return nt_offset_for(addr, mirroring); }
+    // With MMC5 active, arrangement IS a $5105 map (possibly latched by a
+    // render band): each table's 2-bit source decodes from that value, so
+    // ExRAM/fill substitution survives a mid-frame $5105 change.
+    int nt_read_for(int addr, int arrangement) const {
+        const int a = (addr - 0x2000) & 0xFFF;
+        const int table = a >> 10, offset = a & 0x3FF;
+        if (mmc5.active()) {
+            if (auto value = mmc5.nametable_byte(arrangement, table, offset))
+                return *value;
+            return nametables[((arrangement >> (table * 2)) & 1) * 0x400 + offset];
+        }
+        return nametables[nt_offset_for(addr, arrangement)];
+    }
+
+    void set_mmc5_state(int exram_mode, int nametable_map,
+                        int fill_tile, int fill_color, int chr_upper) {
+        mmc5.configure(exram_mode, nametable_map, fill_tile, fill_color,
+                       chr_upper);
+        mirroring = nametable_map;
+    }
+
+    void set_mmc5_exram(int offset, int value) {
+        mmc5.write_exram(offset, value);
+    }
+
+    void set_mmc5_chr(const std::vector<int>& sprite,
+                      const std::vector<int>& background) {
+        mmc5.configure_chr(sprite, background);
+    }
+
+    // The PPU-side ExRAM (nametable/attribute data written via $2007) and
+    // the live exram mode -- for debugging MMC5 background substitution.
+    std::vector<int> mmc5_exram() const {
+        std::vector<int> v(0x400);
+        for (int i = 0; i < 0x400; ++i) v[i] = mmc5.read_exram(i);
+        return v;
+    }
+    int mmc5_exram_mode() const { return mmc5.exram_mode(); }
+
+    // The CHR windows frozen at the last IRQ split (bank indices), for
+    // debugging mid-frame swaps; stale until a split occurs.
+    std::vector<int> mmc5_split_bg() const {
+        std::vector<int> v(8);
+        for (int i = 0; i < 8; ++i) v[i] = mmc5.split_background_banks()[i] / 0x400;
+        return v;
+    }
+    std::vector<int> mmc5_split_sprite() const {
+        std::vector<int> v(8);
+        for (int i = 0; i < 8; ++i) v[i] = mmc5.split_sprite_banks()[i] / 0x400;
+        return v;
+    }
 
     int chr_index(const int* banks, int addr) const {
         if (chr_latch) return chr_latch->map(addr);
@@ -181,7 +250,7 @@ struct PPU {
     int vram_read(int addr) {
         addr &= 0x3FFF;
         if (addr < 0x2000) return chr_at(addr);
-        if (addr < 0x3F00) return nametables[nt_offset(addr)];
+        if (addr < 0x3F00) return nt_read_for(addr, mirroring);
         return palette[palette_index(addr)];
     }
 
@@ -191,7 +260,17 @@ struct PPU {
             if (chr_writable)
                 chr[chr_bank[(addr >> 10) & 7] + (addr & 0x3FF)] = (uint8_t)value;
         } else if (addr < 0x3F00) {
-            nametables[nt_offset(addr)] = (uint8_t)value;
+            const int a = (addr - 0x2000) & 0xFFF;
+            const int table = a >> 10, offset = a & 0x3FF;
+            if (mmc5.active()) {
+                const int source = (mmc5.nametable_map() >> (table * 2)) & 3;
+                if (source == 2)
+                    mmc5.write_exram(offset, value);
+                else if (source != 3)  // fill mode has no memory behind it
+                    nametables[(source & 1) * 0x400 + offset] = (uint8_t)value;
+            } else {
+                nametables[nt_offset_for(addr, mirroring)] = (uint8_t)value;
+            }
         } else {
             palette[palette_index(addr)] = (uint8_t)value;
         }
@@ -279,6 +358,8 @@ struct PPU {
         frame_t_addr = t_addr;
         frame_fine_x = fine_x;
         std::memcpy(frame_chr_bank, chr_bank, sizeof(chr_bank));
+        if (mmc5.active()) mmc5.snapshot_frame();
+        raster_splits.clear();
         frame_latch_valid = true;
     }
 
@@ -339,13 +420,13 @@ struct PPU {
         for (int fetch = 0; fetch < 34; ++fetch) {
             const int coarse = (coarse_start + fetch) & 63;
             const int quad_x = coarse >> 5, tcol = coarse & 31;
-            const int base = nt_offset_for(
-                0x2000 + (quad_y * 2 + quad_x) * 0x400, band.mirroring);
-            const int tile = nametables[base + trow * 32 + tcol];
+            const int logical = 0x2000 + (quad_y * 2 + quad_x) * 0x400;
+            const int tile = nt_read_for(logical + trow * 32 + tcol, band.mirroring);
             const int pattern = ((band.ctrl & 0x10) ? 0x1000 : 0) + tile * 16 + (ly & 7);
             const auto [b0, b1] = fetch_pattern_pair(pattern);
             const uint8_t attr =
-                nametables[base + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2)];
+                nt_read_for(logical + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2),
+                            band.mirroring);
             const int shift = ((trow % 4) / 2) * 4 + ((tcol % 4) / 2) * 2;
             const int palsel = (attr >> shift) & 3;
             const int screen_x = fetch * 8 - band.fine_x;
@@ -392,15 +473,28 @@ struct PPU {
             for (int x = x0; x < 256; ++x) {
                 const int cx = (x + sx) % 512;
                 const int lx = cx % 256, quad_x = cx / 256;
-                const int base = nt_offset_for(
-                    0x2000 + (quad_y * 2 + quad_x) * 0x400, band.mirroring);
                 const int trow = ly >> 3, tcol = lx >> 3;
-                const int tile = nametables[base + trow * 32 + tcol];
-                const int pix = tile_pixel(band.banks, bg_table + tile, ly & 7, lx & 7);
+                const int logical = 0x2000 + (quad_y * 2 + quad_x) * 0x400;
+                const int tile = nt_read_for(logical + trow * 32 + tcol,
+                                             band.mirroring);
+                int pix;
+                if (mmc5.active() && mmc5.extended_attributes()) {
+                    const int pattern = mmc5.extended_chr_base(trow * 32 + tcol)
+                        + tile * 16 + (ly & 7);
+                    const int b0 = chr[pattern % chr.size()];
+                    const int b1 = chr[(pattern + 8) % chr.size()];
+                    const int bit = 7 - (lx & 7);
+                    pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
+                } else {
+                    pix = tile_pixel(band.banks, bg_table + tile, ly & 7, lx & 7);
+                }
                 const uint8_t attr =
-                    nametables[base + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2)];
+                    nt_read_for(logical + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2),
+                                band.mirroring);
                 const int shift = ((trow % 4) / 2) * 4 + ((tcol % 4) / 2) * 2;
-                const int palsel = (attr >> shift) & 3;
+                const int palsel = (mmc5.active() && mmc5.extended_attributes())
+                    ? (mmc5.extended_value(trow * 32 + tcol) >> 6)
+                    : ((attr >> shift) & 3);
                 frame[y * 256 + x] = pix ? pal[palsel * 4 + pix] : backdrop;
                 bg_opaque[y][x] = pix != 0;
             }
@@ -457,12 +551,42 @@ struct PPU {
         if (mid_scanline >= 0 && (vram_addr & 0x7FFF) != (mid_v_addr & 0x7FFF)) {
             live_y_base = scroll_row_480(vram_addr);
         }
+        // MMC5 banks the CHR windows mid-frame at the IRQ split just like
+        // scroll: rows above the split render from the windows frozen at
+        // delivery (mmc5.split_*), rows below from the live windows.  The
+        // split line is captured here because mid_scanline is cleared below.
+        // In 8x8 sprite mode the hardware ignores $5128-$512B entirely and
+        // background fetches use the sprite set; each band's own ctrl bit
+        // picks its set.
+        const int mmc5_split_line = mmc5.active() ? mid_scanline : -1;
+        auto mmc5_bg = [&](int band_ctrl, bool from_split) {
+            if (band_ctrl & 0x20)
+                return from_split ? mmc5.split_background_banks()
+                                  : mmc5.background_banks();
+            return from_split ? mmc5.split_sprite_banks() : mmc5.sprite_banks();
+        };
+        const int* bg_banks;
+        const int* above_banks;
+        if (mmc5.active()) {
+            bg_banks = mmc5_bg(ctrl, false);
+            const int frame_mode = frame_latch_valid ? frame_ctrl : ctrl;
+            if (!frame_latch_valid) {
+                above_banks = bg_banks;
+            } else {
+                above_banks = (frame_mode & 0x20)
+                    ? mmc5.frame_background_banks() : mmc5.frame_sprite_banks();
+            }
+        } else {
+            bg_banks = chr_bank;
+            above_banks = frame_chr_bank;
+        }
         const BandState live{ctrl, mask, mirroring, t_addr, fine_x,
-                             live_y_base, chr_bank};
+                             live_y_base, bg_banks};
         const BandState span = frame_latch_valid
             ? BandState{frame_ctrl, frame_mask, frame_mirroring,
-                        frame_t_addr, frame_fine_x, -1, frame_chr_bank}
-            : BandState{ctrl, mask, mirroring, t_addr, fine_x, -1, chr_bank};
+                        frame_t_addr, frame_fine_x, -1, above_banks}
+            : BandState{ctrl, mask, mirroring, t_addr, fine_x, -1,
+                        mmc5.active() ? above_banks : chr_bank};
 
         // MMC2's CHR latches observe the real fetch order. The ordinary
         // renderer can batch all backgrounds and then all sprites because
@@ -520,26 +644,77 @@ struct PPU {
 
         render_bg_rows(frame, pal, backdrop, span, 0, 240);
 
+        // Sprite 0's pattern fetches through the SPRITE banks: on MMC5 in
+        // 8x16 mode the background set is a different window, and a bogus
+        // hit from the wrong set would reshape the render bands.
+        const int* s0_banks = mmc5.active()
+            ? mmc5.frame_sprite_banks()
+            : span.banks;
         sprite0_scanline = -1;
-        if (mask & 0x10) sprite0_scanline = detect_sprite0(span.banks);
+        if (mask & 0x10) sprite0_scanline = detect_sprite0(s0_banks);
 
         const int s0 = sprite0_scanline;
-        const bool have_mid = mid_scanline >= 0 && mid_scanline + 1 < 240
-            && (s0 < 0 || mid_scanline > s0);
+        const bool have_mid = mid_scanline >= 0 && mid_scanline + 1 < 240;
+        // A sprite-0 split only means something ABOVE the IRQ split (the
+        // SMB-style poll-then-scroll pattern).  A hit below it is just a
+        // status bit -- an ordinary sprite over opaque background (CV3's
+        // player with the MMC5 IRQ at the HUD edge) -- and must not eat
+        // the IRQ split.
+        const bool have_s0 = s0 >= 0 && s0 + 1 < 240
+            && (!have_mid || s0 < mid_scanline);
+        const int* mid_banks = mmc5.active()
+            ? mmc5_bg(mid_ctrl, mmc5_split_line >= 0) : mid_chr_bank;
         const BandState mid_band = have_mid
             ? BandState{mid_ctrl, mid_mask, mid_mirroring,
-                        mid_t_addr, mid_fine_x, -1, mid_chr_bank}
+                        mid_t_addr, mid_fine_x, -1, mid_banks}
             : live;
 
         // The frame's ordered background bands, each starting at its first
         // row: span from the top, then the post-sprite-0 and post-IRQ
         // splits (mid_band collapses to live when there is no IRQ split).
         struct Segment { int y0; const BandState* band; };
-        Segment segs[3];
+        Segment segs[12];
+        BandState raster_bands[8];
+        BandState raster_live = live;
         int nseg = 0;
         segs[nseg++] = {0, &span};
-        if (s0 >= 0 && s0 + 1 < 240) segs[nseg++] = {s0 + 1, &mid_band};
-        if (have_mid) segs[nseg++] = {mid_scanline + 1, &live};
+        if (mmc5.active() && !raster_splits.empty()) {
+            // State after split i is observable at split i+1, whose capture
+            // occurred before that next handler. The final band is live.
+            bool pinned_y = false;
+            int pinned_origin = 0, pinned_start = 0;
+            int previous_v = raster_splits[0].v_addr;
+            for (size_t i = 0; i + 1 < raster_splits.size(); ++i) {
+                const auto& next = raster_splits[i + 1];
+                const int start = raster_splits[i].line + 1;
+                if ((next.v_addr & 0x7FFF) != (previous_v & 0x7FFF)) {
+                    pinned_y = true;
+                    pinned_origin = scroll_row_480(next.v_addr);
+                    pinned_start = start;
+                }
+                const int* banks = (next.ctrl & 0x20)
+                    ? next.mmc5_bg : next.mmc5_sprite;
+                raster_bands[i] = BandState{
+                    next.ctrl, next.mask, next.mirroring, next.t_addr,
+                    next.fine_x,
+                    pinned_y ? (pinned_origin + start - pinned_start) % 480 : -1,
+                    banks};
+                segs[nseg++] = {start, &raster_bands[i]};
+                previous_v = next.v_addr;
+            }
+            const int live_start = raster_splits.back().line + 1;
+            if ((vram_addr & 0x7FFF) != (previous_v & 0x7FFF)) {
+                pinned_y = true;
+                pinned_origin = scroll_row_480(vram_addr);
+                pinned_start = live_start;
+            }
+            if (pinned_y)
+                raster_live.y_base = (pinned_origin + live_start - pinned_start) % 480;
+            segs[nseg++] = {live_start, &raster_live};
+        } else {
+            if (have_s0) segs[nseg++] = {s0 + 1, &mid_band};
+            if (have_mid) segs[nseg++] = {mid_scanline + 1, &live};
+        }
         mid_scanline = -1;
 
         // Repaint each lower band over the full-frame span pass, skipping
@@ -559,6 +734,15 @@ struct PPU {
             for (int i = 1; i < nseg; ++i)
                 if (row >= segs[i].y0) b = segs[i].band;
             return b->banks;
+        };
+
+        auto mmc5_sprite_banks_for_row = [&](int row) -> const int* {
+            if (raster_splits.empty() || row <= raster_splits[0].line)
+                return mmc5.frame_sprite_banks();
+            for (size_t i = 0; i + 1 < raster_splits.size(); ++i)
+                if (row <= raster_splits[i + 1].line)
+                    return raster_splits[i + 1].mmc5_sprite;
+            return mmc5.sprite_banks();
         };
 
         const bool tall = (ctrl & 0x20) != 0;
@@ -586,7 +770,9 @@ struct PPU {
                     t = ((ctrl & 0x08) ? 256 : 0) + tile;
                     prow = src_r;
                 }
-                const int* sbanks = banks_for_row(top + r);
+                const int* sbanks = mmc5.active()
+                    ? mmc5_sprite_banks_for_row(top + r)
+                    : banks_for_row(top + r);
                 for (int c = 0; c < cols; ++c) {
                     if (x + c < sprite_x_min) continue;
                     const int src_c = (attr & 0x40) ? (7 - c) : c;
@@ -615,6 +801,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("set_chr_banks", &PPU::set_chr_banks)
         .def("set_mmc2_banks", &PPU::set_mmc2_banks)
         .def("set_mmc4_banks", &PPU::set_mmc4_banks)
+        .def("set_mmc5_state", &PPU::set_mmc5_state)
+        .def("set_mmc5_exram", &PPU::set_mmc5_exram)
+        .def("set_mmc5_chr", &PPU::set_mmc5_chr)
+        .def("mmc5_split_bg", &PPU::mmc5_split_bg)
+        .def("mmc5_split_sprite", &PPU::mmc5_split_sprite)
+        .def("mmc5_exram", &PPU::mmc5_exram)
+        .def("mmc5_exram_mode", &PPU::mmc5_exram_mode)
         .def_static("palette_index", &PPU::palette_index)
         .def("begin_vblank", &PPU::begin_vblank)
         .def("end_vblank", &PPU::end_vblank)

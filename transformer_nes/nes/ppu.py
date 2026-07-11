@@ -35,6 +35,7 @@ from transformer_nes.nes.native_cache import build_dir
 PPU_CPP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ppu.cpp")
 MMC2_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mmc2.h")
 MMC4_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mmc4.h")
+MMC5_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mmc5.h")
 CHR_LATCH_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chr_latch.h")
 
 # Standard 2C02 palette (RGB triples for the 64 NES colors).
@@ -73,7 +74,7 @@ def load_ppu_module():
         from torch.utils.cpp_extension import load
 
         digest_hash = hashlib.sha256()
-        for path in (PPU_CPP, CHR_LATCH_H, MMC2_H, MMC4_H):
+        for path in (PPU_CPP, CHR_LATCH_H, MMC2_H, MMC4_H, MMC5_H):
             with open(path, "rb") as f:
                 digest_hash.update(f.read())
         digest = digest_hash.hexdigest()[:16]

@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from transformer_nes.nes.cartridge import Cartridge
-from transformer_nes.nes.console import FRAME_CYCLES, Console
+from transformer_nes.nes.console import FRAME_CYCLES, J_EVENT, Console
 
 EXAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
 NESTEST_ROM = os.path.join(EXAMPLES_DIR, "nestest.nes")
@@ -210,6 +210,48 @@ def nametable_text(console: Console) -> str:
         "".join(chr(b) if 0x20 <= b < 0x7F else " " for b in nt[r * 32:(r + 1) * 32])
         for r in range(30)
     )
+
+
+def make_mmc5_chain_cart() -> Cartridge:
+    """MMC5 cart whose IRQ handler re-arms $5203 to a later scanline, the
+    CV3 pattern: one IRQ at the HUD seam chains a second in the same frame."""
+    code = bytearray()
+
+    def emit(*bs: int) -> None:
+        code.extend(bs)
+
+    org = 0x8000
+    emit(0xA2, 0xFF, 0x9A)                    # LDX #$FF; TXS
+    emit(0xA9, 0x1E, 0x8D, 0x01, 0x20)        # PPUMASK: rendering on
+    emit(0xA9, 40, 0x8D, 0x03, 0x52)          # $5203 = 40
+    emit(0xA9, 0x80, 0x8D, 0x04, 0x52)        # $5204 = IRQ enable
+    emit(0x58)                                # CLI
+    main = org + len(code)
+    emit(0x4C, main & 0xFF, main >> 8)        # spin
+    irq = org + len(code)
+    emit(0xE6, 0x12)                          # INC $12 (IRQ counter)
+    emit(0xAD, 0x04, 0x52)                    # LDA $5204 (ack)
+    emit(0xA9, 100, 0x8D, 0x03, 0x52)         # re-arm $5203 = 100
+    emit(0x40)                                # RTI
+
+    prg = bytearray(0x8000)
+    prg[:len(code)] = code
+    prg[0x7FFA:0x7FFC] = bytes((main & 0xFF, main >> 8))
+    prg[0x7FFC:0x7FFE] = bytes((0x00, 0x80))
+    prg[0x7FFE:0x8000] = bytes((irq & 0xFF, irq >> 8))
+    return Cartridge(prg=bytes(prg), chr=bytes(0x2000),
+                     mirroring="vertical", mapper=5)
+
+
+def test_mapper_irq_rearm_chains_within_a_frame():
+    console = Console(make_mmc5_chain_cart(), backend="kernel")
+    console.run(3)
+    per_frame: dict[int, list[int]] = {}
+    for frame, _phase, kind, addr, value, _v_addr, _latch in console.journal.entries:
+        if kind == J_EVENT and value == 1:
+            per_frame.setdefault(frame, []).append(addr)
+    assert per_frame[1] == [40, 100]   # handler's re-arm fired the same frame
+    assert per_frame[2] == [100]       # steady state: one delivery per frame
 
 
 def test_irq_sources_share_the_cpu_line_without_clearing_each_other():
