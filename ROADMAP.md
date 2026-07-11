@@ -31,6 +31,36 @@ backend's hull-log growth (optional cleanup), the Klaus harness cost
 (lockstep reference + trace marshalling, no longer the forwards).  The
 performance numbers in the older sections below are historical.
 
+## 2026-07-10 standard-ML artifact — safetensors + standalone PyTorch runner
+
+The weights are now a portable artifact.  `model/export.py`
+(`python -m transformer_vm.model.export OUT_DIR`) writes
+**weights.safetensors** -- per-matrix CSR, float64 values for exactness
+(dense would be ~11 GB; sparse is **4.2 MB**) plus tok/head dense --
+and **machine.json** (input slot map, readout slots, output-head rows,
+dims, and a prose spec of the execution semantics).  The union model
+only: experts/shapes/engines are execution strategies, not the model.
+
+`experiments/torch_reference/torch_runner.py` is the proof of
+portability: a ~200-line standalone runner importing ONLY
+torch/numpy/json/safetensors (nothing from transformer_vm) that
+re-implements the semantics from the JSON -- fused Q/K/V (2 dims per
+head), per-layer append-only K/V logs, **hardmax attention with exact
+ties won by the latest token** (`flip + argmax`), ReGLU FFN, residual,
+no normalization, half-to-even readouts -- and drives it as a 6502
+machine.  Receipt (`test_export.py`, 81 tests green): the exported
+weights run `verify_program` **lockstep-exact with the reference
+oracle for all 40 steps** at ~16 instr/s in float64 sparse torch.
+Loops, stores, JSR/RTS, stack, arithmetic, flags -- vanilla PyTorch
+executing 6502 machine code off a 4.2 MB safetensors file.
+
+This is the ablation substrate (zero heads / perturb weights / cast
+dtypes and watch which instructions break) and the port spec for a
+jax-js browser demo (same ~200 lines in JAX; dense-per-layer WebGPU
+would run demo-speed -- the fast browser path remains compiling the
+generated C++ engine to WASM).  Not yet done: an ablation example
+notebook; a JAX twin of the runner; exporting bcd=True.
+
 ## 2026-07-10 kernel O(1) attention state — the hull-log growth, fixed
 
 The "C++ problem" from the START HERE list, closed by porting the
