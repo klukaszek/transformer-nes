@@ -38,11 +38,14 @@ KEY_OFFSET, the average tie-break constructor, the vestigial
 matmul/dtype/np_dtype attrs (jj lylmpmvy).  What remains is structural,
 in priority order — the lockstep chain is the safety net for all of it:
 
-1. **One classification module.**  The mem-structure / running-argmax /
-   hull-fallback eligibility logic now exists TWICE: engine_gen's
-   plan_model (matrix-level) and kernel._KernelSpec (graph-expr level).
-   Divergence here is the project's biggest latent hazard.  Extract to
-   `model/classify.py` with both consumers driving it.
+1. **DONE — one classification module.**  The shared numeric licenses for
+   memory structures and running-argmax registers now live in
+   `model/classify.py`; `engine_gen.plan_model` (matrix rows) and
+   `kernel._KernelSpec` (compiled graph expressions) only adapt their local
+   representations into its linear terms.  Boundary tests cover scaling,
+   positional-slot bans, coefficient limits, non-finite values, and LATEST
+   ties.  Receipt: all 85 tests green across the exact evaluator, generated
+   kernel, generated weights engine, export runner, MMIO, and console.
 2. **Split weights_runner.**  Cpu6502TransformerMachine has accreted:
    machine protocol + engine cache orchestration + THREE expert builders
    + scanner + shape matcher + JIT + license checks + CLI.  Carve into

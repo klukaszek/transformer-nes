@@ -38,6 +38,7 @@ from transformer_vm.cpu6502.spec import (
 )
 from transformer_vm.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_vm.graph.core import PersistDimension
+from transformer_vm.model.classify import memory_query, register_query
 
 _ATTENTION_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "attention")
 _CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_kernel_cache")
@@ -184,13 +185,9 @@ class _KernelSpec:
         one_id = rt._one.id
         pos_ids = {rt._position.id, rt._position_sq.id, rt._inv_log_pos.id}
 
-        def const_q(cq):
-            n, ids, coeffs = cq
-            if n == 0:
-                return 0.0
-            if n == 1 and ids[0] == one_id:
-                return float(coeffs[0])
-            return None
+        def q_terms(cq):
+            _n, ids, coeffs = cq
+            return list(zip(coeffs, ids, strict=True))
 
         self.mem_lus: dict[int, dict] = {}
         self.regs: list[dict] = []
@@ -204,32 +201,26 @@ class _KernelSpec:
             qx_c, qy_c = rt._lookup_query_exprs[lu.id]
             if lu.id in mem_ids:
                 mg = getattr(lu, "memory_group", None)
-                qy = const_q(qy_c)
-                ok = (
+                terms = None
+                if (
                     mg is not None and grp["nvp"] == 1
                     and lu.tie_break == "latest"
-                    and qy is not None and qy > 0.0
                     and {d.name: c for d, c in lu.value_exprs[0].terms.items()}
                     == {"byte_value": 1}
                     and {d.name: c for d, c in lu.value_exprs[1].terms.items()}
                     == {"addr_lo": 1, "addr_hi": 256}
-                )
-                terms = []
-                if ok:
-                    n, ids, coeffs = qx_c
-                    for did, c in zip(ids, coeffs, strict=True):
-                        r = c / qy
-                        if did in pos_ids or abs(r - round(r)) > 1e-9 or abs(r) >= 2**24:
-                            ok = False
-                            break
-                        terms.append((int(round(r)), did))
-                if ok:
+                ):
+                    terms = memory_query(q_terms(qx_c), q_terms(qy_c),
+                                         one_id=one_id, banned_ids=pos_ids)
+                if terms is not None:
                     self.mem_lus[lu.id] = {"g": int(mg), "terms": terms}
                 else:
                     self.hull_groups.add(gi)
                 continue
-            qx, qy = const_q(qx_c), const_q(qy_c)
-            if grp["latest"] and qx is not None and qy is not None:
+            reg_q = register_query(q_terms(qx_c), q_terms(qy_c),
+                                   one_id=one_id, latest=grp["latest"])
+            if reg_q is not None:
+                qx, qy = reg_q
                 key = (gi, qx, qy)
                 ri = reg_of.get(key)
                 if ri is None:

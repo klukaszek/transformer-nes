@@ -27,6 +27,8 @@ import time
 import numpy as np
 import scipy.sparse as sp
 
+from transformer_vm.model.classify import memory_query, register_query
+
 _ATTENTION_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "attention"
 )
@@ -1084,57 +1086,41 @@ def generate_source(model, step_spec: dict | None = None,
                 b = head_blocks.setdefault(h, [])
                 hid = hull_of_head[h]
                 tb = "TieBreak::LATEST" if tiebreak[h] else "TieBreak::AVERAGE"
-                # Memory heads qualify for the structure when the query is a
-                # positive scalar multiple of [address - lo, 1]: qy is a lone
-                # positive constant on the one-slot (the hardmax temperature),
-                # and qx / qy has integer coefficients.  A positive scale
-                # multiplies every score, so the argmax is unchanged.
+                # Eligibility decisions live in model/classify.py, shared
+                # with the C++ kernel so the two engines cannot drift.
+                # Position features occupy slots 0-2: banned in queries.
+                q0_idx, q0_dat = _row(ip, 2 * h)
                 q1_idx, q1_dat = _row(ip, 2 * h + 1)
-                mem_ok = (
-                    is_int
-                    and mem_groups[h] >= 0
-                    and len(q1_idx) == 1
-                    and int(q1_idx[0]) == mdl.one_slot
-                    and float(q1_dat[0]) > 0.0
-                )
-                if mem_ok:
-                    q_scale = float(q1_dat[0])
-                    q_idx, q_dat = _row(ip, 2 * h)
-                    q_int = np.asarray(q_dat, dtype=np.float64) / q_scale
-                    q_round = np.round(q_int)
-                    if not (np.all(np.abs(q_int - q_round) < 1e-6)
-                            and np.all(np.abs(q_round) < 2**24)
-                            and not any(int(i) <= 2 for i in q_idx)):
-                        mem_ok = False
+                qx_terms = list(zip(q0_dat, q0_idx, strict=True))
+                qy_terms = list(zip(q1_dat, q1_idx, strict=True))
+                mem_terms = None
+                if is_int and mem_groups[h] >= 0:
+                    mem_terms = memory_query(
+                        qx_terms, qy_terms, one_id=mdl.one_slot,
+                        banned_ids=(0, 1, 2),
+                    )
+                mem_ok = mem_terms is not None
                 if not is_union and mem_groups[h] >= 0 and not mem_ok:
                     raise RuntimeError(
                         f"{label} L{li} head {h}: memory head is not "
                         "structure-eligible; a per-expert hull would diverge"
                     )
 
-                # Non-memory heads with a CONSTANT query [QX, QY] (both rows a
-                # lone term on the one-slot): each token's score QX*kx + QY*ky
-                # is a fixed function of its key, so the historical argmax can
-                # be maintained incrementally at insert time.  Replace-on->=
-                # reproduces the LATEST tie-break (ilp is monotone in double,
-                # so a later equal-key token never compares below an earlier
-                # one), and cleared tokens are skipped as before.
-                reg_ok = False
+                reg_q = None
                 v0_i = v1_i = None
-                if is_int and not mem_ok and tiebreak[h]:
-                    q0_idx, q0_dat = _row(ip, 2 * h)
-                    reg_ok = (
-                        len(q0_idx) == 1 and int(q0_idx[0]) == mdl.one_slot
-                        and len(q1_idx) == 1 and int(q1_idx[0]) == mdl.one_slot
-                    )
-                    if reg_ok:
+                if is_int and not mem_ok:
+                    reg_q = register_query(qx_terms, qy_terms,
+                                           one_id=mdl.one_slot,
+                                           latest=bool(tiebreak[h]))
+                    if reg_q is not None:
                         try:
                             v0_i = _expr_int(*_row(ip, 2 * dm + 2 * h),
                                              xref, f"{label} L{li} reg v0")
                             v1_i = _expr_int(*_row(ip, 2 * dm + 2 * h + 1),
                                              xref, f"{label} L{li} reg v1")
                         except RuntimeError:
-                            reg_ok = False
+                            reg_q = None
+                reg_ok = reg_q is not None
 
                 if mem_ok:
                     # Memory-group lookup served by the exact nearest-address
@@ -1145,7 +1131,9 @@ def generate_source(model, step_spec: dict | None = None,
                     # winner).  Writes arrive only via insert_write; the hull
                     # stays empty and its guard makes that contract loud.
                     g = mem_groups[h]
-                    qi_expr = _expr_int(q_idx, q_round, xref, f"{label} L{li} mem query")
+                    qi_expr = _expr_int([i for _c, i in mem_terms],
+                                        [c for c, _i in mem_terms],
+                                        xref, f"{label} L{li} mem query")
                     k1 = _expr_dbl(*_row(ip, dm + 2 * h + 1), dref)
                     b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
                     b.append("        {")
@@ -1186,8 +1174,7 @@ def generate_source(model, step_spec: dict | None = None,
                                 f"{label} L{li} head {h}: constant-query head "
                                 f"has no union register (lookup {lu_id} pair {pair})"
                             )
-                    qx = float(q0_dat[0])
-                    qy = float(q1_dat[0])
+                    qx, qy = reg_q
                     k0 = _expr_dbl(*_row(ip, dm + 2 * h), dref)
                     k1 = _expr_dbl(*_row(ip, dm + 2 * h + 1), dref)
                     b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
