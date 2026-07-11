@@ -88,9 +88,9 @@ def _match_zero(value: Expression) -> Expression:
 
 def _multiply(a, b) -> Expression:
     """Multiply two scalar expressions using the graph DSL's internal helper."""
-    from transformer_nes.graph.core import _make_multiply, _to_expr
+    from transformer_nes.graph.core import make_multiply, to_expr
 
-    return _make_multiply(_to_expr(a), _to_expr(b))
+    return make_multiply(to_expr(a), to_expr(b))
 
 
 def _mux(gate: Expression, if_one: Expression, if_zero: Expression) -> Expression:

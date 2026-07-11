@@ -11,7 +11,7 @@ Execution protocol (one transformer step = one 6502 instruction):
   2. A STATE token carries the full architectural state (PC, registers, flag
      bits, and the previous instruction's fetch/EA/data fields).
   3. ``evaluate_current`` runs the graph over the latest token: it executes
-     one instruction and exposes the named result dims (_RUNTIME_READ_DIMS).
+     one instruction and exposes the named result dims (RUNTIME_READ_DIMS).
   4. The run loop appends the instruction's memory writes as WRITE tokens,
      builds the next STATE token from the results, and repeats until the
      graph predicts HALT.
@@ -50,16 +50,16 @@ from transformer_nes.graph.core import (
 
 logger = logging.getLogger(__name__)
 
-_OP_SKIP = 0
-_OP_REGLU = 2
-_OP_PERSIST = 3
-_OP_LOOKUP = 4
+OP_SKIP = 0
+OP_REGLU = 2
+OP_PERSIST = 3
+OP_LOOKUP = 4
 
 # Dimensions the run loop reads back from evaluate_current() via _read_dim.
 # The compiled step function only materializes these (and the output-token
 # score terms); everything else stays in locals and is dead-code-eliminated
 # when it does not feed them.
-_RUNTIME_READ_DIMS = (
+RUNTIME_READ_DIMS = (
     "current_pc", "new_a", "new_x", "new_y", "new_s", "new_p", "new_halted",
     "fetched_opcode", "fetched_operand_lo", "fetched_operand_hi",
     "ea", "data_out", "next_pc",
@@ -82,10 +82,10 @@ class Cpu6502Runtime:
             if dim.name not in self.dim_id_by_name:
                 self.dim_id_by_name[dim.name] = dim.id
 
-        self._one = _find_builtin_dim("one")
-        self._position = _find_builtin_dim("position")
-        self._position_sq = _find_builtin_dim("position_sq")
-        self._inv_log_pos = _find_builtin_dim("inv_log_pos")
+        self.one = _find_builtin_dim("one")
+        self.position = _find_builtin_dim("position")
+        self.position_sq = _find_builtin_dim("position_sq")
+        self.inv_log_pos = _find_builtin_dim("inv_log_pos")
 
         self.byte_value = _find_input_dim("byte_value")
         self.is_memory_write = _find_input_dim("is_memory_write")
@@ -131,18 +131,18 @@ class Cpu6502Runtime:
         # Classify the lookups so each token type inserts only into the
         # caches that store it: WRITE -> memory reads, start -> start lookup,
         # STATE -> state lookup.
-        self._memory_read_lus = []
-        self._start_lu = None
-        self._state_lu = None
+        self.memory_read_lus = []
+        self.start_lu = None
+        self.state_lu = None
         for lu in self.all_lookups:
             key_terms = set(lu.key_exprs_2d[0].terms.keys()) | set(lu.key_exprs_2d[1].terms.keys())
             value_first_dims = set(lu.value_exprs[0].terms.keys()) if lu.value_exprs else set()
             if self.byte_value in value_first_dims:
-                self._memory_read_lus.append(lu)
+                self.memory_read_lus.append(lu)
             elif self.is_start in key_terms:
-                self._start_lu = lu
+                self.start_lu = lu
             elif self.is_state in key_terms:
-                self._state_lu = lu
+                self.state_lu = lu
 
         self._share_identical_memory_caches()
         self._build_indexed_schedule()
@@ -151,41 +151,41 @@ class Cpu6502Runtime:
     def _build_indexed_schedule(self):
         self.num_dims = len(self.all_dims)
 
-        self._indexed_dim_ops = [_OP_SKIP] * self.num_dims
+        self._indexed_dim_ops = [OP_SKIP] * self.num_dims
         self._indexed_dim_args = [None] * self.num_dims
-        self._lookup_dim_ids = {
+        self.lookup_dim_ids = {
             lu.id: [dim.id for dim in lu.dims]
             for lu in self.all_lookups
         }
-        self._lookup_query_exprs = {
+        self.lookup_query_exprs = {
             lu.id: (
-                self._compile_expr(lu.query_exprs_2d[0]),
-                self._compile_expr(lu.query_exprs_2d[1]),
+                self.compile_expr(lu.query_exprs_2d[0]),
+                self.compile_expr(lu.query_exprs_2d[1]),
             )
             for lu in self.all_lookups
         }
 
         for dim in self.all_dims:
             if isinstance(dim, ReGLUDimension):
-                self._indexed_dim_ops[dim.id] = _OP_REGLU
+                self._indexed_dim_ops[dim.id] = OP_REGLU
                 self._indexed_dim_args[dim.id] = (
-                    self._compile_expr(dim.a_expr),
-                    self._compile_expr(dim.b_expr),
+                    self.compile_expr(dim.a_expr),
+                    self.compile_expr(dim.b_expr),
                 )
             elif isinstance(dim, PersistDimension):
-                self._indexed_dim_ops[dim.id] = _OP_PERSIST
-                self._indexed_dim_args[dim.id] = self._compile_expr(dim.expr)
+                self._indexed_dim_ops[dim.id] = OP_PERSIST
+                self._indexed_dim_args[dim.id] = self.compile_expr(dim.expr)
             elif isinstance(dim, LookUpDimension):
-                self._indexed_dim_ops[dim.id] = _OP_LOOKUP
+                self._indexed_dim_ops[dim.id] = OP_LOOKUP
                 self._indexed_dim_args[dim.id] = dim.lookup.id
 
         self._indexed_schedule = [
             (dim_id, op, arg)
             for dim_id, (op, arg) in enumerate(zip(self._indexed_dim_ops, self._indexed_dim_args, strict=True))
-            if op != _OP_SKIP
+            if op != OP_SKIP
         ]
-        self._indexed_outputs = [
-            (name, self._compile_expr(expr))
+        self.indexed_outputs = [
+            (name, self.compile_expr(expr))
             for name, expr in self.output_tokens.items()
         ]
 
@@ -229,10 +229,10 @@ class Cpu6502Runtime:
         computed = {dim_id for dim_id, _op, _arg in self._indexed_schedule}
         external = {
             self.dim_id_by_name[name]
-            for name in _RUNTIME_READ_DIMS
+            for name in RUNTIME_READ_DIMS
             if name in self.dim_id_by_name
         }
-        for _name, arg in self._indexed_outputs:
+        for _name, arg in self.indexed_outputs:
             external.update(arg[1])
 
         # Backward pass: keep only schedule entries that (transitively) feed
@@ -240,15 +240,15 @@ class Cpu6502Runtime:
         # ordered, so a single reverse sweep finds the closure.
         needed = set(external)
         for dim_id, op, arg in reversed(self._indexed_schedule):
-            if op == _OP_LOOKUP:
-                lu_dim_ids = self._lookup_dim_ids[arg]
+            if op == OP_LOOKUP:
+                lu_dim_ids = self.lookup_dim_ids[arg]
                 if any(d in needed for d in lu_dim_ids):
                     needed.update(lu_dim_ids)
-                    qx_expr, qy_expr = self._lookup_query_exprs[arg]
+                    qx_expr, qy_expr = self.lookup_query_exprs[arg]
                     needed.update(qx_expr[1])
                     needed.update(qy_expr[1])
             elif dim_id in needed:
-                if op == _OP_REGLU:
+                if op == OP_REGLU:
                     needed.update(arg[0][1])
                     needed.update(arg[1][1])
                 else:
@@ -260,26 +260,26 @@ class Cpu6502Runtime:
         ]
 
         # Exposed for alternate backends (e.g. the C++ kernel emitter).
-        self._live_schedule = live_schedule
-        self._step_input_ids = sorted(needed - computed)
-        self._external_store_ids = sorted(external & computed)
+        self.live_schedule = live_schedule
+        self.step_input_ids = sorted(needed - computed)
+        self.external_store_ids = sorted(external & computed)
 
         namespace = {}
         lines = ["def _step(g, v):"]
-        for dim_id in self._step_input_ids:
+        for dim_id in self.step_input_ids:
             lines.append(f"    d{dim_id} = g.get({dim_id}, 0.0)")
         emitted_lookups = set()
         for dim_id, op, arg in live_schedule:
-            if op == _OP_PERSIST:
+            if op == OP_PERSIST:
                 lines.append(f"    d{dim_id} = {self._expr_src(arg, fmt)}")
-            elif op == _OP_REGLU:
+            elif op == OP_REGLU:
                 a_expr, b_expr = arg
                 lines.append(f"    _b = {self._expr_src(b_expr, fmt)}")
                 lines.append(f"    d{dim_id} = ({self._expr_src(a_expr, fmt)}) * _b if _b > 0.0 else 0.0")
-            elif op == _OP_LOOKUP and arg not in emitted_lookups:
+            elif op == OP_LOOKUP and arg not in emitted_lookups:
                 emitted_lookups.add(arg)
                 lines.extend(self._lookup_query_lines(arg, namespace, fmt))
-        for dim_id in self._external_store_ids:
+        for dim_id in self.external_store_ids:
             lines.append(f"    v[{dim_id}] = d{dim_id}")
         logger.debug(
             "compiled step: %d/%d schedule entries live",
@@ -291,7 +291,7 @@ class Cpu6502Runtime:
     def _lookup_query_lines(self, lu_id, namespace, fmt):
         """Emit inline query code for one lookup into the step function."""
         attn = self.attention[lu_id]
-        qx_expr, qy_expr = self._lookup_query_exprs[lu_id]
+        qx_expr, qy_expr = self.lookup_query_exprs[lu_id]
         buf = f"_q{lu_id}_buf"
         cache = f"_q{lu_id}_cache"
         namespace[buf] = np.empty((attn.num_value_pairs, 2))
@@ -301,11 +301,11 @@ class Cpu6502Runtime:
             f"    {buf}[:, 1] = {self._expr_src(qy_expr, fmt)}",
             f"    _o = {cache}.query(0, {buf}).ravel().tolist()",
         ]
-        for i, dim_id in enumerate(self._lookup_dim_ids[lu_id]):
+        for i, dim_id in enumerate(self.lookup_dim_ids[lu_id]):
             lines.append(f"    d{dim_id} = _o[{i}]")
         return lines
 
-    def _insert_kv_plan(self, lu):
+    def insert_kv_plan(self, lu):
         """Topologically order the derived dims feeding a lookup's key/values.
 
         Returns (order, input_ids) where order lists Persist/ReGLU dims in
@@ -353,7 +353,7 @@ class Cpu6502Runtime:
         whose derived dimensions form a small arithmetic chain over the
         input dims.
         """
-        plan = self._insert_kv_plan(lu)
+        plan = self.insert_kv_plan(lu)
         if plan is None:
             raise NotImplementedError(
                 f"lookup {lu.id} key/values depend on attention state; "
@@ -367,17 +367,17 @@ class Cpu6502Runtime:
             lines.append(f"    d{dim_id} = g.get({dim_id}, 0.0)")
         for dim in order:
             if isinstance(dim, PersistDimension):
-                src = self._expr_src(self._compile_expr(dim.expr), fmt)
+                src = self._expr_src(self.compile_expr(dim.expr), fmt)
                 lines.append(f"    d{dim.id} = {src}")
             else:
-                a_src = self._expr_src(self._compile_expr(dim.a_expr), fmt)
-                b_src = self._expr_src(self._compile_expr(dim.b_expr), fmt)
+                a_src = self._expr_src(self.compile_expr(dim.a_expr), fmt)
+                b_src = self._expr_src(self.compile_expr(dim.b_expr), fmt)
                 lines.append(f"    _b = {b_src}")
                 lines.append(f"    d{dim.id} = ({a_src}) * _b if _b > 0.0 else 0.0")
-        kx_src = self._expr_src(self._compile_expr(lu.key_exprs_2d[0]), fmt)
-        ky_src = self._expr_src(self._compile_expr(lu.key_exprs_2d[1]), fmt)
+        kx_src = self._expr_src(self.compile_expr(lu.key_exprs_2d[0]), fmt)
+        ky_src = self._expr_src(self.compile_expr(lu.key_exprs_2d[1]), fmt)
         val_srcs = ", ".join(
-            self._expr_src(self._compile_expr(expr), fmt) for expr in lu.value_exprs
+            self._expr_src(self.compile_expr(expr), fmt) for expr in lu.value_exprs
         )
         lines.append(f"    return {kx_src}, {ky_src}, ({val_srcs},)")
         namespace = {}
@@ -385,7 +385,7 @@ class Cpu6502Runtime:
         return namespace["_kv"]
 
     @staticmethod
-    def _compile_expr(expr):
+    def compile_expr(expr):
         ids = []
         coeffs = []
         for dim, coeff in expr.terms.items():
@@ -401,16 +401,16 @@ class Cpu6502Runtime:
         keys and values are identical, so the exact evaluator can share one
         backing cache and query it through each lookup's own query expression.
         """
-        if not self._memory_read_lus:
+        if not self.memory_read_lus:
             return
-        first = self.attention[self._memory_read_lus[0].id]
-        for lu in self._memory_read_lus[1:]:
+        first = self.attention[self.memory_read_lus[0].id]
+        for lu in self.memory_read_lus[1:]:
             attn = self.attention[lu.id]
             if (
                 attn.num_value_pairs != first.num_value_pairs
                 or attn.nv != first.nv
-                or not _same_exprs(lu.value_exprs, self._memory_read_lus[0].value_exprs)
-                or not _same_exprs(lu.key_exprs_2d, self._memory_read_lus[0].key_exprs_2d)
+                or not _same_exprs(lu.value_exprs, self.memory_read_lus[0].value_exprs)
+                or not _same_exprs(lu.key_exprs_2d, self.memory_read_lus[0].key_exprs_2d)
             ):
                 continue
             attn.cache = first.cache
@@ -423,13 +423,13 @@ class Cpu6502Runtime:
         self._trace_len = 0
 
     def _set_token(self, token_name: str, overrides: dict | None = None):
-        vals = {self._one: 1.0}
+        vals = {self.one: 1.0}
         embedding = self.input_tokens[token_name]
         for dim, coeff in embedding.terms.items():
             vals[dim] = coeff
-        vals[self._position] = float(self.pos)
-        vals[self._position_sq] = float(self.pos) ** 2
-        vals[self._inv_log_pos] = 1.0 / math.log(2) - 1.0 / math.log(self.pos + 2)
+        vals[self.position] = float(self.pos)
+        vals[self.position_sq] = float(self.pos) ** 2
+        vals[self.inv_log_pos] = 1.0 / math.log(2) - 1.0 / math.log(self.pos + 2)
         if overrides:
             vals.update(overrides)
         return vals
@@ -472,7 +472,7 @@ class Cpu6502Runtime:
     def predict_next(self, values: list[float]) -> str:
         best_score = -1e300
         best_name = None
-        for name, score_expr in self._indexed_outputs:
+        for name, score_expr in self.indexed_outputs:
             score = _eval_indexed_expr(score_expr, values)
             if score > best_score:
                 best_score = score
@@ -532,7 +532,7 @@ class Cpu6502Runtime:
         """
         self.reset()
         prefix_start = time.perf_counter()
-        self._memory_ids = {lu.id for lu in self._memory_read_lus}
+        self._memory_ids = {lu.id for lu in self.memory_read_lus}
 
         # Feed start token with initial PC.
         self.direct_insert(
@@ -542,7 +542,7 @@ class Cpu6502Runtime:
                 self.start_pc_hi: (start_pc >> 8) & 0xFF,
                 self.is_start: 1,
             },
-            lookup_ids={self._start_lu.id},
+            lookup_ids={self.start_lu.id},
         )
 
         # Feed the memory image as WRITE tokens for memory reads.  The graph's
@@ -553,25 +553,25 @@ class Cpu6502Runtime:
                 continue
             self._insert_memory_write(addr, byte, memory_ids=self._memory_ids)
 
-        self._mstate = {
+        self.mstate = {
             "pc": start_pc & 0xFFFF, "a": 0, "x": 0, "y": 0, "s": 0xFD,
             "p": reference.FLAG_U | reference.FLAG_I,
             "ir": 0, "oplo": 0, "ophi": 0, "ea": 0, "data": 0, "halted": 0,
         }
         if state is not None:
-            self._mstate.update({k: state[k] for k in self._mstate if k in state})
-        self._nmi_pending = False
+            self.mstate.update({k: state[k] for k in self.mstate if k in state})
+        self.nmi_pending = False
         self.machine_halted = False
         self.last_prefix_seconds = time.perf_counter() - prefix_start
 
     @property
     def machine_state(self) -> dict:
         """Copy of the architectural state the next machine_step starts from."""
-        return dict(self._mstate)
+        return dict(self.mstate)
 
     def set_nmi(self):
         """Request an NMI: the next machine_step executes the interrupt sequence."""
-        self._nmi_pending = True
+        self.nmi_pending = True
 
     def inject_write(self, addr: int, value: int):
         """Append a device-originated WRITE token (a value appearing on the bus)."""
@@ -579,9 +579,9 @@ class Cpu6502Runtime:
 
     def machine_step(self) -> TraceRow:
         """Insert the next STATE token, evaluate one step, append its writes."""
-        st = self._mstate
-        nmi = 1 if self._nmi_pending else 0
-        self._nmi_pending = False
+        st = self.mstate
+        nmi = 1 if self.nmi_pending else 0
+        self.nmi_pending = False
         p = st["p"]
         self.direct_insert(
             "STATE",
@@ -610,7 +610,7 @@ class Cpu6502Runtime:
                 self.in_halted: st["halted"],
                 self.in_nmi: nmi,
             },
-            lookup_ids={self._state_lu.id},
+            lookup_ids={self.state_lu.id},
         )
 
         vals = self.evaluate_current()
@@ -699,15 +699,15 @@ class Cpu6502Runtime:
 
 
 def _graph_all_dims():
-    from transformer_nes.graph.core import _all_dims
+    from transformer_nes.graph.core import graph_dims
 
-    return _all_dims
+    return graph_dims
 
 
 def _graph_all_lookups():
-    from transformer_nes.graph.core import _all_lookups
+    from transformer_nes.graph.core import graph_lookups
 
-    return _all_lookups
+    return graph_lookups
 
 
 def _find_builtin_dim(name: str):

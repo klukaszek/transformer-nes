@@ -23,7 +23,7 @@ its depth and term counts are measured directly from the graph under test.
 import pytest
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.evaluator import _RUNTIME_READ_DIMS
+from transformer_nes.cpu6502.backends.evaluator import RUNTIME_READ_DIMS
 from transformer_nes.cpu6502.backends.weights.runner import VERIFY_START, verify_program
 from transformer_nes.cpu6502.interpreter import build
 from transformer_nes.cpu6502.spec import OPCODES
@@ -61,7 +61,7 @@ def union_pg():
 
 @pytest.fixture(scope="module")
 def folder(union_pg):
-    return GraphFolder(union_pg, root_names=_RUNTIME_READ_DIMS)
+    return GraphFolder(union_pg, root_names=RUNTIME_READ_DIMS)
 
 
 def _depth(fold_result):
@@ -118,7 +118,7 @@ def test_opcode_fold_is_materially_smaller(folder, union_fold, byte):
     # The shared-state contract: decode pins never reach insert-side exprs.
     assert r.insert_side_hazards == ()
     # Every runtime readout resolves by name (kept or re-materialized).
-    for name in _RUNTIME_READ_DIMS:
+    for name in RUNTIME_READ_DIMS:
         assert name in r.dim_of_name, f"readout {name} missing from fold"
     assert r.n_terms <= base.n_terms * 0.30
     assert _depth(r) < _depth(base) * 0.5
@@ -151,7 +151,7 @@ def _boot_tokens(image):
 
 
 def _read_all(ev, v):
-    return {name: int(round(ev.read(v, name))) for name in _RUNTIME_READ_DIMS}
+    return {name: int(round(ev.read(v, name))) for name in RUNTIME_READ_DIMS}
 
 
 def _writes_of(reads):
@@ -384,9 +384,9 @@ def test_sequence_fold_shadows_union(folder, poll_run, head, code, repeat):
             expected = steps[idx + k]["reads"]
             got = {
                 name: int(round(ev.read(v, f"{name}__s{k}")))
-                for name in _RUNTIME_READ_DIMS
+                for name in RUNTIME_READ_DIMS
             }
-            for name in _RUNTIME_READ_DIMS:
+            for name in RUNTIME_READ_DIMS:
                 mask = 0xFFFF if name in ("current_pc", "next_pc", "ea") else 0xFF
                 assert got[name] & mask == expected[name] & mask, (
                     f"step {k} ({name}) diverged at union step {idx + k}"
@@ -566,7 +566,7 @@ def test_shape_fold_shadows_union(folder, shape_run, shape_id, code):
         v = ev.step(inputs)
         for k in range(n_steps):
             expected = steps[idx + k]["reads"]
-            for name in _RUNTIME_READ_DIMS:
+            for name in RUNTIME_READ_DIMS:
                 mask = 0xFFFF if name in ("current_pc", "next_pc", "ea") else 0xFF
                 got = int(round(ev.read(v, f"{name}__s{k}"))) & mask
                 assert got == expected[name] & mask, (

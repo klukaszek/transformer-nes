@@ -18,10 +18,10 @@ import os
 import time
 
 from transformer_nes.cpu6502.backends.evaluator import (
-    _OP_LOOKUP,
-    _OP_PERSIST,
-    _OP_REGLU,
-    _RUNTIME_READ_DIMS,
+    OP_LOOKUP,
+    OP_PERSIST,
+    OP_REGLU,
+    RUNTIME_READ_DIMS,
     Cpu6502Runtime,
 )
 from transformer_nes.cpu6502.backends.run_protocol import (
@@ -36,12 +36,12 @@ from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRo
 from transformer_nes.graph.core import PersistDimension
 from transformer_nes.model.classify import memory_query, register_query
 
-_PKG_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_ATTENTION_DIR = os.path.join(_PKG_DIR, "attention")
-_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_kernel_cache")
+PKG_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ATTENTION_DIR = os.path.join(PKG_DIR, "attention")
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_kernel_cache")
 
 # STATE-token override fields, in the order the C++ insert_state() takes them.
-_STATE_FIELDS = (
+STATE_FIELDS = (
     "is_state", "in_pc_lo", "in_pc_hi", "in_a", "in_x", "in_y", "in_s",
     "in_p_c", "in_p_z", "in_p_i", "in_p_d", "in_p_b", "in_p_u", "in_p_v", "in_p_n",
     "in_ir", "in_oplo", "in_ophi", "in_ea_lo", "in_ea_hi", "in_data", "in_halted",
@@ -81,7 +81,7 @@ class _KernelSpec:
     def __init__(self, rt: Cpu6502Runtime):
         self.rt = rt
         self.ndims = rt.num_dims
-        self.computed = {dim_id for dim_id, _op, _arg in rt._live_schedule}
+        self.computed = {dim_id for dim_id, _op, _arg in rt.live_schedule}
 
         # Unique cache groups (memory lookups share one backing cache).
         cache_to_group: dict[int, int] = {}
@@ -91,7 +91,7 @@ class _KernelSpec:
             attn = rt.attention[lu.id]
             key = id(attn.cache)
             if key not in cache_to_group:
-                plan = rt._insert_kv_plan(lu)
+                plan = rt.insert_kv_plan(lu)
                 if plan is None:
                     raise NotImplementedError(
                         f"lookup {lu.id} needs the generic insert path; C++ kernel unsupported"
@@ -106,24 +106,24 @@ class _KernelSpec:
                 })
             self.lu_group[lu.id] = cache_to_group[key]
 
-        self.start_group = self.lu_group[rt._start_lu.id]
-        self.state_group = self.lu_group[rt._state_lu.id]
-        self.memory_groups = sorted({self.lu_group[lu.id] for lu in rt._memory_read_lus})
+        self.start_group = self.lu_group[rt.start_lu.id]
+        self.state_group = self.lu_group[rt.state_lu.id]
+        self.memory_groups = sorted({self.lu_group[lu.id] for lu in rt.memory_read_lus})
 
         def input_id(name):
             return getattr(rt, name).id
 
         self.builtin_ids = {
-            "one": rt._one.id,
-            "position": rt._position.id,
-            "position_sq": rt._position_sq.id,
-            "inv_log_pos": rt._inv_log_pos.id,
+            "one": rt.one.id,
+            "position": rt.position.id,
+            "position_sq": rt.position_sq.id,
+            "inv_log_pos": rt.inv_log_pos.id,
         }
         self.write_ids = {name: input_id(name) for name in
                           ("byte_value", "is_memory_write", "addr_lo", "addr_hi")}
         self.start_ids = {name: input_id(name) for name in
                           ("start_pc_lo", "start_pc_hi", "is_start")}
-        self.state_ids = {name: input_id(name) for name in _STATE_FIELDS}
+        self.state_ids = {name: input_id(name) for name in STATE_FIELDS}
 
         # Every embedding coefficient must be shadowed by an override the
         # kernel sets, otherwise the token builders below would be wrong.
@@ -139,8 +139,8 @@ class _KernelSpec:
                         f"{token} embedding term {dim!r} is not overridden by the kernel"
                     )
 
-        self.trace_ids = {name: rt.dim_id_by_name[name] for name in _RUNTIME_READ_DIMS}
-        self.outputs = rt._indexed_outputs  # [(name, expr)] in score order
+        self.trace_ids = {name: rt.dim_id_by_name[name] for name in RUNTIME_READ_DIMS}
+        self.outputs = rt.indexed_outputs  # [(name, expr)] in score order
 
         # ── O(1) attention-state classification (mirrors engine_gen) ──
         # Memory lookups whose query is a positive scalar multiple of
@@ -149,8 +149,8 @@ class _KernelSpec:
         # lookups with constant [qx, qy] queries by running-argmax registers
         # folded at insert time.  Anything else keeps its hull -- correctness
         # never rests on the classification, only speed.
-        one_id = rt._one.id
-        pos_ids = {rt._position.id, rt._position_sq.id, rt._inv_log_pos.id}
+        one_id = rt.one.id
+        pos_ids = {rt.position.id, rt.position_sq.id, rt.inv_log_pos.id}
 
         def q_terms(cq):
             _n, ids, coeffs = cq
@@ -161,11 +161,11 @@ class _KernelSpec:
         self.lu_reg: dict[int, int] = {}
         reg_of: dict[tuple, int] = {}
         self.hull_groups: set[int] = set()
-        mem_ids = {lu.id for lu in rt._memory_read_lus}
+        mem_ids = {lu.id for lu in rt.memory_read_lus}
         for lu in rt.all_lookups:
             gi = self.lu_group[lu.id]
             grp = self.groups[gi]
-            qx_c, qy_c = rt._lookup_query_exprs[lu.id]
+            qx_c, qy_c = rt.lookup_query_exprs[lu.id]
             if lu.id in mem_ids:
                 mg = getattr(lu, "memory_group", None)
                 terms = None
@@ -285,7 +285,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     # Emitted only for groups something still reads through: hull readers
     # and register folds.  Fully structure-served memory groups drop out
     # (insert_write updates the structure directly from (addr, value)).
-    compile_expr = Cpu6502Runtime._compile_expr
+    compile_expr = Cpu6502Runtime.compile_expr
     for gi, grp in enumerate(spec.groups):
         if gi not in spec.live_groups:
             continue
@@ -361,11 +361,11 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
             emit(f'        grp{gi}_insert();')
     emit('    }')
     emit('')
-    state_args = ", ".join(f"double {name}" for name in _STATE_FIELDS[1:])
+    state_args = ", ".join(f"double {name}" for name in STATE_FIELDS[1:])
     emit(f'    void insert_state(double pos, {state_args}) {{')
     emit('        new_token(pos);')
     emit(f'        setg({spec.state_ids["is_state"]}, 1.0);')
-    for name in _STATE_FIELDS[1:]:
+    for name in STATE_FIELDS[1:]:
         emit(f'        setg({spec.state_ids[name]}, {name});')
     emit(f'        grp{spec.state_group}_insert();')
     emit('    }')
@@ -373,31 +373,31 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     # ── Step function ──────────────────────────────────────────────
     emit('')
     emit('    void step(double* v) {')
-    step_locals = set(spec.rt._step_input_ids)
+    step_locals = set(spec.rt.step_input_ids)
 
     def sref(dim_id):
         return f"d{dim_id}" if dim_id in step_locals else gref(dim_id)
 
-    for dim_id in spec.rt._step_input_ids:
+    for dim_id in spec.rt.step_input_ids:
         emit(f'        const double d{dim_id} = g[{dim_id}];')
     emitted_lookups = set()
-    for dim_id, op, arg in spec.rt._live_schedule:
-        if op == _OP_PERSIST:
+    for dim_id, op, arg in spec.rt.live_schedule:
+        if op == OP_PERSIST:
             emit(f'        const double d{dim_id} = {_c_expr(arg, sref)};')
             step_locals.add(dim_id)
-        elif op == _OP_REGLU:
+        elif op == OP_REGLU:
             a_expr, b_expr = arg
             emit(f'        const double _b{dim_id} = {_c_expr(b_expr, sref)};')
             emit(f'        const double d{dim_id} = _b{dim_id} > 0.0 ? ({_c_expr(a_expr, sref)}) * _b{dim_id} : 0.0;')
             step_locals.add(dim_id)
-        elif op == _OP_LOOKUP:
+        elif op == OP_LOOKUP:
             if arg in emitted_lookups:
                 continue
             emitted_lookups.add(arg)
             lu = spec.rt.lookup_by_id[arg]
             gi = spec.lu_group[arg]
             grp = spec.groups[gi]
-            dim_ids = spec.rt._lookup_dim_ids[arg]
+            dim_ids = spec.rt.lookup_dim_ids[arg]
             if arg in spec.mem_lus:
                 # Group-dispatch fusion + exact structure: the query is the
                 # local address for this 4 KiB group; out of range means the
@@ -421,7 +421,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
                     step_locals.add(did)
             else:
                 tb = "TieBreak::LATEST" if grp["latest"] else "TieBreak::AVERAGE"
-                qx_expr, qy_expr = spec.rt._lookup_query_exprs[arg]
+                qx_expr, qy_expr = spec.rt.lookup_query_exprs[arg]
                 emit(f'        const double q{arg}[2] = {{ {_c_expr(qx_expr, sref)}, {_c_expr(qy_expr, sref)} }};')
                 for p in range(grp["nvp"]):
                     emit(f'        double o{arg}_{p}[2] = {{0.0, 0.0}};')
@@ -429,7 +429,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
                 for k, did in enumerate(dim_ids):
                     emit(f'        const double d{did} = o{arg}_{k // 2}[{k % 2}];')
                     step_locals.add(did)
-    for dim_id in spec.rt._external_store_ids:
+    for dim_id in spec.rt.external_store_ids:
         emit(f'        v[{dim_id}] = d{dim_id};')
     emit('    }')
 
@@ -612,8 +612,8 @@ class Cpu6502CppRuntime:
         source = generate_cpp(rt)
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         source = source.replace("KERNEL_T", f"Kernel_{digest}")
-        os.makedirs(_CACHE_DIR, exist_ok=True)
-        src_path = os.path.join(_CACHE_DIR, f"kernel_{digest}.cpp")
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        src_path = os.path.join(CACHE_DIR, f"kernel_{digest}.cpp")
         if not os.path.exists(src_path):
             with open(src_path, "w") as f:
                 f.write(source)
@@ -625,7 +625,7 @@ class Cpu6502CppRuntime:
             name=f"cpu6502_kernel_{digest}",
             sources=[src_path],
             extra_cflags=["-O2", "-std=c++17"],
-            extra_include_paths=[_ATTENTION_DIR],
+            extra_include_paths=[ATTENTION_DIR],
             verbose=False,
         )
         self.compile_seconds = time.perf_counter() - build_start

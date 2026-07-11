@@ -20,7 +20,7 @@ import time
 import numpy as np
 import scipy.sparse as sp
 
-from transformer_nes.cpu6502.backends.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
+from transformer_nes.cpu6502.backends.evaluator import RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.graph.core import InputDimension, ProgramGraph
 from transformer_nes.model.weights import build_model
 from transformer_nes.scheduler.milp import asap_schedule
@@ -44,7 +44,7 @@ def export_model(out_dir: str, *, bcd: bool = False, f64: bool = False) -> dict:
     dim_by_id = {d.id: d for d in rt.all_dims}
     output_tokens = dict(rt.output_tokens)
     readout = 0
-    for name in _RUNTIME_READ_DIMS:
+    for name in RUNTIME_READ_DIMS:
         readout = readout + 1e-6 * dim_by_id[rt.dim_id_by_name[name]]
     output_tokens["READOUT"] = readout
     pg = ProgramGraph(rt.input_tokens, output_tokens)
@@ -111,11 +111,11 @@ def export_model(out_dir: str, *, bcd: bool = False, f64: bool = False) -> dict:
         "n_layers": int(info.n_layers),
         "d_ffn": int(model.ff_in[0].weight.shape[0] // 2),
         "n_heads": int(model.attn[0].num_heads),
-        "one_slot": int(info.slot_of[rt._one]),
+        "one_slot": int(info.slot_of[rt.one]),
         "input_slots": input_slots,
         "readout_slots": {
             name: int(info.slot_of[dim_by_id[rt.dim_id_by_name[name]]])
-            for name in _RUNTIME_READ_DIMS
+            for name in RUNTIME_READ_DIMS
         },
         "state_row": int(tok_to_idx["STATE"]),
         "halt_row": int(tok_to_idx["HALT"]),

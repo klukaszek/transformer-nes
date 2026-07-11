@@ -111,7 +111,7 @@ class GraphFolder:
 
     Build once per union graph; ``fold()`` per expert.  ``root_names`` are
     dim names that must exist in every folded graph (the runtime readout
-    contract -- pass ``_RUNTIME_READ_DIMS`` for the 6502 machine).
+    contract -- pass ``RUNTIME_READ_DIMS`` for the 6502 machine).
     """
 
     def __init__(self, program_graph: ProgramGraph, root_names=()):

@@ -138,7 +138,7 @@ storage choice is separate from the generated runtime's int32 arithmetic.
 1. The graph's dimensions form a static schedule in id (creation) order,
    which is topological by construction.
 2. A backward liveness pass keeps only entries that transitively feed an
-   externally read dim (`_RUNTIME_READ_DIMS` + output-score terms).
+   externally read dim (`RUNTIME_READ_DIMS` + output-score terms).
 3. Expressions are emitted as straight-line arithmetic over locals; lookup
    queries are inlined against the classified attention state (exact
    memory structure, running-argmax register, or hull — `model/classify.py`

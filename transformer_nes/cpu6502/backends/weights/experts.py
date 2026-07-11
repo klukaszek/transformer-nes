@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.evaluator import _RUNTIME_READ_DIMS
+from transformer_nes.cpu6502.backends.evaluator import RUNTIME_READ_DIMS
 from transformer_nes.cpu6502.backends.weights.windows import BRANCH_OPERATIONS
 from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
 from transformer_nes.graph.fold import (
@@ -74,10 +74,10 @@ def fold_step_spec(fold_result, model, tok_to_idx, info, *,
 
     spec = step_spec_base(slot)
     if n_steps is None:
-        spec["outputs"] = {name: slot(name) for name in _RUNTIME_READ_DIMS}
+        spec["outputs"] = {name: slot(name) for name in RUNTIME_READ_DIMS}
     else:
         spec["step_outputs"] = [
-            {name: slot(f"{name}__s{k}") for name in _RUNTIME_READ_DIMS}
+            {name: slot(f"{name}__s{k}") for name in RUNTIME_READ_DIMS}
             for k in range(n_steps)
         ]
     spec["halt_head"] = head_row(model, tok_to_idx["HALT"])
@@ -203,7 +203,7 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
     if not opcodes:
         return []
 
-    folder = GraphFolder(pg, root_names=_RUNTIME_READ_DIMS)
+    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
     experts = []
     for byte in opcodes:
         r = folder.fold(opcode_pins(byte, OPCODES), label=f"{byte:02X}")
@@ -267,7 +267,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     ops = _decode_ops(code) * repeat
     _check_first_read_only(ops, label)
 
-    folder = GraphFolder(pg, root_names=_RUNTIME_READ_DIMS)
+    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
     r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
                              label=f"seq_{head:04X}")
     if r.insert_side_hazards:
@@ -312,7 +312,7 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
     bytes to the head).  A library shape that fails its license is a hard
     error: the library is code.
     """
-    folder = GraphFolder(pg, root_names=_RUNTIME_READ_DIMS)
+    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
     experts: list[dict] = []
     meta: list[dict] = []
     for sid, (name, template, repeat) in enumerate(shapes):

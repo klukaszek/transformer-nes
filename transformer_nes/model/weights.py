@@ -100,9 +100,9 @@ def build_model(program_graph=None, schedule=None):
         output_tokens = pg.output_tokens
         ALL_DIMS = pg.all_dims
         _one = pg.one
-        _position = pg.position
-        _inv_log_pos = pg.inv_log_pos
-        _position_sq = pg.position_sq
+        position = pg.position
+        inv_log_pos = pg.inv_log_pos
+        position_sq = pg.position_sq
     else:
         raise ValueError(
             "build_model requires a program_graph (the default WASM "
@@ -122,7 +122,7 @@ def build_model(program_graph=None, schedule=None):
 
     # ── Slot assignment (interval coloring) ───────────────────
     input_dims = [d for d in ALL_DIMS if isinstance(d, InputDimension)]
-    FIXED = {_position: 0, _inv_log_pos: 1, _position_sq: 2}
+    FIXED = {position: 0, inv_log_pos: 1, position_sq: 2}
     protected_slots = set(FIXED.values())
     slot_of = dict(FIXED)
     next_slot = 3
@@ -210,7 +210,7 @@ def build_model(program_graph=None, schedule=None):
 
     # ── Expressions for passthrough/erase Q/K ─────────────────
     one_expr = Expression({_one: 1})
-    pos_expr = Expression({_position: 1})
+    pos_expr = Expression({position: 1})
     erase_q2d = [pos_expr, one_expr]
     erase_k2d = [pos_expr * 2, one_expr]
 

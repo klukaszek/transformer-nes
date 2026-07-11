@@ -17,7 +17,7 @@ import os
 import numpy as np
 import torch
 
-_STATE_FIELDS = (
+STATE_FIELDS = (
     ("in_pc_lo", lambda s: s["pc"] & 0xFF),
     ("in_pc_hi", lambda s: (s["pc"] >> 8) & 0xFF),
     ("in_a", lambda s: s["a"]), ("in_x", lambda s: s["x"]),
@@ -146,7 +146,7 @@ class TorchMachine:
     def step(self) -> dict:
         """One 6502 instruction: STATE-token forward, readout, writes."""
         values = {"is_state": 1}
-        for name, get in _STATE_FIELDS:
+        for name, get in STATE_FIELDS:
             values[name] = get(self.state)
         h = self.forward(values)
 

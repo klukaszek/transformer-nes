@@ -148,15 +148,15 @@ class GraphCore:
 
     @property
     def pc(self) -> int:
-        return self.rt._mstate["pc"]
+        return self.rt.mstate["pc"]
 
     @property
     def x(self) -> int:
-        return self.rt._mstate["x"]
+        return self.rt.mstate["x"]
 
     @property
     def y(self) -> int:
-        return self.rt._mstate["y"]
+        return self.rt.mstate["y"]
 
     @property
     def halted(self) -> bool:
@@ -164,7 +164,7 @@ class GraphCore:
 
     @property
     def nmi_pending(self) -> bool:
-        return self.rt._nmi_pending
+        return self.rt.nmi_pending
 
     def set_nmi(self) -> None:
         self.rt.set_nmi()

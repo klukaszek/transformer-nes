@@ -34,8 +34,8 @@ from transformer_nes.graph.core import (
     LookUpDimension,
     PersistDimension,
     ReGLUDimension,
-    _all_dims,
-    _all_lookups,
+    graph_dims,
+    graph_lookups,
 )
 from transformer_nes.graph.core import (
     inv_log_pos as _default_inv_log_pos,
@@ -54,14 +54,14 @@ def _build_graph(all_dims=None, all_lookups=None, ilp=None):
     """Build dependency graph from dim/lookup lists.
 
     Args:
-        all_dims: list of Dimension objects (defaults to module-global _all_dims)
-        all_lookups: list of LookUp objects (defaults to module-global _all_lookups)
+        all_dims: list of Dimension objects (defaults to module-global graph_dims)
+        all_lookups: list of LookUp objects (defaults to module-global graph_lookups)
         ilp: the inv_log_pos dimension (defaults to module-global inv_log_pos)
     """
     if all_dims is None:
-        all_dims = _all_dims
+        all_dims = graph_dims
     if all_lookups is None:
-        all_lookups = _all_lookups
+        all_lookups = graph_lookups
     if ilp is None:
         ilp = _default_inv_log_pos
     inputs = [d for d in all_dims if isinstance(d, InputDimension)]

@@ -33,16 +33,16 @@ from transformer_nes.model.classify import (
     register_query,
 )
 
-_ATTENTION_DIR = os.path.join(
+ATTENTION_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "attention"
 )
-_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_engine_cache")
-_MANIFEST_PATH = os.path.join(_CACHE_DIR, "manifest.json")
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_engine_cache")
+MANIFEST_PATH = os.path.join(CACHE_DIR, "manifest.json")
 
 # Everything whose content can change the emitted engine, hashed into the
 # config key so any edit is a cache miss (over-inclusion is safe).
-_CODE_DIRS = ("graph", "scheduler", "model", "attention")
-_CODE_FILES = (
+CODE_DIRS = ("graph", "scheduler", "model", "attention")
+CODE_FILES = (
     "cpu6502/spec.py",
     "cpu6502/backends/evaluator.py",
     "cpu6502/backends/reference.py",
@@ -60,14 +60,14 @@ def _code_digest() -> str:
         return _code_digest_cache
     pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     paths = []
-    for d in _CODE_DIRS:
+    for d in CODE_DIRS:
         for root, dirs, files in os.walk(os.path.join(pkg, d)):
             dirs[:] = [x for x in dirs if x not in ("__pycache__", "_engine_cache")]
             paths.extend(
                 os.path.join(root, f) for f in files
                 if f.endswith((".py", ".h", ".hpp", ".cpp"))
             )
-    paths.extend(os.path.join(pkg, *f.split("/")) for f in _CODE_FILES)
+    paths.extend(os.path.join(pkg, *f.split("/")) for f in CODE_FILES)
     h = hashlib.sha256()
     for p in sorted(paths, key=lambda p: os.path.relpath(p, pkg)):
         h.update(os.path.relpath(p, pkg).encode())
@@ -87,7 +87,7 @@ def engine_config_key(*, bcd: bool, expert_bytes, extra: str = "") -> str:
 
 def _manifest_read() -> dict:
     try:
-        with open(_MANIFEST_PATH) as f:
+        with open(MANIFEST_PATH) as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -96,14 +96,14 @@ def _manifest_read() -> dict:
 def _manifest_put(key: str, entry: dict) -> None:
     manifest = _manifest_read()
     manifest[key] = entry
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    tmp = _MANIFEST_PATH + ".tmp"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = MANIFEST_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(manifest, f, indent=1, sort_keys=True)
-    os.replace(tmp, _MANIFEST_PATH)
+    os.replace(tmp, MANIFEST_PATH)
 
 
-_FUNC_RE = re.compile(r"^    void ((?:layer_|step_core)\w*)\((.*)\) \{$")
+FUNC_RE = re.compile(r"^    void ((?:layer_|step_core)\w*)\((.*)\) \{$")
 
 
 def _shard_source(source: str, struct_name: str, n_shards: int) -> tuple[str, list[str]]:
@@ -120,7 +120,7 @@ def _shard_source(source: str, struct_name: str, n_shards: int) -> tuple[str, li
     i = 0
     while i < len(lines):
         line = lines[i]
-        m = _FUNC_RE.match(line)
+        m = FUNC_RE.match(line)
         if m is not None:
             depth = line.count("{") - line.count("}")
             chunk = [f"void {struct_name}::{m.group(1)}({m.group(2)}) {{"]
@@ -160,7 +160,7 @@ def _load_module(
     """Load a cached extension or compile it from ``sources``."""
     if name in sys.modules:
         return sys.modules[name], 0.0
-    build_dir = os.path.join(_CACHE_DIR, f"build_{digest}")
+    build_dir = os.path.join(CACHE_DIR, f"build_{digest}")
     so_path = os.path.join(build_dir, f"{name}.so")
     if os.path.exists(so_path):
         spec = importlib.util.spec_from_file_location(name, so_path)
@@ -178,7 +178,7 @@ def _load_module(
         name=name,
         sources=sources,
         extra_cflags=cflags,
-        extra_include_paths=[_ATTENTION_DIR, _CACHE_DIR],
+        extra_include_paths=[ATTENTION_DIR, CACHE_DIR],
         build_directory=build_dir,
         verbose=False,
     )
@@ -187,10 +187,10 @@ def _load_module(
 
 def _load_engine_module(digest: str) -> tuple[object, float]:
     shard_glob = sorted(
-        f for f in os.listdir(_CACHE_DIR)
+        f for f in os.listdir(CACHE_DIR)
         if f.startswith(f"engine_{digest}_s") and f.endswith(".cpp")
     )
-    sources = [os.path.join(_CACHE_DIR, path) for path in shard_glob]
+    sources = [os.path.join(CACHE_DIR, path) for path in shard_glob]
     return _load_module(f"weights_gen_{digest}", digest, sources)
 
 
@@ -207,7 +207,7 @@ def _load_seqmod_module(digest: str) -> tuple[object, float]:
     return _load_module(
         f"seqmod_gen_{digest}",
         digest,
-        [os.path.join(_CACHE_DIR, f"seqmod_{digest}.cpp")],
+        [os.path.join(CACHE_DIR, f"seqmod_{digest}.cpp")],
     )
 
 
@@ -332,7 +332,7 @@ def _check_ffn_kinds(model, layer_idx):
 # generated source is `"\n".join(lines)`, so emitting one multi-line block is
 # byte-for-byte identical to emitting each of its lines.
 
-_INCLUDES = """\
+INCLUDES = """\
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cmath>
@@ -348,7 +348,7 @@ using FArr = py::array_t<float, py::array::c_style | py::array::forcecast>;
 using LArr = py::array_t<long long, py::array::c_style | py::array::forcecast>;"""
 
 # Fixed-point rescale/readout guards; ELEM is the int residual type.
-_FIXED_POINT_HELPERS = """\
+FIXED_POINT_HELPERS = """\
     static ELEM shr(ELEM v) {
         // Rescale a product of two fixed-point values; the
         // represented result must stay on the F-bit grid.
@@ -375,14 +375,14 @@ _FIXED_POINT_HELPERS = """\
 
 # Exact nearest-written-address argmax over one 4 KiB memory group; the
 # emission is shared with the C++ kernel (run_protocol.py).
-_MEM_QUERY = mem_query_cpp("long long")
+MEM_QUERY = mem_query_cpp("long long")
 
 # Per-ROM sequence-module hook: a separately compiled window module attaches
 # its dispatch through a raw function pointer, so a new ROM's window set never
 # recompiles this TU.  The module fills seq_out with K trace rows per forward.
 # A pinned module window outranks the canonical shape table (it folded the
 # operands too, so its forward is cheaper); both fall back to per-step.
-_SEQ_HOOK = """\
+SEQ_HOOK = """\
     typedef int (*SeqFn)(void*, void*, long, long, long, long, int);
     SeqFn seq_fn = nullptr;
     void* seq_ctx = nullptr;
@@ -407,7 +407,7 @@ _SEQ_HOOK = """\
 
 # Per-iteration body of the shared run loop (run_protocol.run_loop_cpp):
 # sequence dispatch, then the per-instruction step_core fallback.
-_ENGINE_STEP_BODY = """\
+ENGINE_STEP_BODY = """\
             // A routed sequence consumes a whole window in one forward;
             // its guards (in seq_dispatch) keep this step-for-step
             // equivalent to the per-instruction path below.
@@ -469,11 +469,11 @@ _ENGINE_STEP_BODY = """\
 
 # Shadow-decode + the shared run loop + machine API (run_protocol.py blocks;
 # the C++ kernel emits the same protocol).
-_RUN_LOOP = "\n\n".join((
+RUN_LOOP = "\n\n".join((
     SHADOW_READ_TARGET_CPP,
     IN_RANGES_CPP,
     run_loop_cpp(extra_locals="        long long o[21];",
-                 step_body=_ENGINE_STEP_BODY),
+                 step_body=ENGINE_STEP_BODY),
     """\
     // ── JIT profile counter ──────────────────────────────────
     // The run loop counts every per-instruction (fallback) step by pc;
@@ -521,7 +521,7 @@ _RUN_LOOP = "\n\n".join((
 ))
 
 # The pybind .def() lines gated on has_step (the machine_step + run-loop API).
-_PYBIND_STEP_METHODS = """\
+PYBIND_STEP_METHODS = """\
         .def("machine_step", &ENGINE_T::machine_step)
         .def("run", &ENGINE_T::run, py::arg("max_steps"),
              py::arg("stop_on_trap") = false, py::arg("max_cycles") = 0L)
@@ -544,8 +544,8 @@ _PYBIND_STEP_METHODS = """\
         .def("window_shape", &ENGINE_T::window_shape)"""
 
 
-# Core-side seq_out capacity; keep in sync with SEQ_MAX_K in _SEQ_HOOK.
-_SEQ_MAX_K = 32
+# Core-side seq_out capacity; keep in sync with SEQ_MAX_K in SEQ_HOOK.
+SEQ_MAX_K = 32
 
 
 def _assemble_seq_module(lines, body, experts, core_digest, elem,
@@ -557,10 +557,10 @@ def _assemble_seq_module(lines, body, experts, core_digest, elem,
     core_name = f"Engine_{core_digest}"
     mod_xbuf = max(e["model"].tok.weight.shape[1] for e in experts)
     max_k = max(e["n_steps"] for e in experts)
-    if max_k > _SEQ_MAX_K:
+    if max_k > SEQ_MAX_K:
         raise RuntimeError(
             f"sequence window of {max_k} steps exceeds the core's "
-            f"seq_out capacity ({_SEQ_MAX_K})"
+            f"seq_out capacity ({SEQ_MAX_K})"
         )
     emit("// Generated per-ROM sequence module (model/engine_gen.py): folded")
     emit("// window experts + dispatch, compiled against the core engine's")
@@ -1188,7 +1188,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     has_run = step_spec is not None and n_memory_heads > 0
 
     emit("// Generated exact-int32 engine (model/engine_gen.py).")
-    emit(_INCLUDES)
+    emit(INCLUDES)
     emit("")
     emit("struct ENGINE_T {")
     emit(f"    static constexpr int D = {d_model};")
@@ -1200,9 +1200,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit("    static constexpr double SCALE_D = (double)SCALE;")
     emit(f"    {elem} xbuf[{xbuf_size}];")
     emit("")
-    emit(_FIXED_POINT_HELPERS.replace("ELEM", elem))
+    emit(FIXED_POINT_HELPERS.replace("ELEM", elem))
     emit("")
-    emit(_MEM_QUERY)
+    emit(MEM_QUERY)
     if n_regs:
         emit("")
         emit("    // Running argmax for constant-query heads (exact integer")
@@ -1385,7 +1385,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         # one forward, compiled per-ROM into a separate module that attaches
         # through the function-pointer hook -- no core recompile per ROM.
         emit("")
-        emit(_SEQ_HOOK)
+        emit(SEQ_HOOK)
         emit("")
         emit("    // Per-instruction entry point used by machine_step().")
         emit("    void machine_step(int pc, int a, int xr, int yr, int sr,")
@@ -1403,7 +1403,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
 
         # ── C++ run loop (KernelBus shape) and machine API ───────────
         emit("")
-        emit(_RUN_LOOP)
+        emit(RUN_LOOP)
 
     emit("};")
     emit("")
@@ -1413,7 +1413,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit("        .def(\"reset\", &ENGINE_T::reset)")
     emit("        .def(\"forward_token\", &ENGINE_T::forward_token)")
     if has_step:
-        emit(_PYBIND_STEP_METHODS)
+        emit(PYBIND_STEP_METHODS)
     emit("        .def(\"insert_write\", &ENGINE_T::insert_write);")
     emit("}")
 
@@ -1437,13 +1437,13 @@ class GeneratedWeightsEngine:
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         self.digest = digest
         source = source.replace("ENGINE_T", f"Engine_{digest}")
-        os.makedirs(_CACHE_DIR, exist_ok=True)
-        hpp_path = os.path.join(_CACHE_DIR, f"engine_{digest}.hpp")
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        hpp_path = os.path.join(CACHE_DIR, f"engine_{digest}.hpp")
         if not os.path.exists(hpp_path):
             n_shards = max(1, min((os.cpu_count() or 4) - 2, 12))
             header, shards = _shard_source(source, f"Engine_{digest}", n_shards)
             for k, body in enumerate(shards):
-                with open(os.path.join(_CACHE_DIR, f"engine_{digest}_s{k}.cpp"),
+                with open(os.path.join(CACHE_DIR, f"engine_{digest}_s{k}.cpp"),
                           "w") as f:
                     f.write(f'#include "engine_{digest}.hpp"\n\n{body}')
             with open(hpp_path, "w") as f:
@@ -1466,7 +1466,7 @@ class GeneratedWeightsEngine:
         if entry is None:
             return None
         if not os.path.exists(
-            os.path.join(_CACHE_DIR, f"engine_{entry['digest']}.hpp")
+            os.path.join(CACHE_DIR, f"engine_{entry['digest']}.hpp")
         ):
             return None
         self = cls.__new__(cls)
@@ -1542,8 +1542,8 @@ class SequenceModule:
         source = source.replace("SEQMOD_T", f"SeqMod_{digest}")
         self.core_digest = core_digest
         self.digest = digest
-        os.makedirs(_CACHE_DIR, exist_ok=True)
-        path = os.path.join(_CACHE_DIR, f"seqmod_{digest}.cpp")
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        path = os.path.join(CACHE_DIR, f"seqmod_{digest}.cpp")
         if not os.path.exists(path):
             with open(path, "w") as f:
                 f.write(source)
@@ -1565,7 +1565,7 @@ class SequenceModule:
             or entry.get("kind") != "seqmod"
             or entry["core"] != core_digest
             or not os.path.exists(
-                os.path.join(_CACHE_DIR, f"seqmod_{entry['digest']}.cpp")
+                os.path.join(CACHE_DIR, f"seqmod_{entry['digest']}.cpp")
             )
         ):
             return None

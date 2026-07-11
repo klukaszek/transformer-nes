@@ -22,7 +22,7 @@ from transformer_nes.cpu6502.spec import (
     READS_MEMORY,
 )
 
-_READ_MODE_CODE = {
+READ_MODE_CODE = {
     MODE_ZERO_PAGE: 1,
     MODE_ZERO_PAGE_X: 2,
     MODE_ZERO_PAGE_Y: 3,
@@ -39,7 +39,7 @@ def read_mode_table() -> tuple[int, ...]:
     table = [0] * 256
     for byte, op in OPCODES.items():
         if op.operation in READS_MEMORY:
-            table[byte] = _READ_MODE_CODE.get(op.mode, 0)
+            table[byte] = READ_MODE_CODE.get(op.mode, 0)
     return tuple(table)
 
 
@@ -51,7 +51,7 @@ def cycle_table() -> tuple[int, ...]:
     return tuple(table)
 
 
-_MEM_QUERY_TEMPLATE = """\
+MEM_QUERY_TEMPLATE = """\
     // Exact memory-head argmax: nearest address wins; equal-distance
     // ties use the latest write. One structure serves each 4 KiB group,
     // so attention state is O(1) in the token log.
@@ -110,7 +110,7 @@ def mem_query_cpp(out_type: str) -> str:
     cast = "" if out_type == "long long" else f"({out_type})"
     zero = "0.0" if out_type == "double" else "0"
     return (
-        _MEM_QUERY_TEMPLATE
+        MEM_QUERY_TEMPLATE
         .replace("{OUT}", out_type)
         .replace("{CAST}", cast)
         .replace("{ZERO}", zero)
@@ -182,7 +182,7 @@ MACHINE_API_CPP = """\
     py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }"""
 
 
-_RUN_LOOP_TEMPLATE = """\
+RUN_LOOP_TEMPLATE = """\
     // Run up to max_steps instructions natively, pausing back to
     // Python only on halt / jump-to-self trap / watched device
     // access / cycle budget.  One protocol and result dict for both
@@ -245,7 +245,7 @@ def run_loop_cpp(*, extra_locals: str, step_body: str) -> str:
     per-iteration step body (everything between the watch/lease check and
     the loop's closing brace)."""
     return (
-        _RUN_LOOP_TEMPLATE
+        RUN_LOOP_TEMPLATE
         .replace("{EXTRA_LOCALS}", extra_locals)
         .replace("{STEP_BODY}", step_body)
     )

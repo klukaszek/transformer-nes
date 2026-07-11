@@ -9,16 +9,16 @@ from __future__ import annotations
 
 from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
 
-_SEQUENCE_WRITERS = frozenset({
+SEQUENCE_WRITERS = frozenset({
     "store_a", "store_x", "store_y", "sax", "pha", "php",
     "jsr", "brk", "rti", "rts", "pla", "plp",
 })
-_SEQUENCE_RMW = frozenset({
+SEQUENCE_RMW = frozenset({
     "asl", "lsr", "rol", "ror", "inc", "dec",
     "slo", "rla", "sre", "rra", "dcp", "isb", "lax",
 })
 BRANCH_OPERATIONS = frozenset({"bcc", "bcs", "beq", "bmi", "bne", "bpl", "bvc", "bvs"})
-_MAX_INSTRUCTIONS = 4
+MAX_INSTRUCTIONS = 4
 
 # Canonical window shapes compile once into the core engine with pc and every
 # operand byte symbolic. Entries are (name, template, spin_repeat); operands
@@ -96,14 +96,14 @@ def scan_sequence_windows(image, *, spin_repeat: int = 4, limit: int = 16):
     windows = []
     for head in range(len(data)):
         pc = head
-        for index in range(_MAX_INSTRUCTIONS):
+        for index in range(MAX_INSTRUCTIONS):
             op = OPCODES.get(data[pc]) if pc < len(data) - 2 else None
             if op is None:
                 break
             reads = op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm")
             if (
-                op.operation in _SEQUENCE_WRITERS
-                or (op.operation in _SEQUENCE_RMW and op.mode != "acc")
+                op.operation in SEQUENCE_WRITERS
+                or (op.operation in SEQUENCE_RMW and op.mode != "acc")
                 or (index > 0 and reads)
             ):
                 break

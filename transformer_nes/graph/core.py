@@ -7,8 +7,8 @@ milp_schedule.py + build_model.py.
 
 BIG = 1e30  # large constant used to effectively zero-out attention keys (clear_key mechanism)
 
-_all_dims = []
-_all_lookups = []
+graph_dims = []
+graph_lookups = []
 _multiply_cache = {}
 _reglu_cache = {}
 _stepglu_cache = {}
@@ -121,7 +121,7 @@ class Dimension:
         Dimension._counter += 1
         self.name = name or f"dim_{self.id}"
         self.kind = kind
-        _all_dims.append(self)
+        graph_dims.append(self)
 
     def _as_expr(self):
         return Expression({self: 1})
@@ -203,7 +203,7 @@ class LookUp:
         self.key_exprs_2d = key_exprs_2d  # [kx_expr, ky_expr]
         self.tie_break = tie_break
         self.dims = [LookUpDimension(self, i) for i in range(len(value_exprs))]
-        _all_lookups.append(self)
+        graph_lookups.append(self)
 
 
 class LookUpDimension(Dimension):
@@ -213,7 +213,7 @@ class LookUpDimension(Dimension):
         self.value_index = value_index
 
 
-def _make_multiply(a, b):
+def make_multiply(a, b):
     ka, kb = _expr_key(a), _expr_key(b)
     key = (ka, kb)
     if key in _multiply_cache:
@@ -226,7 +226,7 @@ def _make_multiply(a, b):
     return result
 
 
-def _to_expr(x):
+def to_expr(x):
     if isinstance(x, Expression):
         return x
     if isinstance(x, Dimension):
@@ -243,8 +243,8 @@ def reglu(a, b):
 
     Use when b is known non-negative, giving reglu(a, b) = a * b.
     """
-    a_expr = _to_expr(a)
-    b_expr = _to_expr(b)
+    a_expr = to_expr(a)
+    b_expr = to_expr(b)
     key = (_expr_key(a_expr), _expr_key(b_expr))
     if key in _reglu_cache:
         return Expression({_reglu_cache[key]: 1})
@@ -261,8 +261,8 @@ def stepglu(a, b):
     The two ReGLU dims are internal to the FFN; the persist dim
     stores the difference in a single residual slot.
     """
-    a_expr = _to_expr(a)
-    b_expr = _to_expr(b)
+    a_expr = to_expr(a)
+    b_expr = to_expr(b)
     key = (_expr_key(a_expr), _expr_key(b_expr))
     if key in _stepglu_cache:
         return _stepglu_cache[key]
@@ -280,7 +280,7 @@ def persist(expr, name=None):
     d_model by allowing the expression's constituents to die earlier.
     Treated as a schedulable operation (separate phase) for scheduling.
     """
-    expr = _to_expr(expr)
+    expr = to_expr(expr)
     dim = PersistDimension(expr, name=name)
     return Expression({dim: 1})
 
@@ -301,7 +301,7 @@ def _to_2d_key(k, clear_key_expr=None, tie_break="latest"):
         c = k.terms[position]
         k_abs = Expression({position_sq: c * c})
     else:
-        k_abs = _make_multiply(k, k)
+        k_abs = make_multiply(k, k)
     kx = k * 2
     ky = -k_abs
     if clear_key_expr is not None:
@@ -324,10 +324,10 @@ def _to_2d_query(q):
 def fetch(value, query=None, key=None, clear_key=None, tie_break="latest"):
     is_list = isinstance(value, (list, tuple))
     values = list(value) if is_list else [value]
-    value_exprs = [_to_expr(v) for v in values]
-    q = _to_expr(query) if query is not None else Expression()
-    k = _to_expr(key) if key is not None else Expression()
-    ck = _to_expr(clear_key) if clear_key is not None else None
+    value_exprs = [to_expr(v) for v in values]
+    q = to_expr(query) if query is not None else Expression()
+    k = to_expr(key) if key is not None else Expression()
+    ck = to_expr(clear_key) if clear_key is not None else None
     key_2d = _to_2d_key(k, ck, tie_break=tie_break)
     query_2d = _to_2d_query(q)
     lookup = LookUp(value_exprs, query_2d, key_2d, tie_break=tie_break)
@@ -395,8 +395,8 @@ def reset_graph():
     inv_log_pos, position_sq) that every ALM requires.
     """
     global one, position, inv_log_pos, position_sq
-    _all_dims.clear()
-    _all_lookups.clear()
+    graph_dims.clear()
+    graph_lookups.clear()
     _multiply_cache.clear()
     _reglu_cache.clear()
     _stepglu_cache.clear()
@@ -419,8 +419,8 @@ class ProgramGraph:
     def __init__(self, input_tokens, output_tokens):
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
-        self.all_dims = list(_all_dims)
-        self.all_lookups = list(_all_lookups)
+        self.all_dims = list(graph_dims)
+        self.all_lookups = list(graph_lookups)
         self.one = one
         self.position = position
         self.inv_log_pos = inv_log_pos

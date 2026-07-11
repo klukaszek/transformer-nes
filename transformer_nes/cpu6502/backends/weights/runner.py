@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.evaluator import _RUNTIME_READ_DIMS, Cpu6502Runtime
+from transformer_nes.cpu6502.backends.evaluator import RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.cpu6502.backends.weights.experts import (
     build_opcode_experts,
     build_sequence_expert,
@@ -67,7 +67,7 @@ class Cpu6502TransformerMachine:
         # at prediction time (only STATE vs HALT compete).
         output_tokens = dict(self.rt.output_tokens)
         readout = 0
-        for name in _RUNTIME_READ_DIMS:
+        for name in RUNTIME_READ_DIMS:
             readout = readout + 1e-6 * self._dim_by_name[name]
         output_tokens["READOUT"] = readout
 
@@ -89,9 +89,9 @@ class Cpu6502TransformerMachine:
         self._halt_row = tok_to_idx["HALT"]
         self._read_slots = {
             name: self.slot_of[self._dim_by_name[name]]
-            for name in _RUNTIME_READ_DIMS
+            for name in RUNTIME_READ_DIMS
         }
-        self._one_slot = self.slot_of[self.rt._one]
+        self._one_slot = self.slot_of[self.rt.one]
 
         # The whole layer stack -- hull attention plus the structural
         # passthrough fusion -- runs inside the generated C++ engine
@@ -303,24 +303,24 @@ class Cpu6502TransformerMachine:
             if byte:
                 self._insert_write(addr, byte)
         self._seed_pos = self.pos
-        self._mstate = {
+        self.mstate = {
             "pc": start_pc & 0xFFFF, "a": 0, "x": 0, "y": 0, "s": 0xFD,
             "p": reference.FLAG_U | reference.FLAG_I,
             "ir": 0, "oplo": 0, "ophi": 0, "ea": 0, "data": 0, "halted": 0,
         }
         if state is not None:
-            self._mstate.update({k: int(state[k]) for k in self._mstate if k in state})
-        self._nmi_pending = False
+            self.mstate.update({k: int(state[k]) for k in self.mstate if k in state})
+        self.nmi_pending = False
         self.machine_halted = False
         self._populate_shape_windows()
 
     @property
     def machine_state(self) -> dict:
-        return dict(self._mstate)
+        return dict(self.mstate)
 
     def set_nmi(self):
         """The interrupt sequence itself then runs inside the weights."""
-        self._nmi_pending = True
+        self.nmi_pending = True
         # In the native run loop the pending-NMI flag lives in the engine
         # (the per-step path passes it as an argument instead).
         if self._engine.has_run_loop:
@@ -340,9 +340,9 @@ class Cpu6502TransformerMachine:
         """One instruction entirely in generated C++ (embed, layers,
         readout, direct WRITE inserts, halt logits); Python only unpacks
         the 21-slot result and keeps the mirrors in sync."""
-        st = self._mstate
-        nmi = 1 if self._nmi_pending else 0
-        self._nmi_pending = False
+        st = self.mstate
+        nmi = 1 if self.nmi_pending else 0
+        self.nmi_pending = False
         self._engine.machine_step(
             st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
             st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"],
@@ -391,10 +391,10 @@ class Cpu6502TransformerMachine:
             return False
         state = self.machine_state
         trace_len = self._trace_len
-        nmi = self._nmi_pending
+        nmi = self.nmi_pending
         self.boot_image(self._ram, start_pc=state["pc"], state=state)
         self._trace_len = trace_len
-        self._nmi_pending = nmi
+        self.nmi_pending = nmi
         self.checkpoints += 1
         return True
 
@@ -423,7 +423,7 @@ class Cpu6502TransformerMachine:
         return self._engine.has_run_loop
 
     def _seed_run_state(self) -> None:
-        st = self._mstate
+        st = self.mstate
         self._engine.set_run_state(
             st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
             st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"], st["halted"],
@@ -433,7 +433,7 @@ class Cpu6502TransformerMachine:
         """Copy the engine's architectural state back into the Python mirror
         (called after a native run so machine protocol / checkpointing see it)."""
         s = self._engine.get_run_state()
-        self._mstate.update(
+        self.mstate.update(
             pc=int(s["pc"]), a=int(s["a"]), x=int(s["x"]), y=int(s["y"]),
             s=int(s["s"]), p=int(s["p"]), ir=int(s["ir"]), oplo=int(s["oplo"]),
             ophi=int(s["ophi"]), ea=int(s["ea"]), data=int(s["data"]),
@@ -532,7 +532,7 @@ class Cpu6502TransformerMachine:
     def set_state(self, state: dict) -> None:
         """Restore architectural state after a snapshot rebuild (mirrors the
         C++ kernel's set_state; the trace context fields carry over)."""
-        st = dict(self._mstate)
+        st = dict(self.mstate)
         for k in st:
             if k in state:
                 st[k] = int(state[k])
@@ -541,7 +541,7 @@ class Cpu6502TransformerMachine:
             st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"],
             1 if state.get("halted") else 0,
         )
-        self._mstate.update(st)
+        self.mstate.update(st)
         self.machine_halted = bool(state.get("halted", self.machine_halted))
 
 
