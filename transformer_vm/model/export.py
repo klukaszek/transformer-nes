@@ -81,7 +81,12 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
             "act = gate > 0 ? gate*value : 0, x += ff_out @ act.  No "
             "normalization.  Position features are added at slots 0..2 of "
             "the embedding: pos, 1/ln(2) - 1/ln(pos+2), pos^2.  Readouts "
-            "round half-to-even."
+            "round half-to-even.  Precision: values are exact in float64; "
+            "float32 weights/residuals are also exact for THIS construction "
+            "(certified: residual values are dyadic rationals < 2^24, and "
+            "grouped keys keep attention score gaps above f32 rounding), "
+            "but the three position features must stay float64 -- pos^2 "
+            "exceeds f32's exact-integer range past pos ~ 4096."
         ),
         "bcd": bcd,
         "d_model": int(info.d_model),
