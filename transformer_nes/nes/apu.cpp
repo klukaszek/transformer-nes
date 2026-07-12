@@ -16,8 +16,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cstdint>
-#include <cstring>
-#include <vector>
 
 namespace py = pybind11;
 
@@ -229,7 +227,6 @@ struct APU {
     double cycles_per_sample;
     double sample_accum = 0.0;
     double hp_prev_in = 0.0, hp_prev_out = 0.0;  // DC-blocker state
-    std::vector<float> samples;
     py::function memory_reader;
     int dma_stall = 0;
 
@@ -491,16 +488,22 @@ struct APU {
             py::function& reader;
             ~ResetReader() { reader = py::function(); }
         } reset_reader{memory_reader};
-        samples.clear();
+        // sample_accum is kept in [0, cycles_per_sample), so this is the
+        // exact number the loop below will emit.  Write straight into the
+        // Python-owned result instead of staging in a vector and copying a
+        // second time at the end of every frame.
+        const auto sample_count = static_cast<py::ssize_t>(
+            (sample_accum + cpu_cycles) / cycles_per_sample);
+        auto out = py::array_t<float>(sample_count);
+        float* samples = out.mutable_data();
+        py::ssize_t written = 0;
         for (int i = 0; i < cpu_cycles; ++i) {
             clock_cycle();
             if (++sample_accum >= cycles_per_sample) {
                 sample_accum -= cycles_per_sample;
-                samples.push_back(sample());
+                samples[written++] = sample();
             }
         }
-        auto out = py::array_t<float>((py::ssize_t)samples.size());
-        std::memcpy(out.mutable_data(), samples.data(), samples.size() * sizeof(float));
         return out;
     }
 

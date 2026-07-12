@@ -140,6 +140,10 @@ struct PPU {
         std::memset(nametables, 0, sizeof(nametables));
         std::memset(palette, 0, sizeof(palette));
         std::memset(oam, 0, sizeof(oam));
+        // MMC5 games normally issue only a handful of raster IRQs per frame.
+        // Keep their journal's storage for the PPU lifetime so mark_split()
+        // never visits the allocator during ordinary rendering.
+        raster_splits.reserve(8);
     }
 
     // ── Device protocol (registers $2000-$3FFF, mirrored every 8) ──
@@ -460,6 +464,7 @@ struct PPU {
         const int sy = band.y_base >= 0
             ? ((band.y_base - y0) % 480 + 480) % 480
             : scroll_row_480(bt_addr) % 480;
+        const bool extended = mmc5.active() && mmc5.extended_attributes();
         // Left-edge masking: the leftmost 8 pixels show the backdrop (and
         // count as transparent for sprite priority) with the bit clear.
         const int x0 = (band.mask & 0x02) ? 0 : 8;
@@ -470,31 +475,42 @@ struct PPU {
                 frame[y * 256 + x] = backdrop;
                 bg_opaque[y][x] = false;
             }
+            int cached_tcol = -1, cached_quad_x = -1;
+            int b0 = 0, b1 = 0, palsel = 0;
             for (int x = x0; x < 256; ++x) {
                 const int cx = (x + sx) % 512;
                 const int lx = cx % 256, quad_x = cx / 256;
                 const int trow = ly >> 3, tcol = lx >> 3;
-                const int logical = 0x2000 + (quad_y * 2 + quad_x) * 0x400;
-                const int tile = nt_read_for(logical + trow * 32 + tcol,
-                                             band.mirroring);
-                int pix;
-                if (mmc5.active() && mmc5.extended_attributes()) {
-                    const int pattern = mmc5.extended_chr_base(trow * 32 + tcol)
-                        + tile * 16 + (ly & 7);
-                    const int b0 = chr[pattern % chr.size()];
-                    const int b1 = chr[(pattern + 8) % chr.size()];
-                    const int bit = 7 - (lx & 7);
-                    pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
-                } else {
-                    pix = tile_pixel(band.banks, bg_table + tile, ly & 7, lx & 7);
+                // Tile, attribute, bank and pattern bytes are invariant for
+                // all eight pixels.  The old loop decoded each of them eight
+                // times, which became especially costly with MMC5 routing.
+                if (tcol != cached_tcol || quad_x != cached_quad_x) {
+                    cached_tcol = tcol;
+                    cached_quad_x = quad_x;
+                    const int logical =
+                        0x2000 + (quad_y * 2 + quad_x) * 0x400;
+                    const int tile = nt_read_for(
+                        logical + trow * 32 + tcol, band.mirroring);
+                    if (extended) {
+                        const int pattern =
+                            mmc5.extended_chr_base(trow * 32 + tcol)
+                            + tile * 16 + (ly & 7);
+                        b0 = chr[pattern % chr.size()];
+                        b1 = chr[(pattern + 8) % chr.size()];
+                        palsel = mmc5.extended_value(trow * 32 + tcol) >> 6;
+                    } else {
+                        const int pattern = (bg_table + tile) * 16 + (ly & 7);
+                        b0 = chr[chr_index(band.banks, pattern)];
+                        b1 = chr[chr_index(band.banks, pattern + 8)];
+                        const uint8_t attr = nt_read_for(
+                            logical + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2),
+                            band.mirroring);
+                        const int shift = ((trow & 2) << 1) | (tcol & 2);
+                        palsel = (attr >> shift) & 3;
+                    }
                 }
-                const uint8_t attr =
-                    nt_read_for(logical + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2),
-                                band.mirroring);
-                const int shift = ((trow % 4) / 2) * 4 + ((tcol % 4) / 2) * 2;
-                const int palsel = (mmc5.active() && mmc5.extended_attributes())
-                    ? (mmc5.extended_value(trow * 32 + tcol) >> 6)
-                    : ((attr >> shift) & 3);
+                const int bit = 7 - (lx & 7);
+                const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
                 frame[y * 256 + x] = pix ? pal[palsel * 4 + pix] : backdrop;
                 bg_opaque[y][x] = pix != 0;
             }
