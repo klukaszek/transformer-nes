@@ -602,6 +602,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        .def("set_read_lease_seq", &KERNEL_T::set_read_lease_seq)')
     emit('        .def("take_lease_served", &KERNEL_T::take_lease_served)')
     emit('        .def("clear_read_lease", &KERNEL_T::clear_read_lease)')
+    emit('        .def("clear_read_lease_addr", &KERNEL_T::clear_read_lease_addr)')
     emit('        .def("set_nmi", &KERNEL_T::set_nmi)')
     emit('        .def("set_irq", &KERNEL_T::set_irq)')
     emit('        .def("clear_irq", &KERNEL_T::clear_irq)')
@@ -689,6 +690,9 @@ class Cpu6502CppRuntime:
 
     def clear_read_lease(self):
         self.kernel.clear_read_lease()
+
+    def clear_read_lease_addr(self, addr: int):
+        self.kernel.clear_read_lease_addr(addr)
 
     def set_nmi(self):
         self.kernel.set_nmi()

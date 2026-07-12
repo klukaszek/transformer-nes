@@ -560,6 +560,7 @@ PYBIND_STEP_METHODS = """\
         .def("set_read_lease", &ENGINE_T::set_read_lease)
         .def("set_read_lease_seq", &ENGINE_T::set_read_lease_seq)
         .def("take_lease_served", &ENGINE_T::take_lease_served)
+        .def("clear_read_lease_addr", &ENGINE_T::clear_read_lease_addr)
         .def("clear_read_lease", &ENGINE_T::clear_read_lease)
         .def("set_nmi", &ENGINE_T::set_nmi)
         .def("set_irq", &ENGINE_T::set_irq)
@@ -1528,6 +1529,7 @@ class GeneratedWeightsEngine:
             self.set_read_lease_seq = self.engine.set_read_lease_seq
             self.take_lease_served = self.engine.take_lease_served
             self.clear_read_lease = self.engine.clear_read_lease
+            self.clear_read_lease_addr = self.engine.clear_read_lease_addr
             self.set_nmi = self.engine.set_nmi
             self.set_irq = self.engine.set_irq
             self.clear_irq = self.engine.clear_irq

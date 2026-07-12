@@ -235,6 +235,14 @@ MACHINE_API_CPP = """\
             lease_addr[s] = -1; lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
         }
     }
+    // Targeted invalidation (a write only disturbs its own device's
+    // registers); the bus flushes served counts first.
+    void clear_read_lease_addr(int addr) {
+        const int s = lease_slot(addr & 0xFFFF);
+        if (s >= 0) {
+            lease_addr[s] = -1; lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
+        }
+    }
     long take_lease_served(int addr) {
         const int s = lease_slot(addr & 0xFFFF);
         if (s < 0) return 0;
@@ -297,21 +305,26 @@ RUN_LOOP_TEMPLATE = """\
         auto arr = [](const std::vector<int>& src) {
             return py::array_t<int>((py::ssize_t)src.size(), src.data());
         };
-        out["pc"] = arr(t_pc);
-        out["a"] = arr(t_a);
-        out["x"] = arr(t_x);
-        out["y"] = arr(t_y);
-        out["s"] = arr(t_s);
-        out["p"] = arr(t_p);
-        out["ir"] = arr(t_ir);
-        out["oplo"] = arr(t_oplo);
-        out["ophi"] = arr(t_ophi);
-        out["ea"] = arr(t_ea);
-        out["data"] = arr(t_data);
-        out["halted"] = arr(t_halted);
-        out["w_row"] = py::array_t<long>((py::ssize_t)w_row.size(), w_row.data());
-        out["w_addr"] = arr(w_addr);
-        out["w_value"] = arr(w_value);
+        // Untraced runs (the console's gameplay path pauses 100+ times a
+        // frame) return only what the bus reads; the 12 empty per-step
+        // arrays measurably cost at that pause rate.
+        if (trace) {
+            out["pc"] = arr(t_pc);
+            out["a"] = arr(t_a);
+            out["x"] = arr(t_x);
+            out["y"] = arr(t_y);
+            out["s"] = arr(t_s);
+            out["p"] = arr(t_p);
+            out["ir"] = arr(t_ir);
+            out["oplo"] = arr(t_oplo);
+            out["ophi"] = arr(t_ophi);
+            out["ea"] = arr(t_ea);
+            out["data"] = arr(t_data);
+            out["halted"] = arr(t_halted);
+            out["w_row"] = py::array_t<long>((py::ssize_t)w_row.size(), w_row.data());
+            out["w_addr"] = arr(w_addr);
+            out["w_value"] = arr(w_value);
+        }
         out["hit_addr"] = arr(hit_addr);
         out["hit_value"] = arr(hit_value);
         out["read_addr"] = read_addr;

@@ -565,6 +565,9 @@ class Cpu6502TransformerMachine:
     def clear_read_lease(self) -> None:
         self.engine.clear_read_lease()
 
+    def clear_read_lease_addr(self, addr: int) -> None:
+        self.engine.clear_read_lease_addr(addr)
+
     def read_ram(self, addr: int) -> int:
         return self.engine.read_ram(addr)
 

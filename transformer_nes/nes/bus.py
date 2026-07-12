@@ -336,10 +336,11 @@ class KernelBus:
 
     def __init__(self, rt, memory_image, *, start_pc: int):
         self.rt = rt
-        # Queue-leased devices by address (controller serial reads):
-        # flushed with the engine's served-read counts before any device
-        # is next consulted.
-        self.lease_devices: dict[int, Device] = {}
+        # Active leases: owning device per address, and which of those are
+        # value queues (controller serial reads) needing served-count
+        # flushes before their device is next consulted.
+        self.lease_owner: dict[int, Device] = {}
+        self.lease_queue: set[int] = set()
         rt.load_image(memory_image, start_pc=start_pc)
         self.ranges: list[tuple[int, int, Device, bool]] = []
 
@@ -362,14 +363,27 @@ class KernelBus:
     def flush_lease(self) -> None:
         """Advance queue-leased devices by the reads the engine served
         (tracking survives the flush; entries drop on clear/eviction)."""
-        for addr, device in self.lease_devices.items():
+        for addr in self.lease_queue:
             n = self.rt.take_lease_served(addr)
             if n:
-                device.lease_consumed(addr, n)
+                self.lease_owner[addr].lease_consumed(addr, n)
+
+    def drop_device_leases(self, device: Device) -> None:
+        """A write only disturbs its own device's registers: invalidate
+        that device's leases and leave the rest resident."""
+        for addr in [a for a, d in self.lease_owner.items() if d is device]:
+            if addr in self.lease_queue:
+                n = self.rt.take_lease_served(addr)
+                if n:
+                    self.lease_owner[addr].lease_consumed(addr, n)
+                self.lease_queue.discard(addr)
+            self.rt.clear_read_lease_addr(addr)
+            del self.lease_owner[addr]
 
     def clear_read_lease(self) -> None:
         self.flush_lease()
-        self.lease_devices.clear()
+        self.lease_owner.clear()
+        self.lease_queue.clear()
         self.rt.clear_read_lease()
 
     @property
@@ -437,12 +451,11 @@ class KernelBus:
             executed += int(out["steps"])
             cycles_done += int(out["cycles"])
             # CPU -> device: watched writes from the final step of this run.
-            if len(out["hit_addr"]):
-                # A device write may change what a leased register reads.
-                self.clear_read_lease()
             for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
                 device = self.device_at(int(addr))
                 if device is not None:
+                    if self.lease_owner:
+                        self.drop_device_leases(device)
                     device.write(int(addr), int(value))
                     cycles_done += drain_stall(device)
             reason = out["reason"]
@@ -458,7 +471,8 @@ class KernelBus:
                 # Device -> CPU: place the register value on the bus, resume.
                 # Any queue-leased device must catch up with the engine's
                 # served reads before its read() runs.
-                self.flush_lease()
+                if self.lease_queue:
+                    self.flush_lease()
                 addr = int(out["read_addr"])
                 device = self.device_at(addr)
                 if device is not None:
@@ -471,13 +485,18 @@ class KernelBus:
                     lease = getattr(device, "read_lease", None)
                     if lease is not None:
                         leased = lease(addr)
-                        if isinstance(leased, (bytes, bytearray)):
-                            evicted = self.rt.set_read_lease_seq(addr, bytes(leased))
-                            self.lease_devices.pop(int(evicted), None)
-                            self.lease_devices[addr] = device
-                        elif leased is not None:
-                            evicted = self.rt.set_read_lease(addr, leased)
-                            self.lease_devices.pop(int(evicted), None)
+                        if leased is not None:
+                            if isinstance(leased, (bytes, bytearray)):
+                                evicted = int(self.rt.set_read_lease_seq(
+                                    addr, bytes(leased)))
+                                self.lease_queue.add(addr)
+                            else:
+                                evicted = int(self.rt.set_read_lease(addr, leased))
+                                self.lease_queue.discard(addr)
+                            self.lease_owner[addr] = device
+                            if evicted >= 0 and evicted != addr:
+                                self.lease_owner.pop(evicted, None)
+                                self.lease_queue.discard(evicted)
                 else:
                     value = self.rt.read_ram(addr)
                 self.rt.inject_write(addr, value)
