@@ -166,15 +166,110 @@ def const_root(fold_result, root: str, k: int, label: str) -> int:
     return int(round(expr.terms.get(one, 0.0)))
 
 
-def check_write_free(fold_result, n_steps: int, label: str) -> None:
-    """Every step of a routed window must be write-free and non-halting
-    (verified on the folded constants, not assumed from the opcode list)."""
+def interval_of(fold_result, dim) -> tuple[float, float]:
+    """Conservative [lo, hi] bound of a folded dim over byte-valued inputs
+    (bits give [0, 1], 'one' gives 1); raises on memory lookups, whose
+    values cannot be bounded ahead of dispatch."""
+    from transformer_nes.graph.core import (
+        InputDimension,
+        LookUpDimension,
+        PersistDimension,
+        ReGLUDimension,
+    )
+
+    BIT_INPUTS = frozenset({
+        "is_state", "in_nmi", "in_irq", "in_halted",
+        "in_p_c", "in_p_z", "in_p_i", "in_p_d",
+        "in_p_b", "in_p_u", "in_p_v", "in_p_n",
+    })
+    memo: dict = {}
+
+    def ev(d):
+        r = memo.get(d)
+        if r is not None:
+            return r
+        if isinstance(d, InputDimension):
+            if d.name == "one":
+                r = (1.0, 1.0)
+            elif d.name in BIT_INPUTS:
+                r = (0.0, 1.0)
+            else:
+                r = (0.0, 255.0)
+        elif isinstance(d, ReGLUDimension):
+            (alo, ahi), bhi = evx(d.a_expr), evx(d.b_expr)[1]
+            if bhi <= 0.0:
+                r = (0.0, 0.0)
+            else:
+                # b in (0, bhi]: extremes at b -> 0 and b == bhi.
+                r = (min(0.0, alo * bhi, ahi * bhi),
+                     max(0.0, alo * bhi, ahi * bhi))
+        elif isinstance(d, PersistDimension):
+            r = evx(d.expr)
+        elif isinstance(d, LookUpDimension):
+            # A lookup returns one of its insert-side values (registers
+            # come in via state attention, so this is the live data
+            # path), or 0 when nothing matched.
+            lo, hi = evx(d.lookup.value_exprs[d.value_index])
+            r = (min(lo, 0.0), max(hi, 0.0))
+        else:
+            raise RuntimeError(f"unbounded dim {d.name!r}")
+        memo[d] = r
+        return r
+
+    def evx(e):
+        lo = hi = 0.0
+        for d, c in e.terms.items():
+            dlo, dhi = ev(d)
+            lo += min(c * dlo, c * dhi)
+            hi += max(c * dlo, c * dhi)
+        return (lo, hi)
+
+    return ev(dim)
+
+
+STORE_SLOTS = (
+    ("is_store", "write_addr_out"),
+    ("is_store2", "write_addr2_out"),
+    ("is_store3", "write_addr3_out"),
+)
+
+
+def check_writes_licensed(fold_result, n_steps: int, label: str, *,
+                          window_range: tuple[int, int] | None = None) -> bool:
+    """Stores are licensed when the folded write address provably stays
+    below $2000 -- the console only ever watches registers at or above it,
+    and dispatch additionally requires no watch range below $2000, so a
+    licensed store can never swallow a watch_write pause.  window_range
+    (pinned windows) additionally forbids overlap with the window's own
+    code bytes: the fold pinned them, so a self-modifying store would
+    execute stale semantics.  Every step must still be non-halting.
+    Returns whether any step stores."""
+    has_stores = False
     for k in range(n_steps):
-        for store in ("is_store", "is_store2", "is_store3"):
-            if const_root(fold_result, store, k, label) != 0:
-                raise RuntimeError(f"{label} step {k}: not write-free")
+        for store, addr in STORE_SLOTS:
+            if const_root(fold_result, store, k, label) == 0:
+                continue
+            has_stores = True
+            dim = fold_result.dim_of_name[f"{addr}__s{k}"]
+            try:
+                lo, hi = interval_of(fold_result, dim)
+            except RuntimeError as e:
+                raise RuntimeError(f"{label} step {k}: store target {e}") from e
+            if lo < 0.0 or hi >= 0x2000:
+                raise RuntimeError(
+                    f"{label} step {k}: store target bound [{lo:.0f}, {hi:.0f}]"
+                    " is not provably below $2000"
+                )
+            if window_range is not None:
+                w_lo, w_hi = window_range
+                if hi >= w_lo and lo < w_hi:
+                    raise RuntimeError(
+                        f"{label} step {k}: store bound [{lo:.0f}, {hi:.0f}] "
+                        "may modify the window's own pinned bytes"
+                    )
         if const_root(fold_result, "new_halted", k, label) != 0:
             raise RuntimeError(f"{label} step {k}: may halt")
+    return has_stores
 
 
 def schedule_and_build(fold_result):
@@ -257,10 +352,10 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
 
     The router guarantees pc == head, the window's bytes, no pending NMI,
     and a remaining step/cycle budget covering the whole window, so the
-    fold pins all of it.  The license: every step write-free and
-    non-halting, control flow straight-line inside the window (folded
-    next_pc == the next step's pinned pc), and only the first instruction
-    may read memory.
+    fold pins all of it.  The license: every step non-halting with stores
+    bounded below $2000 (check_writes_licensed), control flow
+    straight-line inside the window (folded next_pc == the next step's
+    pinned pc), and only the first instruction may read memory.
     """
     label = f"sequence @{head:04X}"
     pin_list = sequence_pins(head, code, OPCODES) * repeat
@@ -276,7 +371,9 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
             f"{label}: pins reach insert-side expressions "
             f"of {r.insert_side_hazards}"
         )
-    check_write_free(r, n_steps, label)
+    has_stores = check_writes_licensed(
+        r, n_steps, label, window_range=(head, head + len(code)),
+    )
     for k in range(n_steps - 1):
         nxt = int(pin_list[k + 1]["current_pc_lo"]) | (
             int(pin_list[k + 1]["current_pc_hi"]) << 8
@@ -293,7 +390,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     # windows at one head, and each needs its own step_core symbol.
     return {
         "kind": "seq", "name": f"seq_{head:04X}_{bytes(code).hex()}",
-        "head": head,
+        "head": head, "has_stores": has_stores,
         "window": bytes(code), "n_steps": n_steps, "cycles": cycles,
         "cycles_prefix": cycles - ops[-1].cycles, "model": model,
         "step_spec": fold_step_spec(r, model, tok_to_idx, info,
@@ -308,7 +405,8 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
 
     Each shape folds ONCE with pc and every operand byte symbolic
     (fold_sequence pc_offsets); the license: only the first instruction may
-    read memory, every step write-free and non-halting, and each interior
+    read memory, every step non-halting with stores bounded below $2000
+    (a symbolic zero-page operand bounds itself), and each interior
     step's next_pc equals head + offset -- verified EXHAUSTIVELY over every
     head the window fits at, which is possible exactly because the folded
     expression may depend on nothing but the pc bytes.  The JMP self-spin's
@@ -346,7 +444,12 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
                 f"{label}: pins reach insert-side expressions "
                 f"of {r.insert_side_hazards}"
             )
-        check_write_free(r, n_steps, label)
+        has_stores = check_writes_licensed(r, n_steps, label)
+        if has_stores:
+            # A shape's head is symbolic, so store disjointness from the
+            # window's own bytes cannot be proven; store idioms stay
+            # pinned-window-only until a head-range dispatch guard exists.
+            raise RuntimeError(f"{label}: store shapes are not licensed")
         if not self_target:
             for k in range(n_steps - 1):
                 heads, got = eval_over_heads(
@@ -365,6 +468,7 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
             "kind": "shape", "name": f"shape_{name}", "shape_id": sid,
             "opcode_checks": checks, "length": len(template),
             "self_target": self_target, "n_steps": n_steps,
+            "has_stores": has_stores,
             "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
             "step_spec": fold_step_spec(r, model, tok_to_idx, info,
                                         n_steps=n_steps),

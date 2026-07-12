@@ -452,7 +452,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        st_halted = false; nmi_pending = false; irq_pending = false;')
     emit('        resume_read_skip = false;')
     emit('        cycles_total = 0;')
-    emit('        rwatch.clear(); wwatch.clear();')
+    emit('        clear_watches();')
     emit('        clear_read_lease();')
     emit('    }')
     emit('')

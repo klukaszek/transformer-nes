@@ -171,6 +171,7 @@ def main() -> None:
                 " [HALTED]" if console.halted else "")
     if args.profile:
         profile_fallbacks(console, args.profile)
+    console.save_jit_proposals()
 
 
 if __name__ == "__main__":

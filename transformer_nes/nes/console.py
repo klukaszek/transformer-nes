@@ -20,7 +20,10 @@ NTSC timing, rounded to integer CPU cycles per frame:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
+import os
 import time
 
 from transformer_nes.nes.apu import make_apu
@@ -238,16 +241,41 @@ def profile_fallbacks(console, min_count: int) -> None:
         logger.info("  %04X  %s", pc, "; ".join(text))
 
 
-def collect_sequence_windows(mapper, image, *, cap: int = 48):
-    """Micro-loop windows from the boot image plus every runtime-reachable
-    PRG bank mapping (mapper.prg_scan_regions), so banked-in code gets the
-    pinned tier too.  The module's dispatch byte-verifies live RAM, so a
-    window for a bank that is not currently mapped is inert.  Deduped on
-    (head, code); boot-image windows keep priority under the cap."""
+def jit_sidecar_path(cart: Cartridge) -> str:
+    """Per-ROM store for JIT window proposals, next to the engine cache."""
+    from transformer_nes.model.engine_gen import CACHE_DIR
+
+    digest = hashlib.sha256(cart.prg).hexdigest()[:16]
+    return os.path.join(CACHE_DIR, f"jitwin_{digest}.json")
+
+
+def load_jit_windows(path: str):
+    try:
+        with open(path) as f:
+            return tuple(
+                (int(h), bytes.fromhex(c), int(r)) for h, c, r in json.load(f)
+            )
+    except (OSError, ValueError):
+        return ()
+
+
+def collect_sequence_windows(mapper, image, *, proposals=(), cap: int = 128):
+    """Micro-loop windows from the boot image, last runs' hot JIT window
+    proposals (proven profitable), then every runtime-reachable PRG bank
+    mapping (mapper.prg_scan_regions), so banked-in code gets the pinned
+    tier too.  The module's dispatch byte-verifies live RAM, so a window
+    for a bank that is not currently mapped -- or RAM code not yet copied
+    in -- is inert.  Deduped on (head, code), in that priority order under
+    the cap."""
     from transformer_nes.cpu6502.backends.weights.windows import scan_sequence_windows
 
     windows = list(scan_sequence_windows(image))
     seen = {(head, bytes(code)) for head, code, _ in windows}
+    for head, code, repeat in tuple(proposals)[:64]:  # sub-budget: banks
+        key = (head, bytes(code))                     # still deserve slots
+        if key not in seen:
+            seen.add(key)
+            windows.append((head, code, repeat))
     for base, data in mapper.prg_scan_regions():
         if len(windows) >= cap:
             break
@@ -323,9 +351,13 @@ class Console:
             # same protocol as the kernel.
             from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 
+            self.jit_sidecar = jit_sidecar_path(self.cart)
             machine = Cpu6502TransformerMachine(
                 bcd=False,
-                sequence_windows=collect_sequence_windows(self.mapper, image),
+                sequence_windows=collect_sequence_windows(
+                    self.mapper, image,
+                    proposals=load_jit_windows(self.jit_sidecar),
+                ),
             )
             if not machine.supports_run_loop:
                 raise RuntimeError("the weights backend requires the codegen run loop")
@@ -609,6 +641,28 @@ class Console:
             frame = self.run_frame()
         return frame
 
+    def save_jit_proposals(self) -> None:
+        """Persist this run's hot-window proposals: the NEXT boot folds
+        them into the pinned module (a mid-run fold + compile would stall
+        the frame loop).  Callers invoke this once at shutdown."""
+        proposals = getattr(self.rt, "jit_proposals", None)
+        if not proposals:
+            return
+        known = {
+            head: (head, code.hex(), repeat)
+            for head, code, repeat in load_jit_windows(self.jit_sidecar)
+        }
+        new = 0
+        for head, (h, code, repeat) in proposals.items():
+            if head not in known and len(known) < 192:
+                known[head] = (h, code.hex(), repeat)
+                new += 1
+        if new:
+            with open(self.jit_sidecar, "w") as f:
+                json.dump(sorted(known.values()), f)
+            logger.info("saved %d new jit window proposals (%d total)",
+                        new, len(known))
+
 
 def write_ppm(path: str, frame) -> None:
     """Write a rendered frame as a binary PPM (no dependencies)."""
@@ -655,6 +709,7 @@ def main() -> None:
         console.handoff(args.backend)
     frame = console.run(args.frames - console.frame_index)
     run_elapsed = time.perf_counter() - run_start
+    console.save_jit_proposals()
 
     fps = console.frame_index / run_elapsed if run_elapsed > 0 else 0.0
     logger.info(

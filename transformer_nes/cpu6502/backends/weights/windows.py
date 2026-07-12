@@ -9,13 +9,12 @@ from __future__ import annotations
 
 from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
 
+# Ops that end a window: subroutine/interrupt flow and stack PULLS (reads
+# past the first instruction).  Plain stores, pushes, and leading RMW
+# stay: the fold license (check_writes_licensed) bounds their targets
+# below $2000 and rejects what it cannot bound.
 SEQUENCE_WRITERS = frozenset({
-    "store_a", "store_x", "store_y", "sax", "pha", "php",
-    "jsr", "brk", "rti", "rts", "pla", "plp",
-})
-SEQUENCE_RMW = frozenset({
-    "asl", "lsr", "rol", "ror", "inc", "dec",
-    "slo", "rla", "sre", "rra", "dcp", "isb", "lax",
+    "sax", "jsr", "brk", "rti", "rts", "pla", "plp",
 })
 BRANCH_OPERATIONS = frozenset({"bcc", "bcs", "beq", "bmi", "bne", "bpl", "bvc", "bvs"})
 MAX_INSTRUCTIONS = 4
@@ -89,6 +88,45 @@ def match_shape_at(read, pc: int, shapes_meta) -> int | None:
     return None
 
 
+def propose_window(read, pc: int, *, max_len: int = MAX_INSTRUCTIONS):
+    """Decode a pinned-window candidate anchored at a hot pc: straight-line
+    code obeying the scanner's rules (reads lead, no subroutine/stack-pull
+    flow), ended by an optional single branch.  Closure is not required --
+    hotness is the profitability argument, dispatch is correct for
+    straight-line matches, and the fold license arbitrates stores.
+    Returns (head, code, 1) or None."""
+    code = bytearray()
+    for index in range(max_len):
+        at = pc + len(code)
+        if at + 3 > 0x10000:
+            break
+        op = OPCODES.get(read(at))
+        if op is None:
+            break
+        reads = op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm")
+        if op.operation in SEQUENCE_WRITERS or (index > 0 and reads):
+            break
+        if op.operation == "jmp" or op.mode == "ind":
+            break
+        body = bytes(read(at + j) for j in range(op.length))
+        if op.operation in BRANCH_OPERATIONS:
+            if index > 0:
+                code.extend(body)
+            break
+        code.extend(body)
+    if sum(1 for _ in iter_ops(bytes(code))) < 2:
+        return None
+    return (pc, bytes(code), 1)
+
+
+def iter_ops(code: bytes):
+    off = 0
+    while off < len(code):
+        op = OPCODES[code[off]]
+        yield op
+        off += op.length
+
+
 def scan_sequence_windows(image, *, base: int = 0, spin_repeat: int = 4,
                           limit: int = 16):
     """Find closed, write-free micro-loops eligible for sequence experts.
@@ -105,11 +143,9 @@ def scan_sequence_windows(image, *, base: int = 0, spin_repeat: int = 4,
             if op is None:
                 break
             reads = op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm")
-            if (
-                op.operation in SEQUENCE_WRITERS
-                or (op.operation in SEQUENCE_RMW and op.mode != "acc")
-                or (index > 0 and reads)
-            ):
+            # RMW reads memory, so it may only lead a window (like any
+            # read); its write is the fold license's problem.
+            if op.operation in SEQUENCE_WRITERS or (index > 0 and reads):
                 break
             next_pc = pc + op.length
             if op.operation in BRANCH_OPERATIONS:

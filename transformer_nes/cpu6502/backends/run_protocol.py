@@ -184,6 +184,10 @@ def run_state_members_cpp() -> str:
     long step_index = 0;
     long cycles_total = 0;
     std::vector<std::pair<int,int>> rwatch, wwatch;
+    // Lowest watched-write address (0x10000 = none): store-licensed
+    // windows dispatch only while this stays >= 0x2000, making a watched
+    // write inside a window statically impossible.
+    int watch_write_lo = 0x10000;
     static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};
     // Base cycles per opcode (no penalty cycles); NMI costs 7.
     static constexpr unsigned char CYCLES[256] = {{ {cycles_tab} }};"""
@@ -191,8 +195,11 @@ def run_state_members_cpp() -> str:
 
 MACHINE_API_CPP = """\
     void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
-    void watch_write(int lo, int hi) { wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
-    void clear_watches() { rwatch.clear(); wwatch.clear(); }
+    void watch_write(int lo, int hi) {
+        wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF);
+        if ((lo & 0xFFFF) < watch_write_lo) watch_write_lo = lo & 0xFFFF;
+    }
+    void clear_watches() { rwatch.clear(); wwatch.clear(); watch_write_lo = 0x10000; }
     int lease_slot(int addr) const {
         for (int s = 0; s < NLEASE; ++s) if (lease_addr[s] == addr) return s;
         return -1;

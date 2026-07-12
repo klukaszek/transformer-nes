@@ -14,26 +14,19 @@ SMB3 184, CV3 166 in real gameplay** (vs 480/480/203 at their titles) —
 all comfortably past realtime, with the banked-ROM gap now measured,
 not guessed.  The gameplay-profiled levers, in value order:
 
-1. **Store-licensed sequence windows** (the model-level lever).  The
-   sequence/shape license is write-free, and gameplay is store-heavy:
-   15-25% of gameplay instructions run per-instruction as a WIDE FLAT
-   mass (SMB3: 1,100+ pcs at 200-999 executions per 600 frames, zero
-   above 2K), and CV3's hot list is PHA-prologues, `LSR zp/ROR zp/INX/
-   BNE` RMW loops, and `INC abs/JMP` counters — all excluded by
-   write-freedom alone.  Design sketch: allow stores whose folded target
-   is a CONSTANT below $2000 (pinned windows; zp-store shapes are always
-   safe), emit per-step write slots in seq rows (the K=1 layout already
-   has them), apply writes row-by-row in the core's seq path with the
-   wwatch check truncating commit at the offending row (rows carry full
-   per-step state, so partial commit is exact).
-2. **Native PRG banking for MMC1/MMC3-class mappers.**  SMB3 gameplay
-   pays 148 watched-write pauses/frame (15.3 PRG bank switches/frame
-   plus PPU/APU traffic) ≈ ~2 ms/frame of pause round trips — the
-   single largest cost after execution itself.  Precedent exists: the
-   PPU-side mapper models (mmc2/mmc4/mmc5.h) are already native
-   silicon; a CPU-side native bank overlay (ROM resident engine-side,
-   $8000-region writes served natively, Python keeps CHR/IRQ/mirroring)
-   is the same move.
+1. **Native PRG banking for MMC1/MMC3-class mappers** (the dominant
+   remaining cost).  SMB3 gameplay pays 148 watched-write pauses/frame
+   (15.3 PRG bank switches/frame plus PPU/APU traffic) ≈ ~2 ms/frame of
+   pause round trips.  Precedent exists: the PPU-side mapper models
+   (mmc2/mmc4/mmc5.h) are already native silicon; a CPU-side native
+   bank overlay (ROM resident engine-side, $8000-region writes served
+   natively, Python keeps CHR/IRQ/mirroring) is the same move.
+2. **DONE (log below) — store-licensed sequence windows + warm-boot JIT
+   proposals.**  The write-free wall is down (bounded-store license,
+   static watch guard) and sustained-hot straight-line windows persist
+   per ROM and fold at next boot.  Measured: CV3 +4% (concentrated hot
+   pcs); SMB/SMB3 neutral — their per-instruction share was already
+   too thin and flat to matter, which is the evidence for item 1.
 3. **Profiling caveat for banked ROMs**: fallback pcs accumulate counts
    under whichever bank was mapped; disassembling them later against
    different live RAM prints garbage (CV3's SLO/LAX entries).  Capture
@@ -107,6 +100,63 @@ background pinned-module JIT tier's target.
 fps receipts (240-frame runs, module caches warm; previous = 2026-07-11
 logs): SMB 479.8 (~350), SMB3 479.6 (~192), FF 756.2, Zelda 597.0,
 Punch-Out 327.8, Mega Man 6 238.1, Zelda II 230.8, CV3 202.8.
+
+## 2026-07-12 store-licensed windows + warm-boot JIT — the write-free wall, down
+
+The window license was write-free, and gameplay code stores constantly;
+this arc replaces it with a PROVABLE-BOUND license and adds runtime
+window discovery that persists across sessions.
+
+- **The license** (`experts.check_writes_licensed`): a store is legal
+  when its folded write address provably stays below $2000, shown by
+  interval evaluation over byte-valued inputs — through ReGLUs, persists,
+  and LOOKUPS (registers arrive via state attention, so the bound of a
+  lookup dim is the bound of its insert-side value expression, widened
+  by 0 for the no-match case).  Constants, zp/zp,X, stack pushes
+  ($100+sp), and low abs,X all pass; pointer-indirect targets reject
+  (memory-data address values bound to 64K).  Pinned windows must also
+  prove store DISJOINTNESS from their own byte range (the fold pinned
+  those bytes; self-modification would execute stale semantics), which
+  is why store SHAPES stay banned: a symbolic head cannot prove it.
+  Non-halting and first-read-only checks stay; leading RMW is now legal
+  (its read leads the window, its write is licensed).
+- **Dispatch safety is static, not truncation**: emit_step_core already
+  applied seq-row writes natively in order; what write-freedom really
+  protected was the watch_write pause.  Licensed targets < $2000 plus a
+  dispatch guard (`watch_write_lo >= 0x2000`, maintained in the shared
+  run state) make a watched write inside a window impossible rather
+  than handled.  Traced runs now emit seq-row w_* entries; a core-side
+  seq_head bitmap keeps 128-window module dispatch misses at one array
+  load.  Receipts: store-window lockstep (writes + trace + final RAM
+  byte-identical to per-instruction), decline-under-low-watch (all 256
+  INC $20 writes pause once a $20 watch exists, windows fall back), and
+  license-rejection tests ($2007 store, self-modifying store); 128
+  tests green.
+- **Warm-boot JIT proposals**: sustained-hot fallback pcs (3 jit_hot
+  reports, re-earning 512 steps each) with no library shape decode into
+  straight-line/branch-tailed pinned-window PROPOSALS (closure not
+  required — hotness is the profitability argument), persisted per ROM
+  (`_engine_cache/jitwin_<sha>.json`, saved by app/tape/console at
+  shutdown) and folded into the pinned module at the NEXT boot — a
+  mid-run fold+compile would stall the frame loop.  Budgets bound the
+  fold cost: 96 proposals/run, 64 folded/boot, 192/sidecar, overlap
+  pruned.  A ROM's sidecar converges in 2-3 sessions (SMB3: 96 → 39 →
+  3 → 0 new).
+- **Measured honestly on the tapes**: CV3 166.0 → 173.2 fps (+4%; its
+  profile had CONCENTRATED hot pcs — the MMC5 IRQ prologue, RMW loops —
+  exactly what proposals catch); SMB3 182.3 vs 184.1 baseline and SMB
+  403.1 vs 418.2 — neutral within session noise, because their
+  fallback tier was only ~6-15% of steps spread over thousands of pcs,
+  so even a total win caps below 10% and 64 windows catch half of it.
+  An A/B (all windows / write-free only / none) on an SMB3 gameplay
+  slice measured IDENTICAL 6.1 ms/frame across all three: the
+  per-instruction tier is no longer where banked-ROM frame time lives.
+  The remaining lever is pause round trips — native PRG banking, START
+  HERE item 2.
+- **Cross-substrate receipt**: 8,745 frames byte-identical weights vs
+  kernel under the full SMB3 gameplay tape with store windows and
+  proposals live; full Klaus MATCHED through the weights post-change
+  (30,646,177 steps, decimal, 92.9 s — 330K steps/s).
 
 ## 2026-07-12 input tapes — benchmarking gameplay instead of title screens
 

@@ -388,10 +388,13 @@ SEQ_HOOK = """\
     void* seq_ctx = nullptr;
     static constexpr int SEQ_MAX_K = 32;
     long long seq_out[21 * SEQ_MAX_K];
+    // Module window heads: dispatch misses cost one array load instead
+    // of a cross-module call into the module's head switch.
+    unsigned char seq_head[65536] = {};
 
     int seq_dispatch(long i, long max_steps, long cycles_this,
                      long max_cycles, bool stop_on_trap) {
-        if (seq_fn) {
+        if (seq_fn && seq_head[st_pc]) {
             const int k = seq_fn(seq_ctx, this, i, max_steps, cycles_this,
                                  max_cycles, stop_on_trap ? 1 : 0);
             if (k) return k;
@@ -400,10 +403,19 @@ SEQ_HOOK = """\
                               stop_on_trap);
     }
 
-    void attach_seq(std::uintptr_t fn, std::uintptr_t ctx) {
+    void attach_seq(std::uintptr_t fn, std::uintptr_t ctx, py::bytes heads) {
         seq_fn = (SeqFn)fn; seq_ctx = (void*)ctx;
+        std::memset(seq_head, 0, sizeof(seq_head));
+        const std::string h = heads;
+        for (size_t i = 0; i + 1 < h.size(); i += 2) {
+            const int pc = (unsigned char)h[i] | ((unsigned char)h[i + 1] << 8);
+            seq_head[pc] = 1;
+        }
     }
-    void detach_seq() { seq_fn = nullptr; seq_ctx = nullptr; }"""
+    void detach_seq() {
+        seq_fn = nullptr; seq_ctx = nullptr;
+        std::memset(seq_head, 0, sizeof(seq_head));
+    }"""
 
 # Per-iteration body of the shared run loop (run_protocol.run_loop_cpp):
 # sequence dispatch, then the per-instruction step_core fallback.
@@ -425,6 +437,14 @@ ENGINE_STEP_BODY = """\
                             t_ophi.push_back((int)ok[8]); t_ea.push_back((int)ok[9]);
                             t_data.push_back((int)ok[10]);
                             t_halted.push_back((int)ok[11]);
+                            // Store-licensed rows carry writes (already
+                            // applied inside the forward, below $2000 by
+                            // license + the dispatch watch guard).
+                            for (int w = 0; w < (int)ok[14]; ++w) {
+                                w_row.push_back(step_index);
+                                w_addr.push_back((int)ok[15 + 2 * w]);
+                                w_value.push_back((int)ok[16 + 2 * w]);
+                            }
                         }
                         ++step_index;
                         const long step_cycles = (long)CYCLES[(unsigned char)ok[6]];
@@ -649,6 +669,10 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
                 f"E.ram[0x{(head + j) & 0xFFFF:04X}] == 0x{b:02X}"
                 for j, b in enumerate(window)
             )
+            if exp.get("has_stores"):
+                # Licensed store targets stay below $2000; refuse
+                # dispatch while any write watch reaches below it.
+                match = f"E.watch_write_lo >= 0x2000 && {match}"
             emit(f"            if (i + {k} <= max_steps")
             emit(f"                && (max_cycles <= 0 || cycles_this + {prefix} < max_cycles)")
             emit(f"                && {match}) {{")
@@ -1270,7 +1294,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("        resume_read_skip = false;")
         emit("        clear_read_lease();")
         emit("        step_index = 0; cycles_total = 0;")
-        emit("        rwatch.clear(); wwatch.clear();")
+        emit("        clear_watches();")
     emit("        seq = -1;")
     emit("    }")
     emit("")
@@ -1399,6 +1423,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 if exp.get("self_target"):
                     checks += (" && ram[st_pc + 1] == (st_pc & 0xFF)"
                                " && ram[st_pc + 2] == ((st_pc >> 8) & 0xFF)")
+                if exp.get("has_stores"):
+                    # Licensed store targets stay below $2000; refuse
+                    # dispatch while any write watch reaches below it.
+                    checks = f"watch_write_lo >= 0x2000 && {checks}"
                 emit(f"        case {j + 1}:  // {exp['name']}")
                 emit(f"            if (i + {exp['n_steps']} <= max_steps")
                 emit(f"                && (max_cycles <= 0 || cycles_this + "

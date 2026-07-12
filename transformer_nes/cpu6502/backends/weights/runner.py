@@ -26,6 +26,7 @@ from transformer_nes.cpu6502.backends.weights.windows import (
     SHAPE_LIBRARY,
     match_shape_at,
     match_shape_windows,
+    propose_window,
 )
 from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
@@ -39,6 +40,12 @@ logger = logging.getLogger(__name__)
 # routing is workload-independent (no game-derived tuning set).  NMI steps and
 # any opcode outside a narrowed set fall back to the exact union step.
 DEFAULT_EXPERT_OPCODES = tuple(sorted(OPCODES))
+
+# A pc must report hot this many times (re-earning jit_min_count between
+# reports) before it earns a pinned-window proposal; the budget bounds the
+# next boot's fold cost.
+JIT_PROPOSAL_HEAT = 3
+JIT_PROPOSAL_CAP = 96
 
 
 class Cpu6502TransformerMachine:
@@ -168,7 +175,14 @@ class Cpu6502TransformerMachine:
         self.jit_interval = int(jit_interval)
         self.jit_min_count = int(jit_min_count)
         self.jit_calls = 0
-        self.jit_rejected: set[int] = set()
+        # Per-pc re-report count: a pc re-enters jit_hot only after
+        # re-accumulating min_count steps, so heat measures SUSTAINED
+        # execution, not one burst (a level-load memcpy reports once).
+        self.jit_heat: dict[int, int] = {}
+        # Sustained-hot pcs with no library shape become pinned-window
+        # PROPOSALS for the next boot (the console persists them per ROM):
+        # folding and compiling mid-run would stall the frame loop.
+        self.jit_proposals: dict[int, tuple[int, bytes, int]] = {}
         # Shape matches per injected (base, bank content): a bank switch
         # re-adds its windows from this memo instead of rescanning.
         self.region_windows: dict[tuple[int, bytes], tuple] = {}
@@ -233,14 +247,18 @@ class Cpu6502TransformerMachine:
         else:
             logger.info("sequence module cache hit (max window %d steps)", mod.max_k)
         self.seq_module = mod
-        self.engine.attach_seq(mod.fn_ptr, mod.ctx_ptr)
+        heads = b"".join(
+            head.to_bytes(2, "little")
+            for head in sorted({head for head, _code, _repeat in windows})
+        )
+        self.engine.attach_seq(mod.fn_ptr, mod.ctx_ptr, heads)
 
     def populate_shape_windows(self) -> None:
         """Fill the engine's runtime window table from the current RAM image
         (called at every boot/reseed; dispatch re-verifies bytes live, so a
         stale entry is only a missed fast path)."""
         self.jit_calls = 0
-        self.jit_rejected.clear()
+        self.jit_heat.clear()
         meta = getattr(self.engine, "shapes_meta", None) or []
         if not (meta and self.engine.has_run_loop):
             return
@@ -261,14 +279,30 @@ class Cpu6502TransformerMachine:
             return
         for pc in self.engine.jit_hot(self.jit_min_count):
             pc = int(pc)
-            if pc in self.jit_rejected:
-                continue
+            heat = self.jit_heat.get(pc, 0) + 1
+            self.jit_heat[pc] = heat
+            if heat > 1:
+                continue  # shapes were checked at first heat; proposals below
             sid = match_shape_at(self.engine.read_ram, pc, meta)
-            if sid is None:
-                self.jit_rejected.add(pc)
-            else:
+            if sid is not None:
                 self.engine.add_window(sid, pc)
                 logger.info("jit window: %s at %04X", meta[sid]["name"], pc)
+        # Proposals demand sustained heat, a bounded budget, and no overlap
+        # with an already-proposed window (suffix pcs of one hot run would
+        # each propose their own tail otherwise).
+        for pc, heat in self.jit_heat.items():
+            if heat != JIT_PROPOSAL_HEAT or len(self.jit_proposals) >= JIT_PROPOSAL_CAP:
+                continue
+            if pc in self.jit_proposals or any(
+                head <= pc < head + len(code)
+                for head, code, _r in self.jit_proposals.values()
+            ):
+                continue
+            proposal = propose_window(self.engine.read_ram, pc, max_len=6)
+            if proposal is not None:
+                self.jit_proposals[pc] = proposal
+                logger.info("jit proposal: %d bytes at %04X (next boot)",
+                            len(proposal[1]), pc)
 
     def step_spec(self) -> dict:
         """Slot map for the generated C++ machine_step (engine_gen.py)."""

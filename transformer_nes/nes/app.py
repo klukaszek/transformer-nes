@@ -196,6 +196,7 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
         return frame
 
     def quit_cb():
+        console.save_jit_proposals()
         if record is not None:
             record.close()
         if console.frame_index and emu_seconds > 0:
