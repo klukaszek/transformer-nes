@@ -147,12 +147,16 @@ def debug_dump(console: Console) -> None:
 
 
 def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
-            max_frames: int = 0) -> None:
+            max_frames: int = 0, record=None) -> None:
     """Open the window and play the console until quit.
 
     Does not return on macOS: quitting exits the process inside the
     native run loop ([NSApp terminate:]), so the run stats are logged
     from the quit callback -- the last Python to execute.
+
+    record: open text file; every input transition (press AND release) is
+    serialized as "<frame> <mask hex> <names>" -- a complete tape a
+    headless harness can replay exactly.
     """
     module = load_app_module()
     emu_seconds = 0.0
@@ -167,7 +171,13 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
         if buttons != last_buttons:
             last_buttons = buttons
             pressed = [name for i, name in enumerate(BUTTONS) if buttons >> i & 1]
-            logger.debug("buttons: %s", "+".join(pressed) or "(none)")
+            names = "+".join(pressed) or "(none)"
+            # frame_index is the frame this state takes effect for, so the
+            # tape replays directly as a (frame, buttons) step function.
+            logger.debug("frame %d buttons: %s", console.frame_index, names)
+            if record is not None:
+                record.write(f"{console.frame_index} {buttons & 0xFF:02x} {names}\n")
+                record.flush()  # the process exits inside sapp_run
         console.controller.set_buttons(
             **{name: bool(buttons >> i & 1) for i, name in enumerate(BUTTONS)}
         )
@@ -186,6 +196,8 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
         return frame
 
     def quit_cb():
+        if record is not None:
+            record.close()
         if console.frame_index and emu_seconds > 0:
             logger.info(
                 "%d frames, emulation %.1f ms/frame (headroom: %.0f fps uncapped)%s",
@@ -208,6 +220,11 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=0,
                         help="quit after this many frames (0: play until closed)")
     parser.add_argument("--debug", action="store_true", help="log button changes")
+    parser.add_argument(
+        "--record", metavar="PATH",
+        help="serialize every input transition (frame, mask, names) to PATH "
+             "for exact headless replay",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(message)s")
@@ -225,8 +242,14 @@ def main() -> None:
 
     logger.info("keys: arrows = d-pad, X = A, Z = B, Enter = Start, "
                 "Tab = Select, Esc = quit")
+    # No context manager: the process exits inside sapp_run, so the tape
+    # is flushed per write and closed from quit_cb.
+    record = open(args.record, "w") if args.record else None  # noqa: SIM115
+    if record is not None:
+        logger.info("recording input tape to %s", args.record)
     title = f"transformer-nes: {os.path.basename(args.rom)} ({args.backend})"
-    stats = run_app(console, title=title, scale=args.scale, max_frames=args.frames)
+    stats = run_app(console, title=title, scale=args.scale,
+                    max_frames=args.frames, record=record)
 
     frames, emu = stats["frames"], stats["emu_seconds"]
     if frames and emu > 0:
