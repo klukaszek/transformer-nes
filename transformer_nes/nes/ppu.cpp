@@ -24,6 +24,7 @@
 namespace py = pybind11;
 
 struct PPU {
+    static constexpr size_t MAX_RASTER_SPLITS = 240;
     // Full CHR data (ROM of any 1 KiB-multiple size, or 8 KiB CHR RAM);
     // the PPU's $0000-$1FFF window maps through eight 1 KiB bank slots.
     std::vector<uint8_t> chr;
@@ -86,6 +87,10 @@ struct PPU {
         mid_fine_x = fine_x;
         mid_v_addr = vram_addr;
         std::memcpy(mid_chr_bank, chr_bank, sizeof(chr_bank));
+        // At most one state transition can affect each visible scanline.
+        // Keep the journal and render scratch arrays on the same explicit
+        // bound; the former used to grow past the latter's eight entries.
+        if (raster_splits.size() >= MAX_RASTER_SPLITS) return;
         RasterSplit split{scanline, ctrl, mask, mirroring, t_addr,
                           fine_x, vram_addr, {}, {}, {}};
         std::memcpy(split.chr_banks, chr_bank, sizeof(chr_bank));
@@ -536,11 +541,16 @@ struct PPU {
                 t = ((ctrl & 0x08) ? 256 : 0) + tile;
                 prow = src_r;
             }
+            const int pattern = t * 16 + prow;
+            const int b0 = chr[chr_index(banks, pattern)];
+            const int b1 = chr[chr_index(banks, pattern + 8)];
             for (int c = 0; c < cols; ++c) {
                 // No hit in the left 8 columns when either side is masked.
                 if (x + c < 8 && (mask & 0x06) != 0x06) continue;
                 const int src_c = (attr & 0x40) ? (7 - c) : c;
-                if (tile_pixel(banks, t, prow, src_c) && bg_opaque[top + r][x + c])
+                const int bit = 7 - src_c;
+                const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
+                if (pix && bg_opaque[top + r][x + c])
                     return top + r;
             }
         }
@@ -658,7 +668,9 @@ struct PPU {
             return out;
         }
 
-        render_bg_rows(frame, pal, backdrop, span, 0, 240);
+        const bool raster_mode = mmc5.active() && !raster_splits.empty();
+        if (!raster_mode)
+            render_bg_rows(frame, pal, backdrop, span, 0, 240);
 
         // Sprite 0's pattern fetches through the SPRITE banks: on MMC5 in
         // 8x16 mode the background set is a different window, and a bogus
@@ -667,7 +679,8 @@ struct PPU {
             ? mmc5.frame_sprite_banks()
             : span.banks;
         sprite0_scanline = -1;
-        if (mask & 0x10) sprite0_scanline = detect_sprite0(s0_banks);
+        if (!raster_mode && (mask & 0x10))
+            sprite0_scanline = detect_sprite0(s0_banks);
 
         const int s0 = sprite0_scanline;
         const bool have_mid = mid_scanline >= 0 && mid_scanline + 1 < 240;
@@ -689,12 +702,12 @@ struct PPU {
         // row: span from the top, then the post-sprite-0 and post-IRQ
         // splits (mid_band collapses to live when there is no IRQ split).
         struct Segment { int y0; const BandState* band; };
-        Segment segs[12];
-        BandState raster_bands[8];
+        Segment segs[MAX_RASTER_SPLITS + 2];
+        BandState raster_bands[MAX_RASTER_SPLITS];
         BandState raster_live = live;
         int nseg = 0;
         segs[nseg++] = {0, &span};
-        if (mmc5.active() && !raster_splits.empty()) {
+        if (raster_mode) {
             // State after split i is observable at split i+1, whose capture
             // occurred before that next handler. The final band is live.
             bool pinned_y = false;
@@ -733,12 +746,26 @@ struct PPU {
         }
         mid_scanline = -1;
 
-        // Repaint each lower band over the full-frame span pass, skipping
-        // any whose state matches the band above it.
-        for (int i = 1; i < nseg; ++i) {
-            const int end = (i + 1 < nseg) ? segs[i + 1].y0 : 240;
-            if (!same_band(*segs[i].band, *segs[i - 1].band))
-                render_bg_rows(frame, pal, backdrop, *segs[i].band, segs[i].y0, end);
+        if (raster_mode) {
+            // The bands are known before drawing, so render each visible row
+            // exactly once.  Previously MMC5 first painted all 240 rows from
+            // span and then repainted every changed lower band.
+            for (int i = 0; i < nseg; ++i) {
+                const int end = (i + 1 < nseg) ? segs[i + 1].y0 : 240;
+                render_bg_rows(frame, pal, backdrop, *segs[i].band,
+                               segs[i].y0, end);
+            }
+            if (mask & 0x10)
+                sprite0_scanline = detect_sprite0(s0_banks);
+        } else {
+            // The initial span was needed to discover a sprite-0 split;
+            // repaint only the lower bands whose state actually changes.
+            for (int i = 1; i < nseg; ++i) {
+                const int end = (i + 1 < nseg) ? segs[i + 1].y0 : 240;
+                if (!same_band(*segs[i].band, *segs[i - 1].band))
+                    render_bg_rows(frame, pal, backdrop, *segs[i].band,
+                                   segs[i].y0, end);
+            }
         }
         if (!(mask & 0x10)) return out;
 
@@ -789,10 +816,14 @@ struct PPU {
                 const int* sbanks = mmc5.active()
                     ? mmc5_sprite_banks_for_row(top + r)
                     : banks_for_row(top + r);
+                const int pattern = t * 16 + prow;
+                const int b0 = chr[chr_index(sbanks, pattern)];
+                const int b1 = chr[chr_index(sbanks, pattern + 8)];
                 for (int c = 0; c < cols; ++c) {
                     if (x + c < sprite_x_min) continue;
                     const int src_c = (attr & 0x40) ? (7 - c) : c;
-                    const int pix = tile_pixel(sbanks, t, prow, src_c);
+                    const int bit = 7 - src_c;
+                    const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
                     if (!pix) continue;
                     if (sprite_claimed[top + r][x + c]) continue;
                     sprite_claimed[top + r][x + c] = true;

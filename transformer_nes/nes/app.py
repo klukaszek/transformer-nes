@@ -4,7 +4,7 @@ The window, GPU blit, and keyboard live in `nes/app.cpp` (vendor/sokol
 headers, macOS/Metal), compiled once and cached by content digest like
 the PPU.  Python stays the orchestrator: the app calls back here once
 per NTSC frame with the controller bitmask, and the callback runs
-Console.run_frame() on the chosen backend and returns the RGB frame.
+Console.run_frame() on the chosen backend and returns palette indices.
 
 Keys: arrows = d-pad, X = A, Z = B, Enter = Start, Tab = Select,
 Esc = quit.
@@ -20,7 +20,7 @@ import time
 
 from transformer_nes.nes.console import BUTTONS, Console
 from transformer_nes.nes.native_cache import build_dir
-from transformer_nes.nes.ppu import to_rgb
+from transformer_nes.nes.ppu import NES_PALETTE
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +183,7 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
                 console.frame_index, 1e3 * elapsed, console.checkpoint_count,
                 getattr(console.bus, "log_tokens", "?"),
             )
-        return to_rgb(frame)
+        return frame
 
     def quit_cb():
         if console.frame_index and emu_seconds > 0:
@@ -194,7 +194,7 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
                 " [HALTED]" if console.halted else "",
             )
 
-    module.run(title, scale, frame, quit_cb)
+    module.run(title, scale, frame, NES_PALETTE, quit_cb)
 
 
 def main() -> None:

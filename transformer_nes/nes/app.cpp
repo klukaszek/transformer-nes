@@ -73,6 +73,7 @@ struct AppState {
     uint32_t buttons = 0;
     double acc = 0.0;
     bool have_frame = false;
+    uint8_t palette[64 * 3];
     uint8_t rgba[FRAME_H * FRAME_W * 4];
     sg_image image{};
     sg_view view{};
@@ -129,7 +130,7 @@ static void app_init(void) {
     state->pipeline = sg_make_pipeline(&pip);
 }
 
-// One emulated frame: cb(buttons) -> (240, 256, 3) uint8 RGB, or None to quit.
+// One emulated frame: cb(buttons) -> (240, 256) uint8 palette indices, or None.
 static bool emulate_frame(void) {
     py::object out = state->frame_cb(state->buttons);
     if (out.is_none()) {
@@ -137,15 +138,16 @@ static bool emulate_frame(void) {
         return false;
     }
     auto arr = py::cast<py::array_t<uint8_t, py::array::c_style | py::array::forcecast>>(out);
-    if (arr.ndim() != 3 || arr.shape(0) != FRAME_H || arr.shape(1) != FRAME_W || arr.shape(2) != 3) {
-        throw std::runtime_error("frame callback must return (240, 256, 3) uint8 RGB");
+    if (arr.ndim() != 2 || arr.shape(0) != FRAME_H || arr.shape(1) != FRAME_W) {
+        throw std::runtime_error("frame callback must return (240, 256) uint8 indices");
     }
     const uint8_t* src = arr.data();
     uint8_t* dst = state->rgba;
     for (int i = 0; i < FRAME_W * FRAME_H; i++) {
-        dst[4 * i + 0] = src[3 * i + 0];
-        dst[4 * i + 1] = src[3 * i + 1];
-        dst[4 * i + 2] = src[3 * i + 2];
+        const uint8_t* color = state->palette + (src[i] & 0x3F) * 3;
+        dst[4 * i + 0] = color[0];
+        dst[4 * i + 1] = color[1];
+        dst[4 * i + 2] = color[2];
         dst[4 * i + 3] = 0xFF;
     }
     return true;
@@ -276,10 +278,14 @@ static void app_cleanup(void) {
 // Blocks until the window closes.  The callbacks run on this thread
 // inside sapp_run, so the GIL held by this call covers every frame.
 static void run(const std::string& title, int scale, py::object frame_cb,
+                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> palette,
                 py::object quit_cb) {
+    if (palette.ndim() != 2 || palette.shape(0) != 64 || palette.shape(1) != 3)
+        throw std::runtime_error("palette must have shape (64, 3)");
     AppState st;
     st.frame_cb = frame_cb;
     st.quit_cb = quit_cb;
+    std::memcpy(st.palette, palette.data(), sizeof(st.palette));
     state = &st;
     sapp_desc desc{};
     desc.init_cb = app_init;
@@ -302,6 +308,7 @@ static void run(const std::string& title, int scale, py::object frame_cb,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run", &run, py::arg("title"), py::arg("scale"), py::arg("frame_cb"),
+          py::arg("palette"),
           py::arg("quit_cb") = py::none(),
           "Open the window and drive frame_cb(buttons) until quit; on macOS "
           "the process exits inside run, with quit_cb the last Python to run.");

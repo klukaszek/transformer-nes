@@ -31,6 +31,7 @@ transformer_nes/nes/examples/ff.nes
 transformer_nes/nes/examples/punchout.nes
 transformer_nes/nes/examples/megaman6.nes
 transformer_nes/nes/examples/castlevania3.nes
+transformer_nes/nes/examples/legendofzelda.nes
 
 # F1 debug snapshots
 _debug_dumps/

@@ -135,6 +135,19 @@ def test_mmc5_chained_irqs_preserve_each_raster_band():
     assert frame[100, 0] == 0
 
 
+def test_mmc5_raster_journal_handles_more_than_eight_splits():
+    """Render scratch capacity must match the PPU's raster journal."""
+    ppu = make_ppu()
+    ppu.set_mmc5_state(0, 0, 0, 0, 0)
+    ppu.mask = 0x0A
+    ppu.end_vblank()
+    for scanline in range(10, 130, 10):
+        ppu.mark_split(scanline)
+
+    frame = np.asarray(ppu.render_frame())
+    assert frame.shape == (240, 256)
+
+
 def test_mmc5_v_reload_scrolls_relative_to_moving_irq_boundary():
     ppu = make_ppu()
     ppu.set_mmc5_state(0, 0x44, 0, 0, 0)
