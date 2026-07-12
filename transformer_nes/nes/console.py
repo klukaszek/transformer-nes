@@ -73,6 +73,41 @@ class Controller:
             if strobe:
                 self.index = 0
 
+    def read_lease(self, addr: int):
+        """Serial reads are fully determined between strobes: lease the
+        remaining report bits as a queue (int = repeat one value)."""
+        if addr != 0x4016:
+            return None
+        if self.strobe:
+            return 0x40 | (1 if self.buttons["a"] else 0)
+        if self.index >= 8:
+            return 0x41
+        return bytes(
+            0x40 | (1 if self.buttons[BUTTONS[j]] else 0)
+            for j in range(self.index, 8)
+        )
+
+    def lease_consumed(self, addr: int, n: int) -> None:
+        if addr == 0x4016 and not self.strobe:
+            self.index = min(8, self.index + n)
+
+
+class ApuFrameCounter:
+    """$4017 read shim: writes go to the APU, reads are open bus and
+    leased (the native APU object cannot carry a read_lease attribute)."""
+
+    def __init__(self, apu):
+        self.apu = apu
+
+    def read(self, addr: int) -> int:
+        return self.apu.read(addr)
+
+    def write(self, addr: int, value: int) -> None:
+        self.apu.write(addr, value)
+
+    def read_lease(self, addr: int):
+        return 0x40
+
 
 class OamDma:
     """$4014: copy CPU page -> PPU OAM, stalling the CPU for 513 cycles."""
@@ -176,11 +211,60 @@ class JournaledMapper:
         self.mapper.write(addr, value)
 
 
+def profile_fallbacks(console, min_count: int) -> None:
+    """Dump hot per-instruction-tier pcs with disassembly: the evidence
+    that justifies a SHAPE_LIBRARY addition (ROADMAP START HERE item 4)."""
+    from transformer_nes.cpu6502.spec import OPCODES
+
+    engine = getattr(console.rt, "engine", None)
+    if engine is None or not hasattr(engine, "jit_hot"):
+        logger.info("--profile requires the weights backend")
+        return
+    hot = sorted(int(pc) for pc in engine.jit_hot(min_count))
+    logger.info("%d fallback pcs >= %d steps:", len(hot), min_count)
+    for pc in hot:
+        text, off = [], 0
+        for _ in range(4):
+            byte = console.rt.read_ram((pc + off) & 0xFFFF)
+            op = OPCODES.get(byte)
+            if op is None:
+                text.append(f"${byte:02X}?")
+                break
+            operand = [console.rt.read_ram((pc + off + 1 + j) & 0xFFFF)
+                       for j in range(op.length - 1)]
+            arg = "".join(f"{b:02X}" for b in reversed(operand))
+            text.append(f"{op.mnemonic} {arg}".strip())
+            off += op.length
+        logger.info("  %04X  %s", pc, "; ".join(text))
+
+
+def collect_sequence_windows(mapper, image, *, cap: int = 48):
+    """Micro-loop windows from the boot image plus every runtime-reachable
+    PRG bank mapping (mapper.prg_scan_regions), so banked-in code gets the
+    pinned tier too.  The module's dispatch byte-verifies live RAM, so a
+    window for a bank that is not currently mapped is inert.  Deduped on
+    (head, code); boot-image windows keep priority under the cap."""
+    from transformer_nes.cpu6502.backends.weights.windows import scan_sequence_windows
+
+    windows = list(scan_sequence_windows(image))
+    seen = {(head, bytes(code)) for head, code, _ in windows}
+    for base, data in mapper.prg_scan_regions():
+        if len(windows) >= cap:
+            break
+        for head, code, repeat in scan_sequence_windows(data, base=base):
+            key = (head, bytes(code))
+            if key not in seen:
+                seen.add(key)
+                windows.append((head, code, repeat))
+    return tuple(windows[:cap])
+
+
 class Console:
     """The NES: a 6502 machine backend + PPU + input over the MMIO bus."""
 
     def __init__(self, cart: Cartridge | str, *, backend: str = "kernel",
-                 checkpoint_tokens: int = 2_000_000, sample_rate: float = 44100.0):
+                 checkpoint_tokens: int | None = None,
+                 sample_rate: float = 44100.0):
         if isinstance(cart, str):
             cart = Cartridge.load(cart)
         self.cart = cart
@@ -206,9 +290,13 @@ class Console:
         self.irq_sources: set[str] = set()
         # Snapshot-and-rebuild: once the append-only token log passes this
         # many tokens, it is reseeded from the RAM mirror at the next frame
-        # boundary (a quiet point: no pending NMI or read pause).  Keeps
-        # hull attention memory and query depth bounded over long runs.
-        # 0 disables; the reference backend has no log and never rebuilds.
+        # boundary (a quiet point: no pending NMI or read pause).  0
+        # disables.  None = auto: off for the native engines (kernel/
+        # weights attention state is O(1) in the token log, so a reseed
+        # buys nothing and costs a multi-frame hitch), 2M for the graph
+        # evaluator, whose Python-side log does grow.
+        if checkpoint_tokens is None:
+            checkpoint_tokens = 0 if self.uses_kernel_bus else 2_000_000
         self.checkpoint_tokens = checkpoint_tokens
         self.checkpoint_count = 0
 
@@ -236,11 +324,10 @@ class Console:
             # KernelBus drives it natively (MMIO pauses back to Python), the
             # same protocol as the kernel.
             from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
-            from transformer_nes.cpu6502.backends.weights.windows import scan_sequence_windows
 
             machine = Cpu6502TransformerMachine(
                 bcd=False, checkpoint_tokens=None,
-                sequence_windows=scan_sequence_windows(image),
+                sequence_windows=collect_sequence_windows(self.mapper, image),
             )
             if not machine.supports_run_loop:
                 raise RuntimeError("the weights backend requires the codegen run loop")
@@ -291,7 +378,7 @@ class Console:
         self.bus.attach(self.apu, 0x4000, 0x4013)     # channel registers
         self.bus.attach(self.apu, 0x4015, 0x4015)     # status / enables
         self.bus.attach(self.controller, 0x4016, 0x4016)  # controller 1 (port 1)
-        self.bus.attach(self.apu, 0x4017, 0x4017)     # frame counter (read: open bus)
+        self.bus.attach(ApuFrameCounter(self.apu), 0x4017, 0x4017)  # read: open bus
         if self.mapper.banked:
             mapper_dev = JournaledMapper(self.mapper, self.journal, self)
             for lo, hi in getattr(self.mapper, "register_ranges", ()):
@@ -402,6 +489,7 @@ class Console:
                 1 << 60,
                 max_cycles=target - self.cycles,
                 on_pause=lambda out: self.check_interrupt_lines(),
+                trace=False,
             )
             self.cycles += int(out["cycles"])
             if out["reason"] in ("halt", "trap"):
@@ -546,6 +634,11 @@ def main() -> None:
              "game off to --backend for the remaining frames",
     )
     parser.add_argument("--out", help="write the final frame as a PPM image")
+    parser.add_argument(
+        "--profile", type=int, default=0, metavar="MIN",
+        help="after the run, list fallback pcs executed >= MIN times "
+             "(weights backend; shape-library growth data)",
+    )
     args = parser.parse_args()
 
     build_start = time.perf_counter()
@@ -570,6 +663,8 @@ def main() -> None:
         console.frame_index, run_elapsed, fps, console.cycles, build_elapsed,
         " [HALTED]" if console.halted else "",
     )
+    if args.profile:
+        profile_fallbacks(console, args.profile)
     if args.out and frame is not None:
         write_ppm(args.out, frame)
         logger.info("final frame written to %s", args.out)

@@ -44,6 +44,11 @@ class Mapper:
     def irq_scanline(self) -> int | None:
         return None
 
+    def prg_scan_regions(self) -> tuple[tuple[int, bytes], ...]:
+        """Every (base, bank bytes) PRG mapping reachable at runtime, for
+        the sequence-window scan; the boot image is scanned separately."""
+        return ()
+
 
 class Nrom(Mapper):
     """Mapper 0: fixed PRG, nothing to service."""
@@ -122,6 +127,12 @@ class Mmc1(Mapper):
         image[0x8000:0xC000] = self.prg[lo * BANK16:(lo + 1) * BANK16]
         image[0xC000:0x10000] = self.prg[hi * BANK16:(hi + 1) * BANK16]
         return bytes(image)
+
+    def prg_scan_regions(self) -> tuple[tuple[int, bytes], ...]:
+        return tuple(
+            (base, self.prg[b * BANK16:(b + 1) * BANK16])
+            for b in range(self.n_banks) for base in (0x8000, 0xC000)
+        )
 
     # ── Device protocol ─────────────────────────────────────────────
 
@@ -209,6 +220,14 @@ class Mmc2(Mapper):
             image[base:base + BANK8] = self.prg[bank * BANK8:(bank + 1) * BANK8]
         return bytes(image)
 
+    def prg_scan_regions(self) -> tuple[tuple[int, bytes], ...]:
+        # Only the $8000 slot switches; the fixed upper banks are in the
+        # boot image already.
+        return tuple(
+            (0x8000, self.prg[b * BANK8:(b + 1) * BANK8])
+            for b in range(self.n_banks)
+        )
+
     def read(self, addr: int) -> int:
         raise RuntimeError("mapper range is attached write-only")
 
@@ -295,6 +314,15 @@ class Mmc3(Mapper):
             image[base:base + BANK8] = self.prg[bank * BANK8:(bank + 1) * BANK8]
         return bytes(image)
 
+    def prg_scan_regions(self) -> tuple[tuple[int, bytes], ...]:
+        # Switchable 8 KiB slots at $8000/$A000/$C000 across both modes;
+        # $E000 is always the fixed last bank (boot image).
+        return tuple(
+            (base, self.prg[b * BANK8:(b + 1) * BANK8])
+            for b in range(self.n_banks)
+            for base in (0x8000, 0xA000, 0xC000)
+        )
+
     # ── Device protocol ─────────────────────────────────────────────
 
     def read(self, addr: int) -> int:
@@ -369,6 +397,13 @@ class Mmc4(Mapper):
         image[0x8000:0xC000] = self.prg[lo * BANK16:(lo + 1) * BANK16]
         image[0xC000:0x10000] = self.prg[hi * BANK16:(hi + 1) * BANK16]
         return bytes(image)
+
+    def prg_scan_regions(self) -> tuple[tuple[int, bytes], ...]:
+        # Only the $8000 slot switches; $C000 is the fixed last bank.
+        return tuple(
+            (0x8000, self.prg[b * BANK16:(b + 1) * BANK16])
+            for b in range(self.n_banks)
+        )
 
     def read(self, addr: int) -> int:
         raise RuntimeError("mapper range is attached write-only")
@@ -513,6 +548,15 @@ class Mmc5(Mapper):
         for i in range(4):
             image[0x8000 + i * BANK8:0xA000 + i * BANK8] = self.prg_slot_region(i)
         return bytes(image)
+
+    def prg_scan_regions(self) -> tuple[tuple[int, bytes], ...]:
+        # ROM banks in any of the four 8 KiB slots; PRG-RAM windows are
+        # dynamic content, left to the JIT.
+        return tuple(
+            (base, self.prg[b * BANK8:(b + 1) * BANK8])
+            for b in range(self.n_banks)
+            for base in (0x8000, 0xA000, 0xC000, 0xE000)
+        )
 
     def irq_scanline(self) -> int | None:
         return self.irq_target if self.irq_enabled and self.irq_target else None

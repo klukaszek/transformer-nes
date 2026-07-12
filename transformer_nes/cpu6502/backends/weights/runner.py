@@ -170,6 +170,9 @@ class Cpu6502TransformerMachine:
         self.jit_min_count = int(jit_min_count)
         self.jit_calls = 0
         self.jit_rejected: set[int] = set()
+        # Shape matches per injected (base, bank content): a bank switch
+        # re-adds its windows from this memo instead of rescanning.
+        self.region_windows: dict[tuple[int, bytes], tuple] = {}
 
         self.pos = 0
         self.trace_len = 0
@@ -298,9 +301,8 @@ class Cpu6502TransformerMachine:
             rt.start_pc_hi: (start_pc >> 8) & 0xFF,
             rt.is_start: 1,
         })
-        for addr, byte in enumerate(ram):
-            if byte:
-                self.insert_write(addr, byte)
+        # Native seed: one call for the image instead of one per byte.
+        self.pos += int(self.engine.seed_image(bytes(ram)))
         self.seed_pos = self.pos
         self.mstate = {
             "pc": start_pc & 0xFFFF, "a": 0, "x": 0, "y": 0, "s": 0xFD,
@@ -343,9 +345,22 @@ class Cpu6502TransformerMachine:
     def inject_region(self, base: int, data: bytes):
         """Bulk injection (mapper bank switches): one native call."""
         base &= 0xFFFF
+        data = bytes(data)
         self.ram[base:base + len(data)] = data
-        self.engine.inject_region(base, bytes(data))
+        self.engine.inject_region(base, data)
         self.pos += len(data)
+        # Newly banked-in code gets its shape windows immediately instead
+        # of waiting out JIT warmup; matches are memoized per bank content.
+        meta = getattr(self.engine, "shapes_meta", None) or []
+        if meta and self.engine.has_run_loop:
+            key = (base, data)
+            hits = self.region_windows.get(key)
+            if hits is None:
+                hits = self.region_windows[key] = tuple(
+                    match_shape_windows(data, meta, base=base)
+                )
+            for sid, head in hits:
+                self.engine.add_window(sid, head)
 
     def insert_write(self, addr: int, value: int):
         addr &= 0xFFFF
@@ -524,10 +539,10 @@ class Cpu6502TransformerMachine:
         self.seed_run_state()
 
     def run(self, max_steps: int, *, stop_on_trap: bool = False,
-            max_cycles: int = 0) -> dict:
+            max_cycles: int = 0, trace: bool = True) -> dict:
         """Resume the native run loop from the engine's persistent state
         (no reboot), pausing on halt/trap/watch/cycle budget."""
-        out = self.engine.run(max_steps, stop_on_trap, max_cycles)
+        out = self.engine.run(max_steps, stop_on_trap, max_cycles, trace)
         self.pull_run_state()
         self.jit_tick()
         return out
@@ -538,8 +553,14 @@ class Cpu6502TransformerMachine:
     def watch_write(self, lo: int, hi: int) -> None:
         self.engine.watch_write(lo, hi)
 
-    def set_read_lease(self, addr: int, value: int) -> None:
-        self.engine.set_read_lease(addr, value)
+    def set_read_lease(self, addr: int, value: int) -> int:
+        return int(self.engine.set_read_lease(addr, value))
+
+    def set_read_lease_seq(self, addr: int, values: bytes) -> int:
+        return int(self.engine.set_read_lease_seq(addr, bytes(values)))
+
+    def take_lease_served(self, addr: int) -> int:
+        return int(self.engine.take_lease_served(addr))
 
     def clear_read_lease(self) -> None:
         self.engine.clear_read_lease()

@@ -336,6 +336,10 @@ class KernelBus:
 
     def __init__(self, rt, memory_image, *, start_pc: int):
         self.rt = rt
+        # Queue-leased devices by address (controller serial reads):
+        # flushed with the engine's served-read counts before any device
+        # is next consulted.
+        self.lease_devices: dict[int, Device] = {}
         rt.load_image(memory_image, start_pc=start_pc)
         self.ranges: list[tuple[int, int, Device, bool]] = []
 
@@ -355,7 +359,17 @@ class KernelBus:
                 return device
         return None
 
+    def flush_lease(self) -> None:
+        """Advance queue-leased devices by the reads the engine served
+        (tracking survives the flush; entries drop on clear/eviction)."""
+        for addr, device in self.lease_devices.items():
+            n = self.rt.take_lease_served(addr)
+            if n:
+                device.lease_consumed(addr, n)
+
     def clear_read_lease(self) -> None:
+        self.flush_lease()
+        self.lease_devices.clear()
         self.rt.clear_read_lease()
 
     @property
@@ -384,7 +398,7 @@ class KernelBus:
     def run(self, max_steps: int, *, nmi_at: set[int] | None = None,
             irq_at: set[int] | None = None,
             stop_on_trap: bool = False, max_cycles: int = 0,
-            on_pause=None) -> dict:
+            on_pause=None, trace: bool = True) -> dict:
         """Run up to max_steps instructions, servicing device pauses.
 
         nmi_at/irq_at use the same convention as Bus.run: the interrupt is
@@ -394,7 +408,9 @@ class KernelBus:
         given, is called after every serviced pause -- the hook the console
         uses to check device-raised NMI edges before execution resumes.
         Returns the merged kernel result arrays plus the final "reason"
-        and "cycles" (elapsed this call, stalls included).
+        and "cycles" (elapsed this call, stalls included).  trace=False
+        skips the per-step arrays entirely (the console's gameplay path
+        reads only "reason"/"cycles").
         """
         nmi_list = sorted(nmi_at) if nmi_at else []
         irq_list = sorted(irq_at) if irq_at else []
@@ -415,14 +431,15 @@ class KernelBus:
             if irq_list:
                 limit = min(limit, irq_list[0] - executed)
             cycle_limit = max_cycles - cycles_done if max_cycles > 0 else 0
-            out = self.rt.run(limit, stop_on_trap=stop_on_trap, max_cycles=cycle_limit)
+            out = self.rt.run(limit, stop_on_trap=stop_on_trap, max_cycles=cycle_limit,
+                              trace=trace)
             outs.append(out)
-            executed += len(out["pc"])
+            executed += int(out["steps"])
             cycles_done += int(out["cycles"])
             # CPU -> device: watched writes from the final step of this run.
             if len(out["hit_addr"]):
                 # A device write may change what a leased register reads.
-                self.rt.clear_read_lease()
+                self.clear_read_lease()
             for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
                 device = self.device_at(int(addr))
                 if device is not None:
@@ -439,18 +456,28 @@ class KernelBus:
                 )
             if reason == "watch_read":
                 # Device -> CPU: place the register value on the bus, resume.
+                # Any queue-leased device must catch up with the engine's
+                # served reads before its read() runs.
+                self.flush_lease()
                 addr = int(out["read_addr"])
                 device = self.device_at(addr)
                 if device is not None:
                     value = device.read(addr) & 0xFF
                     cycles_done += drain_stall(device)
                     # Registers whose value is frozen for the rest of the
-                    # span are served natively until the lease is cleared.
+                    # span (int) or whose next values are already determined
+                    # (bytes: serial reports) are served natively until the
+                    # lease is cleared or the queue drains.
                     lease = getattr(device, "read_lease", None)
                     if lease is not None:
                         leased = lease(addr)
-                        if leased is not None:
-                            self.rt.set_read_lease(addr, leased)
+                        if isinstance(leased, (bytes, bytearray)):
+                            evicted = self.rt.set_read_lease_seq(addr, bytes(leased))
+                            self.lease_devices.pop(int(evicted), None)
+                            self.lease_devices[addr] = device
+                        elif leased is not None:
+                            evicted = self.rt.set_read_lease(addr, leased)
+                            self.lease_devices.pop(int(evicted), None)
                 else:
                     value = self.rt.read_ram(addr)
                 self.rt.inject_write(addr, value)
@@ -459,8 +486,9 @@ class KernelBus:
             if reason in ("halt", "trap"):
                 break
 
-        merged = {"reason": reason, "cycles": cycles_done}
-        for key in ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
-                    "ea", "data", "halted", "w_row", "w_addr", "w_value"):
-            merged[key] = np.concatenate([out[key] for out in outs]) if outs else np.array([])
+        merged = {"reason": reason, "cycles": cycles_done, "steps": executed}
+        if trace:
+            for key in ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
+                        "ea", "data", "halted", "w_row", "w_addr", "w_value"):
+                merged[key] = np.concatenate([out[key] for out in outs]) if outs else np.array([])
         return merged

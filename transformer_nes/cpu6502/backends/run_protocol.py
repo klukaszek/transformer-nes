@@ -168,9 +168,19 @@ def run_state_members_cpp() -> str:
     // clear (stays pending until then); NMI wins when both are set.
     bool irq_pending = false;
     bool resume_read_skip = false;
-    // Read lease: watched reads of this address are served natively
-    // with this value (device semantics frozen until the bus clears it).
-    int lease_addr = -1, lease_value = 0;
+    // Read leases: watched reads of these addresses are served natively.
+    // n == 0 repeats one value (device semantics frozen until the bus
+    // clears it); otherwise a finite value queue (controller serial
+    // reads) whose exhaustion pauses, with served reads counted so the
+    // bus can advance the device model.  Multiple slots keep interleaved
+    // port reads ($4016/$4017 bit pairs) from thrashing one slot.
+    static constexpr int NLEASE = 4;
+    int lease_addr[NLEASE] = {{-1, -1, -1, -1}};
+    int lease_value[NLEASE] = {{0, 0, 0, 0}};
+    int lease_vals[NLEASE][8];
+    int lease_n[NLEASE] = {{0, 0, 0, 0}};
+    int lease_i[NLEASE] = {{0, 0, 0, 0}};
+    long lease_served[NLEASE] = {{0, 0, 0, 0}};
     long step_index = 0;
     long cycles_total = 0;
     std::vector<std::pair<int,int>> rwatch, wwatch;
@@ -183,8 +193,53 @@ MACHINE_API_CPP = """\
     void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
     void watch_write(int lo, int hi) { wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
     void clear_watches() { rwatch.clear(); wwatch.clear(); }
-    void set_read_lease(int addr, int value) { lease_addr = addr & 0xFFFF; lease_value = value & 0xFF; }
-    void clear_read_lease() { lease_addr = -1; }
+    int lease_slot(int addr) const {
+        for (int s = 0; s < NLEASE; ++s) if (lease_addr[s] == addr) return s;
+        return -1;
+    }
+    // Reuse the address's slot, else a free one, else an exhausted queue,
+    // else slot 0.  The bus flushes served counts before every set, so an
+    // eviction never loses a device advance.
+    int lease_claim(int addr) {
+        int s = lease_slot(addr);
+        if (s < 0) s = lease_slot(-1);
+        if (s < 0)
+            for (int t = 0; t < NLEASE; ++t)
+                if (lease_n[t] > 0 && lease_i[t] == lease_n[t]) { s = t; break; }
+        return s < 0 ? 0 : s;
+    }
+    // Both setters return the evicted address (or -1) so the bus can drop
+    // its device tracking for it.
+    int set_read_lease(int addr, int value) {
+        addr &= 0xFFFF;
+        const int s = lease_claim(addr);
+        const int evicted = lease_addr[s] == addr ? -1 : lease_addr[s];
+        lease_addr[s] = addr; lease_value[s] = value & 0xFF;
+        lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
+        return evicted;
+    }
+    int set_read_lease_seq(int addr, py::bytes values) {
+        const std::string v = values;
+        addr &= 0xFFFF;
+        const int s = lease_claim(addr);
+        const int evicted = lease_addr[s] == addr ? -1 : lease_addr[s];
+        lease_addr[s] = addr;
+        lease_n[s] = v.size() < 8 ? (int)v.size() : 8;
+        lease_i[s] = 0; lease_served[s] = 0;
+        for (int i = 0; i < lease_n[s]; ++i) lease_vals[s][i] = (unsigned char)v[i];
+        if (lease_n[s] == 0) lease_addr[s] = -1;
+        return evicted;
+    }
+    void clear_read_lease() {
+        for (int s = 0; s < NLEASE; ++s) {
+            lease_addr[s] = -1; lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
+        }
+    }
+    long take_lease_served(int addr) {
+        const int s = lease_slot(addr & 0xFFFF);
+        if (s < 0) return 0;
+        const long n = lease_served[s]; lease_served[s] = 0; return n;
+    }
     void set_nmi() { nmi_pending = true; }
     void set_irq() { irq_pending = true; }
     void clear_irq() { irq_pending = false; }
@@ -199,13 +254,16 @@ RUN_LOOP_TEMPLATE = """\
     // Python only on halt / jump-to-self trap / watched device
     // access / cycle budget.  One protocol and result dict for both
     // generated engines; the KernelBus contract is the spec.
-    py::dict run(long max_steps, bool stop_on_trap, long max_cycles) {
+    // trace=false skips the per-step trace/write arrays (the console's
+    // gameplay path reads only steps/hits/reason/cycles).
+    py::dict run(long max_steps, bool stop_on_trap, long max_cycles, bool trace) {
         std::vector<int> t_pc, t_a, t_x, t_y, t_s, t_p, t_ir, t_oplo, t_ophi, t_ea, t_data, t_halted;
         std::vector<long> w_row; std::vector<int> w_addr, w_value;
         std::vector<int> hit_addr, hit_value;
         const char* reason = "budget";
         int read_addr = -1;
         long cycles_this = 0;
+        const long steps_entry = step_index;
 {EXTRA_LOCALS}
         for (long i = 0; i < max_steps; ++i) {
             if (st_halted) { reason = "halt"; break; }
@@ -214,12 +272,23 @@ RUN_LOOP_TEMPLATE = """\
             if (!nmi_pending && !irq_ready() && !skip && !rwatch.empty()) {
                 const int target = shadow_read_target();
                 if (target >= 0 && in_ranges(rwatch, target)) {
-                    if (target != lease_addr) {
+                    // Leased: serve the device read natively, exactly
+                    // what the Python pause path would inject.  An
+                    // exhausted queue keeps its slot (preserving the
+                    // served count for the bus) but pauses.
+                    bool served = false;
+                    const int ls = lease_slot(target);
+                    if (ls >= 0) {
+                        if (lease_n[ls] == 0) {
+                            inject_write(target, lease_value[ls]); served = true;
+                        } else if (lease_i[ls] < lease_n[ls]) {
+                            inject_write(target, lease_vals[ls][lease_i[ls]++]);
+                            ++lease_served[ls]; served = true;
+                        }
+                    }
+                    if (!served) {
                         resume_read_skip = true; read_addr = target; reason = "watch_read"; break;
                     }
-                    // Leased: serve the device read natively, exactly
-                    // what the Python pause path would inject.
-                    inject_write(target, lease_value);
                 }
             }
 {STEP_BODY}
@@ -248,6 +317,7 @@ RUN_LOOP_TEMPLATE = """\
         out["read_addr"] = read_addr;
         out["reason"] = reason;
         out["cycles"] = cycles_this;
+        out["steps"] = step_index - steps_entry;
         return out;
     }"""
 

@@ -6,31 +6,92 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
-**START HERE (2026-07-11, refactor complete):** the structural refactor
-plan below is DONE through item 6 — the codebase now splits cleanly into
-the model (graph → schedule → weights; `model/classify.py` holds every
-attention-serving license), the machine backends (`cpu6502/backends/`:
-reference, evaluator, kernel, and the `weights/` package — runner +
-expert builders + window policy — with `run_protocol.py` emitting the one
-native run-loop protocol for both generated engines), and the console
-(`nes/`).  Harnesses live next to their assets (`cpu6502/examples/klaus/`,
-`nes/examples/nestest.py`).  The weights forward is integer end-to-end
-(full Klaus decimal record: 89.0 s, 344K steps/s).  The PPU is native
-(`nes/ppu.cpp`, pixel-identical to the Python reference, the console
-default).  **The native app landed 2026-07-11** (log below): a Sokol
-window over the console frame loop — SMB is playable on a keyboard
-through the transformer weights, and getting it playable forced the
-PPU's real scroll model (loopy t + the sprite-0 split, same log).
-**Mappers landed same day** (log below): MMC1 (Final Fantasy plays)
-and MMC3 with the scanline IRQ delivered through the machine model
-(log above) — **SMB3 is fully playable** at 5.2 ms/frame through the
-weights, HUD and all. **The APU landed 2026-07-11** and its DMC/IRQ
-completion is recorded below: native audio through sokol_audio, all five
-channels including sampled percussion, and frame/DMC IRQs on the shared
-CPU line. **MMC2 and MMC4 landed in the follow-ups below**: latch-driven
-CHR is now a shared PPU interface with mapper-specific header-only silicon.
-**MMC5 is underway** (first native slice below) as its own larger
-console-subsystem arc.
+**START HERE (2026-07-12, inter-ROM optimization arc LANDED — log below):**
+The 2026-07-12 audit found every fast-path tier keyed off the boot image
+while SMB is the only NROM ROM in `nes/examples/`; that arc is now landed
+and receipted (see the 2026-07-12 log): all eight example ROMs run
+120/120 frames byte-identical kernel⇔weights, SMB3 479.6 fps (was ~192),
+SMB 479.8 (was ~350), FF 756, Zelda 597, Punch-Out 328, Mega Man 6 238,
+Zelda II 231, CV3 203.  Remaining recorded levers, in value order:
+
+1. **Background pinned-module JIT tier** (the one big unlanded feature):
+   the slowest ROMs (CV3/MM6/Zelda2 at 200-240 fps) now spend ~85% of
+   frame time in native per-instruction execution of FLAT once-per-frame
+   game logic — no single pc is hot enough for the shape table
+   (`--profile` shows zero fallback pcs >= 2K steps/300 frames anywhere).
+   Only folding straight-line windows off-thread into a per-ROM module
+   (attach_seq on completion) reaches that code.
+2. **SHAPE_LIBRARY growth is data-gated now**: `nes.console --profile MIN`
+   dumps hot fallback pcs with disassembly.  Profiles across the slow
+   ROMs currently justify NO additions — re-run after new ROMs land.
+3. **MMC5 $5204 read lease: measured and rejected** (2 reads/frame on
+   CV3; the pause distribution was controller serial reads, fixed by the
+   queued lease below).
+
+## 2026-07-12 inter-ROM performance — every fast path made bank-aware
+
+Five landings, each verified by the full suite (127 tests green, ruff
+clean), 120/120 frame identity kernel⇔weights on ALL EIGHT example ROMs,
+and a 2,000-frame SMB3 soak (481 fps, zero checkpoints, 95.7M tokens,
+RSS byte-flat):
+
+- **trace=False run mode** (run_protocol, both engines): the shared run
+  loop's 12 per-step trace vectors + write arrays and KernelBus's
+  per-frame np.concatenate were pure overhead for gameplay (the console
+  reads only reason/cycles; banked ROMs pause 60-90x/frame on mapper and
+  PPU register writes).  Console.run_until passes trace=False; run()
+  always returns "steps" so the bus no longer needs the arrays to count.
+  Lockstep/receipt paths keep the traced default.
+- **Checkpoint reseeds retired for the native engines.**  Verified in
+  the compiled artifacts that NOTHING grows with the token log anymore:
+  the weights engine's insert_write is O(1) memstruct only and its
+  declared hulls[] were never inserted into or queried (they are no
+  longer emitted; hull_seen survives as the live-insert guard), and the
+  kernel's g_set clears per step.  Console checkpoint_tokens=None now
+  means auto: OFF for kernel/weights, 2M for the graph evaluator whose
+  Python log does grow.  boot_image seeds through a native seed_image
+  (one call, nonzero bytes) instead of ~50K per-byte pybind calls.
+- **Anchored shape windows everywhere** (root cause of the "jit window"
+  log spam: match_shape_windows required loop closure to head, so
+  straight-line matches could only ever arrive via JIT warmup — 512
+  fallback steps + poll latency per pc, re-paid every boot).  Dispatch
+  is correct and byte-verified for straight-line matches, and a cold
+  table entry costs nothing, so the boot scan now adds EVERY anchored
+  match (JMP self-spins keep operand == head); inject_region adds the
+  injected region's matches immediately (memoized per bank content).
+  The JIT tier now only ever fires for code copied to RAM at runtime.
+- **All-bank sequence windows**: mappers expose prg_scan_regions()
+  (every ROM bank at every base it can map: MMC1 16K x2 bases, MMC2/4
+  the $8000 switch slot, MMC3 three 8K slots, MMC5 four); the console
+  scans them all (0.05-0.25s, SMB3 72 / CV3 60 / Zelda 41 unique windows
+  vs 9 boot-only before), dedupes on (head, code), caps at 48, and the
+  per-ROM module folds the lot.  Module dispatch became a switch on
+  st_pc (window bytes arbitrate within a head across banks; expert names
+  carry the window hex to keep symbols unique).  A window for an
+  unmapped bank is inert by byte-verification.
+- **Queued multi-slot read leases**: the pause profile showed controller
+  serial reads dominate device-read pauses on every ROM (32/frame at
+  $4016/$4017; MMC5 $5204 was only 2/frame — lease idea rejected).  The
+  lease grew a 4-slot table (interleaved $4016/$4017 bit pairs thrashed
+  the single slot — CV3 stayed at 38 read pauses/frame until the second
+  slot landed) where each slot repeats one value ($2002, $4017 open bus
+  via an ApuFrameCounter shim) or serves a finite queue (the controller
+  leases its remaining report bits; a served-read counter + bus flush
+  advances the Python device model before its next read, so partial
+  consumption stays exact).  Read pauses: SMB3 37 → 9.2/frame, CV3 38 →
+  10.5/frame.  Receipt beyond frame identity: the interactive nestest
+  suite (Start-button driven through the lease path) stays green.
+
+`nes.console --profile MIN` lands as the shape-library gate: zero
+fallback pcs >= 2K steps/300 frames on cv3/mm6/zelda2/smb3, so no
+library additions are currently justified — the residual CPU time on
+the 200-240 fps ROMs is flat per-frame game logic (~85% native
+execution, ~10K instructions/frame), which is exactly the recorded
+background pinned-module JIT tier's target.
+
+fps receipts (240-frame runs, module caches warm; previous = 2026-07-11
+logs): SMB 479.8 (~350), SMB3 479.6 (~192), FF 756.2, Zelda 597.0,
+Punch-Out 327.8, Mega Man 6 238.1, Zelda II 230.8, CV3 202.8.
 
 ## 2026-07-11 MMC5 PRG-RAM into $8000-$DFFF
 

@@ -289,8 +289,11 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
 
     model, _tokens, tok_to_idx, info = schedule_and_build(r)
     cycles = sum(op.cycles for op in ops)
+    # Window bytes join the name: different banks may carry different
+    # windows at one head, and each needs its own step_core symbol.
     return {
-        "kind": "seq", "name": f"seq_{head:04X}", "head": head,
+        "kind": "seq", "name": f"seq_{head:04X}_{bytes(code).hex()}",
+        "head": head,
         "window": bytes(code), "n_steps": n_steps, "cycles": cycles,
         "cycles_prefix": cycles - ops[-1].cycles, "model": model,
         "step_spec": fold_step_spec(r, model, tok_to_idx, info,

@@ -453,7 +453,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        resume_read_skip = false;')
     emit('        cycles_total = 0;')
     emit('        rwatch.clear(); wwatch.clear();')
-    emit('        lease_addr = -1;')
+    emit('        clear_read_lease();')
     emit('    }')
     emit('')
     emit(MACHINE_API_CPP)
@@ -520,19 +520,25 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     b('                (double)(irq ? 1 : 0));')
     b('            pos += 1.0;')
     b('            step(v);')
-    b(f'            t_pc.push_back((int)(iround(v[{t["current_pc"]}]) & 0xFFFF));')
-    b(f'            t_a.push_back((int)(iround(v[{t["new_a"]}]) & 0xFF));')
-    b(f'            t_x.push_back((int)(iround(v[{t["new_x"]}]) & 0xFF));')
-    b(f'            t_y.push_back((int)(iround(v[{t["new_y"]}]) & 0xFF));')
-    b(f'            t_s.push_back((int)(iround(v[{t["new_s"]}]) & 0xFF));')
-    b(f'            t_p.push_back((int)(iround(v[{t["new_p"]}]) & 0xFF));')
-    b(f'            t_ir.push_back((int)(iround(v[{t["fetched_opcode"]}]) & 0xFF));')
-    b(f'            t_oplo.push_back((int)(iround(v[{t["fetched_operand_lo"]}]) & 0xFF));')
-    b(f'            t_ophi.push_back((int)(iround(v[{t["fetched_operand_hi"]}]) & 0xFF));')
-    b(f'            t_ea.push_back((int)(iround(v[{t["ea"]}]) & 0xFFFF));')
-    b(f'            t_data.push_back((int)(iround(v[{t["data_out"]}]) & 0xFF));')
+    b(f'            const int r_pc = (int)(iround(v[{t["current_pc"]}]) & 0xFFFF);')
+    b(f'            const int r_a = (int)(iround(v[{t["new_a"]}]) & 0xFF);')
+    b(f'            const int r_x = (int)(iround(v[{t["new_x"]}]) & 0xFF);')
+    b(f'            const int r_y = (int)(iround(v[{t["new_y"]}]) & 0xFF);')
+    b(f'            const int r_s = (int)(iround(v[{t["new_s"]}]) & 0xFF);')
+    b(f'            const int r_ir = (int)(iround(v[{t["fetched_opcode"]}]) & 0xFF);')
+    b(f'            const int r_oplo = (int)(iround(v[{t["fetched_operand_lo"]}]) & 0xFF);')
+    b(f'            const int r_ophi = (int)(iround(v[{t["fetched_operand_hi"]}]) & 0xFF);')
+    b(f'            const int r_ea = (int)(iround(v[{t["ea"]}]) & 0xFFFF);')
+    b(f'            const int r_data = (int)(iround(v[{t["data_out"]}]) & 0xFF);')
     b(f'            const bool halted = iround(v[{t["new_halted"]}]) != 0;')
-    b('            t_halted.push_back(halted ? 1 : 0);')
+    b(f'            const long p = iround(v[{t["new_p"]}]) & 0xFF;')
+    b('            if (trace) {')
+    b('                t_pc.push_back(r_pc); t_a.push_back(r_a); t_x.push_back(r_x);')
+    b('                t_y.push_back(r_y); t_s.push_back(r_s); t_p.push_back((int)p);')
+    b('                t_ir.push_back(r_ir); t_oplo.push_back(r_oplo);')
+    b('                t_ophi.push_back(r_ophi); t_ea.push_back(r_ea);')
+    b('                t_data.push_back(r_data); t_halted.push_back(halted ? 1 : 0);')
+    b('            }')
     b('            int n_writes = 0, n_hits = 0;')
     b('            int sh_addr[3], sh_value[3];')
     for store, addr, value in (
@@ -543,7 +549,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
         b(f'            if (iround(v[{t[store]}]) != 0) {{')
         b(f'                pend_addr[n_writes] = (int)(iround(v[{t[addr]}]) & 0xFFFF);')
         b(f'                pend_value[n_writes] = (int)(iround(v[{t[value]}]) & 0xFF);')
-        b('                w_row.push_back(step_index); w_addr.push_back(pend_addr[n_writes]); w_value.push_back(pend_value[n_writes]);')
+        b('                if (trace) { w_row.push_back(step_index); w_addr.push_back(pend_addr[n_writes]); w_value.push_back(pend_value[n_writes]); }')
         b('                ++n_writes;')
         b('            }')
     b('            for (int w = 0; w < n_writes; ++w) {')
@@ -554,15 +560,14 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     b('                }')
     b('            }')
     b(f'            const long next_pc = iround(v[{t["next_pc"]}]) & 0xFFFF;')
-    b(f'            const long p = iround(v[{t["new_p"]}]) & 0xFF;')
     b('            const int prev_pc = st_pc;')
     b('            st_pc = (int)next_pc;')
-    b('            st_a = t_a.back(); st_x = t_x.back(); st_y = t_y.back(); st_s = t_s.back();')
+    b('            st_a = r_a; st_x = r_x; st_y = r_y; st_s = r_s;')
     b('            st_p = (int)p;')
-    b('            st_ir = t_ir.back(); st_oplo = t_oplo.back(); st_ophi = t_ophi.back();')
-    b('            st_ea = t_ea.back(); st_data = t_data.back();')
+    b('            st_ir = r_ir; st_oplo = r_oplo; st_ophi = r_ophi;')
+    b('            st_ea = r_ea; st_data = r_data;')
     b('            ++step_index;')
-    b('            const long step_cycles = (nmi || irq) ? 7 : (long)CYCLES[(unsigned char)t_ir.back()];')
+    b('            const long step_cycles = (nmi || irq) ? 7 : (long)CYCLES[(unsigned char)r_ir];')
     b('            cycles_this += step_cycles; cycles_total += step_cycles;')
     b('            for (int k = 0; k < n_hits; ++k) { hit_addr.push_back(sh_addr[k]); hit_value.push_back(sh_value[k]); }')
     b('            if (halted) { st_halted = true; reason = "halt"; break; }')
@@ -590,10 +595,12 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        .def(py::init<>())')
     emit('        .def("load_image", &KERNEL_T::load_image, py::arg("image"), py::arg("start_pc"))')
     emit('        .def("run", &KERNEL_T::run, py::arg("max_steps"), py::arg("stop_on_trap") = false,')
-    emit('             py::arg("max_cycles") = 0L)')
+    emit('             py::arg("max_cycles") = 0L, py::arg("trace") = true)')
     emit('        .def("watch_read", &KERNEL_T::watch_read)')
     emit('        .def("watch_write", &KERNEL_T::watch_write)')
     emit('        .def("set_read_lease", &KERNEL_T::set_read_lease)')
+    emit('        .def("set_read_lease_seq", &KERNEL_T::set_read_lease_seq)')
+    emit('        .def("take_lease_served", &KERNEL_T::take_lease_served)')
     emit('        .def("clear_read_lease", &KERNEL_T::clear_read_lease)')
     emit('        .def("set_nmi", &KERNEL_T::set_nmi)')
     emit('        .def("set_irq", &KERNEL_T::set_irq)')
@@ -648,18 +655,20 @@ class Cpu6502CppRuntime:
         self.last_prefix_seconds = time.perf_counter() - prefix_start
 
     def run(self, max_steps: int, *, stop_on_trap: bool = False,
-            max_cycles: int = 0) -> dict:
+            max_cycles: int = 0, trace: bool = True) -> dict:
         """Run until a budget, halt, trap, or a watched address is touched.
 
         max_cycles > 0 additionally stops once that many base CPU cycles
         have elapsed in this call (reason "cycles"; used for frame pacing).
-        Returns trace arrays plus "reason" ("budget" | "halt" | "trap" |
-        "watch_read" | "watch_write" | "cycles"), "cycles" (elapsed this
-        call), "read_addr" (pending device read, or -1), and
-        "hit_addr"/"hit_value" (watched writes from the final step).
+        Returns trace arrays plus "steps" (executed this call), "reason"
+        ("budget" | "halt" | "trap" | "watch_read" | "watch_write" |
+        "cycles"), "cycles" (elapsed this call), "read_addr" (pending
+        device read, or -1), and "hit_addr"/"hit_value" (watched writes
+        from the final step).  trace=False leaves the per-step arrays
+        empty (gameplay reads only the scalars).
         """
         step_start = time.perf_counter()
-        out = self.kernel.run(max_steps, stop_on_trap, max_cycles)
+        out = self.kernel.run(max_steps, stop_on_trap, max_cycles, trace)
         self.last_step_seconds += time.perf_counter() - step_start
         return out
 
@@ -669,8 +678,14 @@ class Cpu6502CppRuntime:
     def watch_write(self, lo: int, hi: int):
         self.kernel.watch_write(lo, hi)
 
-    def set_read_lease(self, addr: int, value: int):
-        self.kernel.set_read_lease(addr, value)
+    def set_read_lease(self, addr: int, value: int) -> int:
+        return int(self.kernel.set_read_lease(addr, value))
+
+    def set_read_lease_seq(self, addr: int, values: bytes) -> int:
+        return int(self.kernel.set_read_lease_seq(addr, bytes(values)))
+
+    def take_lease_served(self, addr: int) -> int:
+        return int(self.kernel.take_lease_served(addr))
 
     def clear_read_lease(self):
         self.kernel.clear_read_lease()

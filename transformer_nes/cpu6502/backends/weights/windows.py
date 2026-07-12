@@ -42,8 +42,12 @@ SHAPE_LIBRARY: tuple[tuple[str, bytes, int], ...] = (
 )
 
 
-def match_shape_windows(image, shapes_meta, *, limit: int = 512):
-    """Find heads whose opcode bytes and closing target match a shape."""
+def match_shape_windows(image, shapes_meta, *, base: int = 0, limit: int = 4096):
+    """Every anchored shape match over an image region (heads absolute via
+    ``base``).  Closure to head is NOT required: dispatch is correct for
+    straight-line matches and re-verifies bytes against live RAM, so a
+    cold entry is only an unused table slot.  The JMP self-spin keeps its
+    operand == head demand (that closure is its dispatch predicate)."""
     data = bytes(image)
     n = len(data)
     out = []
@@ -57,19 +61,14 @@ def match_shape_windows(image, shapes_meta, *, limit: int = 512):
             if head < 0:
                 break
             start = head + 1
+            if base + head + length > 0x10000:  # window would wrap $FFFF
+                continue
             if any(data[head + offset] != byte for offset, byte in signature[1:]):
                 continue
-            if meta["close"] == "jmp":
-                if data[head + 1] | (data[head + 2] << 8) != head:
-                    continue
-            else:
-                relative = data[head + length - 1]
-                target = (
-                    head + length + relative - (256 if relative & 0x80 else 0)
-                ) & 0xFFFF
-                if target != head:
-                    continue
-            out.append((int(meta["id"]), head))
+            if (meta["close"] == "jmp"
+                    and data[head + 1] | (data[head + 2] << 8) != base + head):
+                continue
+            out.append((int(meta["id"]), base + head))
     return out
 
 
@@ -90,8 +89,13 @@ def match_shape_at(read, pc: int, shapes_meta) -> int | None:
     return None
 
 
-def scan_sequence_windows(image, *, spin_repeat: int = 4, limit: int = 16):
-    """Find closed, write-free micro-loops eligible for sequence experts."""
+def scan_sequence_windows(image, *, base: int = 0, spin_repeat: int = 4,
+                          limit: int = 16):
+    """Find closed, write-free micro-loops eligible for sequence experts.
+
+    ``base`` scans a bank region at its mapped CPU address: returned heads
+    are absolute, and JMP self-targets compare against base + head (branch
+    closure is relative, so it needs no adjustment)."""
     data = bytes(image)
     windows = []
     for head in range(len(data)):
@@ -112,12 +116,12 @@ def scan_sequence_windows(image, *, spin_repeat: int = 4, limit: int = 16):
                 offset = data[pc + 1]
                 target = (next_pc + offset - (256 if offset & 0x80 else 0)) & 0xFFFF
                 if target == head and index > 0:
-                    windows.append((head, data[head:next_pc], 1))
+                    windows.append((base + head, data[head:next_pc], 1))
                 break
             if op.operation == "jmp":
                 target = data[pc + 1] | (data[pc + 2] << 8)
-                if op.mode == "abs" and target == head:
-                    windows.append((head, data[head:next_pc], spin_repeat))
+                if op.mode == "abs" and target == base + head:
+                    windows.append((base + head, data[head:next_pc], spin_repeat))
                 break
             pc = next_pc
     return tuple(windows[:limit])

@@ -417,13 +417,15 @@ ENGINE_STEP_BODY = """\
                 if (k_seq > 0) {
                     for (int k = 0; k < k_seq; ++k) {
                         const long long* ok = seq_out + 21 * k;
-                        t_pc.push_back((int)ok[0]); t_a.push_back((int)ok[1]);
-                        t_x.push_back((int)ok[2]); t_y.push_back((int)ok[3]);
-                        t_s.push_back((int)ok[4]); t_p.push_back((int)ok[5]);
-                        t_ir.push_back((int)ok[6]); t_oplo.push_back((int)ok[7]);
-                        t_ophi.push_back((int)ok[8]); t_ea.push_back((int)ok[9]);
-                        t_data.push_back((int)ok[10]);
-                        t_halted.push_back((int)ok[11]);
+                        if (trace) {
+                            t_pc.push_back((int)ok[0]); t_a.push_back((int)ok[1]);
+                            t_x.push_back((int)ok[2]); t_y.push_back((int)ok[3]);
+                            t_s.push_back((int)ok[4]); t_p.push_back((int)ok[5]);
+                            t_ir.push_back((int)ok[6]); t_oplo.push_back((int)ok[7]);
+                            t_ophi.push_back((int)ok[8]); t_ea.push_back((int)ok[9]);
+                            t_data.push_back((int)ok[10]);
+                            t_halted.push_back((int)ok[11]);
+                        }
                         ++step_index;
                         const long step_cycles = (long)CYCLES[(unsigned char)ok[6]];
                         cycles_this += step_cycles; cycles_total += step_cycles;
@@ -440,19 +442,23 @@ ENGINE_STEP_BODY = """\
             const int prev_pc = st_pc;
             ++fallback_count[prev_pc];  // JIT profile: per-instruction steps only
             step_core(o);  // updates st_*, applies writes to ram + memory
-            t_pc.push_back((int)o[0]); t_a.push_back((int)o[1]);
-            t_x.push_back((int)o[2]); t_y.push_back((int)o[3]);
-            t_s.push_back((int)o[4]); t_p.push_back((int)o[5]);
-            t_ir.push_back((int)o[6]); t_oplo.push_back((int)o[7]);
-            t_ophi.push_back((int)o[8]); t_ea.push_back((int)o[9]);
-            t_data.push_back((int)o[10]);
+            if (trace) {
+                t_pc.push_back((int)o[0]); t_a.push_back((int)o[1]);
+                t_x.push_back((int)o[2]); t_y.push_back((int)o[3]);
+                t_s.push_back((int)o[4]); t_p.push_back((int)o[5]);
+                t_ir.push_back((int)o[6]); t_oplo.push_back((int)o[7]);
+                t_ophi.push_back((int)o[8]); t_ea.push_back((int)o[9]);
+                t_data.push_back((int)o[10]);
+            }
             const bool halted = o[11] != 0;
-            t_halted.push_back(halted ? 1 : 0);
+            if (trace) t_halted.push_back(halted ? 1 : 0);
             const int n_writes = (int)o[14];
             int n_hits = 0, sh_addr[3], sh_value[3];
             for (int w = 0; w < n_writes; ++w) {
                 const int wa = (int)o[15 + 2 * w], wv = (int)o[16 + 2 * w];
-                w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);
+                if (trace) {
+                    w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);
+                }
                 if (!wwatch.empty() && in_ranges(wwatch, wa)) {
                     sh_addr[n_hits] = wa; sh_value[n_hits] = wv; ++n_hits;
                 }
@@ -507,6 +513,20 @@ RUN_LOOP = "\n\n".join((
             insert_write((base + (int)i) & 0xFFFF, (unsigned char)d[i], seq + 1);
     }
 
+    // Boot/reseed seed: the whole image in one call, nonzero bytes only
+    // (matching boot_image's Python-side semantics); returns tokens added.
+    long seed_image(py::bytes image) {
+        const std::string d = image;
+        if (d.size() != 65536)
+            throw std::runtime_error("seed_image needs a 64 KiB image");
+        long n = 0;
+        for (int a = 0; a < 65536; ++a) {
+            const unsigned char v = (unsigned char)d[a];
+            if (v) { insert_write(a, v, seq + 1); ++n; }
+        }
+        return n;
+    }
+
     void set_run_state(int pc, int a, int x, int y, int s, int p,
                        int ir, int oplo, int ophi, int ea, int data, int halted) {
         st_pc = pc & 0xFFFF; st_a = a & 0xFF; st_x = x & 0xFF; st_y = y & 0xFF;
@@ -532,17 +552,21 @@ RUN_LOOP = "\n\n".join((
 PYBIND_STEP_METHODS = """\
         .def("machine_step", &ENGINE_T::machine_step)
         .def("run", &ENGINE_T::run, py::arg("max_steps"),
-             py::arg("stop_on_trap") = false, py::arg("max_cycles") = 0L)
+             py::arg("stop_on_trap") = false, py::arg("max_cycles") = 0L,
+             py::arg("trace") = true)
         .def("watch_read", &ENGINE_T::watch_read)
         .def("watch_write", &ENGINE_T::watch_write)
         .def("clear_watches", &ENGINE_T::clear_watches)
         .def("set_read_lease", &ENGINE_T::set_read_lease)
+        .def("set_read_lease_seq", &ENGINE_T::set_read_lease_seq)
+        .def("take_lease_served", &ENGINE_T::take_lease_served)
         .def("clear_read_lease", &ENGINE_T::clear_read_lease)
         .def("set_nmi", &ENGINE_T::set_nmi)
         .def("set_irq", &ENGINE_T::set_irq)
         .def("clear_irq", &ENGINE_T::clear_irq)
         .def("inject_write", &ENGINE_T::inject_write)
         .def("inject_region", &ENGINE_T::inject_region)
+        .def("seed_image", &ENGINE_T::seed_image)
         .def("read_ram", &ENGINE_T::read_ram)
         .def("dump_ram", &ENGINE_T::dump_ram)
         .def("set_run_state", &ENGINE_T::set_run_state)
@@ -603,24 +627,35 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
                        exp["model"], exp["step_spec"])
     # Window dispatch: same guards as the per-instruction path needs for
     # step-for-step equivalence -- pc at the head, every window byte
-    # matched, no deliverable interrupt, enough step/cycle budget.
+    # matched, no deliverable interrupt, enough step/cycle budget.  A
+    # switch on st_pc keeps dispatch O(log windows); several banks may
+    # carry different windows at one head, so byte checks arbitrate
+    # within a case.
+    by_head: dict[int, list] = {}
+    for exp in experts:
+        by_head.setdefault(exp["head"], []).append(exp)
     emit("")
     emit("    int dispatch(Eng& E, long i, long max_steps, long cycles_this,")
     emit("                 long max_cycles, bool stop_on_trap) {")
     emit("        if (E.nmi_pending || E.irq_ready() || stop_on_trap) return 0;")
-    for exp in experts:
-        head, window = exp["head"], exp["window"]
-        k, prefix = exp["n_steps"], exp["cycles_prefix"]
-        match = " && ".join(
-            f"E.ram[0x{(head + j) & 0xFFFF:04X}] == 0x{b:02X}"
-            for j, b in enumerate(window)
-        )
-        emit(f"        if (E.st_pc == 0x{head:04X} && i + {k} <= max_steps")
-        emit(f"            && (max_cycles <= 0 || cycles_this + {prefix} < max_cycles)")
-        emit(f"            && {match}) {{")
-        emit(f"            step_core__{exp['name']}(E, E.seq_out);")
-        emit(f"            return {k};")
-        emit("        }")
+    emit("        switch (E.st_pc) {")
+    for head in sorted(by_head):
+        emit(f"        case 0x{head:04X}:")
+        for exp in by_head[head]:
+            window = exp["window"]
+            k, prefix = exp["n_steps"], exp["cycles_prefix"]
+            match = " && ".join(
+                f"E.ram[0x{(head + j) & 0xFFFF:04X}] == 0x{b:02X}"
+                for j, b in enumerate(window)
+            )
+            emit(f"            if (i + {k} <= max_steps")
+            emit(f"                && (max_cycles <= 0 || cycles_this + {prefix} < max_cycles)")
+            emit(f"                && {match}) {{")
+            emit(f"                step_core__{exp['name']}(E, E.seq_out);")
+            emit(f"                return {k};")
+            emit("            }")
+        emit("            return 0;")
+    emit("        }")
     emit("        return 0;")
     emit("    }")
     emit("")
@@ -1186,7 +1221,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit("struct ENGINE_T {")
     emit(f"    static constexpr int D = {d_model};")
     emit("    long seq = -1;")
-    emit(f"    HardAttentionHead hulls[{max(n_hulls, 1)}];")
+    # hull_seen doubles as the per-seq live-insert guard for classified
+    # heads, so it survives even when no head keeps a real hull.
+    if n_hull_heads:
+        emit(f"    HardAttentionHead hulls[{n_hulls}];")
     emit(f"    long hull_seen[{max(n_hulls, 1)}];")
     emit(f"    static constexpr int F = {f_bits};")
     emit(f"    static constexpr {elem} SCALE = 1 << F;")
@@ -1213,7 +1251,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit("")
     emit("    void reset() {")
     emit(f"        for (int i = 0; i < {n_hulls}; ++i) {{")
-    emit("            hulls[i].clear();")
+    if n_hull_heads:
+        emit("            hulls[i].clear();")
     emit("            hull_seen[i] = -1;")
     emit("        }")
     emit("        for (int g = 0; g < 16; ++g)")
@@ -1228,7 +1267,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("        st_ir = st_oplo = st_ophi = st_ea = st_data = 0;")
         emit("        st_halted = false; nmi_pending = false; irq_pending = false;")
         emit("        resume_read_skip = false;")
-        emit("        lease_addr = -1;")
+        emit("        clear_read_lease();")
         emit("        step_index = 0; cycles_total = 0;")
         emit("        rwatch.clear(); wwatch.clear();")
     emit("        seq = -1;")
@@ -1486,11 +1525,14 @@ class GeneratedWeightsEngine:
             self.watch_write = self.engine.watch_write
             self.clear_watches = self.engine.clear_watches
             self.set_read_lease = self.engine.set_read_lease
+            self.set_read_lease_seq = self.engine.set_read_lease_seq
+            self.take_lease_served = self.engine.take_lease_served
             self.clear_read_lease = self.engine.clear_read_lease
             self.set_nmi = self.engine.set_nmi
             self.set_irq = self.engine.set_irq
             self.clear_irq = self.engine.clear_irq
             self.engine_inject_write = self.engine.inject_write
+            self.seed_image = self.engine.seed_image
             self.read_ram = self.engine.read_ram
             self.dump_ram = self.engine.dump_ram
             self.attach_seq = self.engine.attach_seq
