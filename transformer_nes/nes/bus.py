@@ -409,7 +409,8 @@ class KernelBus:
         """
         nmi_list = sorted(nmi_at) if nmi_at else []
         irq_list = sorted(irq_at) if irq_at else []
-        outs: list[dict] = []
+        trace_outs: list[dict] = []
+        pauses = 0
         executed = 0
         cycles_done = 0
         reason = "budget"
@@ -428,8 +429,16 @@ class KernelBus:
             cycle_limit = max_cycles - cycles_done if max_cycles > 0 else 0
             out = self.rt.run(limit, stop_on_trap=stop_on_trap, max_cycles=cycle_limit,
                               trace=trace)
-            outs.append(out)
+            pauses += 1
+            if trace:
+                trace_outs.append(out)
             executed += int(out["steps"])
+            # Mapper writes the engine banked natively: drain their
+            # CHR/IRQ/mirroring side effects into the Python mapper.
+            for addr, value in zip(out["m_addr"], out["m_value"], strict=True):
+                device = self.device_at(int(addr))
+                if device is not None:
+                    device.apply_native(int(addr), int(value))
             cycles_done += int(out["cycles"])
             # CPU -> device: watched writes from the final step of this run.
             for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
@@ -440,10 +449,10 @@ class KernelBus:
                     device.write(int(addr), int(value))
                     cycles_done += drain_stall(device)
             reason = out["reason"]
-            if len(outs) > 100_000:
+            if pauses > 100_000:
                 st = self.rt.get_state()
                 raise RuntimeError(
-                    f"bus runaway: {len(outs)} pauses in one run "
+                    f"bus runaway: {pauses} pauses in one run "
                     f"(executed={executed}, cycles={cycles_done}/{max_cycles}, "
                     f"reason={reason!r}, read_addr={int(out['read_addr'])}, "
                     f"pc={st['pc']:04X}, p={st['p']:02X})"
@@ -490,5 +499,8 @@ class KernelBus:
         if trace:
             for key in ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
                         "ea", "data", "halted", "w_row", "w_addr", "w_value"):
-                merged[key] = np.concatenate([out[key] for out in outs]) if outs else np.array([])
+                merged[key] = (
+                    np.concatenate([out[key] for out in trace_outs])
+                    if trace_outs else np.array([])
+                )
         return merged

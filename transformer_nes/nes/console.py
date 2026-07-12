@@ -213,6 +213,9 @@ class JournaledMapper:
                              J_MAPPER_WRITE, addr, value)
         self.mapper.write(addr, value)
 
+    def apply_native(self, addr: int, value: int) -> None:
+        self.mapper.apply_native(addr, value)
+
 
 def profile_fallbacks(console, min_count: int) -> None:
     """Dump hot per-instruction-tier pcs with disassembly: the evidence
@@ -243,9 +246,14 @@ def profile_fallbacks(console, min_count: int) -> None:
 
 def jit_sidecar_path(cart: Cartridge) -> str:
     """Per-ROM store for JIT window proposals, next to the engine cache."""
+    from transformer_nes.cpu6502.backends.weights.windows import MAX_INSTRUCTIONS
     from transformer_nes.model.engine_gen import CACHE_DIR
 
-    digest = hashlib.sha256(cart.prg).hexdigest()[:16]
+    policy = (
+        f"sequence-v4:safe-prefix:shape-promotion:"
+        f"max-instructions={MAX_INSTRUCTIONS}"
+    ).encode()
+    digest = hashlib.sha256(cart.prg + policy).hexdigest()[:16]
     return os.path.join(CACHE_DIR, f"jitwin_{digest}.json")
 
 
@@ -343,6 +351,7 @@ class Console:
             self.read_cpu = self.rt.read_ram
             self.poke_cpu = self.rt.inject_write
             self.poke_region = self.rt.inject_region
+            self.map_region = self.rt.map_region
             self.uses_kernel_bus = True
             return
         if backend == "weights":
@@ -368,6 +377,7 @@ class Console:
             self.read_cpu = machine.read_ram
             self.poke_cpu = machine.inject_write
             self.poke_region = machine.inject_region
+            self.map_region = machine.map_region
             self.uses_kernel_bus = True
             return
         if backend == "reference":
@@ -400,6 +410,7 @@ class Console:
             for i, byte in enumerate(data):
                 poke(base + i, byte)
         self.poke_region = poke_region
+        self.map_region = poke_region
 
     def attach_devices(self):
         ppu_dev = JournaledPpu(self.ppu, self.journal, self)
@@ -416,7 +427,7 @@ class Console:
             # Registers live in ROM space; reads there must stay native.
             self.bus.attach(mapper_dev, 0x8000, 0xFFFF, writes_only=True)
             self.mapper.poke = self.poke_cpu
-            self.mapper.poke_region = self.poke_region
+            self.mapper.poke_region = self.map_region
             self.mapper.on_mirroring = self.set_mirroring
             if hasattr(self.mapper, "mmc2_banks"):
                 self.mapper.set_mmc2_banks = self.ppu.set_mmc2_banks
@@ -442,6 +453,11 @@ class Console:
                 self.ppu.set_chr_banks(self.mapper.chr_banks())
             if hasattr(self.mapper, "on_irq_ack"):
                 self.mapper.on_irq_ack = self.clear_irq
+            # MMC1/MMC3-class PRG banking runs as native console silicon
+            # when the backend has the run loop; register writes reach the
+            # Python mapper as journal drains (apply_native).
+            if self.uses_kernel_bus and hasattr(self.mapper, "native_attach"):
+                self.mapper.native_attach(self.rt)
 
     def set_mirroring(self, mode: int) -> None:
         self.ppu.mirroring = mode

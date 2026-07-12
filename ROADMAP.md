@@ -6,35 +6,52 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
-**START HERE (2026-07-12, gameplay-informed — the tape logs below):**
-Title-screen fps was measuring idle poll loops, exactly what the window
-tiers serve best; recorded input tapes (`tapes/`, replayed by
-`nes.tape`) now give honest MOMENT-TO-MOMENT numbers: **SMB 418 fps,
-SMB3 184, CV3 166 in real gameplay** (vs 480/480/203 at their titles) —
-all comfortably past realtime, with the banked-ROM gap now measured,
-not guessed.  The gameplay-profiled levers, in value order:
+**START HERE (2026-07-12, mapper + hot-shape optimization landed):**
 
-1. **Native PRG banking for MMC1/MMC3-class mappers** (the dominant
-   remaining cost).  SMB3 gameplay pays 148 watched-write pauses/frame
-   (15.3 PRG bank switches/frame plus PPU/APU traffic) ≈ ~2 ms/frame of
-   pause round trips.  Precedent exists: the PPU-side mapper models
-   (mmc2/mmc4/mmc5.h) are already native silicon; a CPU-side native
-   bank overlay (ROM resident engine-side, $8000-region writes served
-   natively, Python keeps CHR/IRQ/mirroring) is the same move.
-2. **DONE (log below) — store-licensed sequence windows + warm-boot JIT
-   proposals.**  The write-free wall is down (bounded-store license,
-   static watch guard) and sustained-hot straight-line windows persist
-   per ROM and fold at next boot.  Measured: CV3 +4% (concentrated hot
-   pcs); SMB/SMB3 neutral — their per-instruction share was already
-   too thin and flat to matter, which is the evidence for item 1.
-3. **Profiling caveat for banked ROMs**: fallback pcs accumulate counts
-   under whichever bank was mapped; disassembling them later against
-   different live RAM prints garbage (CV3's SLO/LAX entries).  Capture
-   the window bytes at count time (or snapshot per switch) before
-   trusting per-pc listings on MMC carts.
-4. SHAPE_LIBRARY growth stays data-gated via `nes.console --profile` /
-   `nes.tape --profile`; MMC5 $5204 lease measured and rejected
-   (2 reads/frame).
+- MMC1/MMC3 PRG writes now decode inside the native run loop.  The ROM is
+  resident engine-side, changed slots are mapped without Python pauses, and
+  only CHR/IRQ/mirroring side effects drain to the Python mapper.  MMC5 and
+  other Python-serviced bank changes use an in-place mapped-memory operation:
+  a bank switch no longer manufactures 8/16K fictional transformer WRITE
+  tokens.  Measured token growth fell from ~45K→7K/frame on SMB3 and
+  ~69K→12K/frame on CV3.
+- Canonical shape experts are now the zero-compile baseline, not the final
+  tier.  Their executions feed the existing cumulative JIT heat counter;
+  sustained-hot concrete instances persist as safe-prefix proposals and fold
+  into operand-pinned per-ROM experts on the next boot.  This was the major
+  mapper-game lever: SMB3's dominant symbolic `LDA zp; BPL` expert was 24
+  layers / width 280; its two hot pinned instances are 16 layers / width 58.
+  The controlled tape window rose from ~238 to ~469 fps.  CV3's safe-prefix
+  promotion reached ~398 fps in the controlled window (the interactive app's
+  own whole-session ms/frame remains the authoritative gameplay number).
+- Window discovery now considers six instructions and admits later reads only
+  when folded address bounds prove they stay outside watched devices and no
+  earlier write needs intra-forward feedback.  The proposal generator stops
+  at that hazard and retains the longest safe prefix instead of losing the
+  whole hot region.
+- Generated compilation is split into 12 balanced translation units with two
+  compiler jobs by default (`TRANSFORMER_NES_COMPILE_SHARDS` and
+  `TRANSFORMER_NES_COMPILE_JOBS` tune them independently).  Compile layout is
+  cache metadata, so stale giant-shard artifacts are regenerated.  This fixes
+  both invalid C++ brace emission and the previous ~30 GB parallel frontend
+  blow-up mechanism.
+- Temporary route/shape/expert benchmark counters were removed after finding
+  the promotion lever.  Production runtime retains only counters that drive
+  JIT decisions.  `KernelBus.run(trace=False)` also no longer retains result
+  dictionaries needed only by trace concatenation.
+
+Next performance work, in evidence order:
+
+1. Measure full interactive/tape gameplay phases rather than title/early-frame
+   averages; report segment ms/frame alongside any headline fps.
+2. Promote more hot canonical instances and improve proposal ranking/capacity
+   using persisted execution value, without reintroducing passive telemetry.
+3. Move coherent MMC5 CPU register/PRG-RAM state native only where boundary
+   profiles show a real remaining cost; mapped-byte copying itself measured at
+   only microseconds and is not currently the main wall.
+4. Reduce folded expert depth/width for the remaining hot instruction/dataflow
+   mixes, then revisit true PRG pointer indirection if remap volume becomes a
+   measurable share.
 
 ## 2026-07-12 inter-ROM performance — every fast path made bank-aware
 

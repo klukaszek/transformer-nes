@@ -179,9 +179,10 @@ class Cpu6502TransformerMachine:
         # re-accumulating min_count steps, so heat measures SUSTAINED
         # execution, not one burst (a level-load memcpy reports once).
         self.jit_heat: dict[int, int] = {}
-        # Sustained-hot pcs with no library shape become pinned-window
-        # PROPOSALS for the next boot (the console persists them per ROM):
-        # folding and compiling mid-run would stall the frame loop.
+        # Sustained-hot pcs become pinned-window PROPOSALS for the next boot.
+        # This includes canonical shape hits: shapes are the zero-compile
+        # baseline, while a hot concrete instance deserves a smaller model
+        # with its operands folded.  Mid-run compilation would stall frames.
         self.jit_proposals: dict[int, tuple[int, bytes, int]] = {}
         # Shape matches per injected (base, bank content): a bank switch
         # re-adds its windows from this memo instead of rescanning.
@@ -378,6 +379,10 @@ class Cpu6502TransformerMachine:
         data = bytes(data)
         self.ram[base:base + len(data)] = data
         self.engine.inject_region(base, data)
+
+    def map_region(self, base: int, data: bytes):
+        """Replace a mapped cartridge region without creating WRITE tokens."""
+        self.engine.map_region(base, data)
         self.pos += len(data)
         # Newly banked-in code gets its shape windows immediately instead
         # of waiting out JIT warmup; matches are memoized per bank content.
@@ -565,6 +570,18 @@ class Cpu6502TransformerMachine:
 
     def clear_read_lease_addr(self, addr: int) -> None:
         self.engine.clear_read_lease_addr(addr)
+
+    def set_mapper_mmc3(self, prg: bytes, bank_select: int, regs: bytes,
+                        cur: bytes) -> None:
+        self.engine.set_mapper_mmc3(bytes(prg), bank_select, bytes(regs),
+                                    bytes(cur))
+
+    def set_mapper_mmc1(self, prg: bytes, shift: int, control: int,
+                        prg_reg: int, lo: int, hi: int) -> None:
+        self.engine.set_mapper_mmc1(bytes(prg), shift, control, prg_reg, lo, hi)
+
+    def clear_mapper(self) -> None:
+        self.engine.clear_mapper()
 
     def read_ram(self, addr: int) -> int:
         return self.engine.read_ram(addr)

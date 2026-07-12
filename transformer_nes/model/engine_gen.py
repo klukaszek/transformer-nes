@@ -38,6 +38,29 @@ ATTENTION_DIR = os.path.join(
 )
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_engine_cache")
 MANIFEST_PATH = os.path.join(CACHE_DIR, "manifest.json")
+# Shards bound the size of each generated C++ translation unit; jobs bound how
+# many compiler frontends are resident at once.  They are deliberately
+# independent: a few giant shards still make one clang process consume tens of
+# gigabytes, while many unconstrained shards multiply the smaller peak.
+DEFAULT_COMPILE_SHARDS = 12
+DEFAULT_COMPILE_JOBS = 2
+
+
+def positive_env_int(name: str, default: int) -> int:
+    """Read a positive integer build setting without leaking stringly typed
+    environment handling through the engine/cache paths."""
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw is not None else default
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def compile_shards() -> int:
+    return positive_env_int("TRANSFORMER_NES_COMPILE_SHARDS", DEFAULT_COMPILE_SHARDS)
 
 # Everything whose content can change the emitted engine, hashed into the
 # config key so any edit is a cache miss (over-inclusion is safe).
@@ -174,14 +197,25 @@ def load_module(
     build_start = time.perf_counter()
     cflags = ["-O2", "-std=c++17", "-fwrapv"]
     os.makedirs(build_dir, exist_ok=True)
-    module = load(
-        name=name,
-        sources=sources,
-        extra_cflags=cflags,
-        extra_include_paths=[ATTENTION_DIR, CACHE_DIR],
-        build_directory=build_dir,
-        verbose=False,
-    )
+    old_max_jobs = os.environ.get("MAX_JOBS")
+    if old_max_jobs is None:
+        os.environ["MAX_JOBS"] = str(
+            positive_env_int(
+                "TRANSFORMER_NES_COMPILE_JOBS", DEFAULT_COMPILE_JOBS
+            )
+        )
+    try:
+        module = load(
+            name=name,
+            sources=sources,
+            extra_cflags=cflags,
+            extra_include_paths=[ATTENTION_DIR, CACHE_DIR],
+            build_directory=build_dir,
+            verbose=False,
+        )
+    finally:
+        if old_max_jobs is None:
+            del os.environ["MAX_JOBS"]
     return module, time.perf_counter() - build_start
 
 
@@ -399,8 +433,9 @@ SEQ_HOOK = """\
                                  max_cycles, stop_on_trap ? 1 : 0);
             if (k) return k;
         }
-        return shape_dispatch(i, max_steps, cycles_this, max_cycles,
-                              stop_on_trap);
+        const int k = shape_dispatch(i, max_steps, cycles_this, max_cycles,
+                                     stop_on_trap);
+        return k;
     }
 
     void attach_seq(std::uintptr_t fn, std::uintptr_t ctx, py::bytes heads) {
@@ -479,7 +514,9 @@ ENGINE_STEP_BODY = """\
                 if (trace) {
                     w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);
                 }
-                if (!wwatch.empty() && in_ranges(wwatch, wa)) {
+                if (wa >= 0x8000 && mapper_kind) {
+                    mapper_write(wa, wv);  // native banking; no pause
+                } else if (!wwatch.empty() && in_ranges(wwatch, wa)) {
                     sh_addr[n_hits] = wa; sh_value[n_hits] = wv; ++n_hits;
                 }
             }
@@ -503,15 +540,15 @@ RUN_LOOP = "\n\n".join((
     """\
     // ── JIT profile counter ──────────────────────────────────
     // The run loop counts every per-instruction (fallback) step by pc;
-    // jit_hot reports pcs past the CUMULATIVE threshold that have no
-    // window yet, rearming only those (a rejected pc re-reports after
-    // re-heating; the Python side's rejected set filters it cheaply).
+    // jit_hot reports pcs past the cumulative threshold.  Canonical shape
+    // dispatches count too: hot symbolic shapes are candidates for cheaper
+    // operand-pinned per-ROM promotion on the next boot.
     unsigned int fallback_count[65536];
 
     py::array_t<int> jit_hot(long min_count) {
         std::vector<int> hot;
         for (int pc = 0; pc < 65536; ++pc)
-            if ((long)fallback_count[pc] >= min_count && !shape_of_pc[pc]) {
+            if ((long)fallback_count[pc] >= min_count) {
                 hot.push_back(pc);
                 fallback_count[pc] = 0;
             }
@@ -524,6 +561,25 @@ RUN_LOOP = "\n\n".join((
     MACHINE_API_CPP,
     """\
     void inject_write(int addr, int value) { insert_write(addr & 0xFFFF, value & 0xFF, seq + 1); }
+
+    // Cartridge mapping changes address translation; it does not append
+    // thousands of fictional CPU WRITE tokens.  All 6502 memory heads use
+    // this exact-address table, so replacing a mapped byte in place preserves
+    // reads while leaving transformer sequence position unchanged.
+    void map_write(int addr, int value) {
+        addr &= 0xFFFF; value &= 0xFF;
+        ram[addr] = (unsigned char)value;
+        const int group = addr >> 12, wl = addr & 0xFFF;
+        mem_val[group][wl] = value;
+        mem_seq[group][wl] = seq;
+        mem_bits[group][wl >> 6] |= 1ULL << (wl & 63);
+    }
+
+    void map_region(int base, py::bytes data) {
+        const std::string d = data;
+        for (size_t i = 0; i < d.size(); ++i)
+            map_write(base + (int)i, (unsigned char)d[i]);
+    }
 
     // Bulk injection (mapper bank switches): one call per region instead
     // of one Python call per byte.
@@ -587,7 +643,11 @@ PYBIND_STEP_METHODS = """\
         .def("clear_irq", &ENGINE_T::clear_irq)
         .def("inject_write", &ENGINE_T::inject_write)
         .def("inject_region", &ENGINE_T::inject_region)
+        .def("map_region", &ENGINE_T::map_region)
         .def("seed_image", &ENGINE_T::seed_image)
+        .def("set_mapper_mmc3", &ENGINE_T::set_mapper_mmc3)
+        .def("set_mapper_mmc1", &ENGINE_T::set_mapper_mmc1)
+        .def("clear_mapper", &ENGINE_T::clear_mapper)
         .def("read_ram", &ENGINE_T::read_ram)
         .def("dump_ram", &ENGINE_T::dump_ram)
         .def("set_run_state", &ENGINE_T::set_run_state)
@@ -1295,6 +1355,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("        clear_read_lease();")
         emit("        step_index = 0; cycles_total = 0;")
         emit("        clear_watches();")
+        emit("        clear_mapper();")
     emit("        seq = -1;")
     emit("    }")
     emit("")
@@ -1432,6 +1493,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 emit(f"                && (max_cycles <= 0 || cycles_this + "
                      f"{exp['cycles_prefix']} < max_cycles)")
                 emit(f"                && {checks}) {{")
+                emit("                ++fallback_count[st_pc];")
                 emit(f"                step_core__{exp['name']}(seq_out);")
                 emit(f"                return {exp['n_steps']};")
                 emit("            }")
@@ -1498,16 +1560,26 @@ class GeneratedWeightsEngine:
         self.digest = digest
         source = source.replace("ENGINE_T", f"Engine_{digest}")
         os.makedirs(CACHE_DIR, exist_ok=True)
+        n_shards = compile_shards()
         hpp_path = os.path.join(CACHE_DIR, f"engine_{digest}.hpp")
-        if not os.path.exists(hpp_path):
-            n_shards = max(1, min((os.cpu_count() or 4) - 2, 12))
+        shard_paths = [
+            os.path.join(CACHE_DIR, f"engine_{digest}_s{k}.cpp")
+            for k in range(n_shards)
+        ]
+        existing_shards = [
+            os.path.join(CACHE_DIR, path)
+            for path in os.listdir(CACHE_DIR)
+            if path.startswith(f"engine_{digest}_s") and path.endswith(".cpp")
+        ]
+        if not os.path.exists(hpp_path) or set(existing_shards) != set(shard_paths):
             header, shards = shard_source(source, f"Engine_{digest}", n_shards)
-            for k, body in enumerate(shards):
-                with open(os.path.join(CACHE_DIR, f"engine_{digest}_s{k}.cpp"),
-                          "w") as f:
+            for path, body in zip(shard_paths, shards, strict=True):
+                with open(path, "w") as f:
                     f.write(f'#include "engine_{digest}.hpp"\n\n{body}')
             with open(hpp_path, "w") as f:
                 f.write(header)
+            for path in set(existing_shards) - set(shard_paths):
+                os.unlink(path)
         module, self.compile_seconds = load_engine_module(digest)
         if cache_key is not None:
             manifest_put(cache_key, {
@@ -1515,6 +1587,7 @@ class GeneratedWeightsEngine:
                 "n_memory_heads": self.n_memory_heads,
                 "has_machine_step": self.has_machine_step,
                 "shapes": self.shapes_meta,
+                "compile_shards": n_shards,
             })
         self.bind(module)
 
@@ -1524,6 +1597,8 @@ class GeneratedWeightsEngine:
         the source emission entirely; None on any miss."""
         entry = manifest_read().get(cache_key)
         if entry is None:
+            return None
+        if entry.get("compile_shards") != compile_shards():
             return None
         if not os.path.exists(
             os.path.join(CACHE_DIR, f"engine_{entry['digest']}.hpp")
@@ -1563,6 +1638,10 @@ class GeneratedWeightsEngine:
             self.clear_irq = self.engine.clear_irq
             self.engine_inject_write = self.engine.inject_write
             self.seed_image = self.engine.seed_image
+            self.map_region = self.engine.map_region
+            self.set_mapper_mmc3 = self.engine.set_mapper_mmc3
+            self.set_mapper_mmc1 = self.engine.set_mapper_mmc1
+            self.clear_mapper = self.engine.clear_mapper
             self.read_ram = self.engine.read_ram
             self.dump_ram = self.engine.dump_ram
             self.attach_seq = self.engine.attach_seq

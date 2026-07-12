@@ -454,6 +454,7 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        cycles_total = 0;')
     emit('        clear_watches();')
     emit('        clear_read_lease();')
+    emit('        clear_mapper();')
     emit('    }')
     emit('')
     emit(MACHINE_API_CPP)
@@ -473,6 +474,20 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        addr &= 0xFFFF; value &= 0xFF;')
     emit('        ram[addr] = (unsigned char)value;')
     emit('        insert_write(addr, value, pos); pos += 1.0;')
+    emit('    }')
+    emit('')
+    emit('    void map_write(int addr, int value) {')
+    emit('        addr &= 0xFFFF; value &= 0xFF;')
+    emit('        ram[addr] = (unsigned char)value;')
+    emit('        const int wg = addr >> 12, wl = addr & 0xFFF;')
+    emit('        mem_val[wg][wl] = value; mem_seq[wg][wl] = (long long)pos;')
+    emit('        mem_bits[wg][wl >> 6] |= 1ULL << (wl & 63);')
+    emit('    }')
+    emit('')
+    emit('    void map_region(int base, py::bytes data) {')
+    emit('        const std::string d = data;')
+    emit('        for (size_t i = 0; i < d.size(); ++i)')
+    emit('            map_write(base + (int)i, (unsigned char)d[i]);')
     emit('    }')
     emit('')
     emit('    // Bulk injection (mapper bank switches): one call per region.')
@@ -555,7 +570,9 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     b('            for (int w = 0; w < n_writes; ++w) {')
     b('                ram[pend_addr[w]] = (unsigned char)pend_value[w];')
     b('                insert_write(pend_addr[w], pend_value[w], pos); pos += 1.0;')
-    b('                if (!wwatch.empty() && in_ranges(wwatch, pend_addr[w])) {')
+    b('                if (pend_addr[w] >= 0x8000 && mapper_kind) {')
+    b('                    mapper_write(pend_addr[w], pend_value[w]);  // native banking; no pause')
+    b('                } else if (!wwatch.empty() && in_ranges(wwatch, pend_addr[w])) {')
     b('                    sh_addr[n_hits] = pend_addr[w]; sh_value[n_hits] = pend_value[w]; ++n_hits;')
     b('                }')
     b('            }')
@@ -608,6 +625,10 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('        .def("clear_irq", &KERNEL_T::clear_irq)')
     emit('        .def("inject_write", &KERNEL_T::inject_write)')
     emit('        .def("inject_region", &KERNEL_T::inject_region)')
+    emit('        .def("map_region", &KERNEL_T::map_region)')
+    emit('        .def("set_mapper_mmc3", &KERNEL_T::set_mapper_mmc3)')
+    emit('        .def("set_mapper_mmc1", &KERNEL_T::set_mapper_mmc1)')
+    emit('        .def("clear_mapper", &KERNEL_T::clear_mapper)')
     emit('        .def("read_ram", &KERNEL_T::read_ram)')
     emit('        .def("dump_ram", &KERNEL_T::dump_ram)')
     emit('        .def("set_state", &KERNEL_T::set_state)')
@@ -708,6 +729,21 @@ class Cpu6502CppRuntime:
 
     def inject_region(self, base: int, data: bytes):
         self.kernel.inject_region(base, data)
+
+    def map_region(self, base: int, data: bytes):
+        self.kernel.map_region(base, data)
+
+    def set_mapper_mmc3(self, prg: bytes, bank_select: int, regs: bytes,
+                        cur: bytes) -> None:
+        self.kernel.set_mapper_mmc3(bytes(prg), bank_select, bytes(regs),
+                                    bytes(cur))
+
+    def set_mapper_mmc1(self, prg: bytes, shift: int, control: int,
+                        prg_reg: int, lo: int, hi: int) -> None:
+        self.kernel.set_mapper_mmc1(bytes(prg), shift, control, prg_reg, lo, hi)
+
+    def clear_mapper(self) -> None:
+        self.kernel.clear_mapper()
 
     def read_ram(self, addr: int) -> int:
         return self.kernel.read_ram(addr)

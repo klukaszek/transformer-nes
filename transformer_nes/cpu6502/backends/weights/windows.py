@@ -17,7 +17,15 @@ SEQUENCE_WRITERS = frozenset({
     "sax", "jsr", "brk", "rti", "rts", "pla", "plp",
 })
 BRANCH_OPERATIONS = frozenset({"bcc", "bcs", "beq", "bmi", "bne", "bpl", "bvc", "bvs"})
-MAX_INSTRUCTIONS = 4
+# Long enough to amortize a transformer forward on ordinary straight-line
+# 6502 basic blocks, still far below the sequence ABI's 32-row output bound.
+# Safety comes from folding/licensing, not this profitability horizon.
+MAX_INSTRUCTIONS = 6
+MEMORY_WRITE_OPERATIONS = frozenset({
+    "store_a", "store_x", "store_y", "sax",
+    "asl", "lsr", "rol", "ror", "inc", "dec",
+    "dcp", "isb", "slo", "rla", "sre", "rra",
+})
 
 # Canonical window shapes compile once into the core engine with pc and every
 # operand byte symbolic. Entries are (name, template, spin_repeat); operands
@@ -96,6 +104,7 @@ def propose_window(read, pc: int, *, max_len: int = MAX_INSTRUCTIONS):
     straight-line matches, and the fold license arbitrates stores.
     Returns (head, code, 1) or None."""
     code = bytearray()
+    wrote_memory = False
     for index in range(max_len):
         at = pc + len(code)
         if at + 3 > 0x10000:
@@ -103,8 +112,10 @@ def propose_window(read, pc: int, *, max_len: int = MAX_INSTRUCTIONS):
         op = OPCODES.get(read(at))
         if op is None:
             break
+        if op.operation in SEQUENCE_WRITERS:
+            break
         reads = op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm")
-        if op.operation in SEQUENCE_WRITERS or (index > 0 and reads):
+        if wrote_memory and reads:
             break
         if op.operation == "jmp" or op.mode == "ind":
             break
@@ -114,6 +125,7 @@ def propose_window(read, pc: int, *, max_len: int = MAX_INSTRUCTIONS):
                 code.extend(body)
             break
         code.extend(body)
+        wrote_memory |= op.operation in MEMORY_WRITE_OPERATIONS
     if sum(1 for _ in iter_ops(bytes(code))) < 2:
         return None
     return (pc, bytes(code), 1)
@@ -138,14 +150,15 @@ def scan_sequence_windows(image, *, base: int = 0, spin_repeat: int = 4,
     windows = []
     for head in range(len(data)):
         pc = head
+        wrote_memory = False
         for index in range(MAX_INSTRUCTIONS):
             op = OPCODES.get(data[pc]) if pc < len(data) - 2 else None
             if op is None:
                 break
+            if op.operation in SEQUENCE_WRITERS:
+                break
             reads = op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm")
-            # RMW reads memory, so it may only lead a window (like any
-            # read); its write is the fold license's problem.
-            if op.operation in SEQUENCE_WRITERS or (index > 0 and reads):
+            if wrote_memory and reads:
                 break
             next_pc = pc + op.length
             if op.operation in BRANCH_OPERATIONS:
@@ -159,5 +172,6 @@ def scan_sequence_windows(image, *, base: int = 0, spin_repeat: int = 4,
                 if op.mode == "abs" and target == base + head:
                     windows.append((base + head, data[head:next_pc], spin_repeat))
                 break
+            wrote_memory |= op.operation in MEMORY_WRITE_OPERATIONS
             pc = next_pc
     return tuple(windows[:limit])

@@ -15,7 +15,10 @@ import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.evaluator import RUNTIME_READ_DIMS
-from transformer_nes.cpu6502.backends.weights.windows import BRANCH_OPERATIONS
+from transformer_nes.cpu6502.backends.weights.windows import (
+    BRANCH_OPERATIONS,
+    MEMORY_WRITE_OPERATIONS,
+)
 from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
 from transformer_nes.graph.fold import (
     SEQUENCE_FEEDBACK,
@@ -144,15 +147,28 @@ def decode_ops(code: bytes) -> list:
     return ops
 
 
-def check_first_read_only(ops, label: str) -> None:
-    """Only the first instruction of a window may read memory: the run
-    loop's shadow-read watch check covers exactly one instruction."""
-    for op in ops[1:]:
+def check_reads_licensed(fold_result, ops, label: str) -> None:
+    """The run loop shadow-checks only the first instruction.  A later
+    memory read is nevertheless safe when folding proves its effective
+    address stays in native RAM (< $2000) or cartridge ROM (>= $8000),
+    outside every NES device/read-watch range."""
+    wrote_memory = ops[0].operation in MEMORY_WRITE_OPERATIONS
+    for k, op in enumerate(ops[1:], 1):
         if op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm"):
+            if wrote_memory:
+                raise RuntimeError(
+                    f"{label}: {op.mnemonic} step {k} reads after an earlier "
+                    "write that is not fed back inside one forward"
+                )
+            dim = fold_result.dim_of_name[f"ea__s{k}"]
+            lo, hi = interval_of(fold_result, dim)
+            if hi < 0x2000 or lo >= 0x8000:
+                continue
             raise RuntimeError(
-                f"{label}: {op.mnemonic} reads memory past the shadow-watch "
-                "check (only the first instruction may)"
+                f"{label}: {op.mnemonic} step {k} read target bound "
+                f"[{lo:.0f}, {hi:.0f}] may reach a watched device"
             )
+        wrote_memory |= op.operation in MEMORY_WRITE_OPERATIONS
 
 
 def const_root(fold_result, root: str, k: int, label: str) -> int:
@@ -355,14 +371,12 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     fold pins all of it.  The license: every step non-halting with stores
     bounded below $2000 (check_writes_licensed), control flow
     straight-line inside the window (folded next_pc == the next step's
-    pinned pc), and only the first instruction may read memory.
+    pinned pc), and later reads proven outside watched device ranges.
     """
     label = f"sequence @{head:04X}"
     pin_list = sequence_pins(head, code, OPCODES) * repeat
     n_steps = len(pin_list)
     ops = decode_ops(code) * repeat
-    check_first_read_only(ops, label)
-
     folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
     r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
                              label=f"seq_{head:04X}")
@@ -371,6 +385,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
             f"{label}: pins reach insert-side expressions "
             f"of {r.insert_side_hazards}"
         )
+    check_reads_licensed(r, ops, label)
     has_stores = check_writes_licensed(
         r, n_steps, label, window_range=(head, head + len(code)),
     )
@@ -424,7 +439,6 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
         for op in ops[:-1]:
             offs.append(offs[-1] + op.length)
         checks = list(zip(offs, (op.byte for op in ops), strict=True))
-        check_first_read_only(ops, label)
         self_target = (
             len(ops) == 1 and ops[0].operation == "jmp" and ops[0].mode == "abs"
         )
@@ -444,6 +458,7 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
                 f"{label}: pins reach insert-side expressions "
                 f"of {r.insert_side_hazards}"
             )
+        check_reads_licensed(r, ops * repeat, label)
         has_stores = check_writes_licensed(r, n_steps, label)
         if has_stores:
             # A shape's head is symbolic, so store disjointness from the

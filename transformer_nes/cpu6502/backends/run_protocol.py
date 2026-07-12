@@ -188,6 +188,21 @@ def run_state_members_cpp() -> str:
     // windows dispatch only while this stays >= 0x2000, making a watched
     // write inside a window statically impossible.
     int watch_write_lo = 0x10000;
+    // Native cartridge PRG banking (console silicon, like the PPU):
+    // $8000-$FFFF register writes decode natively -- bank switches copy
+    // from the resident PRG ROM, the clobbered ROM byte is repaired --
+    // and are journaled for the Python mapper's CHR/IRQ/mirroring side
+    // effects, drained at every run() return.  The frame-at-once PPU
+    // samples that state only at split/render boundaries, which all
+    // follow a drain, so the deferral is invisible.
+    int mapper_kind = 0;  // 0 none, 1 MMC1, 3 MMC3
+    std::vector<unsigned char> mapper_prg;
+    int mapper_nbanks = 0;
+    int mapper_cur[4] = {{-1, -1, -1, -1}};  // 8K slot banks (MMC1: 16K pairs)
+    int m3_bank_select = 0;
+    int m3_regs[8] = {{0, 0, 0, 0, 0, 0, 0, 0}};
+    int m1_shift = 0x10, m1_control = 0x0C, m1_prg = 0;
+    std::vector<int> mj_addr, mj_value;  // journal since last drain
     static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};
     // Base cycles per opcode (no penalty cycles); NMI costs 7.
     static constexpr unsigned char CYCLES[256] = {{ {cycles_tab} }};"""
@@ -261,7 +276,104 @@ MACHINE_API_CPP = """\
     // IRQ deliverable now: I clear and no NMI ahead of it.
     bool irq_ready() const { return irq_pending && !nmi_pending && !(st_p & 0x04); }
     int read_ram(int addr) { return ram[addr & 0xFFFF]; }
-    py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }"""
+    py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }
+
+    // ── Native PRG banking ───────────────────────────────────────────
+    void mapper_slot(int slot, int bank, int size) {
+        if (mapper_cur[slot] == bank) return;
+        mapper_cur[slot] = bank;
+        const unsigned char* src = mapper_prg.data() + (size_t)bank * size;
+        const int base = 0x8000 + slot * size;
+        for (int i = 0; i < size; ++i) map_write(base + i, src[i]);
+    }
+    void mapper_apply_mmc3() {
+        const int n = mapper_nbanks;
+        const int r6 = m3_regs[6] % n, r7 = m3_regs[7] % n;
+        const int second_last = n - 2, last = n - 1;
+        const bool swap = m3_bank_select & 0x40;
+        mapper_slot(0, swap ? second_last : r6, 0x2000);
+        mapper_slot(1, r7, 0x2000);
+        mapper_slot(2, swap ? r6 : second_last, 0x2000);
+        mapper_slot(3, last, 0x2000);
+    }
+    void mapper_apply_mmc1() {
+        const int n = mapper_nbanks;
+        const int mode = (m1_control >> 2) & 3;
+        const int bank = (m1_prg & 0x0F) % n;
+        int lo, hi;
+        if (mode <= 1) { lo = bank & 0x0E; hi = (bank & 0x0E) | 1; }
+        else if (mode == 2) { lo = 0; hi = bank; }
+        else { lo = bank; hi = n - 1; }
+        mapper_slot(0, lo, 0x4000);
+        mapper_slot(1, hi, 0x4000);
+    }
+    int mapper_rom_byte(int addr) {
+        if (mapper_kind == 1) {
+            const int bank = mapper_cur[(addr >> 14) & 1];
+            return mapper_prg[(size_t)bank * 0x4000 + (addr & 0x3FFF)];
+        }
+        const int bank = mapper_cur[(addr - 0x8000) >> 13];
+        return mapper_prg[(size_t)bank * 0x2000 + (addr & 0x1FFF)];
+    }
+    // Decode a $8000-$FFFF register write, apply any PRG switch, repair
+    // the clobbered ROM byte, journal for the Python mapper's CHR/IRQ/
+    // mirroring side effects.
+    void mapper_write(int addr, int value) {
+        mj_addr.push_back(addr); mj_value.push_back(value);
+        if (mapper_kind == 3) {
+            const int reg = addr & 0xE001;
+            if (reg == 0x8000) { m3_bank_select = value; mapper_apply_mmc3(); }
+            else if (reg == 0x8001) {
+                m3_regs[m3_bank_select & 7] = value & 0xFF;
+                mapper_apply_mmc3();
+            } else if (reg == 0xE000) {
+                irq_pending = false;  // $E000 acks the line NOW; the
+            }                         // drain reconciles console sources
+        } else if (value & 0x80) {
+            m1_shift = 0x10; m1_control |= 0x0C;
+            mapper_apply_mmc1();
+        } else {
+            const bool complete = m1_shift & 1;
+            m1_shift = ((m1_shift >> 1) | ((value & 1) << 4)) & 0x1F;
+            if (complete) {
+                const int reg = (addr >> 13) & 3;
+                if (reg == 0) m1_control = m1_shift;
+                else if (reg == 3) m1_prg = m1_shift;
+                m1_shift = 0x10;
+                mapper_apply_mmc1();
+            }
+        }
+        map_write(addr, mapper_rom_byte(addr));
+    }
+    void set_mapper_mmc3(py::bytes prg, int bank_select, py::bytes regs,
+                         py::bytes cur) {
+        const std::string p = prg, r = regs, c = cur;
+        mapper_prg.assign(p.begin(), p.end());
+        mapper_nbanks = (int)(p.size() / 0x2000);
+        m3_bank_select = bank_select;
+        for (int i = 0; i < 8 && i < (int)r.size(); ++i)
+            m3_regs[i] = (unsigned char)r[i];
+        for (int i = 0; i < 4 && i < (int)c.size(); ++i)
+            mapper_cur[i] = (unsigned char)c[i];
+        mapper_kind = 3;
+    }
+    void set_mapper_mmc1(py::bytes prg, int shift, int control, int prgreg,
+                         int lo, int hi) {
+        const std::string p = prg;
+        mapper_prg.assign(p.begin(), p.end());
+        mapper_nbanks = (int)(p.size() / 0x4000);
+        m1_shift = shift; m1_control = control; m1_prg = prgreg;
+        mapper_cur[0] = lo; mapper_cur[1] = hi;
+        mapper_kind = 1;
+    }
+    void clear_mapper() {
+        mapper_kind = 0; mapper_prg.clear();
+        for (int i = 0; i < 4; ++i) mapper_cur[i] = -1;
+        m1_shift = 0x10; m1_control = 0x0C; m1_prg = 0;
+        m3_bank_select = 0;
+        for (int i = 0; i < 8; ++i) m3_regs[i] = 0;
+        mj_addr.clear(); mj_value.clear();
+    }"""
 
 
 RUN_LOOP_TEMPLATE = """\
@@ -334,6 +446,11 @@ RUN_LOOP_TEMPLATE = """\
         }
         out["hit_addr"] = arr(hit_addr);
         out["hit_value"] = arr(hit_value);
+        // Natively applied mapper writes since the last return: the bus
+        // drains them into the Python mapper's side-effect path.
+        out["m_addr"] = arr(mj_addr);
+        out["m_value"] = arr(mj_value);
+        mj_addr.clear(); mj_value.clear();
         out["read_addr"] = read_addr;
         out["reason"] = reason;
         out["cycles"] = cycles_this;

@@ -175,6 +175,41 @@ class Mmc1(Mapper):
     def load_bank(self, base: int, bank: int) -> None:
         inject_region(self, base, self.prg[bank * BANK16:(bank + 1) * BANK16])
 
+    def native_attach(self, rt) -> None:
+        """Hand the serial register and PRG ROM to the engine's native
+        banking (console silicon, like the PPU); register writes then
+        reach Python only as journal drains via apply_native."""
+        lo, hi = self.prg_banks()
+        rt.set_mapper_mmc1(self.prg, self.shift, self.control,
+                           self.prg_reg, lo, hi)
+
+    def apply_native(self, addr: int, value: int) -> None:
+        """Journal drain: bank injection and ROM-byte repair already
+        happened engine-side; only CHR/mirroring side effects run here."""
+        old_mirroring = self.control & 3
+        old_chr = self.chr_banks() if self.chr_rom else None
+        if value & 0x80:
+            self.shift = 0x10
+            self.control |= 0x0C
+        else:
+            complete = self.shift & 1
+            self.shift = ((self.shift >> 1) | ((value & 1) << 4)) & 0x1F
+            if complete:
+                reg = (addr >> 13) & 3
+                if reg == 0:
+                    self.control = self.shift
+                elif reg in (1, 2):
+                    self.chr_regs[reg - 1] = self.shift
+                elif reg == 3:
+                    self.prg_reg = self.shift
+                self.shift = 0x10
+        if (self.control & 3) != old_mirroring and self.on_mirroring is not None:
+            self.on_mirroring(self.control & 3)
+        if self.chr_rom and self.set_chr_banks is not None:
+            new_chr = self.chr_banks()
+            if new_chr != old_chr:
+                self.set_chr_banks(new_chr)
+
 
 class Mmc2(Mapper):
     """Mapper 9 (PxROM): Punch-Out's 8 KiB PRG switch and CHR latches.
@@ -358,6 +393,35 @@ class Mmc3(Mapper):
 
     def load_bank(self, base: int, bank: int) -> None:
         inject_region(self, base, self.prg[bank * BANK8:(bank + 1) * BANK8])
+
+    def native_attach(self, rt) -> None:
+        """Hand the register file and PRG ROM to the engine's native
+        banking; register writes then reach Python only as journal
+        drains via apply_native."""
+        rt.set_mapper_mmc3(self.prg, self.bank_select, bytes(self.regs),
+                           bytes(self.prg_banks()))
+
+    def apply_native(self, addr: int, value: int) -> None:
+        """Journal drain: bank injection, ROM-byte repair, and the $E000
+        line ack already happened engine-side; CHR/IRQ/mirroring side
+        effects run here."""
+        reg = addr & 0xE001
+        if reg == 0x8000:
+            self.bank_select = value
+        elif reg == 0x8001:
+            self.regs[self.bank_select & 7] = value
+        elif reg == 0xA000:
+            self.on_mirroring(3 if value & 1 else 2)
+        elif reg == 0xC000:
+            self.irq_latch = value
+        elif reg == 0xE000:
+            self.irq_enabled = False
+            if self.on_irq_ack is not None:
+                self.on_irq_ack()
+        elif reg == 0xE001:
+            self.irq_enabled = True
+        if self.chr_rom and reg in (0x8000, 0x8001):
+            self.set_chr_banks(self.chr_banks())
 
 
 class Mmc4(Mapper):
