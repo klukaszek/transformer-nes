@@ -2,8 +2,11 @@
 
 #include <array>
 #include <cstdint>
-#include <optional>
-#include <vector>
+
+struct Mmc5BankSnapshot {
+    std::array<int, 8> sprite{};
+    std::array<int, 8> background{};
+};
 
 // Native PPU-side MMC5 state. CPU register decoding and PRG banking live
 // in mappers.py; this class owns data substituted onto the PPU bus.
@@ -34,10 +37,11 @@ public:
 
     int read_exram(int offset) const { return exram_[offset & 0x3FF]; }
 
-    // A value means MMC5 substitutes the bus; nullopt selects CIRAM 0/1.
-    // The map is a caller-supplied $5105 value: render bands latch it, so
-    // a mid-frame $5105 change must not re-decode through the live one.
-    std::optional<int> nametable_byte(int map, int table, int offset) const {
+    // The map is a caller-supplied $5105 value because render bands latch
+    // it independently of the live register. Route the complete read here
+    // so generic PPU code does not contain MMC5 source decoding.
+    int read_nametable(int map, int table, int offset,
+                       const uint8_t* ciram) const {
         const int source = (map >> (table * 2)) & 3;
         if (source == 2) {
             return exram_mode_ <= 1 ? exram_[offset & 0x3FF] : 0;
@@ -46,11 +50,20 @@ public:
             if (offset < 0x3C0) return fill_tile_;
             return fill_color_ * 0x55;  // replicate AA into all quadrants
         }
-        return std::nullopt;
+        return ciram[source * 0x400 + offset];
     }
 
-    void configure_chr(const std::vector<int>& sprite,
-                       const std::vector<int>& background) {
+    void write_nametable(int table, int offset, int value, uint8_t* ciram) {
+        const int source = (nametable_map_ >> (table * 2)) & 3;
+        if (source == 2) {
+            write_exram(offset, value);
+        } else if (source != 3) {  // fill mode has no memory behind it
+            ciram[source * 0x400 + offset] = static_cast<uint8_t>(value);
+        }
+    }
+
+    void configure_chr(const std::array<int, 8>& sprite,
+                       const std::array<int, 8>& background) {
         for (int i = 0; i < 8; ++i) {
             sprite_banks_[i] = sprite.at(i) * 0x400;
             background_banks_[i] = background.at(i) * 0x400;
@@ -59,6 +72,15 @@ public:
 
     const int* sprite_banks() const { return sprite_banks_.data(); }
     const int* background_banks() const { return background_banks_.data(); }
+    const std::array<uint8_t, 0x400>& exram() const { return exram_; }
+
+    Mmc5BankSnapshot bank_snapshot() const {
+        return {sprite_banks_, background_banks_};
+    }
+
+    const int* live_background_banks(int ctrl) const {
+        return (ctrl & 0x20) ? background_banks_.data() : sprite_banks_.data();
+    }
 
     // State after vblank programming, used from scanline 0 until the first
     // visible IRQ. This is distinct from an IRQ snapshot: chained handlers
@@ -71,6 +93,10 @@ public:
     const int* frame_background_banks() const {
         return frame_background_banks_.data();
     }
+    const int* frame_background_banks(int ctrl) const {
+        return (ctrl & 0x20) ? frame_background_banks_.data()
+                             : frame_sprite_banks_.data();
+    }
 
     // Freeze the CHR windows in effect at a mid-frame IRQ split, so rows
     // above it render from these while later writes only affect below.
@@ -80,6 +106,10 @@ public:
     }
     const int* split_sprite_banks() const { return split_sprite_banks_.data(); }
     const int* split_background_banks() const { return split_background_banks_.data(); }
+    const int* split_background_banks(int ctrl) const {
+        return (ctrl & 0x20) ? split_background_banks_.data()
+                             : split_sprite_banks_.data();
+    }
 
 private:
     bool active_ = false;

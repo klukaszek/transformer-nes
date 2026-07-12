@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 
-from transformer_nes.nes.native_cache import build_dir
+from transformer_nes.nes import build_dir
 
 APU_CPP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apu.cpp")
 

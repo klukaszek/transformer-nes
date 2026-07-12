@@ -9,9 +9,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <array>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -29,7 +29,9 @@ struct PPU {
     // the PPU's $0000-$1FFF window maps through eight 1 KiB bank slots.
     std::vector<uint8_t> chr;
     int chr_bank[8];
-    std::unique_ptr<ChrLatchMapper> chr_latch;
+    Mmc2Chr mmc2;
+    Mmc4Chr mmc4;
+    ChrLatchMapper* chr_latch = nullptr;
     Mmc5Ppu mmc5;
     bool chr_writable;
     // Nametable arrangement, runtime-switchable by mappers (MMC1
@@ -74,9 +76,11 @@ struct PPU {
 
     struct RasterSplit {
         int line, ctrl, mask, mirroring, t_addr, fine_x, v_addr;
-        int chr_banks[8], mmc5_bg[8], mmc5_sprite[8];
+        int chr_banks[8];
+        Mmc5BankSnapshot mapper_banks;
     };
-    std::vector<RasterSplit> raster_splits;
+    std::array<RasterSplit, MAX_RASTER_SPLITS> raster_splits{};
+    size_t raster_split_count = 0;
 
     void mark_split(int scanline) {
         mid_scanline = scanline;
@@ -90,18 +94,15 @@ struct PPU {
         // At most one state transition can affect each visible scanline.
         // Keep the journal and render scratch arrays on the same explicit
         // bound; the former used to grow past the latter's eight entries.
-        if (raster_splits.size() >= MAX_RASTER_SPLITS) return;
+        if (raster_split_count >= raster_splits.size()) return;
         RasterSplit split{scanline, ctrl, mask, mirroring, t_addr,
-                          fine_x, vram_addr, {}, {}, {}};
+                          fine_x, vram_addr, {}, {}};
         std::memcpy(split.chr_banks, chr_bank, sizeof(chr_bank));
         if (mmc5.active()) {
             mmc5.snapshot();
-            std::memcpy(split.mmc5_bg, mmc5.background_banks(),
-                        sizeof(split.mmc5_bg));
-            std::memcpy(split.mmc5_sprite, mmc5.sprite_banks(),
-                        sizeof(split.mmc5_sprite));
+            split.mapper_banks = mmc5.bank_snapshot();
         }
-        raster_splits.push_back(split);
+        raster_splits[raster_split_count++] = split;
     }
 
     // Everything a background row depends on: pattern/enable/edge bits,
@@ -145,10 +146,6 @@ struct PPU {
         std::memset(nametables, 0, sizeof(nametables));
         std::memset(palette, 0, sizeof(palette));
         std::memset(oam, 0, sizeof(oam));
-        // MMC5 games normally issue only a handful of raster IRQs per frame.
-        // Keep their journal's storage for the PPU lifetime so mark_split()
-        // never visits the allocator during ordinary rendering.
-        raster_splits.reserve(8);
     }
 
     // ── Device protocol (registers $2000-$3FFF, mirrored every 8) ──
@@ -181,11 +178,8 @@ struct PPU {
     int nt_read_for(int addr, int arrangement) const {
         const int a = (addr - 0x2000) & 0xFFF;
         const int table = a >> 10, offset = a & 0x3FF;
-        if (mmc5.active()) {
-            if (auto value = mmc5.nametable_byte(arrangement, table, offset))
-                return *value;
-            return nametables[((arrangement >> (table * 2)) & 1) * 0x400 + offset];
-        }
+        if (mmc5.active())
+            return mmc5.read_nametable(arrangement, table, offset, nametables);
         return nametables[nt_offset_for(addr, arrangement)];
     }
 
@@ -200,29 +194,27 @@ struct PPU {
         mmc5.write_exram(offset, value);
     }
 
-    void set_mmc5_chr(const std::vector<int>& sprite,
-                      const std::vector<int>& background) {
+    void set_mmc5_chr(const std::array<int, 8>& sprite,
+                      const std::array<int, 8>& background) {
         mmc5.configure_chr(sprite, background);
     }
 
     // The PPU-side ExRAM (nametable/attribute data written via $2007) and
     // the live exram mode -- for debugging MMC5 background substitution.
-    std::vector<int> mmc5_exram() const {
-        std::vector<int> v(0x400);
-        for (int i = 0; i < 0x400; ++i) v[i] = mmc5.read_exram(i);
-        return v;
+    std::array<uint8_t, 0x400> mmc5_exram() const {
+        return mmc5.exram();
     }
     int mmc5_exram_mode() const { return mmc5.exram_mode(); }
 
     // The CHR windows frozen at the last IRQ split (bank indices), for
     // debugging mid-frame swaps; stale until a split occurs.
-    std::vector<int> mmc5_split_bg() const {
-        std::vector<int> v(8);
+    std::array<int, 8> mmc5_split_bg() const {
+        std::array<int, 8> v{};
         for (int i = 0; i < 8; ++i) v[i] = mmc5.split_background_banks()[i] / 0x400;
         return v;
     }
-    std::vector<int> mmc5_split_sprite() const {
-        std::vector<int> v(8);
+    std::array<int, 8> mmc5_split_sprite() const {
+        std::array<int, 8> v{};
         for (int i = 0; i < 8; ++i) v[i] = mmc5.split_sprite_banks()[i] / 0x400;
         return v;
     }
@@ -238,21 +230,18 @@ struct PPU {
         return value;
     }
 
-    void set_chr_banks(const std::vector<int>& banks_1k) {
-        if (banks_1k.size() != 8) throw std::runtime_error("expected 8 CHR banks");
+    void set_chr_banks(const std::array<int, 8>& banks_1k) {
         const int n = (int)(chr.size() >> 10);
         for (int i = 0; i < 8; ++i) chr_bank[i] = (banks_1k[i] % n) * 0x400;
     }
 
-    void set_mmc2_banks(const std::vector<int>& banks_4k) {
-        if (!dynamic_cast<Mmc2Chr*>(chr_latch.get()))
-            chr_latch = std::make_unique<Mmc2Chr>();
+    void set_mmc2_banks(const std::array<int, 4>& banks_4k) {
+        chr_latch = &mmc2;
         chr_latch->configure(banks_4k, chr.size());
     }
 
-    void set_mmc4_banks(const std::vector<int>& banks_4k) {
-        if (!dynamic_cast<Mmc4Chr*>(chr_latch.get()))
-            chr_latch = std::make_unique<Mmc4Chr>();
+    void set_mmc4_banks(const std::array<int, 4>& banks_4k) {
+        chr_latch = &mmc4;
         chr_latch->configure(banks_4k, chr.size());
     }
 
@@ -271,15 +260,10 @@ struct PPU {
         } else if (addr < 0x3F00) {
             const int a = (addr - 0x2000) & 0xFFF;
             const int table = a >> 10, offset = a & 0x3FF;
-            if (mmc5.active()) {
-                const int source = (mmc5.nametable_map() >> (table * 2)) & 3;
-                if (source == 2)
-                    mmc5.write_exram(offset, value);
-                else if (source != 3)  // fill mode has no memory behind it
-                    nametables[(source & 1) * 0x400 + offset] = (uint8_t)value;
-            } else {
+            if (mmc5.active())
+                mmc5.write_nametable(table, offset, value, nametables);
+            else
                 nametables[nt_offset_for(addr, mirroring)] = (uint8_t)value;
-            }
         } else {
             palette[palette_index(addr)] = (uint8_t)value;
         }
@@ -368,7 +352,7 @@ struct PPU {
         frame_fine_x = fine_x;
         std::memcpy(frame_chr_bank, chr_bank, sizeof(chr_bank));
         if (mmc5.active()) mmc5.snapshot_frame();
-        raster_splits.clear();
+        raster_split_count = 0;
         frame_latch_valid = true;
     }
 
@@ -584,24 +568,13 @@ struct PPU {
         // In 8x8 sprite mode the hardware ignores $5128-$512B entirely and
         // background fetches use the sprite set; each band's own ctrl bit
         // picks its set.
-        const int mmc5_split_line = mmc5.active() ? mid_scanline : -1;
-        auto mmc5_bg = [&](int band_ctrl, bool from_split) {
-            if (band_ctrl & 0x20)
-                return from_split ? mmc5.split_background_banks()
-                                  : mmc5.background_banks();
-            return from_split ? mmc5.split_sprite_banks() : mmc5.sprite_banks();
-        };
         const int* bg_banks;
         const int* above_banks;
         if (mmc5.active()) {
-            bg_banks = mmc5_bg(ctrl, false);
+            bg_banks = mmc5.live_background_banks(ctrl);
             const int frame_mode = frame_latch_valid ? frame_ctrl : ctrl;
-            if (!frame_latch_valid) {
-                above_banks = bg_banks;
-            } else {
-                above_banks = (frame_mode & 0x20)
-                    ? mmc5.frame_background_banks() : mmc5.frame_sprite_banks();
-            }
+            above_banks = frame_latch_valid
+                ? mmc5.frame_background_banks(frame_mode) : bg_banks;
         } else {
             bg_banks = chr_bank;
             above_banks = frame_chr_bank;
@@ -668,7 +641,7 @@ struct PPU {
             return out;
         }
 
-        const bool raster_mode = mmc5.active() && !raster_splits.empty();
+        const bool raster_mode = mmc5.active() && raster_split_count != 0;
         if (!raster_mode)
             render_bg_rows(frame, pal, backdrop, span, 0, 240);
 
@@ -692,7 +665,7 @@ struct PPU {
         const bool have_s0 = s0 >= 0 && s0 + 1 < 240
             && (!have_mid || s0 < mid_scanline);
         const int* mid_banks = mmc5.active()
-            ? mmc5_bg(mid_ctrl, mmc5_split_line >= 0) : mid_chr_bank;
+            ? mmc5.split_background_banks(mid_ctrl) : mid_chr_bank;
         const BandState mid_band = have_mid
             ? BandState{mid_ctrl, mid_mask, mid_mirroring,
                         mid_t_addr, mid_fine_x, -1, mid_banks}
@@ -713,7 +686,7 @@ struct PPU {
             bool pinned_y = false;
             int pinned_origin = 0, pinned_start = 0;
             int previous_v = raster_splits[0].v_addr;
-            for (size_t i = 0; i + 1 < raster_splits.size(); ++i) {
+            for (size_t i = 0; i + 1 < raster_split_count; ++i) {
                 const auto& next = raster_splits[i + 1];
                 const int start = raster_splits[i].line + 1;
                 if ((next.v_addr & 0x7FFF) != (previous_v & 0x7FFF)) {
@@ -722,7 +695,8 @@ struct PPU {
                     pinned_start = start;
                 }
                 const int* banks = (next.ctrl & 0x20)
-                    ? next.mmc5_bg : next.mmc5_sprite;
+                    ? next.mapper_banks.background.data()
+                    : next.mapper_banks.sprite.data();
                 raster_bands[i] = BandState{
                     next.ctrl, next.mask, next.mirroring, next.t_addr,
                     next.fine_x,
@@ -731,7 +705,7 @@ struct PPU {
                 segs[nseg++] = {start, &raster_bands[i]};
                 previous_v = next.v_addr;
             }
-            const int live_start = raster_splits.back().line + 1;
+            const int live_start = raster_splits[raster_split_count - 1].line + 1;
             if ((vram_addr & 0x7FFF) != (previous_v & 0x7FFF)) {
                 pinned_y = true;
                 pinned_origin = scroll_row_480(vram_addr);
@@ -780,11 +754,11 @@ struct PPU {
         };
 
         auto mmc5_sprite_banks_for_row = [&](int row) -> const int* {
-            if (raster_splits.empty() || row <= raster_splits[0].line)
+            if (raster_split_count == 0 || row <= raster_splits[0].line)
                 return mmc5.frame_sprite_banks();
-            for (size_t i = 0; i + 1 < raster_splits.size(); ++i)
+            for (size_t i = 0; i + 1 < raster_split_count; ++i)
                 if (row <= raster_splits[i + 1].line)
-                    return raster_splits[i + 1].mmc5_sprite;
+                    return raster_splits[i + 1].mapper_banks.sprite.data();
             return mmc5.sprite_banks();
         };
 
@@ -889,10 +863,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def_readwrite("mid_t_addr", &PPU::mid_t_addr)
         .def_readwrite("mid_fine_x", &PPU::mid_fine_x)
         .def_property_readonly("chr_banks", [](PPU& p) {
-            return std::vector<int>(p.chr_bank, p.chr_bank + 8);
+            std::array<int, 8> banks{};
+            for (int i = 0; i < 8; ++i) banks[i] = p.chr_bank[i];
+            return banks;
         })
         .def_property_readonly("chr_latches", [](PPU& p) {
-            return p.chr_latch ? p.chr_latch->latches() : std::vector<bool>{};
+            return p.chr_latch ? p.chr_latch->latches()
+                               : std::array<bool, 2>{};
         })
         .def_property_readonly("sprite0_scanline", [](PPU& p) -> std::optional<int> {
             if (p.sprite0_scanline < 0) return std::nullopt;

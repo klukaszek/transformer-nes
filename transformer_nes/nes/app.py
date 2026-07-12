@@ -18,8 +18,8 @@ import logging
 import os
 import time
 
+from transformer_nes.nes import build_dir
 from transformer_nes.nes.console import BUTTONS, Console
-from transformer_nes.nes.native_cache import build_dir
 from transformer_nes.nes.ppu import NES_PALETTE
 
 logger = logging.getLogger(__name__)

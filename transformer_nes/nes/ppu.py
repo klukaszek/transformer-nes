@@ -29,8 +29,8 @@ import os
 
 import numpy as np
 
+from transformer_nes.nes import build_dir
 from transformer_nes.nes.cartridge import MIRROR_VERTICAL, Cartridge
-from transformer_nes.nes.native_cache import build_dir
 
 PPU_CPP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ppu.cpp")
 MMC2_H = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mmc2.h")
