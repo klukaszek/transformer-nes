@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from transformer_nes.nes.cartridge import Cartridge
 from transformer_nes.nes.mappers import BANK8, BANK16, make_mapper
 
@@ -110,11 +108,23 @@ def test_mmc3_chr_arrangement_and_mirroring():
     assert events[-1] == 3       # horizontal
 
 
-def test_mmc1_rejects_chr_rom():
-    cart = Cartridge(prg=prg_of(2, BANK16), chr=bytes(0x2000),
+def test_mmc1_chr_rom_8k_and_4k_modes():
+    cart = Cartridge(prg=prg_of(2, BANK16), chr=bytes(0x20000),
                      mirroring="horizontal", mapper=1)
-    with pytest.raises(NotImplementedError):
-        make_mapper(cart)
+    mapper = make_mapper(cart)
+    wired(mapper)
+    chr_sets = []
+    mapper.set_chr_banks = lambda banks: chr_sets.append(banks)
+
+    mmc1_serial(mapper, 0xA000, 3)  # 8K mode ignores low bit -> 4K bank 2
+    assert mapper.chr_banks() == list(range(8, 16))
+    assert chr_sets[-1] == list(range(8, 16))
+
+    mmc1_serial(mapper, 0x8000, mapper.control | 0x10)  # independent 4K mode
+    mmc1_serial(mapper, 0xA000, 5)
+    mmc1_serial(mapper, 0xC000, 7)
+    assert mapper.chr_banks() == list(range(20, 24)) + list(range(28, 32))
+    assert chr_sets[-1] == list(range(20, 24)) + list(range(28, 32))
 
 
 def test_mmc2_prg_switch_fixed_banks_and_repair():

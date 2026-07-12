@@ -62,27 +62,30 @@ class Nrom(Mapper):
 class Mmc1(Mapper):
     """Mapper 1 (SxROM): the serial 5-bit shift register at $8000-$FFFF.
 
-    CHR-RAM carts only for now (Final Fantasy, Zelda, Metroid): PRG
-    banking + mirroring; the CHR bank registers are accepted and ignored.
+    Supports CHR-RAM boards and CHR-ROM in MMC1's switchable 8 KiB or
+    independent 4 KiB modes.
     """
 
     banked = True
 
     def __init__(self, cart: Cartridge):
-        if cart.chr:
-            raise NotImplementedError(
-                "MMC1 CHR-ROM banking not supported yet (CHR-RAM carts only)")
         if len(cart.prg) % BANK16 or not cart.prg:
             raise ValueError("MMC1 PRG size must be a multiple of 16 KiB")
+        if len(cart.chr) % 0x1000:
+            raise ValueError("MMC1 CHR ROM must use 4 KiB bank alignment")
         self.prg = cart.prg
         self.n_banks = len(cart.prg) // BANK16
+        self.chr_rom = bool(cart.chr)
+        self.n_chr = max(len(cart.chr) // 0x400, 1)
         self.control = 0x0C  # power-on: PRG mode 3 (last bank fixed at $C000)
         self.control |= {MIRROR_VERTICAL: 2}.get(cart.mirroring, 3)
         self.prg_reg = 0
+        self.chr_regs = [0, 0]
         self.shift = 0x10
         self.poke = None           # set by the console per backend
         self.poke_region = None    # bulk variant (native on the engines)
         self.on_mirroring = None   # set by the console (PPU hook)
+        self.set_chr_banks = None  # set by the console for CHR-ROM boards
 
     # ── Mapping ─────────────────────────────────────────────────────
 
@@ -101,6 +104,18 @@ class Mmc1(Mapper):
         bank = lo if addr < 0xC000 else hi
         return self.prg[bank * BANK16 + (addr & 0x3FFF)]
 
+    def chr_banks(self) -> list[int]:
+        """Eight 1 KiB PPU slots under MMC1's 8/4 KiB CHR mode."""
+        if self.control & 0x10:
+            lower = self.chr_regs[0] * 4
+            upper = self.chr_regs[1] * 4
+            banks = range(lower, lower + 4), range(upper, upper + 4)
+            return [bank % self.n_chr for half in banks for bank in half]
+        # In 8 KiB mode CHR bank 0's low bit is ignored. Registers count
+        # 4 KiB units, so an even register selects eight consecutive 1K slots.
+        base = (self.chr_regs[0] & 0x1E) * 4
+        return [(base + i) % self.n_chr for i in range(8)]
+
     def cpu_image(self) -> bytes:
         image = bytearray(0x10000)
         lo, hi = self.prg_banks()
@@ -116,6 +131,7 @@ class Mmc1(Mapper):
     def write(self, addr: int, value: int) -> None:
         old_banks = self.prg_banks()
         old_mirroring = self.control & 3
+        old_chr = self.chr_banks() if self.chr_rom else None
         if value & 0x80:
             self.shift = 0x10
             self.control |= 0x0C
@@ -126,9 +142,10 @@ class Mmc1(Mapper):
                 reg = (addr >> 13) & 3
                 if reg == 0:
                     self.control = self.shift
+                elif reg in (1, 2):
+                    self.chr_regs[reg - 1] = self.shift
                 elif reg == 3:
                     self.prg_reg = self.shift
-                # regs 1/2 are the CHR banks: ignored on CHR-RAM carts
                 self.shift = 0x10
         new_banks = self.prg_banks()
         if new_banks[0] != old_banks[0]:
@@ -139,6 +156,10 @@ class Mmc1(Mapper):
         self.poke(addr, self.rom_byte(addr))
         if (self.control & 3) != old_mirroring and self.on_mirroring is not None:
             self.on_mirroring(self.control & 3)
+        if self.chr_rom and self.set_chr_banks is not None:
+            new_chr = self.chr_banks()
+            if new_chr != old_chr:
+                self.set_chr_banks(new_chr)
 
     def load_bank(self, base: int, bank: int) -> None:
         inject_region(self, base, self.prg[bank * BANK16:(bank + 1) * BANK16])
