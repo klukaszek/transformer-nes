@@ -127,26 +127,6 @@ def test_graph_console_matches_reference_console():
 
 
 @pytest.mark.slow
-def test_checkpoint_is_invisible():
-    """Snapshot-and-rebuild must not change a single pixel, byte, or cycle."""
-    plain = Console(make_cart(), backend="kernel", checkpoint_tokens=0)
-    plain_frames = [plain.run_frame() for _ in range(6)]
-
-    ck = Console(make_cart(), backend="kernel", checkpoint_tokens=1)  # every frame
-    ck_frames = [ck.run_frame() for _ in range(6)]
-
-    assert ck.checkpoint_count == 6
-    for i, (a, b) in enumerate(zip(plain_frames, ck_frames, strict=True)):
-        assert np.array_equal(a, b), f"frame {i} differs"
-    assert plain.cycles == ck.cycles
-    assert ram(plain, 0x10) == ram(ck, 0x10)
-    assert ram(plain, 0x11) == ram(ck, 0x11)
-    assert bytes(plain.ppu.oam) == bytes(ck.ppu.oam)
-    # The log actually shrank back to the RAM reseed each frame.
-    assert ck.bus.log_tokens < plain.bus.log_tokens
-
-
-@pytest.mark.slow
 def test_checkpoint_is_invisible_on_graph_backend():
     ref = Console(make_cart(), backend="reference")
     ref_frames = [ref.run_frame() for _ in range(2)]
@@ -165,26 +145,17 @@ def test_checkpoint_is_invisible_on_graph_backend():
 def test_weights_run_loop_console_matches_kernel():
     """The real transformer driven by its generated C++ run loop (KernelBus
     shape) must render the test cart -- OAM DMA, PPU registers, vblank NMI --
-    byte-for-byte and cycle-for-cycle like the kernel, both plainly and with
-    a snapshot-and-rebuild checkpoint every frame (which exercises the run
-    loop's dump_ram / load_image / set_state path)."""
-    kernel = Console(make_cart(), backend="kernel", checkpoint_tokens=0)
+    byte-for-byte and cycle-for-cycle like the kernel."""
+    kernel = Console(make_cart(), backend="kernel")
     kframes = [kernel.run_frame() for _ in range(6)]
 
-    weights = Console(make_cart(), backend="weights", checkpoint_tokens=0)
+    weights = Console(make_cart(), backend="weights")
     assert weights.uses_kernel_bus  # the codegen engine has the run loop
     wframes = [weights.run_frame() for _ in range(6)]
     for i, (a, b) in enumerate(zip(kframes, wframes, strict=True)):
         assert np.array_equal(a, b), f"frame {i} differs"
     assert kernel.cycles == weights.cycles
     assert bytes(kernel.ppu.oam) == bytes(weights.ppu.oam)
-
-    ck = Console(make_cart(), backend="weights", checkpoint_tokens=1)
-    ckframes = [ck.run_frame() for _ in range(6)]
-    assert ck.checkpoint_count == 6
-    for i, (a, b) in enumerate(zip(kframes, ckframes, strict=True)):
-        assert np.array_equal(a, b), f"checkpointed frame {i} differs"
-    assert kernel.cycles == ck.cycles
 
 
 @pytest.mark.slow

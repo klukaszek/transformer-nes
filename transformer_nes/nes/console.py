@@ -288,15 +288,13 @@ class Console:
         self.sprite0_scanline: int | None = None
         self.last_audio = None      # this frame's APU samples (float32 mono)
         self.irq_sources: set[str] = set()
-        # Snapshot-and-rebuild: once the append-only token log passes this
-        # many tokens, it is reseeded from the RAM mirror at the next frame
-        # boundary (a quiet point: no pending NMI or read pause).  0
-        # disables.  None = auto: off for the native engines (kernel/
-        # weights attention state is O(1) in the token log, so a reseed
-        # buys nothing and costs a multi-frame hitch), 2M for the graph
-        # evaluator, whose Python-side log does grow.
+        # Snapshot-and-rebuild for the GRAPH evaluator only, whose
+        # Python-side token log genuinely grows: past this many tokens it
+        # reseeds from the RAM mirror at the next frame boundary (a quiet
+        # point: no pending NMI or read pause).  The native engines'
+        # attention state is O(1) in the token log and never rebuilds.
         if checkpoint_tokens is None:
-            checkpoint_tokens = 0 if self.uses_kernel_bus else 2_000_000
+            checkpoint_tokens = 2_000_000
         self.checkpoint_tokens = checkpoint_tokens
         self.checkpoint_count = 0
 
@@ -326,7 +324,7 @@ class Console:
             from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 
             machine = Cpu6502TransformerMachine(
-                bcd=False, checkpoint_tokens=None,
+                bcd=False,
                 sequence_windows=collect_sequence_windows(self.mapper, image),
             )
             if not machine.supports_run_loop:
@@ -594,6 +592,7 @@ class Console:
 
         if (
             self.checkpoint_tokens
+            and not self.uses_kernel_bus
             and not self.halted
             and self.bus.log_tokens >= self.checkpoint_tokens
             and self.bus.checkpoint()

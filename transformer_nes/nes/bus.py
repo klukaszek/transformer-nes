@@ -390,25 +390,6 @@ class KernelBus:
     def log_tokens(self) -> int:
         return int(self.rt.get_state()["pos"])
 
-    def checkpoint(self) -> bool:
-        """Snapshot-and-rebuild the kernel's token log from its RAM mirror.
-
-        Captures the architectural state, reloads the RAM snapshot as a
-        fresh (short) WRITE-token prefix, restores the state, and
-        re-registers the watch ranges that load_image cleared.
-        """
-        state = self.rt.get_state()
-        if state["halted"]:
-            return False
-        ram = self.rt.dump_ram()
-        self.rt.load_image(ram, start_pc=state["pc"])
-        self.rt.set_state(state)
-        for lo, hi, _device, writes_only in self.ranges:
-            if not writes_only:
-                self.rt.watch_read(lo, hi)
-            self.rt.watch_write(lo, hi)
-        return True
-
     def run(self, max_steps: int, *, nmi_at: set[int] | None = None,
             irq_at: set[int] | None = None,
             stop_on_trap: bool = False, max_cycles: int = 0,

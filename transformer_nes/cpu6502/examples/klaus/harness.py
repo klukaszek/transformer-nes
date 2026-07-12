@@ -145,7 +145,6 @@ def run_cpp(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float, f
 
 
 def run_weights(image: bytes, *, max_steps: int,
-                checkpoint_tokens: int | None = None,
                 ) -> tuple[bool, int, float, float, str]:
     """Lockstep the real weights-based transformer against the reference.
 
@@ -155,9 +154,7 @@ def run_weights(image: bytes, *, max_steps: int,
     from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
-    machine = Cpu6502TransformerMachine(
-        bcd=True, checkpoint_tokens=checkpoint_tokens,
-    )
+    machine = Cpu6502TransformerMachine(bcd=True)
     mode = "codegen-exact-int32"
     build_elapsed = time.perf_counter() - build_start
 
@@ -204,8 +201,8 @@ def run_weights(image: bytes, *, max_steps: int,
         steps += 1
         if steps % 1_000_000 == 0:
             elapsed = time.perf_counter() - run_start
-            logger.info("  %dM steps, %.0f steps/s, %d checkpoints",
-                        steps // 1_000_000, steps / elapsed, machine.checkpoints)
+            logger.info("  %dM steps, %.0f steps/s",
+                        steps // 1_000_000, steps / elapsed)
         if machine.machine_halted:
             break
     run_elapsed = time.perf_counter() - run_start
@@ -245,11 +242,6 @@ def main() -> None:
         help="instruction count for the graph evaluator run (default 5000)",
     )
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
-    parser.add_argument(
-        "--checkpoint-tokens", type=int, default=0,
-        help="weights runner: snapshot and reseed every N token positions "
-             "(default 0: disabled; generated attention state is O(1))",
-    )
     args = parser.parse_args()
 
     image = load_image(args.image)
@@ -288,7 +280,6 @@ def main() -> None:
     if args.runner == "weights":
         matched, steps, build_s, run_s, mode = run_weights(
             image, max_steps=args.graph_steps,
-            checkpoint_tokens=args.checkpoint_tokens or None,
         )
         rate = steps / run_s if run_s > 0 else 0.0
         status = "MATCHED" if matched else "DIVERGED"

@@ -45,7 +45,6 @@ class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
     def __init__(self, *, bcd: bool = False,
-                 checkpoint_tokens: int | None = None,
                  expert_opcodes=DEFAULT_EXPERT_OPCODES,
                  sequence_windows=(),
                  shape_library=SHAPE_LIBRARY,
@@ -176,11 +175,9 @@ class Cpu6502TransformerMachine:
 
         self.pos = 0
         self.trace_len = 0
-        # RAM mirror for optional snapshot/reseed checkpoints.
+        # RAM mirror: shape-window scans and the machine-protocol paths
+        # read it (the native run loop keeps its own copy).
         self.ram = bytearray(0x10000)
-        self.checkpoint_tokens = checkpoint_tokens
-        self.seed_pos = 0
-        self.checkpoints = 0
 
     # ── Transformer plumbing ────────────────────────────────────────
 
@@ -303,7 +300,6 @@ class Cpu6502TransformerMachine:
         })
         # Native seed: one call for the image instead of one per byte.
         self.pos += int(self.engine.seed_image(bytes(ram)))
-        self.seed_pos = self.pos
         self.mstate = {
             "pc": start_pc & 0xFFFF, "a": 0, "x": 0, "y": 0, "s": 0xFD,
             "p": reference.FLAG_U | reference.FLAG_I,
@@ -369,7 +365,7 @@ class Cpu6502TransformerMachine:
         self.engine.insert_write(addr, value, self.pos)
         self.pos += 1
 
-    def machine_step_cpp(self) -> TraceRow:
+    def machine_step(self) -> TraceRow:
         """One instruction entirely in generated C++ (embed, layers,
         readout, direct WRITE inserts, halt logits); Python only unpacks
         the 21-slot result and keeps the mirrors in sync."""
@@ -413,38 +409,6 @@ class Cpu6502TransformerMachine:
             self.machine_halted = True
         return row
 
-    def checkpoint(self) -> bool:
-        """Snapshot and reseed attention state from the RAM mirror.
-
-        Mirrors KernelBus.checkpoint: captures the architectural state,
-        reseeds attention with a fresh WRITE-token prefix from the mirror,
-        and restores the state. Semantically
-        invisible: unwritten and zero bytes both read as 0 through the
-        exact-address mask, so dropping the history and reseeding only the
-        nonzero RAM bytes preserves every future read.
-        """
-        if self.machine_halted:
-            return False
-        state = self.machine_state
-        trace_len = self.trace_len
-        nmi = self.nmi_pending
-        irq = self.irq_pending
-        self.boot_image(self.ram, start_pc=state["pc"], state=state)
-        self.trace_len = trace_len
-        self.nmi_pending = nmi
-        if irq:
-            self.set_irq()
-        self.checkpoints += 1
-        return True
-
-    def machine_step(self) -> TraceRow:
-        if (
-            self.checkpoint_tokens
-            and self.pos - self.seed_pos >= self.checkpoint_tokens
-        ):
-            self.checkpoint()
-        return self.machine_step_cpp()
-
     def run_image(self, memory_image, *, start_pc: int, max_steps: int) -> Trace:
         self.boot_image(list(memory_image), start_pc=start_pc)
         trace = Trace()
@@ -470,7 +434,7 @@ class Cpu6502TransformerMachine:
 
     def pull_run_state(self) -> None:
         """Copy the engine's architectural state back into the Python mirror
-        (called after a native run so machine protocol / checkpointing see it)."""
+        (called after a native run so the machine protocol sees it)."""
         s = self.engine.get_run_state()
         self.mstate.update(
             pc=int(s["pc"]), a=int(s["a"]), x=int(s["x"]), y=int(s["y"]),

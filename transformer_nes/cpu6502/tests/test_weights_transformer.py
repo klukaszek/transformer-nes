@@ -62,33 +62,6 @@ def test_transformer_int32_engine_matches_high_address_nestest_prefix():
 
 
 @pytest.mark.slow
-def test_checkpoint_rebuild_is_invisible():
-    """Snapshot-and-rebuild mid-run: attention reseeds from the RAM
-    mirror without perturbing the executed trace.  Uses the nestest prefix
-    so high-address reads cross checkpoint boundaries."""
-    from transformer_nes.nes.examples.nestest import START_PC, load_image
-
-    image = load_image()
-    machine = Cpu6502TransformerMachine(bcd=False, checkpoint_tokens=8)
-    machine.boot_image(list(image), start_pc=START_PC)
-    rows = [machine.machine_step() for _ in range(10)]
-    assert machine.checkpoint()  # explicit rebuild between steps
-    rows += [machine.machine_step() for _ in range(10)]
-    assert machine.checkpoints >= 2  # the tiny auto threshold fired too
-
-    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
-    ref.pc = START_PC
-    for i, row in enumerate(rows):
-        assert row.step == i  # trace numbering survives rebuilds
-        ref_row = ref.step()
-        a, b = ref_row.state, row.state
-        assert (a.pc, a.a, a.x, a.y, a.s, a.p) == (b.pc, b.a, b.x, b.y, b.s, b.p), (
-            f"step {i}: ref={a} transformer={b}"
-        )
-        assert ref_row.writes == row.writes, f"step {i} writes"
-
-
-@pytest.mark.slow
 def test_run_loop_matches_per_step():
     """The generated C++ run loop (KernelBus shape) must produce exactly the
     trace the verified per-step machine_step path produces -- same states,

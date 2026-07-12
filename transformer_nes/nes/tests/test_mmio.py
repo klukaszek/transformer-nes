@@ -192,7 +192,7 @@ def test_irq_weights_bus_matches_reference_bus():
     image = make_irq_image()
     ref_rows, _ref_bus = run_irq_reference(image)
 
-    machine = Cpu6502TransformerMachine(bcd=False, checkpoint_tokens=None)
+    machine = Cpu6502TransformerMachine(bcd=False)
     bus = KernelBus(machine, image, start_pc=IRQ_START)
     out = bus.run(IRQ_STEPS, irq_at=set(IRQ_AT))
 
