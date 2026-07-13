@@ -82,7 +82,7 @@ def test_transformer_int32_engine_matches_high_address_nestest_prefix():
 
 @pytest.mark.slow
 def test_run_loop_matches_per_step():
-    """The generated C++ run loop (KernelBus shape) must produce exactly the
+    """The generated C++ run loop (EngineBus shape) must produce exactly the
     trace the verified per-step machine_step path produces -- same states,
     same writes -- and detect the jump-to-self trap.  Also checks the
     chunked stream (w_row rebased per chunk) against the single native run."""

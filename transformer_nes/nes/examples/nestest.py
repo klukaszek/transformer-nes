@@ -130,19 +130,6 @@ def run_graph(image: bytearray, log_rows, *, max_steps: int) -> tuple[bool, int,
     return True, len(graph_trace), build_elapsed, run_elapsed
 
 
-def run_cpp(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float]:
-    """Run the C++ kernel in lockstep with the reference core (2A03 mode)."""
-    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
-    from transformer_nes.cpu6502.examples.klaus.harness import lockstep_arrays_vs_reference
-
-    build_start = time.perf_counter()
-    rt = Cpu6502CppRuntime(bcd=False)
-    build_elapsed = time.perf_counter() - build_start
-    out = rt.run_image_arrays(bytes(image), start_pc=START_PC, max_steps=max_steps)
-    matched, steps = lockstep_arrays_vs_reference(new_cpu(image), out)
-    return matched, steps, build_elapsed, rt.last_step_seconds
-
-
 def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float, str]:
     """Run the real weights-based transformer in lockstep with the reference."""
     from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
@@ -192,7 +179,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description="Run the nestest CPU suite.")
     parser.add_argument(
-        "--runner", choices=["reference", "graph", "cpp", "weights", "both"], default="reference"
+        "--runner", choices=["reference", "graph", "weights", "both"], default="reference"
     )
     parser.add_argument(
         "--graph-steps", type=int, default=8991,
@@ -217,16 +204,6 @@ def main() -> None:
         logger.info(
             "graph: %s  %d steps in %.2fs (%.0f steps/s), graph build %.2fs",
             status, steps, run_s, rate, build_s,
-        )
-        failed |= not matched
-
-    if args.runner in ("cpp", "both"):
-        matched, steps, build_s, step_s = run_cpp(image, max_steps=args.graph_steps)
-        status = "MATCHED" if matched else "DIVERGED"
-        rate = steps / step_s if step_s > 0 else 0.0
-        logger.info(
-            "cpp: %s  %d steps in %.3fs (%.0f steps/s), kernel build %.2fs",
-            status, steps, step_s, rate, build_s,
         )
         failed |= not matched
 

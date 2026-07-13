@@ -410,7 +410,7 @@ FIXED_POINT_HELPERS = """\
     }"""
 
 # Exact nearest-written-address argmax over one 4 KiB memory group; the
-# emission is shared with the C++ kernel (run_protocol.py).
+# emission comes from run_protocol.py.
 MEM_QUERY = mem_query_cpp("long long")
 
 # Per-ROM sequence-module hook: a separately compiled window module attaches
@@ -535,7 +535,7 @@ ENGINE_STEP_BODY = """\
             if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }"""
 
 # Shadow-decode + the shared run loop + machine API (run_protocol.py blocks;
-# the C++ kernel emits the same protocol).
+# the run-loop protocol blocks).
 RUN_LOOP = "\n\n".join((
     SHADOW_READ_TARGET_CPP,
     IN_RANGES_CPP,
@@ -561,7 +561,7 @@ RUN_LOOP = "\n\n".join((
 
     int window_shape(int pc) { return shape_of_pc[pc & 0xFFFF]; }
 
-    // ── Machine API (mirrors the C++ kernel) ─────────────────""",
+    // ── Machine API (run_protocol.py) ────────────────────────""",
     MACHINE_API_CPP,
     """\
     void inject_write(int addr, int value) { insert_write(addr & 0xFFFF, value & 0xFF, seq + 1); }
@@ -924,7 +924,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 hid = hull_of_head[h]
                 tb = "TieBreak::LATEST" if tiebreak[h] else "TieBreak::AVERAGE"
                 # Eligibility decisions live in model/classify.py, shared
-                # with the C++ kernel so the two engines cannot drift.
+                # in model/classify.py, the single license source.
                 q0_idx, q0_dat = row(ip, 2 * h)
                 q1_idx, q1_dat = row(ip, 2 * h + 1)
                 qx_terms = list(zip(q0_dat, q0_idx, strict=True))
@@ -1381,7 +1381,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit(f"    bool reg_any[{n_regs}];")
     if has_run:
         # Persistent-machine state for the C++ run loop (shared with the C++
-        # kernel via run_protocol.py).
+        # run protocol in run_protocol.py).
         emit("")
         emit(run_state_members_cpp())
     emit("")

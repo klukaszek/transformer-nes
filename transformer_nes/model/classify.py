@@ -1,14 +1,13 @@
-"""Shared attention-serving classification for the generated engines.
+"""Attention-serving classification licenses for the generated engine.
 
-Both engines replace hull attention with O(1) state wherever a lookup's
+The engine replaces hull attention with O(1) state wherever a lookup's
 queries license it: memory lookups whose query is a positive scalar
 multiple of [local_address, 1] are served by the exact nearest-written-
 address structure, and constant-query LATEST lookups by running-argmax
 registers (replace-on->= at insert time reproduces the positional LATEST
 tie-break exactly).  The numeric decisions live HERE so the weights
-engine (queries as in_proj matrix rows) and the C++ kernel (queries as
-compiled graph expressions) cannot drift apart; each adapts its
-representation to linear ``(coeff, id)`` terms.  Classification is a
+engine adapts its representation (queries as in_proj matrix rows) to
+linear ``(coeff, id)`` terms against one set of licenses.  Classification is a
 speed decision only -- anything unmatched keeps a real hull.
 """
 

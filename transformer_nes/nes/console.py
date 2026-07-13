@@ -8,7 +8,7 @@ paces frames by CPU cycle budget:
 
 NMI is delivered through the graph's in-model interrupt sequence (the
 console only flags the next STATE token); vblank timing uses the base
-cycle counts shared by every backend, so a kernel-driven console and a
+cycle counts shared by every backend, so a weights-driven console and a
 reference-driven console execute identical instruction streams.
 
 NTSC timing, rounded to integer CPU cycles per frame:
@@ -27,7 +27,7 @@ import os
 import time
 
 from transformer_nes.nes.apu import make_apu
-from transformer_nes.nes.bus import Bus, GraphCore, KernelBus, ReferenceCore
+from transformer_nes.nes.bus import Bus, EngineBus, GraphCore, ReferenceCore
 from transformer_nes.nes.cartridge import Cartridge
 from transformer_nes.nes.mappers import make_mapper
 from transformer_nes.nes.ppu import make_ppu, to_rgb
@@ -298,7 +298,7 @@ def collect_sequence_windows(mapper, image, *, proposals=(), cap: int = 128):
 class Console:
     """The NES: a 6502 machine backend + PPU + input over the MMIO bus."""
 
-    def __init__(self, cart: Cartridge | str, *, backend: str = "kernel",
+    def __init__(self, cart: Cartridge | str, *, backend: str = "weights",
                  checkpoint_tokens: int | None = None,
                  sample_rate: float = 44100.0):
         if isinstance(cart, str):
@@ -340,24 +340,10 @@ class Console:
         """Create the CPU machine + bus for a backend, optionally resuming
         from a snapshot (RAM image + architectural state)."""
         self.backend = backend
-        self.uses_kernel_bus = False
-        if backend == "kernel":
-            from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
-
-            self.rt = Cpu6502CppRuntime(bcd=False)
-            self.bus = KernelBus(self.rt, image, start_pc=start_pc)
-            if state is not None:
-                self.rt.set_state(state)
-            self.read_cpu = self.rt.read_ram
-            self.poke_cpu = self.rt.inject_write
-            self.poke_region = self.rt.inject_region
-            self.map_region = self.rt.map_region
-            self.uses_kernel_bus = True
-            return
+        self.uses_engine_bus = False
         if backend == "weights":
             # The real transformer through its generated C++ run loop:
-            # KernelBus drives it natively (MMIO pauses back to Python), the
-            # same protocol as the kernel.
+            # EngineBus drives it natively (MMIO pauses back to Python).
             from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 
             self.jit_sidecar = jit_sidecar_path(self.cart)
@@ -371,14 +357,14 @@ class Console:
             if not machine.supports_run_loop:
                 raise RuntimeError("the weights backend requires the codegen run loop")
             self.rt = machine
-            self.bus = KernelBus(machine, image, start_pc=start_pc)
+            self.bus = EngineBus(machine, image, start_pc=start_pc)
             if state is not None:
                 machine.set_state(state)
             self.read_cpu = machine.read_ram
             self.poke_cpu = machine.inject_write
             self.poke_region = machine.inject_region
             self.map_region = machine.map_region
-            self.uses_kernel_bus = True
+            self.uses_engine_bus = True
             return
         if backend == "reference":
             from transformer_nes.cpu6502.backends.reference import Cpu6502
@@ -463,14 +449,14 @@ class Console:
             # MMC1/MMC3-class PRG banking runs as native console silicon
             # when the backend has the run loop; register writes reach the
             # Python mapper as journal drains (apply_native).
-            if self.uses_kernel_bus and hasattr(self.mapper, "native_attach"):
+            if self.uses_engine_bus and hasattr(self.mapper, "native_attach"):
                 self.mapper.native_attach(self.rt)
 
     def set_mirroring(self, mode: int) -> None:
         self.ppu.mirroring = mode
 
     def snapshot(self) -> tuple[bytes, dict]:
-        if self.uses_kernel_bus:
+        if self.uses_engine_bus:
             return self.rt.dump_ram(), self.rt.get_state()
         ram = bytes(self.bus.ram)
         core = self.bus.core
@@ -501,14 +487,14 @@ class Console:
     # ── CPU driving ─────────────────────────────────────────────────
 
     def set_nmi(self) -> None:
-        if self.uses_kernel_bus:
+        if self.uses_engine_bus:
             self.rt.set_nmi()
         else:
             self.bus.set_nmi()
 
     def _sync_irq(self) -> None:
         action = "set_irq" if self.irq_sources else "clear_irq"
-        if self.uses_kernel_bus:
+        if self.uses_engine_bus:
             getattr(self.rt, action)()
         else:
             getattr(self.bus, action)()
@@ -535,7 +521,7 @@ class Console:
         """Run the CPU until the console clock reaches target cycles."""
         if self.halted:
             return
-        if self.uses_kernel_bus:
+        if self.uses_engine_bus:
             if target <= self.cycles:
                 return
             out = self.bus.run(
@@ -647,7 +633,7 @@ class Console:
 
         if (
             self.checkpoint_tokens
-            and not self.uses_kernel_bus
+            and not self.uses_engine_bus
             and not self.halted
             and self.bus.log_tokens >= self.checkpoint_tokens
             and self.bus.checkpoint()
@@ -702,12 +688,12 @@ def main() -> None:
     parser.add_argument("rom", help="path to an iNES .nes file")
     parser.add_argument("--frames", type=int, default=60)
     parser.add_argument(
-        "--backend", choices=["kernel", "reference", "graph", "weights"], default="kernel"
+        "--backend", choices=["reference", "graph", "weights"], default="weights"
     )
     parser.add_argument(
         "--warmup-frames", type=int, default=0,
-        help="run this many frames on the kernel first, then hand the running "
-             "game off to --backend for the remaining frames",
+        help="run this many frames on the weights engine first, then hand the "
+             "running game off to --backend for the remaining frames",
     )
     parser.add_argument("--out", help="write the final frame as a PPM image")
     parser.add_argument(
@@ -718,7 +704,7 @@ def main() -> None:
     args = parser.parse_args()
 
     build_start = time.perf_counter()
-    first_backend = "kernel" if args.warmup_frames else args.backend
+    first_backend = "weights" if args.warmup_frames else args.backend
     console = Console(args.rom, backend=first_backend)
     build_elapsed = time.perf_counter() - build_start
 

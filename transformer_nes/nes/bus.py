@@ -16,10 +16,10 @@ they talk to the CPU over the model's own bus, exactly like real hardware:
   interpreter.py, not harness code.
 
 This module drives the Python-stepped cores (the reference oracle and the
-graph evaluator) one instruction at a time.  The C++ kernel implements the
-same protocol natively for speed; kernel.py's machine API pauses back into
-Python whenever a watched address is touched, and KernelBus services those
-pauses with the same Device objects.
+graph evaluator) one instruction at a time.  The generated weights engine
+implements the same protocol natively for speed; its machine API pauses
+back into Python whenever a watched address is touched, and EngineBus
+services those pauses with the same Device objects.
 """
 
 from __future__ import annotations
@@ -228,14 +228,14 @@ class Bus:
             raise ValueError("memory_image must be exactly 64 KiB")
         self.ranges: list[tuple[int, int, Device, bool]] = []
         # Base CPU cycles executed (no penalty cycles; NMI = 7 cycles;
-        # device stalls included).  Matches the C++ kernel's accounting.
+        # device stalls included).  Matches the native engine's accounting.
         self.cycles = 0
 
     def attach(self, device: Device, lo: int, hi: int, *,
                writes_only: bool = False, journal_writes=None) -> None:
         """Map a device over [lo, hi] (inclusive).  writes_only devices
         (mappers: registers in ROM space) never intercept reads.
-        journal_writes is accepted for KernelBus signature parity; the
+        journal_writes is accepted for EngineBus signature parity; the
         per-step Python bus services every write at its instruction."""
         self.ranges.append((lo, hi, device, writes_only))
 
@@ -327,12 +327,12 @@ class Bus:
         pass  # per-step Python bus reads devices directly; nothing leased
 
 
-class KernelBus:
-    """MMIO bus over the C++ kernel machine (kernel.Cpu6502CppRuntime).
+class EngineBus:
+    """MMIO bus over the generated weights engine (weights/runner.py).
 
-    The kernel runs the instruction stream natively and pauses back into
+    The engine runs the instruction stream natively and pauses back into
     Python only when a watched address is touched; this class services
-    those pauses with the same Device objects Bus uses, so a KernelBus run
+    those pauses with the same Device objects Bus uses, so a EngineBus run
     is directly comparable to a Bus run.
     """
 
@@ -420,7 +420,7 @@ class KernelBus:
         (device stalls included) have elapsed in this call.  on_pause, if
         given, is called after every serviced pause -- the hook the console
         uses to check device-raised NMI edges before execution resumes.
-        Returns the merged kernel result arrays plus the final "reason"
+        Returns the merged engine result arrays plus the final "reason"
         and "cycles" (elapsed this call, stalls included).  trace=False
         skips the per-step arrays entirely (the console's gameplay path
         reads only "reason"/"cycles").

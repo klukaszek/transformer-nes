@@ -107,6 +107,26 @@ targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
   Coverage hole exposed: no MMC2/MMC4 example has an input tape --
   record a Punch-Out tape next time the app is up.
 
+- **The C++ kernel backend is retired (supersedes the 2026-07-11 "none
+  are deletable" decision, per explicit user call).**  Its two roles were
+  subsumed: for verification, reference ⇔ weights receipts are strictly
+  stronger (the oracle shares no code with the graph pipeline, while the
+  kernel shared the union graph, the evaluator's schedule, run_protocol,
+  classify, and the hull header with the weights engine — whole bug
+  classes were invisible to kernel ⇔ weights agreement); for speed, the
+  weights engine became the fastest backend once the expert/window/fusion
+  work landed, and the kernel got none of it.  The cost was real: 805
+  lines emitting a parallel engine (every protocol change made twice —
+  the write journal landed identically in kernel.py and engine_gen.py the
+  same day), 51 MB of _kernel_cache, and a second bcd=True build.
+  Deleted kernel.py/test_kernel.py/_kernel_cache; test_trace_convention,
+  test_mmio, and test_console retargeted to the weights engine (device
+  and IRQ scenarios keep three-backend coverage: reference/graph/
+  weights); klaus --runner cpp/cpp-full and nestest --runner cpp removed;
+  Console default backend is now "weights"; **KernelBus renamed
+  EngineBus** (it drives the weights engine).  The chain remains
+  complete: golden logs ⇔ reference ⇔ evaluator ⇔ weights.
+
 **Previous START HERE (2026-07-12, mapper + hot-shape optimization landed):**
 
 - MMC1/MMC3 PRG writes now decode inside the native run loop.  The ROM is

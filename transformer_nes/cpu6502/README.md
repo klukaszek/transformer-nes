@@ -20,7 +20,6 @@ package one-way.
 | `trace.py` | Canonical trace format shared by every backend |
 | `backends/reference.py` | Plain-Python oracle core.  Trusted by construction; every other backend is verified against it |
 | `backends/evaluator.py` | Exact evaluator: compiles the graph's static schedule to one generated Python function |
-| `backends/kernel.py` | C++ backend: emits the same schedule as one C++ translation unit (attention state, token inserts, run loop) |
 | `backends/run_protocol.py` | The native run-loop protocol both generated engines emit (tables + shared C++ blocks) |
 | `backends/weights/runner.py` | The transformer machine: construction, engine-cache orchestration, machine protocol, JIT window discovery |
 | `backends/weights/experts.py` | Fold-and-build expert models (per-opcode, sequence, shape) with their dispatch licenses |
@@ -54,22 +53,21 @@ run loop reads back ~22 named result dims, emits up to three WRITE tokens
 (JSR pushes two bytes, BRK three), builds the next STATE token, and stops
 when the HALT output token outscores STATE (or on a jump-to-self trap).
 
-## Four backends, one semantics
+## Three backends, one semantics
 
 | Backend | Speed (steps/s) | Role |
 |---------|-----------------|------|
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
-| `kernel.py` (generated C++) | ~790K | Same semantics at NES-relevant speed |
-| `weights/runner.py` (real transformer) | ~406K (full Klaus, incl. the lockstep reference) | The thesis: actual hardmax-attention + ReGLU transformer weights |
+| `weights/runner.py` (real transformer) | ~420K (full Klaus, incl. the lockstep reference) | The thesis: actual hardmax-attention + ReGLU transformer weights |
 
-The evaluator and the C++ kernel are **bit-identical**: the kernel emits
-the evaluator's schedule as the same IEEE double operations in the same
-order with the same rounding on read-back.  Its attention state is served
-by the exact O(1) structures where `model/classify.py` licenses them
-(currently all of it) and by the same hull code (`hull2d_cht.h`) with the
-same tie-break configuration otherwise — the classification is exact, so
-either serving returns the identical winner.
+A fourth backend — `kernel.py`, a C++ emission of the evaluator's f64
+schedule — was retired 2026-07-13: its verification role is subsumed by
+reference ⇔ weights receipts (the oracle shares no code with the graph
+pipeline, while the kernel shared the graph, schedule, run protocol, and
+classification with the weights engine), and the weights engine had
+become the faster backend besides.  The recorded rationale lives in
+ROADMAP.md.
 
 ### The transformer itself
 
@@ -144,7 +142,7 @@ float32 by default; that storage choice is separate from the generated
 runtime's int32 arithmetic (and from the expert folds' fused 64K reads,
 which exist only in the engines' execution strategy, never the artifact).
 
-### Compilation pipeline (evaluator and C++ kernel)
+### Compilation pipeline (evaluator)
 
 1. The graph's dimensions form a static schedule in id (creation) order,
    which is topological by construction.
@@ -168,14 +166,14 @@ which exist only in the engines' execution strategy, never the artifact).
 Chain of trust, each link checked instruction-by-instruction:
 
 ```
-nestest golden log (Nintendulator)  ⇔  reference.py  ⇔  evaluator.py  ⇔  kernel.py  ⇔  weights_runner.py
+nestest golden log (Nintendulator)  ⇔  reference.py  ⇔  evaluator.py  ⇔  weights/runner.py
 Klaus functional test (self-checking)  ⇑
 ```
 
 - **Klaus** (`6502_functional_test.bin`): all 151 official opcodes,
-  including decimal mode.  Reference, C++ kernel, and the weights
-  transformer run the **full 30,646,177-instruction suite** to the success
-  trap at `$3469`; all must agree on the exact step count.  Klaus reaches JSR/indirect addressing
+  including decimal mode.  The reference and the weights transformer run
+  the **full 30,646,177-instruction suite** to the success trap at
+  `$3469`; both must agree on the exact step count.  Klaus reaches JSR/indirect addressing
   only after ~20K instructions, stack wrap at ~40K, shifts at ~46K, and
   decimal mode at ~26M — shallow prefix runs prove very little.
 - **nestest**: all 8,991 golden-log lines compared field-by-field
@@ -186,11 +184,10 @@ Klaus functional test (self-checking)  ⇑
 
 ```bash
 uv run 6502-klaus --runner reference          # full suite, ~13s
-uv run 6502-klaus --runner cpp-full           # full suite through the graph, ~40s
 uv run 6502-klaus --runner weights --graph-steps 30700000  # full suite through the WEIGHTS, ~90s
-uv run 6502-klaus --runner graph|cpp --graph-steps N   # lockstep vs reference
+uv run 6502-klaus --runner graph --graph-steps N       # lockstep vs reference
 uv run 6502-nestest --runner both             # reference vs golden log + graph lockstep
-uv run 6502-nestest --runner cpp|weights
+uv run 6502-nestest --runner weights
 ```
 
 ## Numerics: rules that keep the graph exact
@@ -240,8 +237,8 @@ CPU over the model's own bus, like real hardware.  The split is:
 
 `transformer_nes/nes/bus.py` implements this once over the two
 Python-stepped cores (`Bus` + `ReferenceCore`/`GraphCore` adapters, part
-of the NES system layer), and `KernelBus` drives either native engine —
-the C++ kernel or the generated weights engine — through one protocol
+of the NES system layer), and `EngineBus` drives the generated weights
+engine through one protocol
 (`run_protocol.py` emits it for both): `load_image()` / `run(max_steps)`
 execute until a step budget, halt, jump-to-self trap, or a watched address
 is touched (`watch_read` pauses *before* the reading instruction;
@@ -272,7 +269,7 @@ backends.  See `transformer_nes/nes/`.
 
 Long runs stay bounded via **snapshot-and-rebuild checkpointing**: past a
 token threshold the console reseeds the machine's append-only log from
-the RAM mirror at a frame boundary (`KernelBus.checkpoint()` /
+the RAM mirror at a frame boundary (`EngineBus.checkpoint()` /
 `Bus.checkpoint()`).  This is semantically invisible -- unwritten and
 zero bytes both read as 0 through the exact-address mask, so reseeding
 only the nonzero RAM bytes preserves every future read; the invisibility

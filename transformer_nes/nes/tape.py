@@ -65,7 +65,7 @@ class TapeDeck:
 
 def instr_count(console: Console) -> int | None:
     """Executed-instruction counter for native backends (None otherwise)."""
-    if console.uses_kernel_bus:
+    if console.uses_engine_bus:
         return int(console.rt.get_state()["steps"])
     return None
 
@@ -131,7 +131,7 @@ def main() -> None:
     parser.add_argument("rom", help="path to an iNES .nes file")
     parser.add_argument("tape", help="input tape from app --record")
     parser.add_argument(
-        "--backend", choices=["kernel", "reference", "graph", "weights"],
+        "--backend", choices=["reference", "graph", "weights"],
         default="weights")
     parser.add_argument("--segment", type=int, default=600,
                         help="report fps per this many frames")

@@ -2,7 +2,7 @@
 
 A hand-built NROM cart exercises the whole system deterministically
 (palette + CHR RAM + nametable writes through $2006/$2007, OAM DMA from
-the NMI handler, sprite-0 overlap); the kernel-driven console and the
+the NMI handler, sprite-0 overlap); the weights-driven console and the
 reference-driven console must produce identical frames, NMI counts, and
 cycle clocks.  The real nestest ROM then boots through its reset vector
 and runs its full official-opcode suite interactively via the controller.
@@ -73,7 +73,7 @@ def make_cart() -> Cartridge:
 
 
 def ram(console: Console, addr: int) -> int:
-    if console.uses_kernel_bus:  # kernel or weights run loop: mirror in C++
+    if console.uses_engine_bus:  # weights run loop: mirror in C++
         return console.rt.read_ram(addr)
     return console.bus.ram[addr]
 
@@ -93,8 +93,8 @@ def check_final_frame(console: Console, frame) -> None:
 
 
 @pytest.mark.slow
-def test_kernel_console_runs_the_test_cart():
-    console, rendered = run_frames("kernel", 4)
+def test_weights_console_runs_the_test_cart():
+    console, rendered = run_frames("weights", 4)
     check_final_frame(console, rendered[-1])
     assert ram(console, 0x11) == 4               # one NMI per frame
     assert ram(console, 0x10) > 0                # main loop ran
@@ -103,16 +103,16 @@ def test_kernel_console_runs_the_test_cart():
 
 
 @pytest.mark.slow
-def test_reference_console_matches_kernel_console():
-    kernel, kernel_frames = run_frames("kernel", 4)
+def test_reference_console_matches_weights_console():
+    weights, weights_frames = run_frames("weights", 4)
     ref, ref_frames = run_frames("reference", 4)
-    for i, (a, b) in enumerate(zip(kernel_frames, ref_frames, strict=True)):
+    for i, (a, b) in enumerate(zip(weights_frames, ref_frames, strict=True)):
         assert np.array_equal(a, b), f"frame {i} differs"
-    assert kernel.cycles == ref.cycles
-    assert ram(kernel, 0x10) == ram(ref, 0x10)
-    assert ram(kernel, 0x11) == ram(ref, 0x11) == 4
-    assert bytes(kernel.ppu.oam) == bytes(ref.ppu.oam)
-    assert bytes(kernel.ppu.nametables) == bytes(ref.ppu.nametables)
+    assert weights.cycles == ref.cycles
+    assert ram(weights, 0x10) == ram(ref, 0x10)
+    assert ram(weights, 0x11) == ram(ref, 0x11) == 4
+    assert bytes(weights.ppu.oam) == bytes(ref.ppu.oam)
+    assert bytes(weights.ppu.nametables) == bytes(ref.ppu.nametables)
     check_final_frame(ref, ref_frames[-1])
 
 
@@ -142,20 +142,20 @@ def test_checkpoint_is_invisible_on_graph_backend():
 
 
 @pytest.mark.slow
-def test_weights_run_loop_console_matches_kernel():
-    """The real transformer driven by its generated C++ run loop (KernelBus
+def test_weights_run_loop_console_matches_reference():
+    """The real transformer driven by its generated C++ run loop (EngineBus
     shape) must render the test cart -- OAM DMA, PPU registers, vblank NMI --
-    byte-for-byte and cycle-for-cycle like the kernel."""
-    kernel = Console(make_cart(), backend="kernel")
-    kframes = [kernel.run_frame() for _ in range(6)]
+    byte-for-byte and cycle-for-cycle like the reference-driven console."""
+    ref = Console(make_cart(), backend="reference")
+    rframes = [ref.run_frame() for _ in range(6)]
 
     weights = Console(make_cart(), backend="weights")
-    assert weights.uses_kernel_bus  # the codegen engine has the run loop
+    assert weights.uses_engine_bus  # the codegen engine has the run loop
     wframes = [weights.run_frame() for _ in range(6)]
-    for i, (a, b) in enumerate(zip(kframes, wframes, strict=True)):
+    for i, (a, b) in enumerate(zip(rframes, wframes, strict=True)):
         assert np.array_equal(a, b), f"frame {i} differs"
-    assert kernel.cycles == weights.cycles
-    assert bytes(kernel.ppu.oam) == bytes(weights.ppu.oam)
+    assert ref.cycles == weights.cycles
+    assert bytes(ref.ppu.oam) == bytes(weights.ppu.oam)
 
 
 @pytest.mark.slow
@@ -164,7 +164,7 @@ def test_backend_handoff_is_invisible():
     straight = Console(make_cart(), backend="reference")
     straight_frames = [straight.run_frame() for _ in range(4)]
 
-    mixed = Console(make_cart(), backend="kernel")
+    mixed = Console(make_cart(), backend="weights")
     mixed_frames = [mixed.run_frame() for _ in range(2)]
     mixed.handoff("reference")
     mixed_frames += [mixed.run_frame() for _ in range(2)]
@@ -215,7 +215,7 @@ def make_mmc5_chain_cart() -> Cartridge:
 
 
 def test_mapper_irq_rearm_chains_within_a_frame():
-    console = Console(make_mmc5_chain_cart(), backend="kernel")
+    console = Console(make_mmc5_chain_cart(), backend="weights")
     console.run(3)
     per_frame: dict[int, list[int]] = {}
     for frame, _phase, kind, addr, value, _v_addr, _latch in console.journal.entries:
@@ -240,7 +240,7 @@ def test_irq_sources_share_the_cpu_line_without_clearing_each_other():
 
 @pytest.mark.slow
 def test_nestest_boots_and_passes_interactively():
-    console = Console(NESTEST_ROM, backend="kernel")
+    console = Console(NESTEST_ROM, backend="weights")
     console.run(5)
     menu = nametable_text(console)
     assert "Run all tests" in menu

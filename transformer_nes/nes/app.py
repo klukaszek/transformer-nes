@@ -218,7 +218,7 @@ def main() -> None:
         description="Play an NES ROM (NROM/MMC1) in a native window.")
     parser.add_argument("rom", help="path to an iNES .nes file")
     parser.add_argument(
-        "--backend", choices=["kernel", "reference", "graph", "weights"], default="weights"
+        "--backend", choices=["reference", "graph", "weights"], default="weights"
     )
     parser.add_argument("--scale", type=int, default=3, help="window size in framebuffers")
     parser.add_argument("--frames", type=int, default=0,

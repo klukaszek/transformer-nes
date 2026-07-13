@@ -464,7 +464,7 @@ class Cpu6502TransformerMachine:
         return trace
 
     # ── C++ run loop (KernelBus shape) ──────────────────────────────
-    # Native streaming API used by Klaus, nestest, and KernelBus.
+    # Native streaming API used by Klaus, nestest, and EngineBus.
 
     @property
     def supports_run_loop(self) -> bool:
@@ -494,7 +494,7 @@ class Cpu6502TransformerMachine:
                          stop_on_trap: bool = False) -> dict:
         """Boot and run up to max_steps entirely in the C++ run loop.
 
-        Returns the same result dict as the C++ kernel's run(): per-step
+        Returns the run-protocol result dict: per-step
         trace arrays (pc/a/x/y/s/p/ir/oplo/ophi/ea/data/halted), write arrays
         (w_row 0-based within this call, w_addr, w_value), and the run's
         "reason"/"cycles".  Materializes every step's arrays, so it is for
@@ -513,7 +513,7 @@ class Cpu6502TransformerMachine:
                         chunk: int = 200_000, stop_on_trap: bool = False):
         """Stream the C++ run loop in fixed-size chunks (w_row rebased to 0
         per chunk), so the full Klaus suite verifies without materializing a
-        30M-row trace.  Yields the kernel-shape result dict for each chunk.
+        30M-row trace.  Yields the run-protocol result dict for each chunk.
 
         Engine state is O(1) in the token log (memory on the exact
         nearest-address structure, constant-query heads on running-argmax
@@ -538,10 +538,10 @@ class Cpu6502TransformerMachine:
                 break
         self.pull_run_state()
 
-    # ── Kernel-shape machine API (lets KernelBus drive the run loop) ─
-    # These mirror cpu6502.kernel.Cpu6502CppRuntime so the NES bus's
-    # KernelBus adapter drives the weights engine natively, pausing back to
-    # Python only for MMIO -- the same protocol as the C++ kernel.
+    # ── Machine API (lets EngineBus drive the run loop) ──────────────
+    # The run-protocol machine surface: the NES bus's EngineBus adapter
+    # drives the weights engine natively, pausing back to
+    # Python only for MMIO (run_protocol.py).
 
     def load_image(self, memory_image, *, start_pc: int) -> None:
         self.boot_image(list(memory_image), start_pc=start_pc)
@@ -603,7 +603,7 @@ class Cpu6502TransformerMachine:
 
     def set_state(self, state: dict) -> None:
         """Restore architectural state after a snapshot rebuild (mirrors the
-        C++ kernel's set_state; the trace context fields carry over)."""
+        run protocol's set_state; the trace context fields carry over)."""
         st = dict(self.mstate)
         for k in st:
             if k in state:

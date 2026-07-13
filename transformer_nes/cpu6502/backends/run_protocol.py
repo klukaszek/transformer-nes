@@ -1,10 +1,10 @@
 """Shared tables and C++ blocks for the native CPU run loops.
 
-kernel.py (graph kernel) and model/engine_gen.py (weights engine) emit the
-same persistent-machine protocol: one exact memory structure, one shadow
+model/engine_gen.py emits the persistent-machine protocol for the
+generated weights engine: one exact memory structure, one shadow
 decoder, one run loop (watch/lease/trace/budget), one machine API.  The
-KernelBus contract is the spec; emitting these blocks from one place keeps
-the two engines from drifting.
+EngineBus contract is the spec; keeping the blocks here keeps the
+protocol reviewable in one place.
 """
 
 from __future__ import annotations
@@ -414,7 +414,7 @@ RUN_LOOP_TEMPLATE = """\
     // Run up to max_steps instructions natively, pausing back to
     // Python only on halt / jump-to-self trap / watched device
     // access / cycle budget.  One protocol and result dict for both
-    // generated engines; the KernelBus contract is the spec.
+    // generated engine; the EngineBus contract is the spec.
     // trace=false skips the per-step trace/write arrays (the console's
     // gameplay path reads only steps/hits/reason/cycles).
     py::dict run(long max_steps, bool stop_on_trap, long max_cycles, bool trace) {

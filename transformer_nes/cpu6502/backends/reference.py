@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Boring Python 6502 reference core.
 
 No transformer, no graph -- just a trusted oracle that executes the full

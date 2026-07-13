@@ -1,8 +1,9 @@
 """Evaluate 6502 programs through the computation graph with exact arithmetic.
 
-This runs the graph DSL directly -- no transformer weights needed.  It is the
-exact-semantics reference for the generated C++ backend (kernel.py), which is
-bit-identical but ~100x faster.
+This runs the graph DSL directly -- no transformer weights needed.  It is
+the graph's definitional semantics: the weights backend builds its model
+FROM this runtime's graph and dim handles, and locksteps against it in the
+fold receipts.
 
 Execution protocol (one transformer step = one 6502 instruction):
   1. A ``start`` token carries the initial PC, and one WRITE token per nonzero
@@ -21,7 +22,7 @@ function: expressions become straight-line arithmetic over locals, attention
 queries are inlined against per-lookup hull caches, and a backward
 liveness pass drops dims that do not feed an externally read result.
 
-Exactness rules shared with interpreter.py and kernel.py:
+Exactness rules shared with interpreter.py and the generated engine:
   - stepglu/match gates are exact only for integer-valued arguments, so all
     thresholds in the graph must be integers.
   - Read-back uses round-half-to-even (Python round; C++ nearbyint).
@@ -256,7 +257,7 @@ class Cpu6502Runtime:
             if dim_id in needed
         ]
 
-        # Exposed for alternate backends (e.g. the C++ kernel emitter).
+        # Exposed for alternate consumers of the compiled schedule.
         self.live_schedule = live_schedule
         self.step_input_ids = sorted(needed - computed)
         self.external_store_ids = sorted(external & computed)

@@ -106,7 +106,7 @@ def run_graph(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float,
 
 
 def lockstep_arrays_vs_reference(ref: Cpu6502, out: dict) -> tuple[bool, int]:
-    """Compare kernel result arrays against a prepared reference core, step by step."""
+    """Compare native run-loop result arrays against a prepared reference core."""
     from collections import defaultdict
 
     writes_by_row: dict[int, set] = defaultdict(set)
@@ -120,112 +120,48 @@ def lockstep_arrays_vs_reference(ref: Cpu6502, out: dict) -> tuple[bool, int]:
                int(out["s"][i]), int(out["p"][i]))
         if (s.pc, s.a, s.x, s.y, s.s, s.p) != got:
             logger.error(
-                "kernel diverged from reference at step %d:\nREF:    PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X\nKERNEL: PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X",
+                "engine diverged from reference at step %d:\nREF:    PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X\nENGINE: PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X",
                 i, s.pc, s.a, s.x, s.y, s.s, s.p, *got,
             )
             return False, i
         if {(w.addr, w.value) for w in row.writes} != writes_by_row.get(i, set()):
-            logger.error("kernel writes diverged at step %d", i)
+            logger.error("engine writes diverged at step %d", i)
             return False, i
     return True, steps
-
-
-def run_cpp(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float, float]:
-    """Lockstep the C++ kernel against the reference for max_steps."""
-    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
-
-    build_start = time.perf_counter()
-    rt = Cpu6502CppRuntime(bcd=True)
-    build_elapsed = time.perf_counter() - build_start
-    out = rt.run_image_arrays(image, start_pc=START_PC, max_steps=max_steps)
-    ref = Cpu6502(memory=bytearray(image))
-    ref.pc = START_PC
-    matched, steps = lockstep_arrays_vs_reference(ref, out)
-    return matched, steps, build_elapsed, rt.last_prefix_seconds, rt.last_step_seconds
 
 
 def run_weights(image: bytes, *, max_steps: int,
                 ) -> tuple[bool, int, float, float, str]:
     """Lockstep the real weights-based transformer against the reference.
 
-    Klaus at full length (30.6M instructions) is out of reach at
-    transformer speeds; this verifies a prefix, like the graph runner.
+    The generated engine runs the whole stream in C++, pausing only at the
+    jump-to-self success trap; each native chunk locksteps against the
+    streaming reference (engine state is O(1), no checkpointing) -- the
+    full 30.6M-instruction suite fits in ~75 s.
     """
     from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(bcd=True)
-    mode = "codegen-exact-int32"
+    mode = "codegen-exact-int32-runloop"
     build_elapsed = time.perf_counter() - build_start
 
     ref_cpu = Cpu6502(memory=bytearray(image))
     ref_cpu.pc = START_PC
 
-    if machine.supports_run_loop:
-        # The generated engine runs the whole stream in C++, pausing only at
-        # the jump-to-self success trap; lockstep each native chunk against
-        # the streaming reference (engine state is O(1), no checkpointing).
-        mode = f"{mode}-runloop"
-        run_start = time.perf_counter()
-        steps = 0
-        for out in machine.iter_run_arrays(list(image), start_pc=START_PC,
-                                           max_steps=max_steps, chunk=500_000,
-                                           stop_on_trap=True):
-            matched, n = lockstep_arrays_vs_reference(ref_cpu, out)
-            if not matched:
-                return False, steps + n, build_elapsed, time.perf_counter() - run_start, mode
-            steps += len(out["pc"])
-            if steps % 1_000_000 < 500_000:
-                elapsed = time.perf_counter() - run_start
-                logger.info("  %.1fM steps, %.0f steps/s", steps / 1e6, steps / elapsed)
-        return True, steps, build_elapsed, time.perf_counter() - run_start, mode
-
-    # Per-step fallback for any engine without a native run loop.
-    machine.boot_image(list(image), start_pc=START_PC)
     run_start = time.perf_counter()
     steps = 0
-    for i in range(max_steps):
-        row = machine.machine_step()
-        ref_row = ref_cpu.step()
-        s1, s2 = ref_row.state, row.state
-        if (s1.pc, s1.a, s1.x, s1.y, s1.s, s1.p) != (s2.pc, s2.a, s2.x, s2.y, s2.s, s2.p):
-            logger.error(
-                "transformer diverged from reference at step %d:\nREF:         PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X\nTRANSFORMER: PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X",
-                i, s1.pc, s1.a, s1.x, s1.y, s1.s, s1.p,
-                s2.pc, s2.a, s2.x, s2.y, s2.s, s2.p,
-            )
-            return False, i, build_elapsed, time.perf_counter() - run_start, mode
-        if {(w.addr, w.value) for w in ref_row.writes} != {(w.addr, w.value) for w in row.writes}:
-            logger.error("transformer writes diverged at step %d", i)
-            return False, i, build_elapsed, time.perf_counter() - run_start, mode
-        steps += 1
-        if steps % 1_000_000 == 0:
+    for out in machine.iter_run_arrays(list(image), start_pc=START_PC,
+                                       max_steps=max_steps, chunk=500_000,
+                                       stop_on_trap=True):
+        matched, n = lockstep_arrays_vs_reference(ref_cpu, out)
+        if not matched:
+            return False, steps + n, build_elapsed, time.perf_counter() - run_start, mode
+        steps += len(out["pc"])
+        if steps % 1_000_000 < 500_000:
             elapsed = time.perf_counter() - run_start
-            logger.info("  %dM steps, %.0f steps/s",
-                        steps // 1_000_000, steps / elapsed)
-        if machine.machine_halted:
-            break
-    run_elapsed = time.perf_counter() - run_start
-    return True, steps, build_elapsed, run_elapsed, mode
-
-
-def run_cpp_full(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float]:
-    """Run the entire suite on the C++ kernel until the success trap."""
-    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
-
-    build_start = time.perf_counter()
-    rt = Cpu6502CppRuntime(bcd=True)
-    build_elapsed = time.perf_counter() - build_start
-    out = rt.run_image_arrays(image, start_pc=START_PC, max_steps=max_steps, stop_on_trap=True)
-    steps = len(out["pc"])
-    final_pc = int(out["pc"][-1]) if steps else -1
-    passed = final_pc == SUCCESS_PC and steps == KLAUS_EXPECTED_STEPS
-    if not passed:
-        logger.error(
-            "kernel full run: trapped at PC=%04X after %d steps (expected PC=%04X after %d)",
-            final_pc, steps, SUCCESS_PC, KLAUS_EXPECTED_STEPS,
-        )
-    return passed, steps, build_elapsed, rt.last_step_seconds
+            logger.info("  %.1fM steps, %.0f steps/s", steps / 1e6, steps / elapsed)
+    return True, steps, build_elapsed, time.perf_counter() - run_start, mode
 
 
 def main() -> None:
@@ -233,7 +169,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Klaus 6502 functional test suite.")
     parser.add_argument(
         "--runner",
-        choices=["reference", "graph", "cpp", "cpp-full", "weights", "both"],
+        choices=["reference", "graph", "weights", "both"],
         default="reference",
     )
     parser.add_argument("--image", default=KLAUS_BIN)
@@ -267,16 +203,6 @@ def main() -> None:
         )
         failed |= not matched
 
-    if args.runner in ("cpp", "both"):
-        matched, steps, build_s, prefix_s, step_s = run_cpp(image, max_steps=args.graph_steps)
-        rate = steps / step_s if step_s > 0 else 0.0
-        status = "MATCHED" if matched else "DIVERGED"
-        logger.info(
-            "cpp: %s  %d steps in %.2fs (%.0f steps/s), image prefix %.2fs, kernel build %.2fs",
-            status, steps, step_s, rate, prefix_s, build_s,
-        )
-        failed |= not matched
-
     if args.runner == "weights":
         matched, steps, build_s, run_s, mode = run_weights(
             image, max_steps=args.graph_steps,
@@ -288,16 +214,6 @@ def main() -> None:
             mode, status, steps, run_s, rate, build_s,
         )
         failed |= not matched
-
-    if args.runner == "cpp-full":
-        passed, steps, build_s, step_s = run_cpp_full(image, max_steps=args.max_steps)
-        rate = steps / step_s if step_s > 0 else 0.0
-        status = "PASSED" if passed else "FAILED"
-        logger.info(
-            "cpp-full: %s  %d steps in %.2fs (%.0f steps/s), kernel build %.2fs",
-            status, steps, step_s, rate, build_s,
-        )
-        failed |= not passed
 
     raise SystemExit(1 if failed else 0)
 

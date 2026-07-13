@@ -7,7 +7,7 @@ the loaded value, stores/RMW the written byte, compares the difference,
 pure control flow 0).  This is what lets a routed expert fold away memory
 reads whose only consumer was the old raw-read trace convention.
 
-Checked instruction-by-instruction through the C++ kernel (same graph
+Checked instruction-by-instruction through the weights engine (same graph
 semantics as every backend) against the reference oracle: full nestest
 (all official + unofficial opcodes, 2A03) and a Klaus prefix (decimal
 mode, BRK/RTI, stack wrap).
@@ -15,12 +15,12 @@ mode, BRK/RTI, stack wrap).
 
 import pytest
 
-from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
 from transformer_nes.cpu6502.backends.reference import Cpu6502
+from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 
 
 def assert_full_trace_match(image, start_pc, max_steps, *, bcd):
-    rt = Cpu6502CppRuntime(bcd=bcd)
+    rt = Cpu6502TransformerMachine(bcd=bcd)
     out = rt.run_image_arrays(bytes(image), start_pc=start_pc, max_steps=max_steps)
     ref = Cpu6502(memory=bytearray(image), bcd_enabled=bcd)
     ref.pc = start_pc
@@ -32,7 +32,7 @@ def assert_full_trace_match(image, start_pc, max_steps, *, bcd):
                     ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi", "ea", "data"))
         want = (s.pc, s.a, s.x, s.y, s.s, s.p, s.ir,
                 s.operand_lo, s.operand_hi, s.ea, s.data)
-        assert got == want, f"step {i}: kernel={got} ref={want}"
+        assert got == want, f"step {i}: weights={got} ref={want}"
     return n
 
 

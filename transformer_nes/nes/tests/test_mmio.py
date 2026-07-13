@@ -3,7 +3,7 @@
 One scenario, three runs: a program that reads and writes a memory-mapped
 device (absolute and (zp),Y addressing) while NMIs fire at fixed
 instruction indices (including one that lands inside the handler).  The
-reference-core bus, the graph-evaluator bus, and the C++ kernel bus must
+reference-core bus, the graph-evaluator bus, and the weights-engine bus must
 produce identical traces, identical memory writes, and an identical
 device event log.
 """
@@ -16,7 +16,7 @@ import pytest
 
 from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
 from transformer_nes.cpu6502.backends.reference import Cpu6502
-from transformer_nes.nes.bus import Bus, GraphCore, KernelBus, ReferenceCore
+from transformer_nes.nes.bus import Bus, EngineBus, GraphCore, ReferenceCore
 
 DEVICE_LO, DEVICE_HI = 0xD000, 0xD00F
 START_PC = 0x8000
@@ -169,21 +169,6 @@ def test_irq_graph_bus_matches_reference_bus():
 
 
 @pytest.mark.slow
-def test_irq_kernel_bus_matches_reference_bus():
-    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
-
-    image = make_irq_image()
-    ref_rows, _ref_bus = run_irq_reference(image)
-
-    rt = Cpu6502CppRuntime(bcd=True)
-    bus = KernelBus(rt, image, start_pc=IRQ_START)
-    out = bus.run(IRQ_STEPS, irq_at=set(IRQ_AT))
-
-    assert_registers_match(out, ref_rows)
-    assert rt.read_ram(0x30) == len(IRQ_AT)
-
-
-@pytest.mark.slow
 def test_irq_weights_bus_matches_reference_bus():
     from transformer_nes.cpu6502.backends.weights.runner import (
         Cpu6502TransformerMachine,
@@ -193,7 +178,7 @@ def test_irq_weights_bus_matches_reference_bus():
     ref_rows, _ref_bus = run_irq_reference(image)
 
     machine = Cpu6502TransformerMachine(bcd=False)
-    bus = KernelBus(machine, image, start_pc=IRQ_START)
+    bus = EngineBus(machine, image, start_pc=IRQ_START)
     out = bus.run(IRQ_STEPS, irq_at=set(IRQ_AT))
 
     assert_registers_match(out, ref_rows)
@@ -201,15 +186,17 @@ def test_irq_weights_bus_matches_reference_bus():
 
 
 @pytest.mark.slow
-def test_kernel_bus_matches_reference_bus():
-    from transformer_nes.cpu6502.backends.kernel import Cpu6502CppRuntime
+def test_engine_bus_matches_reference_bus():
+    from transformer_nes.cpu6502.backends.weights.runner import (
+        Cpu6502TransformerMachine,
+    )
 
     image = make_image()
     ref_rows, ref_dev, ref_bus = run_reference(image)
 
-    rt = Cpu6502CppRuntime(bcd=True)
+    rt = Cpu6502TransformerMachine(bcd=False)
     device = CounterDevice()
-    bus = KernelBus(rt, image, start_pc=START_PC)
+    bus = EngineBus(rt, image, start_pc=START_PC)
     bus.attach(device, DEVICE_LO, DEVICE_HI)
     out = bus.run(STEPS, nmi_at=set(NMI_AT))
 
