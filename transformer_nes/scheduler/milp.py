@@ -1,4 +1,4 @@
-"""MILP scheduler: minimize d_model for delayed-reuse erase scheduling.
+"""Schedulers: ops onto 4-phase transformer layers.
 
 Assigns each gate (LookUp, ReGLU, Persist) to a 4-phase layer:
   phase 0: Attention (LookUp)
@@ -6,17 +6,15 @@ Assigns each gate (LookUp, ReGLU, Persist) to a 4-phase layer:
   phase 2: FFN (ReGLU)
   phase 3: Persist2
 
-Minimizes d_model = 2 * D_half where D_half >= max over all boundaries of:
-  - ceil(effective_width / 2), counting dims with birth<=c AND death>=c-1
-    AND needs_slot (excludes internal lookup/reglu dims consumed same half-layer)
-  - n_lu_heads + ceil((dying + passthrough) / 2) per attention layer
+Two entry points with one output shape (consumed by model/weights.py):
+``asap_schedule`` (critical path + load-balanced leveling; the production
+scheduler at every scale) and ``milp_schedule`` (the opt-in per-expert
+certificate: exact total-lifetime objective under a width cap).
 """
 
-import heapq
 import logging
 from collections import defaultdict
 
-import numpy as np
 from pulp import (
     LpBinary,
     LpInteger,
@@ -231,14 +229,14 @@ def legal_phases(lo, hi, op):
 
 
 def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
-                  balance=True, hygiene=True):
+                  balance=True):
     """Critical-path (ASAP) schedule, optionally load-balanced.
 
     Same output shape as milp_schedule but no solver: layer count equals
     the dependency critical path.  This is the practical path for large
-    graphs (the 6502 machine's MILP has ~5M integer variables and does not
-    solve in useful time -- the blowup is the formulation's per-dim/
-    per-boundary alive indicators, not the HiGHS engine).
+    graphs (the union machine's MILP does not solve in useful time -- the
+    blowup is the formulation's per-dim/per-boundary alive indicators,
+    not the HiGHS engine).
 
     Plain ASAP piles ops into the earliest layers, and d_model ends up
     dominated by the busiest layer's head/FFN demand rather than by
@@ -246,6 +244,12 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
     re-places every op at the least-loaded legal phase within its
     dependency window (ties -> latest, which also shortens lifetimes),
     spreading persists and ReGLUs across the critical path's slack.
+
+    A persist-moving "hygiene sweep" used to follow the leveling; it was
+    excised 2026-07-13 after measurement: its cost priced attention-side
+    passthroughs only, and it LOST on total passthroughs and union
+    d_model once the FFN side was counted (the partial-objective trap,
+    PLAYBOOK lever 15).
     """
     log = log or logger.info
 
@@ -305,52 +309,6 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
             pa[op] = best
             load[best] += 1
 
-    if balance and hygiene:
-        # Hygiene sweep (the greedy half of the hygiene-MILP receipt): the
-        # engine is nnz-bound and the schedule-variable hygiene cost is
-        # persist-1 passthrough persistence.  Move each persist within its
-        # exact dependency window to (a) prefer persist-2 slots (no
-        # attention passthrough) and (b) co-locate persist-1 consumers of
-        # the same deps, guarded so no phase exceeds the current max load.
-        # Deterministic: topo order, tuple-key min over ordered candidates.
-        persists = [op for op in topo_order if isinstance(op, PersistDimension)]
-        max_load = max(load.values(), default=0)
-        p1_layers = defaultdict(lambda: defaultdict(int))  # dep -> layer -> uses
-        for p in persists:
-            if pa[p] % 4 == 1:
-                for d in op_deps[p]:
-                    p1_layers[d][pa[p] // 4] += 1
-        for _ in range(2):  # a second sweep settles moves the first enabled
-            for p in persists:
-                cur = pa[p]
-                load[cur] -= 1
-                if cur % 4 == 1:
-                    for d in op_deps[p]:
-                        p1_layers[d][cur // 4] -= 1
-                lo = max((pa[d] for d in op_deps[p] if d in pa), default=-1) + 1
-                kids = [pa[c] for c in children.get(p, ()) if c in pa]
-                hi = (min(kids) - 1) if kids else max_phase
-                candidates = list(legal_phases(lo, max(hi, lo), p)) or [cur]
-
-                def hygiene_cost(ph, p=p):
-                    if ph % 4 != 1:
-                        return 0  # persist-2: FFN side, no attention passthrough
-                    L = ph // 4
-                    return sum(
-                        1 for d in op_deps[p]
-                        if p1_layers[d][L] == 0
-                        and not (isinstance(d, LookUp) and pa.get(d) == 4 * L)
-                    )
-
-                best = min(candidates, key=lambda ph: (
-                    load[ph] >= max_load, hygiene_cost(ph), load[ph], -ph,
-                ))
-                pa[p] = best
-                load[best] += 1
-                if best % 4 == 1:
-                    for d in op_deps[p]:
-                        p1_layers[d][best // 4] += 1
-
     (num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after) = (
         layers_and_liveness(
             pa, all_dims, graph["dim_to_op"], graph["consumers"], output_dims
@@ -376,25 +334,28 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
 
 
 def milp_schedule(
-    input_tokens, output_tokens, max_layers=None, max_ffn=None, log=None,
-    program_graph=None, time_limit=3600,
-    objective="width", width_bound=None,
+    input_tokens, output_tokens, max_layers=None, log=None,
+    program_graph=None, time_limit=3600, width_bound=None,
 ):
-    """Optimal schedule minimizing dependency width at persist boundaries.
+    """Optimal-lifetime schedule: the per-expert certificate.
+
+    Minimizes total dim lifetime (every phase a value stays alive past its
+    producer is one passthrough/erase statement in the emitted engine, on
+    the attention OR FFN side) plus the attention passthrough-persistence
+    sum, under a width cap.  Earlier objectives were excised by
+    measurement 2026-07-13: "width" (the engine is nnz-bound, not
+    width-bound) and attention-only "hygiene" (a wash -- the solver dumped
+    carries into the unpriced FFN pool; PLAYBOOK lever 15).
 
     Args:
         max_layers: maximum number of transformer layers.
-        max_ffn: maximum FFN neurons per layer.
         log: logging callable (defaults to logger.info).
         program_graph: optional ProgramGraph; if provided, uses its dims/lookups
             and positional dimensions instead of module-level globals.
         time_limit: solver budget in seconds; at the limit HiGHS returns its
             best incumbent (the schedule is feasible, just not proven optimal).
-        objective: "width" minimizes d_model; "hygiene" minimizes the
-            passthrough-persistence indicator sum (the engine is nnz-bound,
-            and slot hygiene -- not width -- is the schedule-variable part),
-            usually with width_bound set to the balanced-ASAP d_model.
-        width_bound: optional cap on d_model (2 * D_half <= width_bound).
+        width_bound: optional cap on d_model (2 * D_half <= width_bound),
+            usually the balanced-ASAP d_model.
     """
     log = log or print
 
@@ -406,7 +367,6 @@ def milp_schedule(
     ops = graph["ops"]
     od = graph["op_deps"]
     tt = graph.get("tight_to", {})
-    produced = graph["produced"]
     consumers = graph["consumers"]
     dim_to_op = graph["dim_to_op"]
 
@@ -424,7 +384,6 @@ def milp_schedule(
     # ── MILP ──────────────────────────────────────────────────────
     prob = LpProblem("schedule", LpMinimize)
     D_half = LpVariable("D_half", 0, cat="Integer")
-    prob += D_half
 
     k = {op: LpVariable(f"k_{i}", 0, N - 1, LpInteger) for i, op in enumerate(ops)}
     z = {
@@ -462,19 +421,6 @@ def milp_schedule(
         for c_op in cons:
             prob += dv >= phase_of(c_op)
         death[d] = dv
-
-    # ── FFN width limit: at most max_ffn ReGLUs per layer ─────────
-    if max_ffn is not None:
-        reglus_list = graph["reglus"]
-        n_reg = len(reglus_list)
-        fb = {}
-        for i, rg in enumerate(reglus_list):
-            for L in range(N):
-                fb[i, L] = LpVariable(f"fb_{i}_{L}", 0, 1, LpBinary)
-            prob += lpSum(fb[i, L] for L in range(N)) == 1
-            prob += k[rg] == lpSum(L * fb[i, L] for L in range(N))
-        for L in range(N):
-            prob += lpSum(fb[i, L] for i in range(n_reg)) <= max_ffn
 
     di = {d: i for i, d in enumerate(all_dims)}
     lookups = graph["lookups"]
@@ -647,27 +593,17 @@ def milp_schedule(
     # ── Objective / width bound ───────────────────────────────────
     if width_bound is not None:
         prob += 2 * D_half <= int(width_bound)
-    if objective == "hygiene":
-        # Attention-side passthrough persistence only.  Measured 2026-07-13:
-        # a wash against the greedy sweep -- the solver pushes carried
-        # values into UNPRICED FFN passthroughs (the larger pool).
-        prob.setObjective(lpSum(pd_var.values()) + 0.001 * D_half)
-    elif objective == "lifetime":
-        # The engine's emitted hygiene cost is proportional to slots
-        # carried across boundaries: every phase a value stays alive past
-        # its producer is one unit of passthrough/erase traffic, on the
-        # attention OR FFN side.  Total lifetime prices both, linearly in
-        # variables the formulation already has.
-        births = lpSum(
-            phase_of(dim_to_op[d]) for d in death
-            if dim_to_op.get(d) in k
-        )
-        prob.setObjective(
-            lpSum(death.values()) - births
-            + lpSum(pd_var.values()) + 0.001 * D_half
-        )
-    elif objective != "width":
-        raise ValueError(f"unknown objective {objective!r}")
+    # Total lifetime prices every carried slot -- attention and FFN --
+    # linearly in variables the formulation already has; the attention
+    # passthrough sum and a small width term break ties.
+    births = lpSum(
+        phase_of(dim_to_op[d]) for d in death
+        if dim_to_op.get(d) in k
+    )
+    prob.setObjective(
+        lpSum(death.values()) - births
+        + lpSum(pd_var.values()) + 0.001 * D_half
+    )
 
     # ── Solve ─────────────────────────────────────────────────────
     log("Solving MILP...")
@@ -684,9 +620,8 @@ def milp_schedule(
     if prob.status != 1:
         raise RuntimeError(f"MILP infeasible (status={prob.status}); try more layers")
 
-    opt_D_half = int(round(value(D_half)))
-    opt_D = 2 * opt_D_half
-    log(f"MILP optimal d_model: {opt_D}")
+    lifetime = int(round(value(prob.objective)))
+    opt_D = 2 * int(round(value(D_half)))
 
     # ── Extract assignment & build layers ──────────────────────────
     pa = {}
@@ -700,156 +635,11 @@ def milp_schedule(
             is_p2 = int(round(value(z[op])))
             pa[op] = 4 * layer + 1 + 2 * is_p2
 
-    (num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after) = (
+    (num_layers, _max_phase, std_layers, dim_birth, dim_death, alive_after) = (
         layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims)
     )
-
-    # ── Linear width at persist boundaries ────────────────────────
-    dim_col = {d: i for i, d in enumerate(all_dims)}
-    n_dims = len(all_dims)
-
-    def expr_vec(expr):
-        v = np.zeros(n_dims)
-        if isinstance(expr, Expression):
-            for dim, coeff in expr.terms.items():
-                if dim in dim_col:
-                    v[dim_col[dim]] = coeff
-        return v
-
-    op_vecs = {}
-    for op in ops:
-        if isinstance(op, PersistDimension):
-            op_vecs[op] = [expr_vec(op.expr)]
-        elif isinstance(op, ReGLUDimension):
-            op_vecs[op] = [expr_vec(op.a_expr), expr_vec(op.b_expr)]
-        elif isinstance(op, LookUp):
-            op_vecs[op] = [
-                expr_vec(e) for e in op.query_exprs_2d + op.key_exprs_2d + op.value_exprs
-            ]
-    out_vecs = [expr_vec(e) for e in output_tokens.values()]
-
-    lin_widths = {}
-    for c in sorted(alive_after):
-        past = np.array([dim_birth.get(d, max_phase + 1) <= c for d in all_dims], dtype=bool)
-        rows = []
-        for op in ops:
-            if pa[op] > c:
-                for v in op_vecs.get(op, []):
-                    m = v * past
-                    if np.any(m != 0):
-                        rows.append(m)
-        for v in out_vecs:
-            m = v * past
-            if np.any(m != 0):
-                rows.append(m)
-        if rows:
-            M = np.vstack(rows)
-            norms = np.linalg.norm(M, axis=1, keepdims=True)
-            norms[norms == 0] = 1
-            lin_widths[c] = int(np.linalg.matrix_rank(M / norms))
-        else:
-            lin_widths[c] = 0
-
-    # ── Expanded lin width (persists → base expressions) ──────────
-    expand_cache = {}
-
-    def expand_dim(dim):
-        if dim in expand_cache:
-            return expand_cache[dim]
-        if isinstance(dim, PersistDimension):
-            v = np.zeros(n_dims)
-            for d, c in dim.expr.terms.items():
-                v += c * expand_dim(d)
-        else:
-            v = np.zeros(n_dims)
-            if dim in dim_col:
-                v[dim_col[dim]] = 1.0
-        expand_cache[dim] = v
-        return v
-
-    def expr_vec_expanded(expr):
-        v = np.zeros(n_dims)
-        if isinstance(expr, Expression):
-            for dim, coeff in expr.terms.items():
-                v += coeff * expand_dim(dim)
-        return v
-
-    op_vecs_exp = {}
-    for op in ops:
-        if isinstance(op, PersistDimension):
-            op_vecs_exp[op] = [expr_vec_expanded(op.expr)]
-        elif isinstance(op, ReGLUDimension):
-            op_vecs_exp[op] = [expr_vec_expanded(op.a_expr), expr_vec_expanded(op.b_expr)]
-        elif isinstance(op, LookUp):
-            op_vecs_exp[op] = [
-                expr_vec_expanded(e) for e in op.query_exprs_2d + op.key_exprs_2d + op.value_exprs
-            ]
-    out_vecs_exp = [expr_vec_expanded(e) for e in output_tokens.values()]
-
-    exp_lin_widths = {}
-    for c in sorted(alive_after):
-        past = np.array([dim_birth.get(d, max_phase + 1) <= c for d in all_dims], dtype=bool)
-        rows = []
-        for op in ops:
-            if pa[op] > c:
-                for v in op_vecs_exp.get(op, []):
-                    m = v * past
-                    if np.any(m != 0):
-                        rows.append(m)
-        for v in out_vecs_exp:
-            m = v * past
-            if np.any(m != 0):
-                rows.append(m)
-        if rows:
-            M = np.vstack(rows)
-            norms = np.linalg.norm(M, axis=1, keepdims=True)
-            norms[norms == 0] = 1
-            exp_lin_widths[c] = int(np.linalg.matrix_rank(M / norms))
-        else:
-            exp_lin_widths[c] = 0
-
-    # ── Report ────────────────────────────────────────────────────
-    max_dep = max((len(s) for s in alive_after.values()), default=0)
-    max_lin = max(lin_widths.values(), default=0)
-    max_exp_lin = max(exp_lin_widths.values(), default=0)
-    log(
-        f"\nSchedule: {num_layers} layers, d_model={opt_D}, "
-        f"max_dep={max_dep}, max_lin={max_lin}, max_exp_lin={max_exp_lin}"
-    )
-
-    for L in range(num_layers):
-        attn, p1, ffn, p2 = std_layers[L]
-        c1, c3 = 4 * L + 1, 4 * L + 3
-        dw1 = len(alive_after.get(c1, set()))
-        lw1 = lin_widths.get(c1, 0)
-        ew1 = exp_lin_widths.get(c1, 0)
-        dw3 = len(alive_after.get(c3, set()))
-        lw3 = lin_widths.get(c3, 0)
-        ew3 = exp_lin_widths.get(c3, 0)
-        log(
-            f"  L{L}: A[{len(attn)}] P1[{len(p1)}] F[{len(ffn)}] P2[{len(p2)}]  "
-            f"after_attn={dw1}/{lw1}/{ew1} after_ffn={dw3}/{lw3}/{ew3}"
-        )
-
-    for L in range(num_layers - 1):
-        c = 4 * L + 3
-        names = sorted(d.name for d in alive_after.get(c, set()))
-        log(f"  Cut L{L}/L{L + 1} ({len(names)}): {names}")
-
-    # ── Write plan.yaml ───────────────────────────────────────────
-    write_plan(
-        "plan.yaml",
-        std_layers,
-        num_layers,
-        opt_D,
-        max_dep,
-        max_lin,
-        alive_after,
-        lin_widths,
-        produced,
-        max_phase,
-    )
-    log("Schedule written to plan.yaml")
+    log(f"MILP schedule: {num_layers} layers, d_model {opt_D}, "
+        f"objective {lifetime}")
 
     return dict(
         phase_assign=pa,
@@ -858,117 +648,7 @@ def milp_schedule(
         dim_birth=dim_birth,
         dim_death=dim_death,
         alive_after=alive_after,
-        lin_widths=lin_widths,
         width=opt_D,
     )
-
-
-class _InlineList(list):
-    """Tag for lists that should be rendered inline in YAML."""
-
-    pass
-
-
-def compact_representer(dumper, data):
-    return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True)
-
-
-def write_plan(
-    path,
-    std_layers,
-    num_layers,
-    width,
-    max_dep,
-    max_lin,
-    alive_after,
-    lin_widths,
-    produced,
-    max_phase,
-):
-    """Write schedule to plan.yaml for inspection."""
-    import yaml
-
-    yaml.add_representer(_InlineList, compact_representer)
-
-    plan = {
-        "summary": {
-            "layers": num_layers,
-            "milp_d_model": width,
-            "max_dep_width": max_dep,
-            "max_lin_width": max_lin,
-        },
-        "layers": [],
-    }
-    for L in range(num_layers):
-        attn, p1, ffn, p2 = std_layers[L]
-        c1, c3 = 4 * L + 1, 4 * L + 3
-
-        attn_dims = []
-        for lu in attn:
-            attn_dims.extend(d.name for d in produced.get(lu, []))
-
-        entry = {
-            "layer": L,
-            "attention": _InlineList(attn_dims),
-            "persist1": _InlineList(pd.name for pd in p1),
-            "after_persist1": {
-                "dep_width": len(alive_after.get(c1, set())),
-                "lin_width": lin_widths.get(c1, 0),
-                "dims": _InlineList(sorted(d.name for d in alive_after.get(c1, set()))),
-            },
-            "ffn": _InlineList(rg.name for rg in ffn),
-            "persist2": _InlineList(pd.name for pd in p2),
-        }
-        if c3 <= max_phase:
-            entry["after_persist2"] = {
-                "dep_width": len(alive_after.get(c3, set())),
-                "lin_width": lin_widths.get(c3, 0),
-                "dims": _InlineList(sorted(d.name for d in alive_after.get(c3, set()))),
-            }
-        plan["layers"].append(entry)
-
-    with open(path, "w") as f:
-        yaml.dump(plan, f, default_flow_style=False, sort_keys=False, width=200)
-
-
-# ── Utilities (used by build_model.py) ────────────────────────────
-
-
-def interval_coloring(all_dims, dim_birth, dim_death, fixed=None):
-    """Greedy interval coloring: assign slots to dims with [birth, death) lifetimes.
-
-    fixed: optional dict {dim: slot} of pre-assigned slots.
-    Returns dict mapping dim -> slot.
-    """
-    fixed = fixed or {}
-    remaining = [d for d in all_dims if d not in fixed]
-    items = sorted(
-        (dim_birth[d], dim_death[d], i, d)
-        for i, d in enumerate(remaining)
-        if d in dim_birth and d in dim_death and dim_death[d] > dim_birth[d]
-    )
-    slot_of = dict(fixed)
-    free = []
-    next_slot = max(fixed.values(), default=-1) + 1
-    for d, s in fixed.items():
-        if d in dim_death:
-            heapq.heappush(free, (dim_death[d], s))
-
-    for birth, death_phase, _idx, d in items:
-        available = []
-        while free and free[0][0] <= birth:
-            available.append(heapq.heappop(free)[1])
-        if available:
-            slot = min(available)
-            for s in available:
-                if s != slot:
-                    heapq.heappush(free, (birth, s))
-        else:
-            slot = next_slot
-            next_slot += 1
-        slot_of[d] = slot
-        heapq.heappush(free, (death_phase, slot))
-
-    return slot_of
 
 

@@ -1,3 +1,3 @@
-"""Scheduling: MILP-based layer assignment and interval coloring."""
+"""Scheduling: ops onto 4-phase transformer layers (ASAP + MILP)."""
 
-__all__ = ["milp_schedule"]
+__all__ = ["asap_schedule", "milp_schedule"]

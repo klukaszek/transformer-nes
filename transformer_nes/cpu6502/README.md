@@ -76,7 +76,7 @@ either serving returns the identical winner.
 `backends/weights/` (`6502-transformer`) closes the loop on the project's
 premise: the graph is scheduled onto layers and compiled by
 `model/weights.py` into actual transformer weight matrices
-(`WeightModel` — d_model=702, 75 layers, 351 attention heads),
+(`WeightModel` — d_model=634, 75 layers, 317 attention heads),
 constructed analytically, no training.  Execution is genuine transformer
 inference: embeddings, Q/K/V projections, hardmax attention, ReGLU FFN,
 residual stream, output head.  There is **no position encoding** — token
@@ -92,15 +92,16 @@ a correctness one).
 Scheduling: the optimal-width MILP does not scale at union size — the
 blowup is the formulation (per-dim/per-boundary alive indicators; HiGHS
 presolve alone exceeds an hour), not the solver.
-`scheduler/milp.py:asap_schedule` instead takes the critical path,
+`scheduler/milp.py:asap_schedule` instead takes the critical path and
 load-balances ops across its slack with a reverse-topological leveling
 pass (deterministic; ties go to the latest phase, which also shortens
-lifetimes), then runs a greedy hygiene sweep that re-places persists
-within their dependency windows to minimize passthrough/erase work —
-capturing essentially the whole hygiene-MILP win in milliseconds.  The
-MILP survives as an opt-in per-expert certificate
-(`expert_schedule="milp"`, hygiene objective, width capped at the
-balanced-ASAP width).
+lifetimes).  A persist-moving hygiene sweep and the MILP's width/
+attention-hygiene objectives were excised 2026-07-13 after measurement:
+each priced only part of the emitted cost and lost (or washed) on the
+whole.  The MILP survives as an opt-in per-expert certificate
+(`expert_schedule="milp"`) with a total-lifetime objective — every
+phase a value outlives its producer is one emitted passthrough/erase
+statement — width-capped at the balanced-ASAP d_model.
 
 Performance: the analytic weights are ~99.9% zeros, so inference runs the
 same linear maps sparsely. `model/engine_gen.py` emits model-specific C++

@@ -62,6 +62,25 @@ targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
   is only ~7% of expert lines now, so default builds keep the greedy.
   A lifetime-cost greedy variant measured mixed (one expert −13%) and
   was reverted.
+- **Scheduler de-noised (same day):** the greedy hygiene sweep and the
+  MILP's width/attention-hygiene objectives were excised.  The sweep,
+  re-measured on the honest metric, was the partial-objective trap in
+  greedy form: fewer attention passthroughs, MORE total passthroughs
+  (union 3,561 vs 3,480 without it) and a WIDER union (d_model 702 vs
+  634).  Emitted lines post-peephole were mixed (experts +6%, union
+  −7% without it) and Klaus was a wash — DEMONSTRATED with 3 runs per
+  config: no-sweep 417.2-423.9K vs sweep 413.8-424.0K steps/s, fully
+  overlapping at ±1% run noise, no-sweep ahead on means — so simplicity
+  and the smaller exported model won: **union d_model is now 634
+  (317 heads)**.  milp_schedule keeps ONE objective (total lifetime +
+  attention-passthrough tie-break, width-capped); the width objective,
+  attention-only hygiene objective, and max_ffn machinery are gone, and
+  so is the width-era diagnostic stratum (per-boundary matrix-rank
+  "linear width" analyses, per-layer/cut report dumps, the plan.yaml
+  writer, and the consumer-less interval_coloring): milp.py 962 → 654
+  lines.  Receipts: 128 tests green, full Klaus MATCHED, SMB3 tape
+  segments ~906 fps, milp_schedule exercised end-to-end post-slim
+  (A5: 120 → 104 passthrough entries, 28 s).
 - Two smaller landings the same day: device **write journaling** (PPU regs
   1-7 + APU $4000-$400F apply natively and drain in order at run()
   returns instead of pausing; NMI-edge/IRQ-ack/DMA/strobe registers still

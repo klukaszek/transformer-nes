@@ -1,7 +1,7 @@
 """Analytical weight construction for the transformer.
 
-Reads a schedule plan (plan.yaml or MILP-generated) and constructs the weight
-matrices of the transformer from the computation graph.
+Takes a schedule (asap_schedule / milp_schedule output) and constructs the
+weight matrices of the transformer from the computation graph.
 
 Each half-layer is a transform: input dims -> latent (gates + passthrough) -> output dims.
 The persist/output phase is a linear projection. For each output slot:
