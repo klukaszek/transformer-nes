@@ -42,6 +42,25 @@ def test_transformer_weights_match_reference():
     lockstep_vs_reference(trace, image)
 
 
+def test_region_ops_keep_write_position_in_sync():
+    """inject_region advances the engine sequence one WRITE token per byte
+    and map_region not at all; the Python position mirror must match both,
+    or the next single-byte poke throws.  MMC2/MMC4 hit exactly this: a
+    bank switch (inject_region) and the clobbered-register repair
+    (inject_write) inside ONE pause servicing, with no run() between to
+    resync the mirror (Punch-Out, found 2026-07-13)."""
+    machine = Cpu6502TransformerMachine(bcd=False)
+    machine.load_image(bytes(65536), start_pc=0x0400)
+    machine.inject_region(0x8000, bytes(range(1, 65)))
+    machine.inject_write(0x0010, 0x42)  # threw before the mirror fix
+    machine.map_region(0x9000, bytes(range(1, 65)))
+    machine.inject_write(0x0011, 0x43)
+    assert machine.read_ram(0x8001) == 2
+    assert machine.read_ram(0x9001) == 2
+    assert machine.read_ram(0x0010) == 0x42
+    assert machine.read_ram(0x0011) == 0x43
+
+
 @pytest.mark.slow
 def test_transformer_int32_engine_matches_high_address_nestest_prefix():
     from transformer_nes.nes.examples.nestest import START_PC, load_image

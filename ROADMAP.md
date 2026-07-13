@@ -89,6 +89,23 @@ targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
   kept for the pause-count reduction), and `interpreter.py` joined the
   engine cache digest (it shapes the emitted model; a graph edit
   previously reused stale engines silently).
+- **Punch-Out weights crash, fixed (user report; latent since the
+  2026-07-12 native-banking arc, NOT this session's changes -- it
+  reproduces at that commit).**  The runner's write-position mirror
+  disagreed with the engine in both region ops: `inject_region` inserts
+  one WRITE token per byte engine-side but never advanced `self.pos`,
+  and `map_region` advanced `self.pos` though `map_write` stamps state
+  without touching the sequence.  Every native run() resyncs the mirror,
+  which masked both -- until a mapper does a region op AND a single-byte
+  poke inside ONE pause servicing.  MMC2/MMC4 are the only such mappers
+  left (bank switch + clobbered-register repair) after MMC1/MMC3 went
+  native and MMC5 moved to map_region, so only Punch-Out could trip the
+  engine's strict `seq == pos` check.  Receipts: Punch-Out 240 frames
+  byte- AND cycle-identical weights vs reference; CV3 full tape still
+  byte-identical (the map_region side); regression test
+  (`test_region_ops_keep_write_position_in_sync`); 129 tests green.
+  Coverage hole exposed: no MMC2/MMC4 example has an input tape --
+  record a Punch-Out tape next time the app is up.
 
 **Previous START HERE (2026-07-12, mapper + hot-shape optimization landed):**
 

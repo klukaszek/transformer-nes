@@ -374,16 +374,22 @@ class Cpu6502TransformerMachine:
         self.insert_write(addr & 0xFFFF, value & 0xFF)
 
     def inject_region(self, base: int, data: bytes):
-        """Bulk injection (mapper bank switches): one native call."""
+        """Bulk injection (mapper bank switches): one native call.
+
+        The engine inserts one WRITE token per byte, so the position
+        mirror advances with it -- a following inject_write in the same
+        pause servicing (MMC2/MMC4 repair the clobbered register byte)
+        must present the engine's exact sequence."""
         base &= 0xFFFF
         data = bytes(data)
         self.ram[base:base + len(data)] = data
         self.engine.inject_region(base, data)
+        self.pos += len(data)
 
     def map_region(self, base: int, data: bytes):
-        """Replace a mapped cartridge region without creating WRITE tokens."""
+        """Replace a mapped cartridge region without creating WRITE tokens
+        (the engine's map_write stamps state in place; no sequence advance)."""
         self.engine.map_region(base, data)
-        self.pos += len(data)
         # Newly banked-in code gets its shape windows immediately instead
         # of waiting out JIT warmup; matches are memoized per bank content.
         meta = getattr(self.engine, "shapes_meta", None) or []
