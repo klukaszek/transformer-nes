@@ -339,7 +339,7 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
             sched = milp_schedule(fp.input_tokens, fp.output_tokens,
                                   program_graph=fp, log=logger.debug,
                                   time_limit=milp_seconds,
-                                  objective="hygiene",
+                                  objective="lifetime",
                                   width_bound=ainfo.d_model)
             logger.info("expert %02X: hygiene MILP in %.0fs",
                         byte, time.perf_counter() - t0)

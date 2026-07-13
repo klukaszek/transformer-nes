@@ -140,6 +140,26 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
    decodes fields from packed integers: build the cumulative ladder
    once, take differences linearly, persist only the named results.
 
+14. **Pay the hazard convention only where a hazard exists** (−26% total
+   emitted lines; Klaus +3.4%).  Phase-structured in-place updates
+   (capture all reads, then apply all writes) cost two statements per
+   value moved or erased.  A linear scan in apply order proves most
+   rows' operands are untouched by the phase's earlier writes, so the
+   pair collapses to one statement — and an erase whose target slot is
+   unwritten becomes plain assignment.  Transfers to any generated
+   engine with a read-then-write phase discipline: the convention is
+   for the general case; the emitter can prove the special cases.
+
+15. **A partial-cost objective is worse than none: the solver dumps cost
+   into whatever you did not price.**  The scheduling MILP's "hygiene"
+   objective priced attention-side passthroughs only and measured as a
+   wash — it reduced the priced pool 28% while growing the unpriced
+   (3x larger) FFN pool.  Total dim lifetime — Σ(death − birth), linear
+   in variables the formulation already had — prices every carried slot
+   uniformly and wins 10-20% per expert.  Generalizes to any greedy
+   sweep too: check what the objective does NOT see before trusting a
+   win on what it does.
+
 ## Dead ends (kept so they stay dead)
 
 - GPU per-matrix sparse matvec for a single stream: one dispatch costs a

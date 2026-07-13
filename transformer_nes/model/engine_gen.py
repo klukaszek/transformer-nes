@@ -1117,28 +1117,57 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     b.append("        }")
                 b.append(f"        (void)ho{2 * h}; (void)ho{2 * h + 1};")
 
-            # attn_direct reads pre-attention x; capture before updating.
-            # These fused rows are passthrough/erase (slot-hygiene) work
-            # within this model's own residual layout.
+            # Direct-map (passthrough/erase slot hygiene) emission with a
+            # peephole: the two-phase capture+apply pair exists so reads
+            # precede the phase's writes, so a row whose operands are
+            # untouched by earlier statements of the phase collapses to ONE
+            # statement at apply position -- an erase row (diagonal -1,
+            # target unwritten) becomes plain assignment.  Scanned in apply
+            # order, tracking written slots, so the transform is exact.
+            def fuse_direct(mat, rows, var, pre_written, label):
+                defs, applies = [], []
+                written = set(pre_written)
+                for r in rows:
+                    idxs, dat = row(mat, r)
+                    terms = list(zip(idxs, dat, strict=True))
+                    diag = dict(terms).get(r)
+                    rest = [(i, c) for i, c in terms if i != r]
+                    support = {int(i) for i, _ in rest}
+                    if diag == -1.0 and r not in written and not support & written:
+                        if rest:
+                            e = expr_int([i for i, _ in rest],
+                                         [c for _, c in rest],
+                                         xref, f"{label} fused")
+                            applies.append(f"        x[{r}] = {e};")
+                        else:
+                            applies.append(f"        x[{r}] = 0;")
+                    elif diag is None and not support & written:
+                        e = expr_int(idxs, dat, xref, f"{label} fused")
+                        applies.append(f"        x[{r}] += {e};")
+                    else:
+                        defs.append(f"        const {elem} {var}{r} = "
+                                    f"{row_int(mat, r, xref, label)};")
+                        applies.append(f"        x[{r}] += {var}{r};")
+                    written.add(int(r))
+                return defs, applies
+
+            # attn_direct reads pre-attention x; out_proj rows read the
+            # hull outputs ho{..} and apply first.
             ad_rows = [r for r in range(dm)
                        if attn_direct.indptr[r + 1] > attn_direct.indptr[r]]
-            ad_def = [f"        const {elem} ad{r} = "
-                      f"{row_int(attn_direct, r, xref, f'L{li} attn_direct')};"
-                      for r in ad_rows]
-            # out_proj rows read the hull outputs ho{..}.
             opkept: list[tuple[int, list[int], list[float]]] = []
             for r in range(dm):
                 if op_kept.indptr[r + 1] > op_kept.indptr[r]:
                     idxs, dat = row(op_kept, r)
                     opkept.append((r, [int(c) for c in idxs], list(dat)))
-            ad_apply = [f"        x[{r}] += ad{r};" for r in ad_rows]
+            ad_def, ad_apply = fuse_direct(
+                attn_direct, ad_rows, "ad", (r for r, _i, _d in opkept),
+                f"L{li} attn_direct",
+            )
 
             # ── FFN: direct map and activations read post-attention x ─
             fd_rows = [r for r in range(dm)
                        if ffn_direct.indptr[r + 1] > ffn_direct.indptr[r]]
-            fd_def = [f"        const {elem} fd{r} = "
-                      f"{row_int(ffn_direct, r, xref, f'L{li} ffn_direct')};"
-                      for r in fd_rows]
             neuron_blocks: dict[int, list[str]] = {}
             for j in live:
                 g = row_int(fi, j, xref, f"L{li} ff_gate")
@@ -1154,7 +1183,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 if fo_kept.indptr[r + 1] > fo_kept.indptr[r]:
                     idxs, dat = row(fo_kept, r)
                     fokept.append((r, [int(c) for c in idxs], list(dat)))
-            fd_apply = [f"        x[{r}] += fd{r};" for r in fd_rows]
+            fd_def, fd_apply = fuse_direct(
+                ffn_direct, fd_rows, "fd", (r for r, _i, _d in fokept),
+                f"L{li} ffn_direct",
+            )
 
             plans.append({
                 "li": li, "lookup": lookup, "head_blocks": head_blocks,

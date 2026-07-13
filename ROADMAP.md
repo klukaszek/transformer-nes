@@ -42,6 +42,26 @@ targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
   between 15 ms idles (DVFS: measured 1.30 → 4.30 ms/frame on identical
   frames with a 14.5 ms sleep inserted); its stats line now says "at
   60 Hz pacing" instead of claiming uncapped headroom.
+- **Same-day follow-up — hygiene emission peephole + MILP realignment.**
+  The post-fusion census showed ~half of every expert forward was slot
+  hygiene: erase/move rows emitted as capture+apply PAIRS (the two-phase
+  form exists only so reads precede the phase's writes).  plan_model now
+  scans each phase in apply order and collapses any row whose operands
+  are provably untouched into one statement (an erase with an unwritten
+  target becomes plain assignment): emitted erase pairs 38,977 → 28,
+  total 255,604 → 190,084 lines (−26%), hot experts −23%, **Klaus 406K →
+  420K steps/s (72.9 s)**; tapes unchanged within noise (frames are no
+  longer forward-bound).  The scheduler MILP also got its objective
+  realigned: the old "hygiene" objective priced only attention-side
+  passthroughs and measured as a WASH against the greedy sweep (the
+  solver dumped carries into the unpriced, 3x-larger FFN pool);
+  `objective="lifetime"` (total dim lifetime, linear in existing
+  variables) prices both sides and wins −10-20% passthrough entries per
+  expert at 15-80 s/expert on post-diet sizes.  It stays the opt-in
+  certificate (`expert_schedule="milp"`): the schedulable pool (moves)
+  is only ~7% of expert lines now, so default builds keep the greedy.
+  A lifetime-cost greedy variant measured mixed (one expert −13%) and
+  was reverted.
 - Two smaller landings the same day: device **write journaling** (PPU regs
   1-7 + APU $4000-$400F apply natively and drain in order at run()
   returns instead of pausing; NMI-edge/IRQ-ack/DMA/strobe registers still

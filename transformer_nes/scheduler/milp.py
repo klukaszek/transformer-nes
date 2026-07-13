@@ -648,12 +648,24 @@ def milp_schedule(
     if width_bound is not None:
         prob += 2 * D_half <= int(width_bound)
     if objective == "hygiene":
-        # Realigned to the engine's cost model: total dying is
-        # schedule-invariant (every dim dies once), but the passthrough
-        # persistence sum varies with persist co-scheduling and the
-        # persist1/persist2 choice.  D_half enters as a small tie-break so
-        # incumbents do not wander wide under the bound.
+        # Attention-side passthrough persistence only.  Measured 2026-07-13:
+        # a wash against the greedy sweep -- the solver pushes carried
+        # values into UNPRICED FFN passthroughs (the larger pool).
         prob.setObjective(lpSum(pd_var.values()) + 0.001 * D_half)
+    elif objective == "lifetime":
+        # The engine's emitted hygiene cost is proportional to slots
+        # carried across boundaries: every phase a value stays alive past
+        # its producer is one unit of passthrough/erase traffic, on the
+        # attention OR FFN side.  Total lifetime prices both, linearly in
+        # variables the formulation already has.
+        births = lpSum(
+            phase_of(dim_to_op[d]) for d in death
+            if dim_to_op.get(d) in k
+        )
+        prob.setObjective(
+            lpSum(death.values()) - births
+            + lpSum(pd_var.values()) + 0.001 * D_half
+        )
     elif objective != "width":
         raise ValueError(f"unknown objective {objective!r}")
 
