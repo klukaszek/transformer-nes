@@ -572,6 +572,8 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     b('                insert_write(pend_addr[w], pend_value[w], pos); pos += 1.0;')
     b('                if (pend_addr[w] >= 0x8000 && mapper_kind) {')
     b('                    mapper_write(pend_addr[w], pend_value[w]);  // native banking; no pause')
+    b('                } else if (wjournal[pend_addr[w]]) {')
+    b('                    journal_write(pend_addr[w], pend_value[w]);  // order-only device state; no pause')
     b('                } else if (!wwatch.empty() && in_ranges(wwatch, pend_addr[w])) {')
     b('                    sh_addr[n_hits] = pend_addr[w]; sh_value[n_hits] = pend_value[w]; ++n_hits;')
     b('                }')
@@ -615,8 +617,11 @@ def generate_cpp(rt: Cpu6502Runtime) -> str:
     emit('             py::arg("max_cycles") = 0L, py::arg("trace") = true)')
     emit('        .def("watch_read", &KERNEL_T::watch_read)')
     emit('        .def("watch_write", &KERNEL_T::watch_write)')
-    emit('        .def("set_read_lease", &KERNEL_T::set_read_lease)')
-    emit('        .def("set_read_lease_seq", &KERNEL_T::set_read_lease_seq)')
+    emit('        .def("set_write_journal", &KERNEL_T::set_write_journal)')
+    emit('        .def("set_read_lease", &KERNEL_T::set_read_lease,')
+    emit('             py::arg("addr"), py::arg("value"), py::arg("group") = 0)')
+    emit('        .def("set_read_lease_seq", &KERNEL_T::set_read_lease_seq,')
+    emit('             py::arg("addr"), py::arg("values"), py::arg("group") = 0)')
     emit('        .def("take_lease_served", &KERNEL_T::take_lease_served)')
     emit('        .def("clear_read_lease", &KERNEL_T::clear_read_lease)')
     emit('        .def("clear_read_lease_addr", &KERNEL_T::clear_read_lease_addr)')
@@ -700,11 +705,14 @@ class Cpu6502CppRuntime:
     def watch_write(self, lo: int, hi: int):
         self.kernel.watch_write(lo, hi)
 
-    def set_read_lease(self, addr: int, value: int) -> int:
-        return int(self.kernel.set_read_lease(addr, value))
+    def set_write_journal(self, groups: bytes) -> None:
+        self.kernel.set_write_journal(bytes(groups))
 
-    def set_read_lease_seq(self, addr: int, values: bytes) -> int:
-        return int(self.kernel.set_read_lease_seq(addr, bytes(values)))
+    def set_read_lease(self, addr: int, value: int, group: int = 0) -> int:
+        return int(self.kernel.set_read_lease(addr, value, group))
+
+    def set_read_lease_seq(self, addr: int, values: bytes, group: int = 0) -> int:
+        return int(self.kernel.set_read_lease_seq(addr, bytes(values), group))
 
     def take_lease_served(self, addr: int) -> int:
         return int(self.kernel.take_lease_served(addr))

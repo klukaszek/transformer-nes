@@ -16,7 +16,7 @@ package one-way.
 | File | Role |
 |------|------|
 | `spec.py` | Single source of truth: 227-opcode table (151 official + stable unofficial), flags, addressing modes, tiny assembler |
-| `interpreter.py` | The 6502 as a graph: ~9,200 dimensions built from ReGLU/persist/lookup primitives |
+| `interpreter.py` | The 6502 as a graph: ~6,500 dimensions built from ReGLU/persist/lookup primitives |
 | `trace.py` | Canonical trace format shared by every backend |
 | `backends/reference.py` | Plain-Python oracle core.  Trusted by construction; every other backend is verified against it |
 | `backends/evaluator.py` | Exact evaluator: compiles the graph's static schedule to one generated Python function |
@@ -61,7 +61,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
 | `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `kernel.py` (generated C++) | ~790K | Same semantics at NES-relevant speed |
-| `weights/runner.py` (real transformer) | ~344K (full Klaus, incl. the lockstep reference) | The thesis: actual hardmax-attention + ReGLU transformer weights |
+| `weights/runner.py` (real transformer) | ~406K (full Klaus, incl. the lockstep reference) | The thesis: actual hardmax-attention + ReGLU transformer weights |
 
 The evaluator and the C++ kernel are **bit-identical**: the kernel emits
 the evaluator's schedule as the same IEEE double operations in the same
@@ -76,7 +76,7 @@ either serving returns the identical winner.
 `backends/weights/` (`6502-transformer`) closes the loop on the project's
 premise: the graph is scheduled onto layers and compiled by
 `model/weights.py` into actual transformer weight matrices
-(`WeightModel` — d_model=1762, 74 layers, 881 attention heads),
+(`WeightModel` — d_model=702, 75 layers, 351 attention heads),
 constructed analytically, no training.  Execution is genuine transformer
 inference: embeddings, Q/K/V projections, hardmax attention, ReGLU FFN,
 residual stream, output head.  There is **no position encoding** — token
@@ -107,7 +107,11 @@ same linear maps sparsely. `model/engine_gen.py` emits model-specific C++
 with indices and coefficients embedded in expressions. The residual is exact
 fixed-point int32; shifts are guarded and signed wrap is defined. Memory heads
 use exact nearest-address structures, constant-query heads use integer
-running-argmax registers, and remaining heads use hull attention. Generated
+running-argmax registers, and remaining heads use hull attention. Expert
+folds additionally rebuild each `memory_at` site as ONE fused 64K-span
+lookup plus its exact-address mask (`graph/fold.py:masked_exact_read`) —
+the 16-group form serves the union's f32 export score range, which the
+exact-int expert engines never compute. Generated
 artifacts are cached by a digest covering every source file that shapes
 emission; a manifest hit skips folding and emission and dlopens the compiled
 core directly.
@@ -123,18 +127,21 @@ at runtime — including code the program copies into RAM — and adds them to
 the dispatch table mid-run.
 
 With the generated engine, **the full 8,991-instruction nestest suite runs
-through the actual transformer weights in ~0.1 s** (`6502-nestest --runner
-weights`) and the full 30.6M-instruction Klaus suite lockstep-matches with
-decimal mode in ~90 s, checkpointing disabled entirely (engine state is
-O(1); the snapshot-and-rebuild machinery remains for the NES console).  SMB
-gameplay through the weights runs at ~333 fps with its pinned module and
-~155 fps from the shipped core alone, byte-identical to the C++ kernel's
-frames and cycles.
+through the actual transformer weights in under 0.1 s** (`6502-nestest
+--runner weights`) and the full 30.6M-instruction Klaus suite
+lockstep-matches with decimal mode in ~75 s, checkpointing disabled
+entirely (engine state is O(1); the snapshot-and-rebuild machinery remains
+for the NES console).  Gameplay through the weights on the recorded input
+tapes runs at ~1,050 fps (SMB), 756-885 fps (SMB3), and 386-485 fps (CV3),
+byte-identical frame-for-frame to the reference-driven console under the
+same tapes.
 
-Memory is split into 16 × 4 KiB groups. Address scores therefore remain in
-an exactly represented range, while LATEST ties are resolved by insertion
-order. The standalone safetensors export remains float32 by default; that
-storage choice is separate from the generated runtime's int32 arithmetic.
+Memory is split into 16 × 4 KiB groups in the union graph. Address scores
+therefore remain in an exactly represented range, while LATEST ties are
+resolved by insertion order. The standalone safetensors export remains
+float32 by default; that storage choice is separate from the generated
+runtime's int32 arithmetic (and from the expert folds' fused 64K reads,
+which exist only in the engines' execution strategy, never the artifact).
 
 ### Compilation pipeline (evaluator and C++ kernel)
 
@@ -238,8 +245,11 @@ the C++ kernel or the generated weights engine — through one protocol
 execute until a step budget, halt, jump-to-self trap, or a watched address
 is touched (`watch_read` pauses *before* the reading instruction;
 `watch_write` after the writing step), `inject_write()` / `set_nmi()` are
-the device-side entry points, and a read lease serves idempotent device
-polls (the `$2002` vblank wait) natively without pausing.  The shadow
+the device-side entry points, a read lease serves idempotent device
+polls (the `$2002` vblank wait) natively without pausing, and a write
+journal applies order-only device writes (PPU scroll/VRAM/OAM, APU
+channel registers) natively, draining them in program order at every
+run() return instead of pausing per write.  The shadow
 decode uses a generated 256-entry table derived from `spec.READS_MEMORY`,
 so every backend classifies device reads identically.
 
@@ -255,8 +265,8 @@ C++ frame-level PPU, controllers, frame loop) runs NROM ROMs against any
 of the four CPU backends; frame pacing uses base-cycle counting
 implemented identically in the native engines and the Python bus.  nestest boots through its reset
 vector and passes its full official-opcode suite interactively (controller
-input, vblank NMI, OAM DMA); SMB plays at ~74 fps on the kernel and ~333
-fps through the transformer weights, frames byte-identical across
+input, vblank NMI, OAM DMA); SMB gameplay replays at ~1,050 fps through
+the transformer weights on its recorded tape, frames byte-identical across
 backends.  See `transformer_nes/nes/`.
 
 Long runs stay bounded via **snapshot-and-rebuild checkpointing**: past a

@@ -200,8 +200,11 @@ def run_app(console: Console, *, title: str = "transformer-nes", scale: int = 3,
         if record is not None:
             record.close()
         if console.frame_index and emu_seconds > 0:
+            # Paced slices run at idle-clock DVFS (~3x slower than
+            # sustained); tape replay measures uncapped throughput.
             logger.info(
-                "%d frames, emulation %.1f ms/frame (headroom: %.0f fps uncapped)%s",
+                "%d frames, emulation %.1f ms/frame at 60 Hz pacing "
+                "(%.0f fps; sustained throughput: bench with tapes)%s",
                 console.frame_index, 1e3 * emu_seconds / console.frame_index,
                 console.frame_index / emu_seconds,
                 " [HALTED]" if console.halted else "",
@@ -255,7 +258,8 @@ def main() -> None:
     frames, emu = stats["frames"], stats["emu_seconds"]
     if frames and emu > 0:
         logger.info(
-            "%d frames, emulation %.1f ms/frame (headroom: %.0f fps uncapped)%s",
+            "%d frames, emulation %.1f ms/frame at 60 Hz pacing "
+            "(%.0f fps; sustained throughput: bench with tapes)%s",
             frames, 1e3 * emu / frames, frames / emu,
             " [HALTED]" if console.halted else "",
         )

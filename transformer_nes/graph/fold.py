@@ -79,6 +79,42 @@ def subst(expr: Expression, val: dict) -> Expression:
     return out
 
 
+def graph_delta(start_d: int, start_l: int) -> tuple[int, int, int, int]:
+    """(reglus, persists, lookups, terms) created since the registry marks;
+    the fused-read builder goes through the DSL, so its dims are counted
+    from the registry rather than by hand."""
+    nr = np_ = nl = nt = 0
+    for x in graph.graph_dims[start_d:]:
+        if isinstance(x, ReGLUDimension):
+            nr += 1
+            nt += len(x.a_expr.terms) + len(x.b_expr.terms)
+        elif isinstance(x, PersistDimension):
+            np_ += 1
+            nt += len(x.expr.terms)
+    for lu in graph.graph_lookups[start_l:]:
+        nl += 1
+        for e in lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs:
+            nt += len(e.terms)
+    return nr, np_, nl, nt
+
+
+def masked_exact_read(addr, byte_value, write_addr, is_write) -> Expression:
+    """A memory_at site rebuilt flat, in the folded graph's context: ONE
+    64K-span lookup (memory_group FUSED) plus the exact-address mask.
+    Identical output to the union's 16-group sum -- the mask keeps only
+    exact hits, and an exact hit answers from its own group either way --
+    at ~8 dims instead of ~300 per read.  Expert folds only: the union's
+    group split serves the exported artifact's f32 score range."""
+    value, found = graph.fetch([byte_value, write_addr], query=addr,
+                               key=write_addr, clear_key=1 - is_write,
+                               tie_break="latest")
+    value.lookup.memory_group = graph.MEMORY_GROUP_FUSED
+    diff = addr - Expression({found: 1})
+    abs_diff = graph.persist(graph.reglu(diff, diff) + graph.reglu(-diff, -diff))
+    exact = graph.stepglu(Expression({graph.one: 1}), -abs_diff)
+    return graph.make_multiply(Expression({value: 1}), exact)
+
+
 @dataclass
 class FoldResult:
     """A rebuilt graph plus the provenance an engine needs to share state."""
@@ -254,8 +290,15 @@ class GraphFolder:
                 a, b = folded[d]
                 deps = set(a.terms) | set(b.terms)
             elif isinstance(d, PersistDimension):
-                (e,) = folded[d]
-                deps = set(e.terms)
+                site = getattr(d, "memory_read", None)
+                if site is not None:
+                    # Fused read: only the site's raw ingredients stay
+                    # live; the 16-group fabric behind the persist dies.
+                    for e in site.values():
+                        deps |= set(subst(e, val).terms)
+                else:
+                    (e,) = folded[d]
+                    deps = set(e.terms)
             elif isinstance(d, LookUpDimension):
                 fx = lookup_exprs[d.lookup]
                 for e in fx["query"] + fx["key"] + fx["values"]:
@@ -305,6 +348,21 @@ class GraphFolder:
                 n_reglus += 1
                 n_terms += len(nd.a_expr.terms) + len(nd.b_expr.terms)
             elif isinstance(d, PersistDimension):
+                site = getattr(d, "memory_read", None)
+                if site is not None:
+                    marks = len(graph.graph_dims), len(graph.graph_lookups)
+                    expr = masked_exact_read(
+                        tr(site["address"]), tr(site["byte_value"]),
+                        tr(site["write_addr"]), tr(site["is_write"]),
+                    )
+                    nd = PersistDimension(expr, name=d.name)
+                    sub[d] = Expression({nd: 1})
+                    dr, dp, dl, dt = graph_delta(*marks)
+                    n_reglus += dr
+                    n_persists += dp
+                    n_lookups += dl
+                    n_terms += dt
+                    continue
                 (e,) = folded[d]
                 nd = PersistDimension(tr(e), name=d.name)
                 sub[d] = Expression({nd: 1})
@@ -515,8 +573,15 @@ class GraphFolder:
                     a, b = folded[d]
                     deps = set(a.terms) | set(b.terms)
                 elif isinstance(d, PersistDimension):
-                    (e,) = folded[d]
-                    deps = set(e.terms)
+                    site = getattr(d, "memory_read", None)
+                    if site is not None:
+                        # Fused read: only the site's raw ingredients stay
+                        # live; the 16-group fabric behind the persist dies.
+                        for e in site.values():
+                            deps |= set(subst(e, val).terms)
+                    else:
+                        (e,) = folded[d]
+                        deps = set(e.terms)
                 elif isinstance(d, LookUpDimension):
                     fx = lookup_exprs[d.lookup]
                     for e in fx["query"] + fx["key"] + fx["values"]:
@@ -582,6 +647,21 @@ class GraphFolder:
                     n_reglus += 1
                     n_terms += len(nd.a_expr.terms) + len(nd.b_expr.terms)
                 elif isinstance(d, PersistDimension):
+                    site = getattr(d, "memory_read", None)
+                    if site is not None:
+                        marks = len(graph.graph_dims), len(graph.graph_lookups)
+                        expr = masked_exact_read(
+                            tr(site["address"]), tr(site["byte_value"]),
+                            tr(site["write_addr"]), tr(site["is_write"]),
+                        )
+                        nd = PersistDimension(expr, name=sname(d.name))
+                        sub[d] = Expression({nd: 1})
+                        dr, dp, dl, dt = graph_delta(*marks)
+                        n_reglus += dr
+                        n_persists += dp
+                        n_lookups += dl
+                        n_terms += dt
+                        continue
                     (e,) = folded[d]
                     nd = PersistDimension(tr(e), name=sname(d.name))
                     sub[d] = Expression({nd: 1})

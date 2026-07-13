@@ -1,7 +1,8 @@
 # Optimization playbook
 
 Levers that took the 6502 weights transformer from 0.13 instr/s to
-~335K instr/s (SMB at 123 fps), stated architecture-agnostically so they
+~406K instr/s (full Klaus incl. lockstep; SMB gameplay tape ~1,050 fps),
+stated architecture-agnostically so they
 transfer to future targets (other CPUs, WASM, batched fleets).  Each
 entry: the lever, the receipt here, and what it needs to transfer.
 Session-by-session history lives in [ROADMAP.md](ROADMAP.md); design
@@ -107,6 +108,38 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
    only loses the fast path.  Budget guards keep dispatch step-for-step
    equivalent to the per-instruction path.
 
+11. **Attribute emitted cost to construction gadgets before touching the
+   construction** (found the 4x).  Wrap the graph's dim constructors to
+   record each dim's creation site, replay the fold's liveness pass, and
+   histogram live dims per helper-function line.  Here it showed ~80% of
+   a median expert was ONE gadget (the grouped memory read) and RTI was
+   ~78% bit-extraction ladders — nothing else was worth touching.
+   Transfers to any generated-from-graph system: the emitted artifact
+   tells you *how much*, only creation-site attribution tells you *what*.
+
+12. **Serve formulation constraints only to the consumer that has them**
+   (~4x emitted lines; SMB3/CV3 tapes 2.5-3x).  The union model splits
+   memory into 16 lookup groups purely so the exported artifact's f32
+   attention scores stay exactly representable — but the exact-int
+   engines never compute those scores.  The construction annotates each
+   read site with its raw ingredients (address/value/write-gate exprs);
+   expert folds rebuild the site as ONE full-span lookup + exact-address
+   mask, and emission serves it as a single computed-group structure
+   query.  General form: when a graph pattern exists to satisfy a
+   numeric constraint of one consumer (export dtype, score range,
+   normalization), let every other consumer serve a rebuilt equivalent —
+   licensed by the same receipts as everything else, with the artifact
+   untouched.
+
+13. **Share one monotone threshold ladder across parallel decodes of the
+   same value** (union d_model 1762 → 702).  k separate bit/range
+   extractions of one bounded integer each cost a full equality ladder
+   (256 match gates per bit); one shared ge-threshold ladder (255
+   parallel stepglus, depth one) makes every extraction a FREE linear
+   telescoping run-sum over it.  Transfers to any construction that
+   decodes fields from packed integers: build the cumulative ladder
+   once, take differences linearly, persist only the named results.
+
 ## Dead ends (kept so they stay dead)
 
 - GPU per-matrix sparse matvec for a single stream: one dispatch costs a
@@ -125,3 +158,19 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
 - Same-window comparisons only: fps in a sprite-0-polling window is not
   comparable to a title-screen window (this produced a stale "MMIO is
   5%" conclusion that survived three sessions).
+- The artifact digest must include EVERY source that shapes the model:
+  the graph construction file was missing from the engine cache key, so
+  a construction edit silently benchmarked (and nearly shipped) stale
+  engines.  Caught only because d_model changed enough to crash.
+- Tape/bench totals can hide one-time boot work: a changed proposal
+  sidecar refolds the per-ROM module at boot (~20 s), which read as
+  "265 fps total" against 750-900 fps in every segment.  Report
+  steady-state segments and totals separately.
+- Paced slices are not throughput: a frame loop that runs 1.3 ms of
+  emulation then idles 15 ms to the next display callback measures
+  4.3 ms/frame for the SAME work (DVFS drops the clocks and cools the
+  caches between slices), and the penalty compresses real differences
+  between workloads into near-identical numbers (SMB/SMB3/CV3 all read
+  ~240 fps paced vs 1,050/800/440 sustained).  Extrapolating "uncapped
+  fps" from paced slice times understates throughput ~3x; measure
+  sustained regimes (tape replay) for throughput claims.

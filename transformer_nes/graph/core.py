@@ -188,6 +188,13 @@ class ReGLUDimension(Dimension):
         self.b_expr = b_expr
 
 
+# memory_group sentinel for a fused 64K-span memory read (expert folds
+# only): one full-address query, group computed at serve time.  The union
+# keeps its 16 groups, whose purpose is the f32 attention-score range of
+# the exported artifact.
+MEMORY_GROUP_FUSED = -2
+
+
 class LookUp:
     counter = 0
 

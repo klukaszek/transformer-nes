@@ -556,11 +556,14 @@ class Cpu6502TransformerMachine:
     def watch_write(self, lo: int, hi: int) -> None:
         self.engine.watch_write(lo, hi)
 
-    def set_read_lease(self, addr: int, value: int) -> int:
-        return int(self.engine.set_read_lease(addr, value))
+    def set_write_journal(self, groups: bytes) -> None:
+        self.engine.set_write_journal(bytes(groups))
 
-    def set_read_lease_seq(self, addr: int, values: bytes) -> int:
-        return int(self.engine.set_read_lease_seq(addr, bytes(values)))
+    def set_read_lease(self, addr: int, value: int, group: int = 0) -> int:
+        return int(self.engine.set_read_lease(addr, value, group))
+
+    def set_read_lease_seq(self, addr: int, values: bytes, group: int = 0) -> int:
+        return int(self.engine.set_read_lease_seq(addr, bytes(values), group))
 
     def take_lease_served(self, addr: int) -> int:
         return int(self.engine.take_lease_served(addr))

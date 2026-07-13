@@ -232,9 +232,11 @@ class Bus:
         self.cycles = 0
 
     def attach(self, device: Device, lo: int, hi: int, *,
-               writes_only: bool = False) -> None:
+               writes_only: bool = False, journal_writes=None) -> None:
         """Map a device over [lo, hi] (inclusive).  writes_only devices
-        (mappers: registers in ROM space) never intercept reads."""
+        (mappers: registers in ROM space) never intercept reads.
+        journal_writes is accepted for KernelBus signature parity; the
+        per-step Python bus services every write at its instruction."""
         self.ranges.append((lo, hi, device, writes_only))
 
     def set_nmi(self) -> None:
@@ -341,18 +343,34 @@ class KernelBus:
         # flushes before their device is next consulted.
         self.lease_owner: dict[int, Device] = {}
         self.lease_queue: set[int] = set()
+        # Write-journal groups: devices whose watched writes apply natively
+        # and drain at run() returns instead of pausing.  A device's group
+        # id tags its leases so a journaled write kills them engine-side,
+        # standing in for the pause path's drop_device_leases.
+        self.journal_group: dict[int, int] = {}  # id(device) -> group
+        self.journal_mask = bytearray(0x10000)
         rt.load_image(memory_image, start_pc=start_pc)
         self.ranges: list[tuple[int, int, Device, bool]] = []
 
     def attach(self, device: Device, lo: int, hi: int, *,
-               writes_only: bool = False) -> None:
+               writes_only: bool = False, journal_writes=None) -> None:
         """Map a device over [lo, hi].  writes_only devices (mappers:
         registers in ROM space) never watch reads -- ROM fetches and
-        table reads stay native."""
+        table reads stay native.  journal_writes, if given, is a predicate
+        over addresses in the range: writes there are order-only device
+        state (consumed at drain boundaries, never raising interrupts or
+        stalls), so the engine journals them instead of pausing."""
         self.ranges.append((lo, hi, device, writes_only))
         if not writes_only:
             self.rt.watch_read(lo, hi)
         self.rt.watch_write(lo, hi)
+        if journal_writes is not None:
+            group = self.journal_group.setdefault(
+                id(device), len(self.journal_group) + 1)
+            for addr in range(lo, hi + 1):
+                if journal_writes(addr):
+                    self.journal_mask[addr] = group
+            self.rt.set_write_journal(bytes(self.journal_mask))
 
     def device_at(self, addr: int) -> Device | None:
         for lo, hi, device, _writes_only in self.ranges:
@@ -433,12 +451,27 @@ class KernelBus:
             if trace:
                 trace_outs.append(out)
             executed += int(out["steps"])
-            # Mapper writes the engine banked natively: drain their
-            # CHR/IRQ/mirroring side effects into the Python mapper.
-            for addr, value in zip(out["m_addr"], out["m_value"], strict=True):
-                device = self.device_at(int(addr))
-                if device is not None:
-                    device.apply_native(int(addr), int(value))
+            # Leases the engine killed for journaled writes: advance any
+            # queue-leased device by its served reads, drop the tracking.
+            for addr, n in zip(out["ls_addr"], out["ls_served"], strict=True):
+                addr = int(addr)
+                owner = self.lease_owner.pop(addr, None)
+                was_queue = addr in self.lease_queue
+                self.lease_queue.discard(addr)
+                if owner is not None and was_queue and n:
+                    owner.lease_consumed(addr, int(n))
+            # Writes the engine applied natively, in program order: mapper
+            # registers drain their CHR/IRQ/mirroring side effects, journaled
+            # device registers drain as ordinary device writes.
+            for addr, value in zip(out["wj_addr"], out["wj_value"], strict=True):
+                addr = int(addr)
+                device = self.device_at(addr)
+                if device is None:
+                    continue
+                if addr >= 0x8000:
+                    device.apply_native(addr, int(value))
+                else:
+                    device.write(addr, int(value))
             cycles_done += int(out["cycles"])
             # CPU -> device: watched writes from the final step of this run.
             for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
@@ -476,12 +509,14 @@ class KernelBus:
                     if lease is not None:
                         leased = lease(addr)
                         if leased is not None:
+                            group = self.journal_group.get(id(device), 0)
                             if isinstance(leased, (bytes, bytearray)):
                                 evicted = int(self.rt.set_read_lease_seq(
-                                    addr, bytes(leased)))
+                                    addr, bytes(leased), group))
                                 self.lease_queue.add(addr)
                             else:
-                                evicted = int(self.rt.set_read_lease(addr, leased))
+                                evicted = int(self.rt.set_read_lease(
+                                    addr, leased, group))
                                 self.lease_queue.discard(addr)
                             self.lease_owner[addr] = device
                             if evicted >= 0 and evicted != addr:

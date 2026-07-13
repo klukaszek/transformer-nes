@@ -181,6 +181,7 @@ def run_state_members_cpp() -> str:
     int lease_n[NLEASE] = {{0, 0, 0, 0}};
     int lease_i[NLEASE] = {{0, 0, 0, 0}};
     long lease_served[NLEASE] = {{0, 0, 0, 0}};
+    int lease_group[NLEASE] = {{0, 0, 0, 0}};
     long step_index = 0;
     long cycles_total = 0;
     std::vector<std::pair<int,int>> rwatch, wwatch;
@@ -188,6 +189,11 @@ def run_state_members_cpp() -> str:
     // windows dispatch only while this stays >= 0x2000, making a watched
     // write inside a window statically impossible.
     int watch_write_lo = 0x10000;
+    // Journaled watched writes: a nonzero wjournal[addr] applies the write
+    // to the journal instead of pausing (order-only device state, drained
+    // at every run() return); the value is the lease group the write must
+    // invalidate, standing in for the pause path's per-device lease drop.
+    unsigned char wjournal[65536] = {{}};
     // Native cartridge PRG banking (console silicon, like the PPU):
     // $8000-$FFFF register writes decode natively -- bank switches copy
     // from the resident PRG ROM, the clobbered ROM byte is repaired --
@@ -202,7 +208,8 @@ def run_state_members_cpp() -> str:
     int m3_bank_select = 0;
     int m3_regs[8] = {{0, 0, 0, 0, 0, 0, 0, 0}};
     int m1_shift = 0x10, m1_control = 0x0C, m1_prg = 0;
-    std::vector<int> mj_addr, mj_value;  // journal since last drain
+    std::vector<int> wj_addr, wj_value;  // write journal since last drain
+    std::vector<int> ls_addr; std::vector<long> ls_served;  // native lease kills
     static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};
     // Base cycles per opcode (no penalty cycles); NMI costs 7.
     static constexpr unsigned char CYCLES[256] = {{ {cycles_tab} }};"""
@@ -214,7 +221,30 @@ MACHINE_API_CPP = """\
         wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF);
         if ((lo & 0xFFFF) < watch_write_lo) watch_write_lo = lo & 0xFFFF;
     }
-    void clear_watches() { rwatch.clear(); wwatch.clear(); watch_write_lo = 0x10000; }
+    void clear_watches() {
+        rwatch.clear(); wwatch.clear(); watch_write_lo = 0x10000;
+        for (int a = 0; a < 65536; ++a) wjournal[a] = 0;
+    }
+    void set_write_journal(py::bytes groups) {
+        const std::string g = groups;
+        for (int a = 0; a < 65536 && a < (int)g.size(); ++a)
+            wjournal[a] = (unsigned char)g[a];
+    }
+    // Journaled watched write: applied natively, drained at run() return.
+    // Kills same-group read leases exactly where the pause path would
+    // (drop_device_leases); every kill is reported with its served count
+    // so the bus can advance the device model and drop its tracking.
+    void journal_write(int addr, int value) {
+        wj_addr.push_back(addr); wj_value.push_back(value);
+        const int g = wjournal[addr];
+        for (int s = 0; s < NLEASE; ++s) {
+            if (lease_addr[s] < 0 || lease_group[s] != g) continue;
+            ls_addr.push_back(lease_addr[s]);
+            ls_served.push_back(lease_served[s]);
+            lease_addr[s] = -1; lease_n[s] = lease_i[s] = 0;
+            lease_served[s] = 0; lease_group[s] = 0;
+        }
+    }
     int lease_slot(int addr) const {
         for (int s = 0; s < NLEASE; ++s) if (lease_addr[s] == addr) return s;
         return -1;
@@ -232,15 +262,16 @@ MACHINE_API_CPP = """\
     }
     // Both setters return the evicted address (or -1) so the bus can drop
     // its device tracking for it.
-    int set_read_lease(int addr, int value) {
+    int set_read_lease(int addr, int value, int group) {
         addr &= 0xFFFF;
         const int s = lease_claim(addr);
         const int evicted = lease_addr[s] == addr ? -1 : lease_addr[s];
         lease_addr[s] = addr; lease_value[s] = value & 0xFF;
         lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
+        lease_group[s] = group;
         return evicted;
     }
-    int set_read_lease_seq(int addr, py::bytes values) {
+    int set_read_lease_seq(int addr, py::bytes values, int group) {
         const std::string v = values;
         addr &= 0xFFFF;
         const int s = lease_claim(addr);
@@ -248,6 +279,7 @@ MACHINE_API_CPP = """\
         lease_addr[s] = addr;
         lease_n[s] = v.size() < 8 ? (int)v.size() : 8;
         lease_i[s] = 0; lease_served[s] = 0;
+        lease_group[s] = group;
         for (int i = 0; i < lease_n[s]; ++i) lease_vals[s][i] = (unsigned char)v[i];
         if (lease_n[s] == 0) lease_addr[s] = -1;
         return evicted;
@@ -255,6 +287,7 @@ MACHINE_API_CPP = """\
     void clear_read_lease() {
         for (int s = 0; s < NLEASE; ++s) {
             lease_addr[s] = -1; lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
+            lease_group[s] = 0;
         }
     }
     // Targeted invalidation (a write only disturbs its own device's
@@ -263,6 +296,7 @@ MACHINE_API_CPP = """\
         const int s = lease_slot(addr & 0xFFFF);
         if (s >= 0) {
             lease_addr[s] = -1; lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
+            lease_group[s] = 0;
         }
     }
     long take_lease_served(int addr) {
@@ -319,7 +353,7 @@ MACHINE_API_CPP = """\
     // the clobbered ROM byte, journal for the Python mapper's CHR/IRQ/
     // mirroring side effects.
     void mapper_write(int addr, int value) {
-        mj_addr.push_back(addr); mj_value.push_back(value);
+        wj_addr.push_back(addr); wj_value.push_back(value);
         if (mapper_kind == 3) {
             const int reg = addr & 0xE001;
             if (reg == 0x8000) { m3_bank_select = value; mapper_apply_mmc3(); }
@@ -372,7 +406,7 @@ MACHINE_API_CPP = """\
         m1_shift = 0x10; m1_control = 0x0C; m1_prg = 0;
         m3_bank_select = 0;
         for (int i = 0; i < 8; ++i) m3_regs[i] = 0;
-        mj_addr.clear(); mj_value.clear();
+        wj_addr.clear(); wj_value.clear();
     }"""
 
 
@@ -446,11 +480,16 @@ RUN_LOOP_TEMPLATE = """\
         }
         out["hit_addr"] = arr(hit_addr);
         out["hit_value"] = arr(hit_value);
-        // Natively applied mapper writes since the last return: the bus
-        // drains them into the Python mapper's side-effect path.
-        out["m_addr"] = arr(mj_addr);
-        out["m_value"] = arr(mj_value);
-        mj_addr.clear(); mj_value.clear();
+        // Natively applied writes since the last return, in program order:
+        // mapper registers (side effects only) and journaled device
+        // registers; the bus drains them into the device models, after
+        // any served counts from natively killed read leases.
+        out["wj_addr"] = arr(wj_addr);
+        out["wj_value"] = arr(wj_value);
+        wj_addr.clear(); wj_value.clear();
+        out["ls_addr"] = arr(ls_addr);
+        out["ls_served"] = py::array_t<long>((py::ssize_t)ls_served.size(), ls_served.data());
+        ls_addr.clear(); ls_served.clear();
         out["read_addr"] = read_addr;
         out["reason"] = reason;
         out["cycles"] = cycles_this;

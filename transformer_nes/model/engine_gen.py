@@ -27,6 +27,7 @@ from transformer_nes.cpu6502.backends.run_protocol import (
     run_loop_cpp,
     run_state_members_cpp,
 )
+from transformer_nes.graph.core import MEMORY_GROUP_FUSED
 from transformer_nes.model.classify import (
     integer_score_terms,
     memory_query,
@@ -67,6 +68,7 @@ def compile_shards() -> int:
 CODE_DIRS = ("graph", "scheduler", "model", "attention")
 CODE_FILES = (
     "cpu6502/spec.py",
+    "cpu6502/interpreter.py",
     "cpu6502/backends/evaluator.py",
     "cpu6502/backends/reference.py",
     "cpu6502/backends/run_protocol.py",
@@ -516,6 +518,8 @@ ENGINE_STEP_BODY = """\
                 }
                 if (wa >= 0x8000 && mapper_kind) {
                     mapper_write(wa, wv);  // native banking; no pause
+                } else if (wjournal[wa]) {
+                    journal_write(wa, wv);  // order-only device state; no pause
                 } else if (!wwatch.empty() && in_ranges(wwatch, wa)) {
                     sh_addr[n_hits] = wa; sh_value[n_hits] = wv; ++n_hits;
                 }
@@ -633,8 +637,11 @@ PYBIND_STEP_METHODS = """\
         .def("watch_read", &ENGINE_T::watch_read)
         .def("watch_write", &ENGINE_T::watch_write)
         .def("clear_watches", &ENGINE_T::clear_watches)
-        .def("set_read_lease", &ENGINE_T::set_read_lease)
-        .def("set_read_lease_seq", &ENGINE_T::set_read_lease_seq)
+        .def("set_write_journal", &ENGINE_T::set_write_journal)
+        .def("set_read_lease", &ENGINE_T::set_read_lease,
+             py::arg("addr"), py::arg("value"), py::arg("group") = 0)
+        .def("set_read_lease_seq", &ENGINE_T::set_read_lease_seq,
+             py::arg("addr"), py::arg("values"), py::arg("group") = 0)
         .def("take_lease_served", &ENGINE_T::take_lease_served)
         .def("clear_read_lease_addr", &ENGINE_T::clear_read_lease_addr)
         .def("clear_read_lease", &ENGINE_T::clear_read_lease)
@@ -923,15 +930,20 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 qx_terms = list(zip(q0_dat, q0_idx, strict=True))
                 qy_terms = list(zip(q1_dat, q1_idx, strict=True))
                 mem_terms = None
-                if mem_groups[h] >= 0:
+                fused = mem_groups[h] == MEMORY_GROUP_FUSED
+                if mem_groups[h] >= 0 or fused:
                     mem_terms = memory_query(
                         qx_terms, qy_terms, one_id=mdl.one_slot,
                     )
                 mem_ok = mem_terms is not None
-                if not is_union and mem_groups[h] >= 0 and not mem_ok:
+                if not is_union and (mem_groups[h] >= 0 or fused) and not mem_ok:
                     raise RuntimeError(
                         f"{label} L{li} head {h}: memory head is not "
                         "structure-eligible; a per-expert hull would diverge"
+                    )
+                if fused and is_union:
+                    raise RuntimeError(
+                        f"{label} L{li} head {h}: fused reads are expert-only"
                     )
 
                 reg_q = None
@@ -999,12 +1011,21 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     b.append("            }")
                     b.append(f"            const long long qi = shr2({qi_expr});")
                     b.append("            long long mo[2] = {0, 0};")
-                    # Group dispatch: qi is the address minus this group's
-                    # base, so qi in [0, 4096) iff the address falls in this
-                    # group.  Other groups' contributions are gate-zeroed
-                    # downstream, and (0,0) is exactly the empty-group result.
-                    b.append("            if ((unsigned long long)qi >> 12 == 0)")
-                    b.append(f"                {E}mem_query({g}, qi, mo);")
+                    if fused:
+                        # Fused 64K-span read (expert folds): the group is
+                        # the address's own high nibble; the exact mask
+                        # downstream zeroes any non-exact winner, and (0,0)
+                        # is exactly the empty-structure result.
+                        b.append("            if ((unsigned long long)qi >> 16 == 0)")
+                        b.append(f"                {E}mem_query((int)(qi >> 12), "
+                                 "qi & 4095, mo);")
+                    else:
+                        # Group dispatch: qi is the address minus this group's
+                        # base, so qi in [0, 4096) iff the address falls in this
+                        # group.  Other groups' contributions are gate-zeroed
+                        # downstream, and (0,0) is exactly the empty-group result.
+                        b.append("            if ((unsigned long long)qi >> 12 == 0)")
+                        b.append(f"                {E}mem_query({g}, qi, mo);")
                     b.append(f"            ho{2 * h} = ({elem})(mo[0] << F);")
                     b.append(f"            ho{2 * h + 1} = ({elem})(mo[1] << F);")
                     b.append("        }")
@@ -1628,6 +1649,7 @@ class GeneratedWeightsEngine:
             self.watch_read = self.engine.watch_read
             self.watch_write = self.engine.watch_write
             self.clear_watches = self.engine.clear_watches
+            self.set_write_journal = self.engine.set_write_journal
             self.set_read_lease = self.engine.set_read_lease
             self.set_read_lease_seq = self.engine.set_read_lease_seq
             self.take_lease_served = self.engine.take_lease_served

@@ -414,9 +414,16 @@ class Console:
 
     def attach_devices(self):
         ppu_dev = JournaledPpu(self.ppu, self.journal, self)
-        self.bus.attach(ppu_dev, 0x2000, 0x3FFF)      # registers + mirrors
+        # Journaled writes never pause: PPU scroll/address/VRAM/OAM traffic
+        # and pulse/triangle/noise registers are order-only state consumed
+        # at drain boundaries.  $2000 stays pausing (its NMI edge must reach
+        # check_interrupt_lines at the write), as do $4010-$4017 (DMC/frame
+        # IRQ acks, DMA stall, controller strobe vs. serial-read leases).
+        self.bus.attach(ppu_dev, 0x2000, 0x3FFF,      # registers + mirrors
+                        journal_writes=lambda a: (a & 7) != 0)
         self.bus.attach(self.dma, 0x4014, 0x4014)     # OAM DMA
-        self.bus.attach(self.apu, 0x4000, 0x4013)     # channel registers
+        self.bus.attach(self.apu, 0x4000, 0x4013,     # channel registers
+                        journal_writes=lambda a: a <= 0x400F)
         self.bus.attach(self.apu, 0x4015, 0x4015)     # status / enables
         self.bus.attach(self.controller, 0x4016, 0x4016)  # controller 1 (port 1)
         self.bus.attach(ApuFrameCounter(self.apu), 0x4017, 0x4017)  # read: open bus

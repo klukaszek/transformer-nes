@@ -6,7 +6,52 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
-**START HERE (2026-07-12, mapper + hot-shape optimization landed):**
+**START HERE (2026-07-13, fused memory reads — the construction diet):**
+
+- The census that reordered everything: ~80% of a median opcode expert's
+  emitted lines were `memory_at`'s 16-group fabric (range gates, exact
+  masks, combine multiplies — ~300 dims per logical read), and RTI/PLP
+  were dominated by `low_bit`'s per-flag 256-value match ladders.  Both
+  levers landed:
+- **Fused memory reads** (`graph/fold.py:masked_exact_read`): expert folds
+  rebuild every `memory_at` site as ONE 64K-span lookup (memory_group
+  FUSED) plus the exact-address mask, from raw-ingredient annotations the
+  construction leaves on the site persist.  Identical output by receipt
+  (an exact hit answers from its own group either way; the mask zeroes
+  everything else).  The union keeps its 16 groups — their purpose is the
+  f32 attention-score range of the exported artifact, which the exact-int
+  expert engines never compute.  LDA zp fold: 830 → 140 live dims.
+- **Pulled-P threshold ladder** (`interpreter.pulled_flag_bits`): all
+  eight flag bits of a pulled byte from one shared 255-stepglu ladder
+  (each bit a telescoping run sum, depth one) instead of eight separate
+  256-value match ladders.  The union model more than halved: d_model
+  1762 → 702, heads 881 → 351 (layers 74 → 75); RTI's expert fell
+  14.5K → 2.4K emitted lines.
+- Core totals: 1,080,420 → 260,135 emitted lines (median opcode expert
+  3,922 → 863, max 14,557 → 2,783); engine build 84 → 24 s.
+- Receipts: 128 tests + fold receipts green, ruff clean; **full Klaus
+  MATCHED through the weights at 406K steps/s (75.4 s — the record, was
+  344K)**; full nestest MATCHED; **full-tape lockstep weights vs reference
+  byte-identical on SMB3 (8,745 frames) and CV3 (5,293 frames)**.
+  Gameplay tapes (segment fps): **SMB3 753-906, every segment** (was
+  170-275), **CV3 386-485** (was 150-207), **SMB ~1,050** (was 392-475);
+  SMB3 fully-warm tape total 745 fps (11.7 s).  A tape total can hide
+  ~20 s of one-time boot folding whenever the proposal sidecar changed —
+  report segments and totals separately.  The interactive app reads
+  ~4 ms/frame for the same work because 60 Hz pacing runs 1.3 ms bursts
+  between 15 ms idles (DVFS: measured 1.30 → 4.30 ms/frame on identical
+  frames with a 14.5 ms sleep inserted); its stats line now says "at
+  60 Hz pacing" instead of claiming uncapped headroom.
+- Two smaller landings the same day: device **write journaling** (PPU regs
+  1-7 + APU $4000-$400F apply natively and drain in order at run()
+  returns instead of pausing; NMI-edge/IRQ-ack/DMA/strobe registers still
+  pause; journaled writes natively kill their own device's read leases,
+  mirroring drop_device_leases.  Measured neutral-to-small on the tapes,
+  kept for the pause-count reduction), and `interpreter.py` joined the
+  engine cache digest (it shapes the emitted model; a graph edit
+  previously reused stale engines silently).
+
+**Previous START HERE (2026-07-12, mapper + hot-shape optimization landed):**
 
 - MMC1/MMC3 PRG writes now decode inside the native run loop.  The ROM is
   resident engine-side, changed slots are mapped without Python pauses, and
@@ -42,16 +87,18 @@ targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
 Next performance work, in evidence order:
 
-1. Measure full interactive/tape gameplay phases rather than title/early-frame
-   averages; report segment ms/frame alongside any headline fps.
+1. Re-profile the tapes post-fusion: the per-instruction mass is ~4x
+   cheaper, so the wall has moved — measure before choosing the next lever
+   (candidate suspects: remaining pause round trips, state-register
+   argmax traffic, hygiene erase/move share of the surviving lines).
 2. Promote more hot canonical instances and improve proposal ranking/capacity
    using persisted execution value, without reintroducing passive telemetry.
 3. Move coherent MMC5 CPU register/PRG-RAM state native only where boundary
    profiles show a real remaining cost; mapped-byte copying itself measured at
    only microseconds and is not currently the main wall.
-4. Reduce folded expert depth/width for the remaining hot instruction/dataflow
-   mixes, then revisit true PRG pointer indirection if remap volume becomes a
-   measurable share.
+4. DONE 2026-07-13 (fused memory reads + pulled-P ladder, above) — reduce
+   folded expert depth/width.  True PRG pointer indirection remains open
+   if remap volume ever becomes a measurable share.
 
 ## 2026-07-12 inter-ROM performance — every fast path made bank-aware
 

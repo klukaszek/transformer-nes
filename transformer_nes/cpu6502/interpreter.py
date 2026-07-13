@@ -71,6 +71,7 @@ from transformer_nes.graph.core import (
     persist,
     reglu,
     stepglu,
+    to_expr,
 )
 
 # ── Low-level gating helpers ───────────────────────────────────────
@@ -158,7 +159,19 @@ def memory_at(address: Expression, name: str) -> Expression:
         group_value.lookup.memory_group = group
         exact = match_zero(address - found_addr)
         value = value + multiply(query_in_group, multiply(group_value, exact))
-    return persist(value, name=name)
+    result = persist(value, name=name)
+    # The site's raw ingredients, for the expert folds: they rebuild the
+    # read as ONE 64K-span lookup + exact mask (graph/fold.py).  The
+    # 16-group form above exists for the union's f32 attention-score
+    # range; expert engines serve reads exactly and never compute it.
+    site = next(iter(result.terms))
+    site.memory_read = {
+        "address": to_expr(address),
+        "byte_value": to_expr(byte_value),
+        "write_addr": write_addr_expr,
+        "is_write": to_expr(is_memory_write),
+    }
+    return result
 
 
 # ── Graph helper implementations ───────────────────────────────────
@@ -191,14 +204,23 @@ def extract_bits(value: Expression, name: str) -> list[Expression]:
     return bits
 
 
-def low_bit(value: Expression, mask: int) -> Expression:
-    """Extract the bit corresponding to mask (e.g., FLAG_C) from an 8-bit value."""
-    bit = (mask.bit_length() - 1) if mask else 0
-    result = 0
-    for v in range(256):
-        if (v >> bit) & 1:
-            result = result + match_byte(value, v)
-    return persist(result, name=f"low_bit_{mask:02X}")
+def pulled_flag_bits(value: Expression, name: str) -> dict[int, Expression]:
+    """All eight bits of an 8-bit value from ONE shared threshold ladder.
+
+    ge[k] = step(value >= k) for k in 1..255; every bit is then a linear
+    telescoping run sum over the ladder (eq_k = ge_k - ge_{k+1}), so eight
+    extractions share 255 parallel stepglus at depth one."""
+    one = graph.one
+    ge = [None] + [stepglu(one, value - k) for k in range(1, 256)]
+    bits: dict[int, Expression] = {}
+    for b in range(8):
+        result = 0
+        for start in range(1 << b, 256, 1 << (b + 1)):
+            result = result + ge[start]
+            if start + (1 << b) < 256:
+                result = result - ge[start + (1 << b)]
+        bits[1 << b] = persist(result, name=f"{name}_bit{b}")
+    return bits
 
 
 # ── Main graph builder ─────────────────────────────────────────────
@@ -996,12 +1018,13 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
 
     # PLP/RTI update all flags from the pulled byte (B cleared, U set)
     op_pull_p = op_plp + op_rti
-    new_p_c = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_C), new_p_c)
-    new_p_z = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_Z), new_p_z)
-    new_p_i = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_I), new_p_i)
-    new_p_d = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_D), new_p_d)
-    new_p_v = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_V), new_p_v)
-    new_p_n = mux(op_pull_p, low_bit(stack_pull_byte, FLAG_N), new_p_n)
+    pull_bits = pulled_flag_bits(stack_pull_byte, "pullp")
+    new_p_c = mux(op_pull_p, pull_bits[FLAG_C], new_p_c)
+    new_p_z = mux(op_pull_p, pull_bits[FLAG_Z], new_p_z)
+    new_p_i = mux(op_pull_p, pull_bits[FLAG_I], new_p_i)
+    new_p_d = mux(op_pull_p, pull_bits[FLAG_D], new_p_d)
+    new_p_v = mux(op_pull_p, pull_bits[FLAG_V], new_p_v)
+    new_p_n = mux(op_pull_p, pull_bits[FLAG_N], new_p_n)
     # NMI: the interrupted instruction's flag effects are discarded; the
     # sequence only sets I (NMOS interrupts do not touch D).  These muxes
     # come last so they also override the PLP/RTI pull path above.
