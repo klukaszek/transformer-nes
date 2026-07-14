@@ -1,42 +1,21 @@
 """6502 CPU expressed in Percepta's computation graph DSL.
 
-This is an instruction-level interpreter (one transformer step = one 6502
-instruction) for the full official NMOS 6502 opcode set plus the stable
-unofficial opcodes exercised by nestest.  Code and data share one
-attention-backed 64 KiB memory image, so instruction fetch is just memory
-read at PC.  CPU state is stored in the residual stream of STATE tokens; the
-"current" state is the latest STATE token.  Memory writes are appended as
-WRITE tokens; reads look up the latest write for an address, with non-exact
-nearest-address hits masked to zero (so unwritten memory reads as 0).
+This is an instruction-level interpreter (one transformer step = one 6502 instruction) for the full official NMOS 6502 opcode set plus the stable unofficial opcodes exercised by nestest.
+
+Code and data share one attention-backed 64 KiB memory image, so instruction fetch is just memory read at PC.  CPU state is stored in the residual stream of STATE tokens; the "current" state is the latest STATE token.  Memory writes are appended as WRITE tokens; reads look up the latest write for an address, with non-exact nearest-address hits masked to zero (so unwritten memory reads as 0).
 
 Correctness contract for graph construction:
-  - stepglu(one, b) equals step(b >= 0) ONLY for integer-valued b; every
-    threshold expression must therefore be an integer (never `x - 9.5`).
-    Likewise match_zero/match_byte require integer arguments.
-  - wrap8 / wrap16 subtract at most one modulus, so their arguments must
-    lie in [-256, 511] / [-65536, 131071]; splitting a full 16-bit value
-    into bytes must instead be derived from values that are already bytes
-    (see the JSR/BRK push-address construction).
+  - stepglu(one, b) equals step(b >= 0) ONLY for integer-valued b; every threshold expression must therefore be an integer (never `x - 9.5`). Likewise match_zero/match_byte require integer arguments.
+  - wrap8 / wrap16 subtract at most one modulus, so their arguments must lie in [-256, 511] / [-65536, 131071]; splitting a full 16-bit value into bytes must instead be derived from values that are already bytes (see the JSR/BRK push-address construction).
   - Opcode/mode gates are one-hot 0/1 signals; mux chains rely on this.
-  - bcd=False models the NES 2A03, which ignores the D flag: ADC/SBC (and
-    the unofficial RRA/ISB) always compute in binary, and the decimal
-    circuitry is left out of the graph entirely.  The unofficial RRA/ISB
-    are binary-only even with bcd=True (no test suite exercises them in
-    decimal mode).
-  - Flags in decimal mode: V always reflects the binary sum, as on NMOS
-    hardware; the reference core matches this.
-  - Interrupts are graph logic, not harness magic: when a STATE token
-    carries in_nmi=1 or in_irq=1 (never both; the harness gates IRQ on the
-    I flag at the step boundary), the step performs the interrupt sequence
-    instead of the fetched instruction -- push PCH/PCL/P (B clear, U set)
-    through the three write channels, S-3, I=1, and vector through
-    $FFFA/$FFFB (NMI) or $FFFE/$FFFF (IRQ) via the shared vector-read
-    slots.  Every effect of the (decoded but not executed) instruction at
-    PC is discarded by final is_int muxes.  The interrupt trace row
-    reports the interrupted PC with ea=0 and data=0.
+  - bcd=False models the NES 2A03, which ignores the D flag: ADC/SBC (and the unofficial RRA/ISB) always compute in binary, and the decimal circuitry is left out of the graph entirely.  The unofficial RRA/ISB are binary-only even with bcd=True (no test suite exercises them in decimal mode).
+  - Flags in decimal mode: V always reflects the binary sum, as on NMOS hardware; the reference core matches this.
+  - Interrupts are graph logic, not harness magic: when a STATE token carries in_nmi=1 or in_irq=1 (never both; the harness gates IRQ on the I flag at the step boundary), the step performs the interrupt sequence instead of the fetched instruction -- push PCH/PCL/P (B clear, U set) through the three write channels, S-3, I=1, and vector through $FFFA/$FFFB (NMI) or $FFFE/$FFFF (IRQ) via the shared vector-read slots.  Every effect of the (decoded but not executed) instruction at PC is discarded by final is_int muxes.  The interrupt trace row reports the interrupted PC with ea=0 and data=0.
 """
 
 from __future__ import annotations
+
+from typing import cast
 
 from transformer_nes.cpu6502.spec import (
     FLAG_B,
@@ -65,24 +44,36 @@ from transformer_nes.cpu6502.spec import (
 from transformer_nes.graph import core as graph
 from transformer_nes.graph.core import (
     Expression,
+    ExprLike,
     InputDimension,
     auto_name,
     fetch,
+    make_multiply,
     persist,
     reglu,
     stepglu,
     to_expr,
 )
 
+# WRITE/start/state token input dims: module globals rebound by build()
+# after each reset_graph; memory_at and the token builders read them.
+byte_value = cast("InputDimension", None)
+is_memory_write = cast("InputDimension", None)
+addr_lo = cast("InputDimension", None)
+addr_hi = cast("InputDimension", None)
+is_start = cast("InputDimension", None)
+is_state = cast("InputDimension", None)
+
+
 # ── Low-level gating helpers ───────────────────────────────────────
 
 
-def match_byte(value: Expression, byte: int) -> Expression:
+def match_byte(value: ExprLike, byte: int) -> Expression:
     """Return a 0/1 gate: 1 iff value == byte."""
     return match_zero(value - byte)
 
 
-def match_zero(value: Expression) -> Expression:
+def match_zero(value: ExprLike) -> Expression:
     """Return a 0/1 gate: 1 iff an integer expression is exactly zero."""
     one = graph.one
     abs_diff = persist(reglu(value, value) + reglu(-value, -value))
@@ -91,35 +82,33 @@ def match_zero(value: Expression) -> Expression:
 
 def multiply(a, b) -> Expression:
     """Multiply two scalar expressions using the graph DSL's internal helper."""
-    from transformer_nes.graph.core import make_multiply, to_expr
-
     return make_multiply(to_expr(a), to_expr(b))
 
 
-def mux(gate: Expression, if_one: Expression, if_zero: Expression) -> Expression:
+def mux(gate: ExprLike, if_one: ExprLike, if_zero: ExprLike) -> Expression:
     """Select between two linear expressions using a 0/1 gate."""
     return if_zero + multiply(if_one - if_zero, gate)
 
 
-def wrap8(value: Expression) -> Expression:
+def wrap8(value: ExprLike) -> Expression:
     """Reduce an integer expression to an unsigned 8-bit value."""
     one = graph.one
     return value - 256 * stepglu(one, value - 256) + 256 * stepglu(one, -value - 1)
 
 
-def wrap16(value: Expression) -> Expression:
+def wrap16(value: ExprLike) -> Expression:
     """Reduce an integer expression to an unsigned 16-bit value."""
     one = graph.one
     return value - 65536 * stepglu(one, value - 65536) + 65536 * stepglu(one, -value - 1)
 
 
-def signed_byte(value: Expression) -> Expression:
+def signed_byte(value: ExprLike) -> Expression:
     """Interpret an unsigned byte as a signed 8-bit value."""
     one = graph.one
     return value - 256 * stepglu(one, value - 128)
 
 
-def memory_at(address: Expression, name: str) -> Expression:
+def memory_at(address: ExprLike, name: str) -> Expression:
     """Read the latest WRITE token at the given 16-bit address."""
     one = graph.one
     write_addr_expr = addr_lo + 256 * addr_hi
@@ -177,7 +166,7 @@ def memory_at(address: Expression, name: str) -> Expression:
 # ── Graph helper implementations ───────────────────────────────────
 
 
-def overflow(a: Expression, b: Expression, r: Expression) -> Expression:
+def overflow(a: ExprLike, b: ExprLike, r: ExprLike) -> Expression:
     """Return 1 iff the sign of r differs from a and b while a and b agree."""
     one = graph.one
     a_sign = stepglu(one, a - 128)
@@ -188,7 +177,7 @@ def overflow(a: Expression, b: Expression, r: Expression) -> Expression:
     return multiply(same_sign, diff_from_result)
 
 
-def extract_bits(value: Expression, name: str) -> list[Expression]:
+def extract_bits(value: ExprLike, name: str) -> list[Expression]:
     """Extract bits 7..0 of an 8-bit value expression using binary thresholds.
 
     Returns a list where bits[0] is bit 7 (MSB) and bits[7] is bit 0 (LSB).
@@ -204,17 +193,17 @@ def extract_bits(value: Expression, name: str) -> list[Expression]:
     return bits
 
 
-def pulled_flag_bits(value: Expression, name: str) -> dict[int, Expression]:
+def pulled_flag_bits(value: ExprLike, name: str) -> dict[int, Expression]:
     """All eight bits of an 8-bit value from ONE shared threshold ladder.
 
     ge[k] = step(value >= k) for k in 1..255; every bit is then a linear
     telescoping run sum over the ladder (eq_k = ge_k - ge_{k+1}), so eight
     extractions share 255 parallel stepglus at depth one."""
     one = graph.one
-    ge = [None] + [stepglu(one, value - k) for k in range(1, 256)]
+    ge = {k: stepglu(one, value - k) for k in range(1, 256)}
     bits: dict[int, Expression] = {}
     for b in range(8):
-        result = 0
+        result = Expression()
         for start in range(1 << b, 256, 1 << (b + 1)):
             result = result + ge[start]
             if start + (1 << b) < 256:
@@ -391,8 +380,8 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
         MODE_INDIRECT, MODE_INDIRECT_X, MODE_INDIRECT_Y,
         MODE_RELATIVE, MODE_IMPLIED, MODE_ACCUMULATOR,
     }
-    mode_gates: dict[str, Expression] = {m: 0 for m in all_modes}
-    op_family_gates: dict[str, Expression] = {op.operation: 0 for op in OPCODES.values()}
+    mode_gates: dict[str, ExprLike] = {m: 0 for m in all_modes}
+    op_family_gates: dict[str, ExprLike] = {op.operation: 0 for op in OPCODES.values()}
     for op in OPCODES.values():
         gate = opcode_gates[op.byte]
         mode_gates[op.mode] = mode_gates[op.mode] + gate
@@ -736,34 +725,22 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # Shifts (using arithmetic and the extracted LSB for LSR/ROR carry)
     asl_result = wrap8(2 * operand)
     asl_carry = operand_bits[0]
-    asl_n = stepglu(one, asl_result - 128)
-    asl_z = 1 - stepglu(one, asl_result - 1)
 
     lsr_result = operand * 0.5 - operand_bits[7] * 0.5
     lsr_result = persist(lsr_result, name="lsr_result")
     lsr_carry = operand_bits[7]
-    lsr_n = 0
-    lsr_z = 1 - stepglu(one, lsr_result - 1)
 
     rol_result = wrap8(2 * operand + carry_in)
     rol_carry = operand_bits[0]
-    rol_n = stepglu(one, rol_result - 128)
-    rol_z = 1 - stepglu(one, rol_result - 1)
 
     ror_result = operand * 0.5 - operand_bits[7] * 0.5 + carry_in * 128
     ror_result = persist(ror_result, name="ror_result")
     ror_carry = operand_bits[7]
-    ror_n = stepglu(one, ror_result - 128)
-    ror_z = 1 - stepglu(one, ror_result - 1)
 
     # Increments / decrements
     inc_result = wrap8(operand + 1)
-    inc_n = stepglu(one, inc_result - 128)
-    inc_z = 1 - stepglu(one, inc_result - 1)
 
     dec_result = wrap8(operand - 1)
-    dec_n = stepglu(one, dec_result - 128)
-    dec_z = 1 - stepglu(one, dec_result - 1)
 
     inx_result = wrap8(current_x + 1)
     iny_result = wrap8(current_y + 1)
@@ -1126,15 +1103,15 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     # Second and third stack pushes (JSR pushes 2 bytes, BRK and NMI push 3).
     # The push addresses are shared: NMI uses the same S-1/S-2 slots as
     # JSR/BRK, so only the gates and pushed values need is_int muxes.
-    is_store2 = persist(mux(is_int, 1, op_jsr + op_brk), name="is_store2")
-    write_addr2 = persist(0x0100 + wrap8(current_s - 1), name="write_addr2_out")
-    write_value2 = persist(mux(is_int, current_pc_lo, push_ret_lo), name="write_value2_out")
+    persist(mux(is_int, 1, op_jsr + op_brk), name="is_store2")
+    persist(0x0100 + wrap8(current_s - 1), name="write_addr2_out")
+    persist(mux(is_int, current_pc_lo, push_ret_lo), name="write_value2_out")
 
     # NMI/IRQ push P with B clear and U set (BRK/PHP push with B set).
     int_push_p = current_p - FLAG_B * current_p_b + FLAG_U * (1 - current_p_u)
-    is_store3 = persist(mux(is_int, 1, op_brk), name="is_store3")
-    write_addr3 = persist(0x0100 + wrap8(current_s - 2), name="write_addr3_out")
-    write_value3 = persist(mux(is_int, int_push_p, php_push_value), name="write_value3_out")
+    persist(mux(is_int, 1, op_brk), name="is_store3")
+    persist(0x0100 + wrap8(current_s - 2), name="write_addr3_out")
+    persist(mux(is_int, int_push_p, php_push_value), name="write_value3_out")
 
     # ── Trace-context outputs (reference-aligned, 2026-07-09) ────────
     # The trace reports exactly what reference.py reports, field for field:

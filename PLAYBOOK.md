@@ -11,8 +11,8 @@ details in [transformer_nes/cpu6502/README.md](transformer_nes/cpu6502/README.md
 ## Preconditions
 
 **A lockstep verification chain is the license for everything below.**
-Golden logs ⇔ reference oracle ⇔ exact graph ⇔ generated kernel ⇔
-weights, compared field-for-field at every step.  Every lever landed
+Golden logs ⇔ reference oracle ⇔ exact graph ⇔ weights, compared
+field-for-field at every step.  Every lever landed
 with a byte-identity receipt; several were *rejected* by one.  Without
 the chain, aggressive semantic optimizations (exact structures, routing,
 leases) are unverifiable.

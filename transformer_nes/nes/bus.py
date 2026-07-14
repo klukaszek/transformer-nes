@@ -24,7 +24,7 @@ services those pauses with the same Device objects.
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, cast
 
 import numpy as np
 
@@ -55,6 +55,20 @@ class Device(Protocol):
 
     def read(self, addr: int) -> int: ...
     def write(self, addr: int, value: int) -> None: ...
+
+
+class QueueLeaseDevice(Device, Protocol):
+    """A device that granted a queue lease (serial reads): the bus advances
+    it by the reads the engine served."""
+
+    def lease_consumed(self, addr: int, n: int) -> None: ...
+
+
+class BankedDevice(Device, Protocol):
+    """A mapper whose $8000+ register writes applied natively: the drain
+    delivers only their side effects."""
+
+    def apply_native(self, addr: int, value: int) -> None: ...
 
 
 def drain_stall(device) -> int:
@@ -149,7 +163,7 @@ class ReferenceCore:
 
 
 class GraphCore:
-    """Bus adapter for the graph evaluator (evaluator.Cpu6502Runtime).
+    """Bus adapter for the graph evaluator (graph.Cpu6502Runtime).
 
     The runtime must already be booted via boot_image().
     """
@@ -384,7 +398,7 @@ class EngineBus:
         for addr in self.lease_queue:
             n = self.rt.take_lease_served(addr)
             if n:
-                self.lease_owner[addr].lease_consumed(addr, n)
+                cast(QueueLeaseDevice, self.lease_owner[addr]).lease_consumed(addr, n)
 
     def drop_device_leases(self, device: Device) -> None:
         """A write only disturbs its own device's registers: invalidate
@@ -393,7 +407,7 @@ class EngineBus:
             if addr in self.lease_queue:
                 n = self.rt.take_lease_served(addr)
                 if n:
-                    self.lease_owner[addr].lease_consumed(addr, n)
+                    cast(QueueLeaseDevice, self.lease_owner[addr]).lease_consumed(addr, n)
                 self.lease_queue.discard(addr)
             self.rt.clear_read_lease_addr(addr)
             del self.lease_owner[addr]
@@ -407,6 +421,79 @@ class EngineBus:
     @property
     def log_tokens(self) -> int:
         return int(self.rt.get_state()["pos"])
+
+    def drain_native(self, out: dict) -> None:
+        """Apply a run()'s native journals in order: lease kills first,
+        then writes (mapper registers drain side effects via apply_native,
+        journaled device registers drain as ordinary writes)."""
+        for addr, n in zip(out["ls_addr"], out["ls_served"], strict=True):
+            addr = int(addr)
+            owner = self.lease_owner.pop(addr, None)
+            was_queue = addr in self.lease_queue
+            self.lease_queue.discard(addr)
+            if owner is not None and was_queue and n:
+                cast(QueueLeaseDevice, owner).lease_consumed(addr, int(n))
+        for addr, value in zip(out["wj_addr"], out["wj_value"], strict=True):
+            addr = int(addr)
+            device = self.device_at(addr)
+            if device is None:
+                continue
+            if addr >= 0x8000:
+                cast(BankedDevice, device).apply_native(addr, int(value))
+            else:
+                device.write(addr, int(value))
+
+    def service_write_hits(self, out: dict) -> int:
+        """CPU -> device: forward the final step's watched writes; returns
+        stall cycles the devices charged."""
+        stalls = 0
+        for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
+            device = self.device_at(int(addr))
+            if device is not None:
+                if self.lease_owner:
+                    self.drop_device_leases(device)
+                device.write(int(addr), int(value))
+                stalls += drain_stall(device)
+        return stalls
+
+    def service_read(self, out: dict) -> int:
+        """Device -> CPU: put the register value on the bus, granting a
+        native lease where the device offers one; returns stall cycles."""
+        # Any queue-leased device must catch up with the engine's served
+        # reads before its read() runs.
+        if self.lease_queue:
+            self.flush_lease()
+        stalls = 0
+        addr = int(out["read_addr"])
+        device = self.device_at(addr)
+        if device is not None:
+            value = device.read(addr) & 0xFF
+            stalls = drain_stall(device)
+            # Registers whose value is frozen for the rest of the span
+            # (int) or whose next values are already determined (bytes:
+            # serial reports) are served natively until the lease is
+            # cleared or the queue drains.
+            lease = getattr(device, "read_lease", None)
+            if lease is not None:
+                leased = lease(addr)
+                if leased is not None:
+                    group = self.journal_group.get(id(device), 0)
+                    if isinstance(leased, (bytes, bytearray)):
+                        evicted = int(self.rt.set_read_lease_seq(
+                            addr, bytes(leased), group))
+                        self.lease_queue.add(addr)
+                    else:
+                        evicted = int(self.rt.set_read_lease(
+                            addr, leased, group))
+                        self.lease_queue.discard(addr)
+                    self.lease_owner[addr] = device
+                    if evicted >= 0 and evicted != addr:
+                        self.lease_owner.pop(evicted, None)
+                        self.lease_queue.discard(evicted)
+        else:
+            value = self.rt.read_ram(addr)
+        self.rt.inject_write(addr, value)
+        return stalls
 
     def run(self, max_steps: int, *, nmi_at: set[int] | None = None,
             irq_at: set[int] | None = None,
@@ -451,36 +538,9 @@ class EngineBus:
             if trace:
                 trace_outs.append(out)
             executed += int(out["steps"])
-            # Leases the engine killed for journaled writes: advance any
-            # queue-leased device by its served reads, drop the tracking.
-            for addr, n in zip(out["ls_addr"], out["ls_served"], strict=True):
-                addr = int(addr)
-                owner = self.lease_owner.pop(addr, None)
-                was_queue = addr in self.lease_queue
-                self.lease_queue.discard(addr)
-                if owner is not None and was_queue and n:
-                    owner.lease_consumed(addr, int(n))
-            # Writes the engine applied natively, in program order: mapper
-            # registers drain their CHR/IRQ/mirroring side effects, journaled
-            # device registers drain as ordinary device writes.
-            for addr, value in zip(out["wj_addr"], out["wj_value"], strict=True):
-                addr = int(addr)
-                device = self.device_at(addr)
-                if device is None:
-                    continue
-                if addr >= 0x8000:
-                    device.apply_native(addr, int(value))
-                else:
-                    device.write(addr, int(value))
+            self.drain_native(out)
             cycles_done += int(out["cycles"])
-            # CPU -> device: watched writes from the final step of this run.
-            for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
-                device = self.device_at(int(addr))
-                if device is not None:
-                    if self.lease_owner:
-                        self.drop_device_leases(device)
-                    device.write(int(addr), int(value))
-                    cycles_done += drain_stall(device)
+            cycles_done += self.service_write_hits(out)
             reason = out["reason"]
             if pauses > 100_000:
                 st = self.rt.get_state()
@@ -491,40 +551,7 @@ class EngineBus:
                     f"pc={st['pc']:04X}, p={st['p']:02X})"
                 )
             if reason == "watch_read":
-                # Device -> CPU: place the register value on the bus, resume.
-                # Any queue-leased device must catch up with the engine's
-                # served reads before its read() runs.
-                if self.lease_queue:
-                    self.flush_lease()
-                addr = int(out["read_addr"])
-                device = self.device_at(addr)
-                if device is not None:
-                    value = device.read(addr) & 0xFF
-                    cycles_done += drain_stall(device)
-                    # Registers whose value is frozen for the rest of the
-                    # span (int) or whose next values are already determined
-                    # (bytes: serial reports) are served natively until the
-                    # lease is cleared or the queue drains.
-                    lease = getattr(device, "read_lease", None)
-                    if lease is not None:
-                        leased = lease(addr)
-                        if leased is not None:
-                            group = self.journal_group.get(id(device), 0)
-                            if isinstance(leased, (bytes, bytearray)):
-                                evicted = int(self.rt.set_read_lease_seq(
-                                    addr, bytes(leased), group))
-                                self.lease_queue.add(addr)
-                            else:
-                                evicted = int(self.rt.set_read_lease(
-                                    addr, leased, group))
-                                self.lease_queue.discard(addr)
-                            self.lease_owner[addr] = device
-                            if evicted >= 0 and evicted != addr:
-                                self.lease_owner.pop(evicted, None)
-                                self.lease_queue.discard(evicted)
-                else:
-                    value = self.rt.read_ram(addr)
-                self.rt.inject_write(addr, value)
+                cycles_done += self.service_read(out)
             if on_pause is not None:
                 on_pause(out)
             if reason in ("halt", "trap"):

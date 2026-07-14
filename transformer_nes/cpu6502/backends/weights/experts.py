@@ -14,12 +14,18 @@ import time
 import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.evaluator import RUNTIME_READ_DIMS
+from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS
 from transformer_nes.cpu6502.backends.weights.windows import (
     BRANCH_OPERATIONS,
     MEMORY_WRITE_OPERATIONS,
 )
 from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
+from transformer_nes.graph.core import (
+    InputDimension,
+    LookUpDimension,
+    PersistDimension,
+    ReGLUDimension,
+)
 from transformer_nes.graph.fold import (
     SEQUENCE_FEEDBACK,
     GraphFolder,
@@ -28,7 +34,7 @@ from transformer_nes.graph.fold import (
     sequence_shape_pins,
 )
 from transformer_nes.model.weights import build_model
-from transformer_nes.scheduler.milp import asap_schedule
+from transformer_nes.scheduler.milp import asap_schedule, milp_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -96,13 +102,6 @@ def eval_over_heads(fold_result, dim, length):
     raw inputs never carry it); evaluation cuts there and raises if the
     value depends on anything else -- the straight-line license needs
     next_pc to be a pure function of pc."""
-    from transformer_nes.graph.core import (
-        InputDimension,
-        LookUpDimension,
-        PersistDimension,
-        ReGLUDimension,
-    )
-
     heads = np.arange(0x10000 - length + 1, dtype=np.float64)
     memo: dict = {
         fold_result.dim_of_name["current_pc_lo__s0"]: heads % 256.0,
@@ -186,13 +185,6 @@ def interval_of(fold_result, dim) -> tuple[float, float]:
     """Conservative [lo, hi] bound of a folded dim over byte-valued inputs
     (bits give [0, 1], 'one' gives 1); raises on memory lookups, whose
     values cannot be bounded ahead of dispatch."""
-    from transformer_nes.graph.core import (
-        InputDimension,
-        LookUpDimension,
-        PersistDimension,
-        ReGLUDimension,
-    )
-
     BIT_INPUTS = frozenset({
         "is_state", "in_nmi", "in_irq", "in_halted",
         "in_p_c", "in_p_z", "in_p_i", "in_p_d",
@@ -330,8 +322,6 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
             # Exact hygiene-objective schedule: tractable at expert scale; at
             # the time limit the solver's best incumbent is used -- feasible,
             # just unproven.  Width is capped at the balanced-ASAP width.
-            from transformer_nes.scheduler.milp import milp_schedule
-
             t0 = time.perf_counter()
             asap = asap_schedule(fp.input_tokens, fp.output_tokens,
                                  program_graph=fp, log=logger.debug)

@@ -125,7 +125,32 @@ targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
   weights); klaus --runner cpp/cpp-full and nestest --runner cpp removed;
   Console default backend is now "weights"; **KernelBus renamed
   EngineBus** (it drives the weights engine).  The chain remains
-  complete: golden logs ⇔ reference ⇔ evaluator ⇔ weights.
+  complete: golden logs ⇔ reference ⇔ graph ⇔ weights.  Follow-up
+  de-noising (2026-07-14): `backends/evaluator.py` renamed
+  `backends/graph.py` (matching the backend's name everywhere else),
+  `run_protocol.py` moved into `backends/weights/` (its only consumer
+  since the kernel left), and the dead per-step fallbacks in the Klaus
+  and nestest weights runners removed (no engine without a native run
+  loop can exist).  PLAYBOOK's chain line updated.
+- **Refactor sweep (2026-07-14, ongoing before the final phase):** a
+  function-length census ranked the spaghetti; the worst offender was
+  engine_gen.generate_source (821 lines of closures-in-closures sharing
+  a dozen nonlocals).  plan_model/fuse_direct/row_int hoisted to module
+  level with an explicit EmitterContext; generate_source is 446 lines of
+  linear orchestration now.  **Receipt: emitted source byte-identical
+  pre/post** (technique, recreate as needed: wrap generate_source with a
+  capturing shim, build a tiny 2-expert machine so both the core and a
+  sequence module emit, save the sources, diff after each stage).  Also:
+  EngineBus.run's drains
+  extracted to methods, app.py's dead stats path removed.  The
+  fold()/fold_sequence() liveness+materialization dedup landed with the
+  same byte-identity receipt: walk_live() + GraphMaterializer (counters
+  and lookup provenance accumulate across per-step calls; same-lookup
+  dedup stays per call); fold 182 → 97 lines, fold_sequence 316 → 231.
+  Deliberately NOT refactored: interpreter.build (its statement order IS
+  the schedule's dim-creation order, and auto_name(locals()) derives dim
+  names from its locals) and weights.build_model (linear staged
+  construction, not closure spaghetti -- long but readable).
 
 **Previous START HERE (2026-07-12, mapper + hot-shape optimization landed):**
 

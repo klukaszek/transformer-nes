@@ -19,8 +19,8 @@ package one-way.
 | `interpreter.py` | The 6502 as a graph: ~6,500 dimensions built from ReGLU/persist/lookup primitives |
 | `trace.py` | Canonical trace format shared by every backend |
 | `backends/reference.py` | Plain-Python oracle core.  Trusted by construction; every other backend is verified against it |
-| `backends/evaluator.py` | Exact evaluator: compiles the graph's static schedule to one generated Python function |
-| `backends/run_protocol.py` | The native run-loop protocol both generated engines emit (tables + shared C++ blocks) |
+| `backends/graph.py` | Exact evaluator: compiles the graph's static schedule to one generated Python function |
+| `backends/weights/run_protocol.py` | The weights engine's native run-loop protocol (tables + C++ blocks) |
 | `backends/weights/runner.py` | The transformer machine: construction, engine-cache orchestration, machine protocol, JIT window discovery |
 | `backends/weights/experts.py` | Fold-and-build expert models (per-opcode, sequence, shape) with their dispatch licenses |
 | `backends/weights/windows.py` | ROM-independent shape library, window scanning, and shape matching |
@@ -58,7 +58,7 @@ when the HALT output token outscores STATE (or on a jump-to-self trap).
 | Backend | Speed (steps/s) | Role |
 |---------|-----------------|------|
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
-| `evaluator.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
+| `graph.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
 | `weights/runner.py` (real transformer) | ~420K (full Klaus, incl. the lockstep reference) | The thesis: actual hardmax-attention + ReGLU transformer weights |
 
 A fourth backend — `kernel.py`, a C++ emission of the evaluator's f64
@@ -166,7 +166,7 @@ which exist only in the engines' execution strategy, never the artifact).
 Chain of trust, each link checked instruction-by-instruction:
 
 ```
-nestest golden log (Nintendulator)  ⇔  reference.py  ⇔  evaluator.py  ⇔  weights/runner.py
+nestest golden log (Nintendulator)  ⇔  reference.py  ⇔  graph.py  ⇔  weights/runner.py
 Klaus functional test (self-checking)  ⇑
 ```
 
@@ -239,7 +239,7 @@ CPU over the model's own bus, like real hardware.  The split is:
 Python-stepped cores (`Bus` + `ReferenceCore`/`GraphCore` adapters, part
 of the NES system layer), and `EngineBus` drives the generated weights
 engine through one protocol
-(`run_protocol.py` emits it for both): `load_image()` / `run(max_steps)`
+(`weights/run_protocol.py` emits it): `load_image()` / `run(max_steps)`
 execute until a step budget, halt, jump-to-self trap, or a watched address
 is touched (`watch_read` pauses *before* the reading instruction;
 `watch_write` after the writing step), `inject_write()` / `set_nmi()` are

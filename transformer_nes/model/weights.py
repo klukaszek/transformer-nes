@@ -20,6 +20,14 @@ from typing import NamedTuple
 
 import numpy as np
 
+from transformer_nes.graph.core import (
+    Expression,
+    InputDimension,
+    LookUpDimension,
+    PersistDimension,
+    ReGLUDimension,
+)
+
 logger = logging.getLogger(__name__)
 
 HARD_K = 1e10  # softmax temperature scaling to approximate hardmax (argmax) attention
@@ -60,6 +68,20 @@ class WeightModel:
     """Numpy weight container the analytic construction populates and the
     generated C++ engine reads.  Not a torch module -- there is no forward."""
 
+    # Per-layer classification metadata, attached by build_model: head/FFN
+    # kinds (0 unused, 1 lookup, 2 passthrough), tie-breaks, cache/memory
+    # groups, lookup provenance, and erase masks.
+    head_kinds: list[list[int]]
+    ffn_kinds: list[list[int]]
+    head_tiebreak: list[list[int]]
+    head_cache_groups: list[list[int]]
+    head_memory_groups: list[list[int]]
+    head_lookup_ids: list[list[int]]
+    head_pairs: list[list[int]]
+    attn_erase: list
+    ffn_erase: list
+    one_slot: int
+
     def __init__(self, vocab, d_model, n_heads, n_layers, d_ffn, stop_token_id=0):
         self.stop_token_id = stop_token_id
         self.tok = _Weight((vocab, d_model))
@@ -79,14 +101,6 @@ def build_model(program_graph=None, schedule=None):
     Slots are reused across dead dims (interval coloring) and freed slots are
     erased before reuse, so the represented computation is unchanged.
     """
-    from transformer_nes.graph.core import (
-        Expression,
-        InputDimension,
-        LookUpDimension,
-        PersistDimension,
-        ReGLUDimension,
-    )
-
     if program_graph is not None:
         pg = program_graph
         input_tokens = pg.input_tokens
@@ -364,7 +378,7 @@ def build_model(program_graph=None, schedule=None):
                     "pair": p,
                     "values": vals,
                     "tie_break": lu.tie_break,
-                    "memory_group": getattr(lu, "memory_group", -1),
+                    "memory_group": -1 if lu.memory_group is None else lu.memory_group,
                     "cache_key": (
                         expr_sig(lu.key_exprs_2d[0]),
                         expr_sig(lu.key_exprs_2d[1]),

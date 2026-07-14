@@ -1,47 +1,22 @@
 """Partial evaluation of a ProgramGraph into a rebuilt (folded) graph.
 
-The opcode-routed engine (model/engine_gen.py) currently prunes the *union*
-model in place: per expert opcode it keeps only the live subset of the
-union's neurons and heads, but a ReGLU whose gate folds to a positive
-constant under the pin (the taken branch of a mux) must still run as a
-neuron, because the union arithmetic is shared.  That is the measured gap
-between the in-place experts (~0.29x of the union terms kept) and full
-partial evaluation (~0.195x): the missing factor is exactly the
-gate=1 multiplies, which fold to plain linear maps and disappear into their
-consumers' expressions.
+``GraphFolder.fold(pins)`` pins gate persists to constants and rebuilds
+only what stays live: a ReGLU with a non-positive folded gate is removed,
+one with a positive constant gate inlines as a linear map, constant
+persists inline, and backward liveness from the output tokens plus
+``root_names`` keeps the rest.  Folded-away roots come back as named
+persists so readout slots always resolve by name.
 
-``GraphFolder.fold(pins)`` produces a new ProgramGraph --
-suitable for asap_schedule + build_model -- in which:
+Surviving ops keep their union names, and LookUps carry provenance
+(``union_lookup_of``, ``memory_group``) so engines share attention state
+across folds.  That contract is checked, not assumed: a lookup whose
+insert-side expressions can reach a pin is reported in
+``FoldResult.insert_side_hazards`` for the caller to refuse.
 
-- pinned decode gates (``is_op_XX``/``is_nmi`` persists) are constants;
-- a ReGLU whose folded gate is a non-positive constant (or whose folded
-  value is the zero expression) is the zero function and is removed;
-- a ReGLU whose folded gate is a *positive* constant is an exact linear
-  map, inlined into every consumer (the rebuilt-expert lever);
-- a persist whose folded expression is constant is inlined; a non-constant
-  persist is kept (it still groups its expression into one slot);
-- backward liveness from the folded output tokens plus ``root_names`` keeps
-  only ops that still reach a readout through non-zero contributions.
-
-Every surviving op keeps its union name.  LookUps carry provenance
-(``union_lookup_of``, plus ``memory_group`` tags copied over) so an engine
-can share attention state -- the 16x4KiB memory structure and the
-running-argmax registers -- across expert models built from different folds
-of the same union graph.  The shared-state contract is checked here, not
-assumed: a lookup whose *insert-side* expressions (key/clear/values) can
-reach a pinned gate in the union graph would insert pin-dependent history
-into shared state, so it is reported in ``FoldResult.insert_side_hazards``
-for the caller to refuse or special-case.
-
-Folded-away root dims (a readout that folds to a passthrough or a
-constant under the pin, e.g. ``new_y`` for an opcode that never touches Y)
-are re-materialized as persists with the root's name, so a step_spec can
-always resolve its readout slots by name.
-
-NOTE: materialization calls ``reset_graph()`` -- the module-level graph
-context afterwards holds the *folded* graph.  The union graph stays alive
-through the ProgramGraph snapshot the folder was constructed with; any
-later graph construction must call ``reset_graph()`` itself (build() does).
+NOTE: materialization calls ``reset_graph()``, so the module-level graph
+context afterwards holds the *folded* graph; the union survives through
+the folder's ProgramGraph snapshot, and any later construction must call
+``reset_graph()`` itself (build() does).
 """
 
 from __future__ import annotations
@@ -59,6 +34,7 @@ from transformer_nes.graph.core import (
     ProgramGraph,
     ReGLUDimension,
     reset_graph,
+    stepglu,
 )
 
 
@@ -98,13 +74,125 @@ def graph_delta(start_d: int, start_l: int) -> tuple[int, int, int, int]:
     return nr, np_, nl, nt
 
 
+def walk_live(seeds, val, folded, lookup_exprs, is_leaf) -> set:
+    """Backward liveness over folded union dims.  A memory-read persist
+    walks only its raw ingredients (its group fabric dies); a live lookup
+    produces all of its value dims."""
+    live: set = set()
+    stack = [d for d in seeds if d not in val and not is_leaf(d)]
+    while stack:
+        d = stack.pop()
+        if d in live:
+            continue
+        live.add(d)
+        deps: set = set()
+        if isinstance(d, ReGLUDimension):
+            a, b = folded[d]
+            deps = set(a.terms) | set(b.terms)
+        elif isinstance(d, PersistDimension):
+            site = getattr(d, "memory_read", None)
+            if site is not None:
+                for e in site.values():
+                    deps |= set(subst(e, val).terms)
+            else:
+                (e,) = folded[d]
+                deps = set(e.terms)
+        elif isinstance(d, LookUpDimension):
+            fx = lookup_exprs[d.lookup]
+            for e in fx["query"] + fx["key"] + fx["values"]:
+                deps |= set(e.terms)
+            for sib in d.lookup.dims:
+                if sib not in live and sib not in val:
+                    live.add(sib)
+        for dep in deps:
+            if dep not in val and not is_leaf(dep) and dep not in live:
+                stack.append(dep)
+    return live
+
+
+class GraphMaterializer:
+    """Translate live folded union dims into the fresh graph context.
+    Counters and lookup provenance accumulate across per-step calls
+    (lookup_of_union keeps the last instance); the same-lookup dedup is
+    per call, so each sequence step gets its own lookup instances."""
+
+    def __init__(self):
+        self.union_lookup_of: dict[int, int] = {}
+        self.lookup_of_union: dict[int, LookUp] = {}
+        self.insert_side_hazards: list[str] = []
+        self.n_reglus = 0
+        self.n_persists = 0
+        self.n_lookups = 0
+        self.n_terms = 0
+
+    def materialize(self, all_dims, live, val, folded, lookup_exprs, sub, tr,
+                    *, name_of=lambda n: n, is_leaf=None,
+                    hazards=frozenset()) -> None:
+        made = set()
+        for d in all_dims:
+            if d in val or d not in live:
+                continue
+            if isinstance(d, InputDimension) or (is_leaf is not None and is_leaf(d)):
+                continue
+            if isinstance(d, ReGLUDimension):
+                a, b = folded[d]
+                nd = ReGLUDimension(tr(a), tr(b), name=name_of(d.name))
+                sub[d] = Expression({nd: 1})
+                self.n_reglus += 1
+                self.n_terms += len(nd.a_expr.terms) + len(nd.b_expr.terms)
+            elif isinstance(d, PersistDimension):
+                site = getattr(d, "memory_read", None)
+                if site is not None:
+                    marks = len(graph.graph_dims), len(graph.graph_lookups)
+                    expr = masked_exact_read(
+                        tr(site["address"]), tr(site["byte_value"]),
+                        tr(site["write_addr"]), tr(site["is_write"]),
+                    )
+                    nd = PersistDimension(expr, name=name_of(d.name))
+                    sub[d] = Expression({nd: 1})
+                    dr, dp, dl, dt = graph_delta(*marks)
+                    self.n_reglus += dr
+                    self.n_persists += dp
+                    self.n_lookups += dl
+                    self.n_terms += dt
+                    continue
+                (e,) = folded[d]
+                nd = PersistDimension(tr(e), name=name_of(d.name))
+                sub[d] = Expression({nd: 1})
+                self.n_persists += 1
+                self.n_terms += len(nd.expr.terms)
+            elif isinstance(d, LookUpDimension):
+                lu = d.lookup
+                if lu in made:
+                    continue
+                made.add(lu)
+                fx = lookup_exprs[lu]
+                nlu = LookUp(
+                    [tr(e) for e in fx["values"]],
+                    [tr(e) for e in fx["query"]],
+                    [tr(e) for e in fx["key"]],
+                    tie_break=lu.tie_break,
+                )
+                nlu.name = name_of(lu.name)
+                nlu.memory_group = lu.memory_group
+                self.union_lookup_of[nlu.id] = lu.id
+                self.lookup_of_union[lu.id] = nlu
+                for ud, ndim in zip(lu.dims, nlu.dims, strict=True):
+                    ndim.name = name_of(ud.name)
+                    sub[ud] = Expression({ndim: 1})
+                if lu in hazards:
+                    self.insert_side_hazards.append(lu.name or f"lookup_{lu.id}")
+                self.n_lookups += 1
+                for e in nlu.query_exprs_2d + nlu.key_exprs_2d + nlu.value_exprs:
+                    self.n_terms += len(e.terms)
+
+
 def masked_exact_read(addr, byte_value, write_addr, is_write) -> Expression:
-    """A memory_at site rebuilt flat, in the folded graph's context: ONE
-    64K-span lookup (memory_group FUSED) plus the exact-address mask.
-    Identical output to the union's 16-group sum -- the mask keeps only
-    exact hits, and an exact hit answers from its own group either way --
-    at ~8 dims instead of ~300 per read.  Expert folds only: the union's
-    group split serves the exported artifact's f32 score range."""
+    """A memory_at site rebuilt flat: one 64K-span lookup plus the
+    exact-address mask.  Identical output to the union's 16-group sum
+    (the mask keeps exact hits only, and an exact hit answers from its
+    own group either way); the group split exists for the exported
+    artifact's f32 score range, which expert engines never compute."""
     value, found = graph.fetch([byte_value, write_addr], query=addr,
                                key=write_addr, clear_key=1 - is_write,
                                tie_break="latest")
@@ -278,37 +366,10 @@ class GraphFolder:
         for d in root_dims:
             seeds |= set(val[d].terms) if d in val else {d}
 
-        live: set = set()
-        stack = [d for d in seeds if d not in val and not isinstance(d, InputDimension)]
-        while stack:
-            d = stack.pop()
-            if d in live:
-                continue
-            live.add(d)
-            deps: set = set()
-            if isinstance(d, ReGLUDimension):
-                a, b = folded[d]
-                deps = set(a.terms) | set(b.terms)
-            elif isinstance(d, PersistDimension):
-                site = getattr(d, "memory_read", None)
-                if site is not None:
-                    # Fused read: only the site's raw ingredients stay
-                    # live; the 16-group fabric behind the persist dies.
-                    for e in site.values():
-                        deps |= set(subst(e, val).terms)
-                else:
-                    (e,) = folded[d]
-                    deps = set(e.terms)
-            elif isinstance(d, LookUpDimension):
-                fx = lookup_exprs[d.lookup]
-                for e in fx["query"] + fx["key"] + fx["values"]:
-                    deps |= set(e.terms)
-                for sib in d.lookup.dims:  # a live lookup produces all values
-                    if sib not in live and sib not in val:
-                        live.add(sib)
-            for dep in deps:
-                if dep not in val and not isinstance(dep, InputDimension) and dep not in live:
-                    stack.append(dep)
+        live = walk_live(
+            seeds, val, folded, lookup_exprs,
+            lambda d: isinstance(d, InputDimension),
+        )
 
         # ── Materialize the new graph ─────────────────────────────────
         reset_graph()
@@ -333,67 +394,9 @@ class GraphFolder:
                 out = out + s * c
             return out
 
-        union_lookup_of: dict[int, int] = {}
-        lookup_of_union: dict[int, LookUp] = {}
-        insert_side_hazards: list[str] = []
-        made = set()
-        n_reglus = n_persists = n_lookups = n_terms = 0
-        for d in pg.all_dims:
-            if isinstance(d, InputDimension) or d in val or d not in live:
-                continue
-            if isinstance(d, ReGLUDimension):
-                a, b = folded[d]
-                nd = ReGLUDimension(tr(a), tr(b), name=d.name)
-                sub[d] = Expression({nd: 1})
-                n_reglus += 1
-                n_terms += len(nd.a_expr.terms) + len(nd.b_expr.terms)
-            elif isinstance(d, PersistDimension):
-                site = getattr(d, "memory_read", None)
-                if site is not None:
-                    marks = len(graph.graph_dims), len(graph.graph_lookups)
-                    expr = masked_exact_read(
-                        tr(site["address"]), tr(site["byte_value"]),
-                        tr(site["write_addr"]), tr(site["is_write"]),
-                    )
-                    nd = PersistDimension(expr, name=d.name)
-                    sub[d] = Expression({nd: 1})
-                    dr, dp, dl, dt = graph_delta(*marks)
-                    n_reglus += dr
-                    n_persists += dp
-                    n_lookups += dl
-                    n_terms += dt
-                    continue
-                (e,) = folded[d]
-                nd = PersistDimension(tr(e), name=d.name)
-                sub[d] = Expression({nd: 1})
-                n_persists += 1
-                n_terms += len(nd.expr.terms)
-            elif isinstance(d, LookUpDimension):
-                lu = d.lookup
-                if lu in made:
-                    continue
-                made.add(lu)
-                fx = lookup_exprs[lu]
-                nlu = LookUp(
-                    [tr(e) for e in fx["values"]],
-                    [tr(e) for e in fx["query"]],
-                    [tr(e) for e in fx["key"]],
-                    tie_break=lu.tie_break,
-                )
-                nlu.name = lu.name
-                mg = getattr(lu, "memory_group", None)
-                if mg is not None:
-                    nlu.memory_group = mg
-                union_lookup_of[nlu.id] = lu.id
-                lookup_of_union[lu.id] = nlu
-                for ud, ndim in zip(lu.dims, nlu.dims, strict=True):
-                    ndim.name = ud.name
-                    sub[ud] = Expression({ndim: 1})
-                if lu in hazards:
-                    insert_side_hazards.append(lu.name or f"lookup_{lu.id}")
-                n_lookups += 1
-                for e in nlu.query_exprs_2d + nlu.key_exprs_2d + nlu.value_exprs:
-                    n_terms += len(e.terms)
+        mat = GraphMaterializer()
+        mat.materialize(pg.all_dims, live, val, folded, lookup_exprs, sub, tr,
+                        hazards=hazards)
 
         # Folded-away roots come back as named persists so readout slots
         # always resolve by name (and stay alive via the output tokens).
@@ -403,8 +406,8 @@ class GraphFolder:
                 nd = PersistDimension(tr(val[d]), name=d.name)
                 sub[d] = Expression({nd: 1})
                 folded_roots.append(d.name)
-                n_persists += 1
-                n_terms += len(nd.expr.terms)
+                mat.n_persists += 1
+                mat.n_terms += len(nd.expr.terms)
 
         new_inputs = {
             name: tr(expr) if isinstance(expr, Expression) else expr
@@ -425,13 +428,13 @@ class GraphFolder:
             pins=pins,
             program_graph=new_pg,
             dim_of_name=dim_of_name,
-            union_lookup_of=union_lookup_of,
-            lookup_of_union=lookup_of_union,
-            insert_side_hazards=tuple(insert_side_hazards),
-            n_reglus=n_reglus,
-            n_persists=n_persists,
-            n_lookups=n_lookups,
-            n_terms=n_terms,
+            union_lookup_of=mat.union_lookup_of,
+            lookup_of_union=mat.lookup_of_union,
+            insert_side_hazards=tuple(mat.insert_side_hazards),
+            n_reglus=mat.n_reglus,
+            n_persists=mat.n_persists,
+            n_lookups=mat.n_lookups,
+            n_terms=mat.n_terms,
             folded_roots=tuple(folded_roots),
         )
 
@@ -484,12 +487,10 @@ class GraphFolder:
                 base_sub[d] = Expression({InputDimension(d.name): 1})
 
         all_pins: dict[str, float] = {}
-        union_lookup_of: dict[int, int] = {}
-        lookup_of_union: dict[int, LookUp] = {}
+        mat = GraphMaterializer()  # counters/provenance accumulate per step
         insert_side_hazards: set[str] = set()
         folded_roots: list[str] = []
         keep_alive = Expression()
-        n_reglus = n_persists = n_lookups = n_terms = 0
         fb_expr: dict[str, Expression] = {}  # prev step's outputs, new-graph space
         fb_const: dict[str, float] = {}
         new_outputs = None
@@ -561,37 +562,7 @@ class GraphFolder:
                     or (isinstance(d, PersistDimension) and d.name in frozen)
                 )
 
-            live: set = set()
-            stack = [d for d in seeds if d not in val and not is_leaf(d)]
-            while stack:
-                d = stack.pop()
-                if d in live:
-                    continue
-                live.add(d)
-                deps: set = set()
-                if isinstance(d, ReGLUDimension):
-                    a, b = folded[d]
-                    deps = set(a.terms) | set(b.terms)
-                elif isinstance(d, PersistDimension):
-                    site = getattr(d, "memory_read", None)
-                    if site is not None:
-                        # Fused read: only the site's raw ingredients stay
-                        # live; the 16-group fabric behind the persist dies.
-                        for e in site.values():
-                            deps |= set(subst(e, val).terms)
-                    else:
-                        (e,) = folded[d]
-                        deps = set(e.terms)
-                elif isinstance(d, LookUpDimension):
-                    fx = lookup_exprs[d.lookup]
-                    for e in fx["query"] + fx["key"] + fx["values"]:
-                        deps |= set(e.terms)
-                    for sib in d.lookup.dims:
-                        if sib not in live and sib not in val:
-                            live.add(sib)
-                for dep in deps:
-                    if dep not in val and not is_leaf(dep) and dep not in live:
-                        stack.append(dep)
+            live = walk_live(seeds, val, folded, lookup_exprs, is_leaf)
 
             # Materialize this step (fresh sub: the same union dim holds a
             # different value per step); frozen persists resolve to the
@@ -605,9 +576,8 @@ class GraphFolder:
                 # Shape fold: pc(k) = head + offset, byte-split with one
                 # stepglu carry (exact on integer bytes).  No $FFFF wrap by
                 # the caller's license.
-                from transformer_nes.graph.core import stepglu
-
                 off = int(pc_offsets[k])
+                assert pc_exprs is not None  # captured at k == 0
                 lo0, hi0 = pc_exprs
                 if off == 0:
                     lo_e, hi_e = lo0, hi0
@@ -636,61 +606,8 @@ class GraphFolder:
             def sname(name, *, k=k):
                 return f"{name}__s{k}" if name else None
 
-            made = set()
-            for d in pg.all_dims:
-                if d in val or d not in live or is_leaf(d):
-                    continue
-                if isinstance(d, ReGLUDimension):
-                    a, b = folded[d]
-                    nd = ReGLUDimension(tr(a), tr(b), name=sname(d.name))
-                    sub[d] = Expression({nd: 1})
-                    n_reglus += 1
-                    n_terms += len(nd.a_expr.terms) + len(nd.b_expr.terms)
-                elif isinstance(d, PersistDimension):
-                    site = getattr(d, "memory_read", None)
-                    if site is not None:
-                        marks = len(graph.graph_dims), len(graph.graph_lookups)
-                        expr = masked_exact_read(
-                            tr(site["address"]), tr(site["byte_value"]),
-                            tr(site["write_addr"]), tr(site["is_write"]),
-                        )
-                        nd = PersistDimension(expr, name=sname(d.name))
-                        sub[d] = Expression({nd: 1})
-                        dr, dp, dl, dt = graph_delta(*marks)
-                        n_reglus += dr
-                        n_persists += dp
-                        n_lookups += dl
-                        n_terms += dt
-                        continue
-                    (e,) = folded[d]
-                    nd = PersistDimension(tr(e), name=sname(d.name))
-                    sub[d] = Expression({nd: 1})
-                    n_persists += 1
-                    n_terms += len(nd.expr.terms)
-                elif isinstance(d, LookUpDimension):
-                    lu = d.lookup
-                    if lu in made:
-                        continue
-                    made.add(lu)
-                    fx = lookup_exprs[lu]
-                    nlu = LookUp(
-                        [tr(e) for e in fx["values"]],
-                        [tr(e) for e in fx["query"]],
-                        [tr(e) for e in fx["key"]],
-                        tie_break=lu.tie_break,
-                    )
-                    nlu.name = sname(lu.name)
-                    mg = getattr(lu, "memory_group", None)
-                    if mg is not None:
-                        nlu.memory_group = mg
-                    union_lookup_of[nlu.id] = lu.id
-                    lookup_of_union[lu.id] = nlu  # last step wins; ids share state
-                    for ud, ndim in zip(lu.dims, nlu.dims, strict=True):
-                        ndim.name = sname(ud.name)
-                        sub[ud] = Expression({ndim: 1})
-                    n_lookups += 1
-                    for e in nlu.query_exprs_2d + nlu.key_exprs_2d + nlu.value_exprs:
-                        n_terms += len(e.terms)
+            mat.materialize(pg.all_dims, live, val, folded, lookup_exprs,
+                            sub, tr, name_of=sname, is_leaf=is_leaf)
 
             # Roots: every step's readout set, suffixed; folded-away roots
             # come back as named persists (same contract as fold()).
@@ -699,8 +616,8 @@ class GraphFolder:
                     nd = PersistDimension(tr(val[d]), name=sname(d.name))
                     sub[d] = Expression({nd: 1})
                     folded_roots.append(nd.name)
-                    n_persists += 1
-                    n_terms += len(nd.expr.terms)
+                    mat.n_persists += 1
+                    mat.n_terms += len(nd.expr.terms)
                 keep_alive = keep_alive + 1e-6 * sub[d]
 
             if pc_offsets is not None and k == 0:
@@ -731,6 +648,7 @@ class GraphFolder:
                     for name, expr in pg.output_tokens.items()
                 }
 
+        assert new_inputs is not None and new_outputs is not None
         prev = new_outputs.get(keep_alive_token)
         prev = prev if isinstance(prev, Expression) else Expression()
         new_outputs[keep_alive_token] = prev + keep_alive
@@ -745,13 +663,13 @@ class GraphFolder:
             pins=all_pins,
             program_graph=new_pg,
             dim_of_name=dim_of_name,
-            union_lookup_of=union_lookup_of,
-            lookup_of_union=lookup_of_union,
+            union_lookup_of=mat.union_lookup_of,
+            lookup_of_union=mat.lookup_of_union,
             insert_side_hazards=tuple(sorted(insert_side_hazards)),
-            n_reglus=n_reglus,
-            n_persists=n_persists,
-            n_lookups=n_lookups,
-            n_terms=n_terms,
+            n_reglus=mat.n_reglus,
+            n_persists=mat.n_persists,
+            n_lookups=mat.n_lookups,
+            n_terms=mat.n_terms,
             folded_roots=tuple(folded_roots),
             n_steps=n_steps,
         )

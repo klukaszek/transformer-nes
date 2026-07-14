@@ -18,6 +18,7 @@ import argparse
 import logging
 import os
 import time
+from collections import defaultdict
 
 from transformer_nes.cpu6502.backends.reference import Cpu6502
 
@@ -65,7 +66,7 @@ def run_graph(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float,
     Every step is compared against the reference core.  Returns
     (matched, steps_executed, build_seconds, prefix_seconds, run_seconds).
     """
-    from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
+    from transformer_nes.cpu6502.backends.graph import Cpu6502Runtime
 
     build_start = time.perf_counter()
     rt = Cpu6502Runtime()
@@ -107,8 +108,6 @@ def run_graph(image: bytes, *, max_steps: int) -> tuple[bool, int, float, float,
 
 def lockstep_arrays_vs_reference(ref: Cpu6502, out: dict) -> tuple[bool, int]:
     """Compare native run-loop result arrays against a prepared reference core."""
-    from collections import defaultdict
-
     writes_by_row: dict[int, set] = defaultdict(set)
     for row, addr, value in zip(out["w_row"], out["w_addr"], out["w_value"], strict=True):
         writes_by_row[int(row)].add((int(addr), int(value)))

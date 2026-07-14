@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass
 
 # ── Processor status flag bits (NV-BDIZC) ─────────────────────────
@@ -359,7 +360,7 @@ class Asm:
             self.buf.append(v)
         return self
 
-    def bytes(self) -> bytes:
+    def bytes(self) -> builtins.bytes:
         return bytes(self.buf)
 
     # Load / store

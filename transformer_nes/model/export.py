@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 
 import numpy as np
 import scipy.sparse as sp
 
-from transformer_nes.cpu6502.backends.evaluator import RUNTIME_READ_DIMS, Cpu6502Runtime
+from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.graph.core import InputDimension, ProgramGraph
 from transformer_nes.model.weights import build_model
 from transformer_nes.scheduler.milp import asap_schedule
@@ -36,8 +37,6 @@ def csr_tensors(name: str, mat: np.ndarray, out: dict, dtype) -> None:
 
 def export_model(out_dir: str, *, bcd: bool = False, f64: bool = False) -> dict:
     """Build the union model and write the artifact; returns the metadata."""
-    import os
-
     from safetensors.numpy import save_file
 
     rt = Cpu6502Runtime(bcd=bcd)

@@ -38,6 +38,7 @@ def test_lda_imm_sets_a_and_flags():
 def test_lda_zero_sets_z_flag():
     trace = reference.run(example("zero_flag.bin"), start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.a == 0x00
     assert final.p & FLAG_Z
     assert (final.p & FLAG_N) == 0
@@ -46,6 +47,7 @@ def test_lda_zero_sets_z_flag():
 def test_lda_negative_sets_n_flag():
     trace = reference.run(example("negative_flag.bin"), start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.a == 0x80
     assert final.p & FLAG_N
     assert (final.p & FLAG_Z) == 0
@@ -70,6 +72,7 @@ def test_sta_zpg_writes_memory():
 def test_bne_loop_counts_down():
     trace = reference.run(example("branch_loop.bin"), start_pc=0x8000, max_steps=20)
     final = trace.final_state()
+    assert final is not None
     assert final.x == 0x00
     assert final.p & FLAG_Z
     assert final.halted
@@ -85,6 +88,7 @@ def test_ldx_imm():
     program = asm().ldx_imm(0xAB).brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.x == 0xAB
     assert final.p & FLAG_N
 
@@ -93,6 +97,7 @@ def test_ldy_imm():
     program = asm().ldy_imm(0x05).brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.y == 0x05
     assert (final.p & FLAG_Z) == 0
 
@@ -111,6 +116,7 @@ def test_adc_imm():
     program = asm().lda_imm(0x05).adc_imm(0x07).brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.a == 0x0C
     assert (final.p & FLAG_C) == 0
     assert (final.p & FLAG_Z) == 0
@@ -122,6 +128,7 @@ def test_adc_imm_with_carry():
     program = asm().lda_imm(0xFF).adc_imm(0x01).brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.a == 0x00
     assert final.p & FLAG_C
     assert final.p & FLAG_Z
@@ -134,6 +141,7 @@ def test_sbc_imm():
     program = asm().lda_imm(0x0A).sbc_imm(0x03).brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.a == 0x06
     assert final.p & FLAG_C  # no borrow
 
@@ -142,6 +150,7 @@ def test_inx():
     program = asm().ldx_imm(0x7F).inx().brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.x == 0x80
     assert final.p & FLAG_N
     assert (final.p & FLAG_Z) == 0
@@ -151,6 +160,7 @@ def test_dex_wrap():
     program = asm().ldx_imm(0x00).dex().brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.x == 0xFF
     assert final.p & FLAG_N
 
@@ -159,6 +169,7 @@ def test_tax():
     program = asm().lda_imm(0x00).tax().brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     assert final.x == 0x00
     assert final.p & FLAG_Z
 
@@ -167,6 +178,7 @@ def test_jmp_abs():
     program = asm().jmp_abs(0x8005).lda_imm(0xAA).brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     # Should skip over LDA #AA and halt at BRK
     assert final.a == 0x00
     assert final.halted
@@ -176,6 +188,7 @@ def test_beq_taken():
     program = asm().lda_imm(0x00).beq(0x02).lda_imm(0xFF).brk().bytes()
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
+    assert final is not None
     # BEQ taken skips LDA #FF, so A stays 0
     assert final.a == 0x00
     assert final.halted

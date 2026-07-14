@@ -97,7 +97,7 @@ def run_graph(image: bytearray, log_rows, *, max_steps: int) -> tuple[bool, int,
     The reference is the oracle here; it is itself validated against the
     golden log by run_reference.  Returns (matched, steps, build_s, run_s).
     """
-    from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
+    from transformer_nes.cpu6502.backends.graph import Cpu6502Runtime
 
     build_start = time.perf_counter()
     rt = Cpu6502Runtime(bcd=False)
@@ -133,46 +133,21 @@ def run_graph(image: bytearray, log_rows, *, max_steps: int) -> tuple[bool, int,
 def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float, str]:
     """Run the real weights-based transformer in lockstep with the reference."""
     from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
+    from transformer_nes.cpu6502.examples.klaus.harness import lockstep_arrays_vs_reference
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(bcd=False)
-    mode = "codegen-exact-int32"
+    mode = "codegen-exact-int32-runloop"
     build_elapsed = time.perf_counter() - build_start
 
-    if machine.supports_run_loop:
-        # Whole suite through the C++ run loop, then lockstep the arrays.
-        mode = f"{mode}-runloop"
-        run_start = time.perf_counter()
-        out = machine.run_image_arrays(bytes(image), start_pc=START_PC, max_steps=max_steps)
-        run_elapsed = time.perf_counter() - run_start
-        from transformer_nes.cpu6502.examples.klaus.harness import lockstep_arrays_vs_reference
-
-        ref = new_cpu(image)
-        matched, n = lockstep_arrays_vs_reference(ref, out)
-        return matched, n, build_elapsed, run_elapsed, mode
-
+    # Whole suite through the C++ run loop, then lockstep the arrays.
     run_start = time.perf_counter()
-    trace = machine.run_image(bytes(image), start_pc=START_PC, max_steps=max_steps)
+    out = machine.run_image_arrays(bytes(image), start_pc=START_PC, max_steps=max_steps)
     run_elapsed = time.perf_counter() - run_start
 
     ref = new_cpu(image)
-    for i, row in enumerate(trace):
-        ref_row = ref.step()
-        s1, s2 = ref_row.state, row.state
-        if (
-            s1.pc != s2.pc or s1.a != s2.a or s1.x != s2.x or s1.y != s2.y
-            or s1.s != s2.s or s1.p != s2.p
-        ):
-            logger.error(
-                "transformer diverged from reference at step %d:\nREF:         PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X\nTRANSFORMER: PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X",
-                i, s1.pc, s1.a, s1.x, s1.y, s1.s, s1.p,
-                s2.pc, s2.a, s2.x, s2.y, s2.s, s2.p,
-            )
-            return False, i, build_elapsed, run_elapsed, mode
-        if {(w.addr, w.value) for w in ref_row.writes} != {(w.addr, w.value) for w in row.writes}:
-            logger.error("transformer writes diverged at step %d", i)
-            return False, i, build_elapsed, run_elapsed, mode
-    return True, len(trace.rows), build_elapsed, run_elapsed, mode
+    matched, n = lockstep_arrays_vs_reference(ref, out)
+    return matched, n, build_elapsed, run_elapsed, mode
 
 
 def main() -> None:

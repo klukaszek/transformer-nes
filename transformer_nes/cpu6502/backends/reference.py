@@ -6,6 +6,7 @@ official NMOS 6502 opcode set using the shared spec table.
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -39,11 +40,12 @@ from transformer_nes.cpu6502.spec import (
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 
 
-def irq_deliverable(p: int, irq_pending: bool, nmi_pending: bool = False) -> bool:
+def irq_deliverable(p: int, irq_pending: bool | int,
+                    nmi_pending: bool | int = False) -> bool:
     """An IRQ is taken at a step boundary only with the I flag clear and no
     NMI ahead of it (NMI wins).  The canonical Python gate; the generated
     C++ engines carry the identical test as their own irq_ready()."""
-    return irq_pending and not nmi_pending and not (p & FLAG_I)
+    return bool(irq_pending and not nmi_pending and not (p & FLAG_I))
 
 
 @dataclass
@@ -184,7 +186,7 @@ class Cpu6502:
         value &= 0xFF
         self.p = (self.p & ~(FLAG_N | FLAG_Z)) | (FLAG_N if value & 0x80 else 0) | (FLAG_Z if value == 0 else 0)
 
-    def set_flag(self, flag: str, value: bool) -> None:
+    def set_flag(self, flag: str, value: bool | int) -> None:
         mask = FLAG_MASKS[flag]
         if value:
             self.p |= mask
@@ -973,7 +975,6 @@ def run_image(image: bytes | bytearray, *, start_pc: int = 0x0400,
 
 
 def main() -> None:
-    import argparse
 
     parser = argparse.ArgumentParser(description="Run a 6502 binary through the reference core.")
     parser.add_argument("program", help="Path to a .bin file")

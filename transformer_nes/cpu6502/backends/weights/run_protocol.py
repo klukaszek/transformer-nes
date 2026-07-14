@@ -1,10 +1,9 @@
-"""Shared tables and C++ blocks for the native CPU run loops.
+"""Tables and C++ blocks for the weights engine's native run loop.
 
-model/engine_gen.py emits the persistent-machine protocol for the
-generated weights engine: one exact memory structure, one shadow
-decoder, one run loop (watch/lease/trace/budget), one machine API.  The
-EngineBus contract is the spec; keeping the blocks here keeps the
-protocol reviewable in one place.
+model/engine_gen.py emits this persistent-machine protocol into the
+generated engine: one exact memory structure, one shadow decoder, one run
+loop (watch/lease/trace/budget), one machine API.  The EngineBus contract
+is the spec; keeping the blocks here keeps the protocol reviewable in one place.
 """
 
 from __future__ import annotations

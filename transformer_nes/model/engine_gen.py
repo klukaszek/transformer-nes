@@ -15,11 +15,12 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 
 import numpy as np
 import scipy.sparse as sp
 
-from transformer_nes.cpu6502.backends.run_protocol import (
+from transformer_nes.cpu6502.backends.weights.run_protocol import (
     IN_RANGES_CPP,
     MACHINE_API_CPP,
     SHADOW_READ_TARGET_CPP,
@@ -69,9 +70,9 @@ CODE_DIRS = ("graph", "scheduler", "model", "attention")
 CODE_FILES = (
     "cpu6502/spec.py",
     "cpu6502/interpreter.py",
-    "cpu6502/backends/evaluator.py",
+    "cpu6502/backends/graph.py",
     "cpu6502/backends/reference.py",
-    "cpu6502/backends/run_protocol.py",
+    "cpu6502/backends/weights/run_protocol.py",
     "cpu6502/backends/weights/windows.py",
     "cpu6502/backends/weights/experts.py",
     "cpu6502/backends/weights/runner.py",
@@ -169,11 +170,12 @@ def shard_source(source: str, struct_name: str, n_shards: int) -> tuple[str, lis
         header.append(line)
         i += 1
 
-    shards = [[] for _ in range(max(1, n_shards))]
+    shards: list[list[str]] = [[] for _ in range(max(1, n_shards))]
     sizes = [0] * len(shards)
-    for chunk in sorted(chunks, key=len, reverse=True):
+    for chunk in sorted(chunks, key=lambda c: len(c), reverse=True):
         k = sizes.index(min(sizes))
-        shards[k].extend(chunk + [""])
+        shards[k].extend(chunk)
+        shards[k].append("")
         sizes[k] += len(chunk)
     shards[0] = pybind + [""] + shards[0]
     return "\n".join(header) + "\n", ["\n".join(s) + "\n" for s in shards]
@@ -189,6 +191,7 @@ def load_module(
     so_path = os.path.join(build_dir, f"{name}.so")
     if os.path.exists(so_path):
         spec = importlib.util.spec_from_file_location(name, so_path)
+        assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         sys.modules[name] = module
@@ -309,7 +312,7 @@ def expr_int(indices, data, ref, where: str) -> str:
     return join(terms) or "0"
 
 
-def row(csr, r):
+def row(csr, r) -> tuple[np.ndarray, np.ndarray]:
     lo, hi = csr.indptr[r], csr.indptr[r + 1]
     return csr.indices[lo:hi], csr.data[lo:hi]
 
@@ -340,6 +343,38 @@ def compose(outer: sp.csr_matrix, cols, inner_rows: sp.csr_matrix) -> sp.csr_mat
     direct.eliminate_zeros()
     direct.sort_indices()
     return direct
+
+
+def fuse_direct(mat, rows, var, pre_written, label, *, elem, xref):
+    """Direct-map emission with the hygiene peephole: a row whose operands
+    are untouched by the phase's earlier writes applies as ONE statement
+    (an erase with an unwritten target becomes assignment); anything else
+    keeps the capture+apply pair.  Returns (defs, applies)."""
+    defs, applies = [], []
+    written = set(pre_written)
+    for r in rows:
+        idxs, dat = row(mat, r)
+        terms = list(zip(idxs, dat, strict=True))
+        diag = dict(terms).get(r)
+        rest = [(i, c) for i, c in terms if i != r]
+        support = {int(i) for i, _ in rest}
+        if diag == -1.0 and r not in written and not support & written:
+            if rest:
+                e = expr_int([i for i, _ in rest],
+                             [c for _, c in rest],
+                             xref, f"{label} fused")
+                applies.append(f"        x[{r}] = {e};")
+            else:
+                applies.append(f"        x[{r}] = 0;")
+        elif diag is None and not support & written:
+            e = expr_int(idxs, dat, xref, f"{label} fused")
+            applies.append(f"        x[{r}] += {e};")
+        else:
+            defs.append(f"        const {elem} {var}{r} = "
+                        f"{expr_int(*row(mat, r), xref, label)};")
+            applies.append(f"        x[{r}] += {var}{r};")
+        written.add(int(r))
+    return defs, applies
 
 
 def check_ffn_kinds(model, layer_idx):
@@ -772,6 +807,371 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
     return "\n".join(lines) + "\n", 0, False
 
 
+class EmitterContext:
+    """Shared emission state: the union pass allocates (hulls, memory
+    targets, registers), expert passes resolve onto it, the epilogue
+    emits from it.  Also the dialect: element type and member prefix
+    ("" for the engine, "E." for a sequence module)."""
+
+    def __init__(self, *, elem: str, E: str, inv_scale: str):
+        self.elem = elem
+        self.E = E
+        self.inv_scale = inv_scale
+        self.hull_tiebreak: list[int] = []  # flat hull id -> latest?
+        self.mem_hulls: list[list[int]] = [[] for _ in range(16)]
+        self.mem_fallback_hulls: list[int] = []
+        self.n_memory_heads = 0
+        self.n_hull_heads = 0  # heads still on real hulls
+        # Running-argmax registers for constant-query heads, keyed by
+        # (union lookup id, value pair): the union pass allocates in
+        # head-scan order, expert passes resolve through fold provenance.
+        self.reg_of: dict[tuple[int, int], int] = {}
+
+    def xref(self, i):
+        return f"x[{i}]"
+
+    def dref(self, i):
+        return f"({self.inv_scale}*(double)x[{i}])"
+
+
+def row_int(csr_m, r, ref, where):
+    return expr_int(*row(csr_m, r), ref, where)
+
+
+def row_raw(indices, data, ref, where):
+    return expr_int(indices, data, ref, where)
+
+
+def plan_model(ctx, mdl, label, union_lookup_of=None):
+    """Per-layer emission plans for one model.
+
+    The union pass (union_lookup_of is None) allocates the shared engine
+    state -- hull ids, the memory-structure insert targets, and the
+    running-argmax registers keyed by (lookup id, value pair) -- in
+    head-scan order.  Expert passes resolve their heads onto that state
+    through the fold's lookup provenance and never allocate: an expert
+    head whose classification disagrees with the union's is a hard
+    error, because a per-expert hull would accumulate divergent history
+    across routed steps.
+    """
+    is_union = union_lookup_of is None
+    dm = mdl.tok.weight.shape[1]
+    nh = mdl.attn[0].num_heads
+    plans: list[dict] = []
+    for li in range(len(mdl.attn)):
+        check_ffn_kinds(mdl, li)
+        ip = csr(mdl.attn[li].in_proj_weight)
+        op = csr(mdl.attn[li].out_proj.weight)
+        fi = csr(mdl.ff_in[li].weight)
+        fo = csr(mdl.ff_out[li].weight)
+        ffn = fo.shape[1]
+        kinds = mdl.head_kinds[li]
+        ffn_kinds = mdl.ffn_kinds[li]
+        tiebreak = mdl.head_tiebreak[li]
+        groups = mdl.head_cache_groups[li]
+        mem_groups = mdl.head_memory_groups[li]
+        lookup_ids = mdl.head_lookup_ids[li]
+        pairs = mdl.head_pairs[li]
+
+        lookup = [h for h in range(nh) if kinds[h] == 1]
+        passthrough = [h for h in range(nh) if kinds[h] == 2]
+        for h in lookup:
+            if not tiebreak[h]:
+                raise RuntimeError(
+                    f"{label} L{li} head {h}: AVERAGE tie-break can return "
+                    "fractional hull outputs"
+                )
+
+        # Shared hulls, first-seen in ascending head order (engine order).
+        # Expert hull ids exist only for the hull_seen live-insert guard;
+        # only the union's memory hulls receive insert_write tokens.
+        hull_base = len(ctx.hull_tiebreak)
+        hull_of_group: dict[int, int] = {}
+        hull_of_head: dict[int, int] = {}
+        for h in lookup:
+            g = groups[h]
+            if g < 0:
+                raise RuntimeError(f"{label} L{li} head {h}: negative cache group")
+            if g not in hull_of_group:
+                hull_of_group[g] = hull_base + len(hull_of_group)
+                ctx.hull_tiebreak.append(int(tiebreak[h]))
+            hull_of_head[h] = hull_of_group[g]
+            if mem_groups[h] >= 0 and is_union:
+                ctx.mem_hulls[mem_groups[h]].append(hull_of_head[h])
+                ctx.n_memory_heads += 1
+
+        # Structural passthrough/erase fusion: fold kind-2 heads and
+        # neurons into direct D->D residual maps (no hull/ReGLU needed).
+        pt_cols = [2 * h + c for h in passthrough for c in range(2)]
+        attn_direct = compose(op, pt_cols, ip[[2 * dm + c for c in pt_cols], :])
+        op_kept = zero_columns(op, pt_cols)
+
+        lookup_cols = {2 * h + c for h in lookup for c in range(2)}
+        for c in np.unique(op_kept.indices):
+            if int(c) not in lookup_cols:
+                raise RuntimeError(
+                    f"{label} L{li}: out_proj column {int(c)} survives at a "
+                    "non-lookup head slot"
+                )
+
+        pt_j = [j for j in range(ffn) if ffn_kinds[j] == 2]
+        ffn_direct = compose(fo, pt_j, fi[[ffn + j for j in pt_j], :])
+        fo_kept = zero_columns(fo, pt_j)
+        live = sorted(int(j) for j in np.unique(fo_kept.indices))
+
+        # Per-head emission blocks (each self-contained: it defines
+        # ho{2h} and ho{2h+1}), keyed by head.
+        head_blocks: dict[int, list[str]] = {}
+
+        # ── Attention: hull heads, then residual updates ─────────
+        for h in lookup:
+            b = head_blocks.setdefault(h, [])
+            hid = hull_of_head[h]
+            tb = "TieBreak::LATEST" if tiebreak[h] else "TieBreak::AVERAGE"
+            # Eligibility decisions live in model/classify.py, shared
+            # in model/classify.py, the single license source.
+            q0_idx, q0_dat = row(ip, 2 * h)
+            q1_idx, q1_dat = row(ip, 2 * h + 1)
+            qx_terms = list(zip(q0_dat, q0_idx, strict=True))
+            qy_terms = list(zip(q1_dat, q1_idx, strict=True))
+            mem_terms = None
+            fused = mem_groups[h] == MEMORY_GROUP_FUSED
+            if mem_groups[h] >= 0 or fused:
+                mem_terms = memory_query(
+                    qx_terms, qy_terms, one_id=mdl.one_slot,
+                )
+            mem_ok = mem_terms is not None
+            if not is_union and (mem_groups[h] >= 0 or fused) and not mem_ok:
+                raise RuntimeError(
+                    f"{label} L{li} head {h}: memory head is not "
+                    "structure-eligible; a per-expert hull would diverge"
+                )
+            if fused and is_union:
+                raise RuntimeError(
+                    f"{label} L{li} head {h}: fused reads are expert-only"
+                )
+
+            reg_q = None
+            reg_score = None
+            v0_i = v1_i = None
+            if not mem_ok:
+                reg_q = register_query(qx_terms, qy_terms,
+                                       one_id=mdl.one_slot,
+                                       latest=bool(tiebreak[h]))
+                if reg_q is not None:
+                    # The integer score form is part of the register
+                    # license: qx == qy > 0 makes the score a positive
+                    # multiple of kx + ky, and the clear gate an exact
+                    # zero test -- no f64 in the fold or the compare.
+                    k0_idx, k0_dat = row(ip, dm + 2 * h)
+                    k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
+                    reg_score = integer_score_terms(
+                        reg_q[0], reg_q[1],
+                        list(zip(k0_dat, k0_idx, strict=True)),
+                        list(zip(k1_dat, k1_idx, strict=True)),
+                    )
+                    if reg_score is None:
+                        reg_q = None
+                if reg_q is not None:
+                    try:
+                        v0_i = expr_int(*row(ip, 2 * dm + 2 * h),
+                                         ctx.xref, f"{label} L{li} reg v0")
+                        v1_i = expr_int(*row(ip, 2 * dm + 2 * h + 1),
+                                         ctx.xref, f"{label} L{li} reg v1")
+                    except RuntimeError:
+                        reg_q = None
+            reg_ok = reg_q is not None
+
+            if mem_ok:
+                # Memory-group lookup served by the exact nearest-address
+                # structure. Nearest address wins and equal-distance ties
+                # use the latest write. The hull remains empty by design.
+                g = mem_groups[h]
+                assert mem_terms is not None  # mem_ok on this branch
+                qi_expr = expr_int([i for _c, i in mem_terms],
+                                    [c for c, _i in mem_terms],
+                                    ctx.xref, f"{label} L{li} mem query")
+                k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
+                guard = integer_score_terms(
+                    1.0, 1.0, [],
+                    list(zip(k1_dat, k1_idx, strict=True)),
+                )
+                b.append(f"        {ctx.elem} ho{2 * h}, ho{2 * h + 1};")
+                b.append("        {")
+                b.append(f"            if (hull_seen[{hid}] != {ctx.E}seq) {{")
+                if guard is not None:
+                    # A live (unrescinded) K row means the model would
+                    # insert into a memory hull, which this engine cannot
+                    # do; the clear gate is an exact zero test.
+                    live_cond = " && ".join(
+                        f"x[{g_id}] == 0" for g_id in guard[1]
+                    ) or "true"
+                    b.append(f"                if ({live_cond})")
+                else:
+                    k1 = expr_dbl(*row(ip, dm + 2 * h + 1), ctx.dref)
+                    b.append(f"                const double kyg = {k1};")
+                    b.append("                if (kyg > -1.0e29)")
+                b.append('                    throw std::runtime_error('
+                         '"live forward insert into a memory-group hull");')
+                b.append(f"                hull_seen[{hid}] = {ctx.E}seq;")
+                b.append("            }")
+                b.append(f"            const long long qi = shr2({qi_expr});")
+                b.append("            long long mo[2] = {0, 0};")
+                if fused:
+                    # Fused 64K-span read (expert folds): the group is
+                    # the address's own high nibble; the exact mask
+                    # downstream zeroes any non-exact winner, and (0,0)
+                    # is exactly the empty-structure result.
+                    b.append("            if ((unsigned long long)qi >> 16 == 0)")
+                    b.append(f"                {ctx.E}mem_query((int)(qi >> 12), "
+                             "qi & 4095, mo);")
+                else:
+                    # Group dispatch: qi is the address minus this group's
+                    # base, so qi in [0, 4096) iff the address falls in this
+                    # group.  Other groups' contributions are gate-zeroed
+                    # downstream, and (0,0) is exactly the empty-group result.
+                    b.append("            if ((unsigned long long)qi >> 12 == 0)")
+                    b.append(f"                {ctx.E}mem_query({g}, qi, mo);")
+                b.append(f"            ho{2 * h} = ({ctx.elem})(mo[0] << F);")
+                b.append(f"            ho{2 * h + 1} = ({ctx.elem})(mo[1] << F);")
+                b.append("        }")
+            elif reg_ok:
+                # Register index: allocated by the union in scan order,
+                # resolved by experts through the fold's provenance so
+                # every model folds into / reads the same register.
+                lu_id, pair = lookup_ids[h], pairs[h]
+                if is_union:
+                    key = (lu_id, pair)
+                    if key in ctx.reg_of:
+                        raise RuntimeError(
+                            f"union L{li} head {h}: register key {key} repeated"
+                        )
+                    r = ctx.reg_of[key] = len(ctx.reg_of)
+                else:
+                    assert union_lookup_of is not None  # expert pass
+                    r = ctx.reg_of.get((union_lookup_of.get(lu_id, -1), pair))
+                    if r is None:
+                        raise RuntimeError(
+                            f"{label} L{li} head {h}: constant-query head "
+                            f"has no union register (lookup {lu_id} pair {pair})"
+                        )
+                assert reg_score is not None  # reg_ok on this branch
+                score_terms, gate_ids = reg_score
+                s_expr = expr_int(
+                    [i for _c, i in score_terms],
+                    [c for c, _i in score_terms],
+                    ctx.xref, f"{label} L{li} reg score",
+                )
+                live_cond = " && ".join(
+                    f"x[{g_id}] == 0" for g_id in gate_ids
+                ) or "true"
+                b.append(f"        {ctx.elem} ho{2 * h}, ho{2 * h + 1};")
+                b.append("        {")
+                b.append(f"            if ({live_cond}) {{  // live: fold into the running argmax")
+                b.append(f"                const long long s = {s_expr};")
+                b.append(f"                if (!{ctx.E}reg_any[{r}] || s >= {ctx.E}reg_s[{r}]) {{")
+                b.append(f"                    {ctx.E}reg_any[{r}] = true;")
+                b.append(f"                    {ctx.E}reg_s[{r}] = s;")
+                b.append(f"                    {ctx.E}reg_v0[{r}] = {v0_i};")
+                b.append(f"                    {ctx.E}reg_v1[{r}] = {v1_i};")
+                b.append("                }")
+                b.append("            }")
+                b.append(f"            ho{2 * h} = {ctx.E}reg_any[{r}] ? {ctx.E}reg_v0[{r}] : 0;")
+                b.append(f"            ho{2 * h + 1} = {ctx.E}reg_any[{r}] ? {ctx.E}reg_v1[{r}] : 0;")
+                b.append("        }")
+            else:
+                if not is_union:
+                    raise RuntimeError(
+                        f"{label} L{li} head {h}: expert lookup head needs a "
+                        "real hull; refusing (its history would diverge from "
+                        "the union's across routed steps)"
+                    )
+                ctx.n_hull_heads += 1
+                if mem_groups[h] >= 0:
+                    ctx.mem_fallback_hulls.append(hid)
+                # Q/K/V straight to double: the hull resolves in double.
+                q0 = expr_dbl(*row(ip, 2 * h), ctx.dref)
+                q1 = expr_dbl(*row(ip, 2 * h + 1), ctx.dref)
+                k0 = expr_dbl(*row(ip, dm + 2 * h), ctx.dref)
+                k1 = expr_dbl(*row(ip, dm + 2 * h + 1), ctx.dref)
+                v0 = expr_dbl(*row(ip, 2 * dm + 2 * h), ctx.dref)
+                v1 = expr_dbl(*row(ip, 2 * dm + 2 * h + 1), ctx.dref)
+                b.append(f"        {ctx.elem} ho{2 * h}, ho{2 * h + 1};")
+                b.append("        {")
+                b.append(f"            if (hull_seen[{hid}] != seq) {{")
+                b.append(f"                const double key[2] = {{{k0}, {k1}}};")
+                b.append("                // clear_key-gated tokens (ky -= 1e30) can never")
+                b.append("                // win a query; skipping the insert is invisible.")
+                b.append("                if (key[1] > -1.0e29) {")
+                b.append(f"                    const double val[2] = {{{v0}, {v1}}};")
+                b.append(f"                    hulls[{hid}].insert(key, val, seq);")
+                b.append("                }")
+                b.append(f"                hull_seen[{hid}] = seq;")
+                b.append("            }")
+                b.append(f"            const double query[2] = {{{q0}, {q1}}};")
+                b.append("            double od[2] = {0.0, 0.0};")
+                b.append(f"            hulls[{hid}].query(query, {tb}, od);")
+                b.append("            const double s0 = od[0] * SCALE_D, "
+                         "s1 = od[1] * SCALE_D;")
+                b.append("            const long long t0 = (long long)s0, "
+                         "t1 = (long long)s1;")
+                b.append(f"            ho{2 * h} = ({ctx.elem})t0;")
+                b.append(f"            ho{2 * h + 1} = ({ctx.elem})t1;")
+                b.append(f"            if ((double)t0 != s0 || (double)t1 != s1 "
+                         f"|| ho{2 * h} != t0 || ho{2 * h + 1} != t1)")
+                b.append('                throw std::runtime_error('
+                         '"hull output not representable at the fixed-point '
+                         'scale");')
+                b.append("        }")
+            b.append(f"        (void)ho{2 * h}; (void)ho{2 * h + 1};")
+
+        # attn_direct reads pre-attention x; out_proj rows read the
+        # hull outputs ho{..} and apply first.
+        ad_rows = [r for r in range(dm)
+                   if attn_direct.indptr[r + 1] > attn_direct.indptr[r]]
+        opkept: list[tuple[int, list[int], list[float]]] = []
+        for r in range(dm):
+            if op_kept.indptr[r + 1] > op_kept.indptr[r]:
+                idxs, dat = row(op_kept, r)
+                opkept.append((r, [int(c) for c in idxs], list(dat)))
+        ad_def, ad_apply = fuse_direct(
+            attn_direct, ad_rows, "ad", (r for r, _i, _d in opkept),
+            f"L{li} attn_direct", elem=ctx.elem, xref=ctx.xref,
+        )
+
+        # ── FFN: direct map and activations read post-attention x ─
+        fd_rows = [r for r in range(dm)
+                   if ffn_direct.indptr[r + 1] > ffn_direct.indptr[r]]
+        neuron_blocks: dict[int, list[str]] = {}
+        for j in live:
+            g = row_int(fi, j, ctx.xref, f"L{li} ff_gate")
+            v = row_int(fi, ffn + j, ctx.xref, f"L{li} ff_value")
+            nb = [f"        {ctx.elem} a{j};"]
+            nb.append(f"        {{ const {ctx.elem} g = {g}; "
+                      f"const {ctx.elem} v = {v}; "
+                      f"a{j} = g > 0 ? shr(g*v) : 0; }}")
+            neuron_blocks[j] = nb
+        # ff_out rows read the ReGLU activations a{..}.
+        fokept: list[tuple[int, list[int], list[float]]] = []
+        for r in range(dm):
+            if fo_kept.indptr[r + 1] > fo_kept.indptr[r]:
+                idxs, dat = row(fo_kept, r)
+                fokept.append((r, [int(c) for c in idxs], list(dat)))
+        fd_def, fd_apply = fuse_direct(
+            ffn_direct, fd_rows, "fd", (r for r, _i, _d in fokept),
+            f"L{li} ffn_direct", elem=ctx.elem, xref=ctx.xref,
+        )
+
+        plans.append({
+            "li": li, "lookup": lookup, "head_blocks": head_blocks,
+            "ad_def": ad_def, "opkept": opkept, "ad_apply": ad_apply,
+            "fd_def": fd_def, "live": live, "neuron_blocks": neuron_blocks,
+            "fokept": fokept, "fd_apply": fd_apply,
+        })
+    return plans
+
+
+
 def generate_source(model, step_spec: dict | None = None, experts=None,
                     seq_module_core: str | None = None) -> tuple[str, int, bool]:
     """Return ``(source, memory_head_count, has_machine_step)``.
@@ -810,399 +1210,24 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit = lines.append
 
     body: list[str] = []  # per-layer member functions
-    hull_tiebreak: list[int] = []  # flat hull id -> latest?
-    mem_hulls: list[list[int]] = [[] for _ in range(16)]  # group -> flat hull ids
-    mem_fallback_hulls: list[int] = []  # memory hulls kept on the hull path
-    n_memory_heads = 0
-    n_hull_heads = 0  # heads still on real hulls
-    # Running-argmax registers for constant-query heads, keyed by
-    # (union lookup id, value pair): the union pass allocates in head-scan
-    # order, expert passes resolve through the fold's lookup provenance.
-    reg_of: dict[tuple[int, int], int] = {}
 
     elem = "int"
     f_bits = 1
     inv_scale = f"0x1p-{f_bits}"
+    ctx = EmitterContext(elem=elem, E=E, inv_scale=inv_scale)
 
-    def xref(i):
-        return f"x[{i}]"
-
-    def dref(i):
-        return f"({inv_scale}*(double)x[{i}])"
-
-    def row_int(csr_m, r, ref, where):
-        return expr_int(*row(csr_m, r), ref, where)
-
-    def row_raw(indices, data, ref, where):
-        return expr_int(indices, data, ref, where)
-
-    def plan_model(mdl, label, union_lookup_of=None):
-        """Per-layer emission plans for one model.
-
-        The union pass (union_lookup_of is None) allocates the shared engine
-        state -- hull ids, the memory-structure insert targets, and the
-        running-argmax registers keyed by (lookup id, value pair) -- in
-        head-scan order.  Expert passes resolve their heads onto that state
-        through the fold's lookup provenance and never allocate: an expert
-        head whose classification disagrees with the union's is a hard
-        error, because a per-expert hull would accumulate divergent history
-        across routed steps.
-        """
-        nonlocal n_memory_heads, n_hull_heads
-        is_union = union_lookup_of is None
-        dm = mdl.tok.weight.shape[1]
-        nh = mdl.attn[0].num_heads
-        plans: list[dict] = []
-        for li in range(len(mdl.attn)):
-            check_ffn_kinds(mdl, li)
-            ip = csr(mdl.attn[li].in_proj_weight)
-            op = csr(mdl.attn[li].out_proj.weight)
-            fi = csr(mdl.ff_in[li].weight)
-            fo = csr(mdl.ff_out[li].weight)
-            ffn = fo.shape[1]
-            kinds = mdl.head_kinds[li]
-            ffn_kinds = mdl.ffn_kinds[li]
-            tiebreak = mdl.head_tiebreak[li]
-            groups = mdl.head_cache_groups[li]
-            mem_groups = mdl.head_memory_groups[li]
-            lookup_ids = mdl.head_lookup_ids[li]
-            pairs = mdl.head_pairs[li]
-
-            lookup = [h for h in range(nh) if kinds[h] == 1]
-            passthrough = [h for h in range(nh) if kinds[h] == 2]
-            for h in lookup:
-                if not tiebreak[h]:
-                    raise RuntimeError(
-                        f"{label} L{li} head {h}: AVERAGE tie-break can return "
-                        "fractional hull outputs"
-                    )
-
-            # Shared hulls, first-seen in ascending head order (engine order).
-            # Expert hull ids exist only for the hull_seen live-insert guard;
-            # only the union's memory hulls receive insert_write tokens.
-            hull_base = len(hull_tiebreak)
-            hull_of_group: dict[int, int] = {}
-            hull_of_head: dict[int, int] = {}
-            for h in lookup:
-                g = groups[h]
-                if g < 0:
-                    raise RuntimeError(f"{label} L{li} head {h}: negative cache group")
-                if g not in hull_of_group:
-                    hull_of_group[g] = hull_base + len(hull_of_group)
-                    hull_tiebreak.append(int(tiebreak[h]))
-                hull_of_head[h] = hull_of_group[g]
-                if mem_groups[h] >= 0 and is_union:
-                    mem_hulls[mem_groups[h]].append(hull_of_head[h])
-                    n_memory_heads += 1
-
-            # Structural passthrough/erase fusion: fold kind-2 heads and
-            # neurons into direct D->D residual maps (no hull/ReGLU needed).
-            pt_cols = [2 * h + c for h in passthrough for c in range(2)]
-            attn_direct = compose(op, pt_cols, ip[[2 * dm + c for c in pt_cols], :])
-            op_kept = zero_columns(op, pt_cols)
-
-            lookup_cols = {2 * h + c for h in lookup for c in range(2)}
-            for c in np.unique(op_kept.indices):
-                if int(c) not in lookup_cols:
-                    raise RuntimeError(
-                        f"{label} L{li}: out_proj column {int(c)} survives at a "
-                        "non-lookup head slot"
-                    )
-
-            pt_j = [j for j in range(ffn) if ffn_kinds[j] == 2]
-            ffn_direct = compose(fo, pt_j, fi[[ffn + j for j in pt_j], :])
-            fo_kept = zero_columns(fo, pt_j)
-            live = sorted(int(j) for j in np.unique(fo_kept.indices))
-
-            # Per-head emission blocks (each self-contained: it defines
-            # ho{2h} and ho{2h+1}), keyed by head.
-            head_blocks: dict[int, list[str]] = {}
-
-            # ── Attention: hull heads, then residual updates ─────────
-            for h in lookup:
-                b = head_blocks.setdefault(h, [])
-                hid = hull_of_head[h]
-                tb = "TieBreak::LATEST" if tiebreak[h] else "TieBreak::AVERAGE"
-                # Eligibility decisions live in model/classify.py, shared
-                # in model/classify.py, the single license source.
-                q0_idx, q0_dat = row(ip, 2 * h)
-                q1_idx, q1_dat = row(ip, 2 * h + 1)
-                qx_terms = list(zip(q0_dat, q0_idx, strict=True))
-                qy_terms = list(zip(q1_dat, q1_idx, strict=True))
-                mem_terms = None
-                fused = mem_groups[h] == MEMORY_GROUP_FUSED
-                if mem_groups[h] >= 0 or fused:
-                    mem_terms = memory_query(
-                        qx_terms, qy_terms, one_id=mdl.one_slot,
-                    )
-                mem_ok = mem_terms is not None
-                if not is_union and (mem_groups[h] >= 0 or fused) and not mem_ok:
-                    raise RuntimeError(
-                        f"{label} L{li} head {h}: memory head is not "
-                        "structure-eligible; a per-expert hull would diverge"
-                    )
-                if fused and is_union:
-                    raise RuntimeError(
-                        f"{label} L{li} head {h}: fused reads are expert-only"
-                    )
-
-                reg_q = None
-                reg_score = None
-                v0_i = v1_i = None
-                if not mem_ok:
-                    reg_q = register_query(qx_terms, qy_terms,
-                                           one_id=mdl.one_slot,
-                                           latest=bool(tiebreak[h]))
-                    if reg_q is not None:
-                        # The integer score form is part of the register
-                        # license: qx == qy > 0 makes the score a positive
-                        # multiple of kx + ky, and the clear gate an exact
-                        # zero test -- no f64 in the fold or the compare.
-                        k0_idx, k0_dat = row(ip, dm + 2 * h)
-                        k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
-                        reg_score = integer_score_terms(
-                            reg_q[0], reg_q[1],
-                            list(zip(k0_dat, k0_idx, strict=True)),
-                            list(zip(k1_dat, k1_idx, strict=True)),
-                        )
-                        if reg_score is None:
-                            reg_q = None
-                    if reg_q is not None:
-                        try:
-                            v0_i = expr_int(*row(ip, 2 * dm + 2 * h),
-                                             xref, f"{label} L{li} reg v0")
-                            v1_i = expr_int(*row(ip, 2 * dm + 2 * h + 1),
-                                             xref, f"{label} L{li} reg v1")
-                        except RuntimeError:
-                            reg_q = None
-                reg_ok = reg_q is not None
-
-                if mem_ok:
-                    # Memory-group lookup served by the exact nearest-address
-                    # structure. Nearest address wins and equal-distance ties
-                    # use the latest write. The hull remains empty by design.
-                    g = mem_groups[h]
-                    qi_expr = expr_int([i for _c, i in mem_terms],
-                                        [c for c, _i in mem_terms],
-                                        xref, f"{label} L{li} mem query")
-                    k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
-                    guard = integer_score_terms(
-                        1.0, 1.0, [],
-                        list(zip(k1_dat, k1_idx, strict=True)),
-                    )
-                    b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
-                    b.append("        {")
-                    b.append(f"            if (hull_seen[{hid}] != {E}seq) {{")
-                    if guard is not None:
-                        # A live (unrescinded) K row means the model would
-                        # insert into a memory hull, which this engine cannot
-                        # do; the clear gate is an exact zero test.
-                        live_cond = " && ".join(
-                            f"x[{g_id}] == 0" for g_id in guard[1]
-                        ) or "true"
-                        b.append(f"                if ({live_cond})")
-                    else:
-                        k1 = expr_dbl(*row(ip, dm + 2 * h + 1), dref)
-                        b.append(f"                const double kyg = {k1};")
-                        b.append("                if (kyg > -1.0e29)")
-                    b.append('                    throw std::runtime_error('
-                             '"live forward insert into a memory-group hull");')
-                    b.append(f"                hull_seen[{hid}] = {E}seq;")
-                    b.append("            }")
-                    b.append(f"            const long long qi = shr2({qi_expr});")
-                    b.append("            long long mo[2] = {0, 0};")
-                    if fused:
-                        # Fused 64K-span read (expert folds): the group is
-                        # the address's own high nibble; the exact mask
-                        # downstream zeroes any non-exact winner, and (0,0)
-                        # is exactly the empty-structure result.
-                        b.append("            if ((unsigned long long)qi >> 16 == 0)")
-                        b.append(f"                {E}mem_query((int)(qi >> 12), "
-                                 "qi & 4095, mo);")
-                    else:
-                        # Group dispatch: qi is the address minus this group's
-                        # base, so qi in [0, 4096) iff the address falls in this
-                        # group.  Other groups' contributions are gate-zeroed
-                        # downstream, and (0,0) is exactly the empty-group result.
-                        b.append("            if ((unsigned long long)qi >> 12 == 0)")
-                        b.append(f"                {E}mem_query({g}, qi, mo);")
-                    b.append(f"            ho{2 * h} = ({elem})(mo[0] << F);")
-                    b.append(f"            ho{2 * h + 1} = ({elem})(mo[1] << F);")
-                    b.append("        }")
-                elif reg_ok:
-                    # Register index: allocated by the union in scan order,
-                    # resolved by experts through the fold's provenance so
-                    # every model folds into / reads the same register.
-                    lu_id, pair = lookup_ids[h], pairs[h]
-                    if is_union:
-                        key = (lu_id, pair)
-                        if key in reg_of:
-                            raise RuntimeError(
-                                f"union L{li} head {h}: register key {key} repeated"
-                            )
-                        r = reg_of[key] = len(reg_of)
-                    else:
-                        r = reg_of.get((union_lookup_of.get(lu_id, -1), pair))
-                        if r is None:
-                            raise RuntimeError(
-                                f"{label} L{li} head {h}: constant-query head "
-                                f"has no union register (lookup {lu_id} pair {pair})"
-                            )
-                    score_terms, gate_ids = reg_score
-                    s_expr = expr_int(
-                        [i for _c, i in score_terms],
-                        [c for c, _i in score_terms],
-                        xref, f"{label} L{li} reg score",
-                    )
-                    live_cond = " && ".join(
-                        f"x[{g_id}] == 0" for g_id in gate_ids
-                    ) or "true"
-                    b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
-                    b.append("        {")
-                    b.append(f"            if ({live_cond}) {{  // live: fold into the running argmax")
-                    b.append(f"                const long long s = {s_expr};")
-                    b.append(f"                if (!{E}reg_any[{r}] || s >= {E}reg_s[{r}]) {{")
-                    b.append(f"                    {E}reg_any[{r}] = true;")
-                    b.append(f"                    {E}reg_s[{r}] = s;")
-                    b.append(f"                    {E}reg_v0[{r}] = {v0_i};")
-                    b.append(f"                    {E}reg_v1[{r}] = {v1_i};")
-                    b.append("                }")
-                    b.append("            }")
-                    b.append(f"            ho{2 * h} = {E}reg_any[{r}] ? {E}reg_v0[{r}] : 0;")
-                    b.append(f"            ho{2 * h + 1} = {E}reg_any[{r}] ? {E}reg_v1[{r}] : 0;")
-                    b.append("        }")
-                else:
-                    if not is_union:
-                        raise RuntimeError(
-                            f"{label} L{li} head {h}: expert lookup head needs a "
-                            "real hull; refusing (its history would diverge from "
-                            "the union's across routed steps)"
-                        )
-                    n_hull_heads += 1
-                    if mem_groups[h] >= 0:
-                        mem_fallback_hulls.append(hid)
-                    # Q/K/V straight to double: the hull resolves in double.
-                    q0 = expr_dbl(*row(ip, 2 * h), dref)
-                    q1 = expr_dbl(*row(ip, 2 * h + 1), dref)
-                    k0 = expr_dbl(*row(ip, dm + 2 * h), dref)
-                    k1 = expr_dbl(*row(ip, dm + 2 * h + 1), dref)
-                    v0 = expr_dbl(*row(ip, 2 * dm + 2 * h), dref)
-                    v1 = expr_dbl(*row(ip, 2 * dm + 2 * h + 1), dref)
-                    b.append(f"        {elem} ho{2 * h}, ho{2 * h + 1};")
-                    b.append("        {")
-                    b.append(f"            if (hull_seen[{hid}] != seq) {{")
-                    b.append(f"                const double key[2] = {{{k0}, {k1}}};")
-                    b.append("                // clear_key-gated tokens (ky -= 1e30) can never")
-                    b.append("                // win a query; skipping the insert is invisible.")
-                    b.append("                if (key[1] > -1.0e29) {")
-                    b.append(f"                    const double val[2] = {{{v0}, {v1}}};")
-                    b.append(f"                    hulls[{hid}].insert(key, val, seq);")
-                    b.append("                }")
-                    b.append(f"                hull_seen[{hid}] = seq;")
-                    b.append("            }")
-                    b.append(f"            const double query[2] = {{{q0}, {q1}}};")
-                    b.append("            double od[2] = {0.0, 0.0};")
-                    b.append(f"            hulls[{hid}].query(query, {tb}, od);")
-                    b.append("            const double s0 = od[0] * SCALE_D, "
-                             "s1 = od[1] * SCALE_D;")
-                    b.append("            const long long t0 = (long long)s0, "
-                             "t1 = (long long)s1;")
-                    b.append(f"            ho{2 * h} = ({elem})t0;")
-                    b.append(f"            ho{2 * h + 1} = ({elem})t1;")
-                    b.append(f"            if ((double)t0 != s0 || (double)t1 != s1 "
-                             f"|| ho{2 * h} != t0 || ho{2 * h + 1} != t1)")
-                    b.append('                throw std::runtime_error('
-                             '"hull output not representable at the fixed-point '
-                             'scale");')
-                    b.append("        }")
-                b.append(f"        (void)ho{2 * h}; (void)ho{2 * h + 1};")
-
-            # Direct-map (passthrough/erase slot hygiene) emission with a
-            # peephole: the two-phase capture+apply pair exists so reads
-            # precede the phase's writes, so a row whose operands are
-            # untouched by earlier statements of the phase collapses to ONE
-            # statement at apply position -- an erase row (diagonal -1,
-            # target unwritten) becomes plain assignment.  Scanned in apply
-            # order, tracking written slots, so the transform is exact.
-            def fuse_direct(mat, rows, var, pre_written, label):
-                defs, applies = [], []
-                written = set(pre_written)
-                for r in rows:
-                    idxs, dat = row(mat, r)
-                    terms = list(zip(idxs, dat, strict=True))
-                    diag = dict(terms).get(r)
-                    rest = [(i, c) for i, c in terms if i != r]
-                    support = {int(i) for i, _ in rest}
-                    if diag == -1.0 and r not in written and not support & written:
-                        if rest:
-                            e = expr_int([i for i, _ in rest],
-                                         [c for _, c in rest],
-                                         xref, f"{label} fused")
-                            applies.append(f"        x[{r}] = {e};")
-                        else:
-                            applies.append(f"        x[{r}] = 0;")
-                    elif diag is None and not support & written:
-                        e = expr_int(idxs, dat, xref, f"{label} fused")
-                        applies.append(f"        x[{r}] += {e};")
-                    else:
-                        defs.append(f"        const {elem} {var}{r} = "
-                                    f"{row_int(mat, r, xref, label)};")
-                        applies.append(f"        x[{r}] += {var}{r};")
-                    written.add(int(r))
-                return defs, applies
-
-            # attn_direct reads pre-attention x; out_proj rows read the
-            # hull outputs ho{..} and apply first.
-            ad_rows = [r for r in range(dm)
-                       if attn_direct.indptr[r + 1] > attn_direct.indptr[r]]
-            opkept: list[tuple[int, list[int], list[float]]] = []
-            for r in range(dm):
-                if op_kept.indptr[r + 1] > op_kept.indptr[r]:
-                    idxs, dat = row(op_kept, r)
-                    opkept.append((r, [int(c) for c in idxs], list(dat)))
-            ad_def, ad_apply = fuse_direct(
-                attn_direct, ad_rows, "ad", (r for r, _i, _d in opkept),
-                f"L{li} attn_direct",
-            )
-
-            # ── FFN: direct map and activations read post-attention x ─
-            fd_rows = [r for r in range(dm)
-                       if ffn_direct.indptr[r + 1] > ffn_direct.indptr[r]]
-            neuron_blocks: dict[int, list[str]] = {}
-            for j in live:
-                g = row_int(fi, j, xref, f"L{li} ff_gate")
-                v = row_int(fi, ffn + j, xref, f"L{li} ff_value")
-                nb = [f"        {elem} a{j};"]
-                nb.append(f"        {{ const {elem} g = {g}; "
-                          f"const {elem} v = {v}; "
-                          f"a{j} = g > 0 ? shr(g*v) : 0; }}")
-                neuron_blocks[j] = nb
-            # ff_out rows read the ReGLU activations a{..}.
-            fokept: list[tuple[int, list[int], list[float]]] = []
-            for r in range(dm):
-                if fo_kept.indptr[r + 1] > fo_kept.indptr[r]:
-                    idxs, dat = row(fo_kept, r)
-                    fokept.append((r, [int(c) for c in idxs], list(dat)))
-            fd_def, fd_apply = fuse_direct(
-                ffn_direct, fd_rows, "fd", (r for r, _i, _d in fokept),
-                f"L{li} ffn_direct",
-            )
-
-            plans.append({
-                "li": li, "lookup": lookup, "head_blocks": head_blocks,
-                "ad_def": ad_def, "opkept": opkept, "ad_apply": ad_apply,
-                "fd_def": fd_def, "live": live, "neuron_blocks": neuron_blocks,
-                "fokept": fokept, "fd_apply": fd_apply,
-            })
-        return plans
-
-    layer_plans = plan_model(model, "union")
+    layer_plans = plan_model(ctx, model, "union")
     expert_plans = [
-        (exp, plan_model(exp["model"], f"expert {exp['name']}",
+        (exp, plan_model(ctx, exp["model"], f"expert {exp['name']}",
                          exp["union_lookup_of"]))
         for exp in experts
     ]
-    n_regs = len(reg_of)
+    hull_tiebreak = ctx.hull_tiebreak
+    mem_hulls = ctx.mem_hulls
+    mem_fallback_hulls = ctx.mem_fallback_hulls
+    n_memory_heads = ctx.n_memory_heads
+    n_hull_heads = ctx.n_hull_heads
+    n_regs = len(ctx.reg_of)
     layer_sig = f"{elem}* x"
     if seq_mode:
         layer_sig = f"Eng& E, {layer_sig}"
@@ -1454,7 +1479,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("        const double key[2] = {(double)kx_f, (double)ky_f};")
         emit("        const double val[2] = {(double)(value & 0xFF), (double)(addr & 0xFFFF)};")
         emit(f"        static const int offs[17] = {{{', '.join(map(str, hull_offs))}}};")
-        emit(f"        static const int ids[{len(hull_targets)}] = {{{', '.join(map(str, hull_targets))}}};")
+        emit(f"        static const int ids[{len(hull_targets)}] = {{{', '.join(str(i) for i in hull_targets)}}};")
         emit("        for (int i = offs[group]; i < offs[group + 1]; ++i) {")
         emit("            const int hid = ids[i];")
         emit("            if (hull_seen[hid] == seq) continue;")
@@ -1598,6 +1623,40 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
 
 class GeneratedWeightsEngine:
     """The 6502 transformer as generated exact-int32 C++."""
+
+    # Native methods bound straight off the pybind module (bind()): the hot
+    # loops call them with no wrapper frame in between.
+    machine_step: Callable
+    run: Callable
+    set_run_state: Callable
+    get_run_state: Callable
+    watch_read: Callable
+    watch_write: Callable
+    clear_watches: Callable
+    set_write_journal: Callable
+    set_read_lease: Callable
+    set_read_lease_seq: Callable
+    take_lease_served: Callable
+    clear_read_lease: Callable
+    clear_read_lease_addr: Callable
+    set_nmi: Callable
+    set_irq: Callable
+    clear_irq: Callable
+    engine_inject_write: Callable
+    seed_image: Callable
+    map_region: Callable
+    set_mapper_mmc3: Callable
+    set_mapper_mmc1: Callable
+    clear_mapper: Callable
+    read_ram: Callable
+    dump_ram: Callable
+    attach_seq: Callable
+    detach_seq: Callable
+    add_window: Callable
+    clear_windows: Callable
+    jit_hot: Callable
+    window_shape: Callable
+    digest: str
 
     def __init__(self, model, *, step_spec: dict | None = None,
                  experts=None, cache_key: str | None = None,

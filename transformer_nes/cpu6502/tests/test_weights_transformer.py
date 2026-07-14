@@ -9,6 +9,8 @@ codegen C++ engine, lockstep against the reference oracle.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from transformer_nes.cpu6502.backends import reference
@@ -184,7 +186,7 @@ def test_sequence_experts_match_per_step():
 
     fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
               "ea", "data", "halted")
-    configs = (
+    configs: tuple[dict[str, Any], ...] = (
         {"sequence_windows": windows},           # pinned module + shape table
         {},                                      # shape table only
         {"shape_library": ()},                   # pure per-instruction
@@ -264,7 +266,10 @@ def test_store_windows_match_per_step():
     fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
               "ea", "data", "halted", "w_addr", "w_value")
     traces, rams = [], []
-    for cfg in ({"sequence_windows": windows}, {"shape_library": ()}):
+    configs2: tuple[dict[str, Any], ...] = (
+        {"sequence_windows": windows}, {"shape_library": ()},
+    )
+    for cfg in configs2:
         m = Cpu6502TransformerMachine(bcd=False, **cfg)
         m.load_image(bytes(image), start_pc=0x0400)
         chunks = []
@@ -362,8 +367,11 @@ def test_jit_discovers_runtime_window():
     fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
               "ea", "data", "halted")
     traces = []
-    for cfg in ({"jit_interval": 1, "jit_min_count": 64},
-                {"shape_library": ()}):
+    configs3: tuple[dict[str, Any], ...] = (
+        {"jit_interval": 1, "jit_min_count": 64},
+        {"shape_library": ()},
+    )
+    for cfg in configs3:
         m = Cpu6502TransformerMachine(bcd=False, **cfg)
         m.load_image(bytes(image), start_pc=0x0400)
         if "shape_library" not in cfg:

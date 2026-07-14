@@ -15,6 +15,7 @@ import os
 import numpy as np
 import pytest
 
+from transformer_nes.nes.bus import Bus, ReferenceCore
 from transformer_nes.nes.cartridge import Cartridge
 from transformer_nes.nes.console import FRAME_CYCLES, J_EVENT, Console
 
@@ -73,7 +74,7 @@ def make_cart() -> Cartridge:
 
 
 def ram(console: Console, addr: int) -> int:
-    if console.uses_engine_bus:  # weights run loop: mirror in C++
+    if not isinstance(console.bus, Bus):  # weights run loop: mirror in C++
         return console.rt.read_ram(addr)
     return console.bus.ram[addr]
 
@@ -227,7 +228,10 @@ def test_mapper_irq_rearm_chains_within_a_frame():
 
 def test_irq_sources_share_the_cpu_line_without_clearing_each_other():
     console = Console(make_cart(), backend="reference")
-    cpu = console.bus.core.cpu
+    assert isinstance(console.bus, Bus)
+    core = console.bus.core
+    assert isinstance(core, ReferenceCore)
+    cpu = core.cpu
 
     console.set_irq("mapper")
     console.set_irq("apu")

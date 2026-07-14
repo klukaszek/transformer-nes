@@ -6,8 +6,8 @@ import os
 
 import pytest
 
-from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
-from transformer_nes.cpu6502.backends.evaluator import run_program as graph_run
+from transformer_nes.cpu6502.backends.graph import Cpu6502Runtime
+from transformer_nes.cpu6502.backends.graph import run_program as graph_run
 from transformer_nes.cpu6502.backends.reference import run as ref_run
 from transformer_nes.cpu6502.spec import asm
 

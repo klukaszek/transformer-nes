@@ -26,6 +26,7 @@ import logging
 import os
 import time
 
+from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.nes.apu import make_apu
 from transformer_nes.nes.bus import Bus, EngineBus, GraphCore, ReferenceCore
 from transformer_nes.nes.cartridge import Cartridge
@@ -220,8 +221,6 @@ class JournaledMapper:
 def profile_fallbacks(console, min_count: int) -> None:
     """Dump hot per-instruction-tier pcs with disassembly: the evidence
     that justifies a SHAPE_LIBRARY addition (ROADMAP START HERE item 4)."""
-    from transformer_nes.cpu6502.spec import OPCODES
-
     engine = getattr(console.rt, "engine", None)
     if engine is None or not hasattr(engine, "jit_hot"):
         logger.info("--profile requires the weights backend")
@@ -324,11 +323,9 @@ class Console:
         self.sprite0_scanline: int | None = None
         self.last_audio = None      # this frame's APU samples (float32 mono)
         self.irq_sources: set[str] = set()
-        # Snapshot-and-rebuild for the GRAPH evaluator only, whose
-        # Python-side token log genuinely grows: past this many tokens it
-        # reseeds from the RAM mirror at the next frame boundary (a quiet
-        # point: no pending NMI or read pause).  The native engines'
-        # attention state is O(1) in the token log and never rebuilds.
+        # Snapshot-and-rebuild for the GRAPH evaluator only (its Python
+        # token log grows; native engine state is O(1)): past this many
+        # tokens, reseed from RAM at the next frame boundary.
         if checkpoint_tokens is None:
             checkpoint_tokens = 2_000_000
         self.checkpoint_tokens = checkpoint_tokens
@@ -377,19 +374,20 @@ class Console:
                 )
             core = ReferenceCore(cpu)
         elif backend == "graph":
-            from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
+            from transformer_nes.cpu6502.backends.graph import Cpu6502Runtime
 
             rt = Cpu6502Runtime(bcd=False)
             rt.boot_image(list(image), start_pc=start_pc, state=state)
             core = GraphCore(rt)
         else:
             raise ValueError(f"unknown backend {backend!r}")
-        self.bus = Bus(core, image)
-        self.read_cpu = lambda addr: self.bus.ram[addr & 0xFFFF]
+        bus = Bus(core, image)
+        self.bus = bus
+        self.read_cpu = lambda addr: bus.ram[addr & 0xFFFF]
 
         def poke(addr: int, value: int) -> None:
             core.poke(addr, value)
-            self.bus.ram[addr & 0xFFFF] = value & 0xFF
+            bus.ram[addr & 0xFFFF] = value & 0xFF
         self.poke_cpu = poke
 
         def poke_region(base: int, data: bytes) -> None:
@@ -400,11 +398,9 @@ class Console:
 
     def attach_devices(self):
         ppu_dev = JournaledPpu(self.ppu, self.journal, self)
-        # Journaled writes never pause: PPU scroll/address/VRAM/OAM traffic
-        # and pulse/triangle/noise registers are order-only state consumed
-        # at drain boundaries.  $2000 stays pausing (its NMI edge must reach
-        # check_interrupt_lines at the write), as do $4010-$4017 (DMC/frame
-        # IRQ acks, DMA stall, controller strobe vs. serial-read leases).
+        # Journaled writes never pause: order-only state, consumed at
+        # drain boundaries.  $2000 pauses (NMI edge at the write), as do
+        # $4010-$4017 (IRQ acks, DMA stall, strobe vs. serial leases).
         self.bus.attach(ppu_dev, 0x2000, 0x3FFF,      # registers + mirrors
                         journal_writes=lambda a: (a & 7) != 0)
         self.bus.attach(self.dma, 0x4014, 0x4014)     # OAM DMA
@@ -456,7 +452,7 @@ class Console:
         self.ppu.mirroring = mode
 
     def snapshot(self) -> tuple[bytes, dict]:
-        if self.uses_engine_bus:
+        if not isinstance(self.bus, Bus):
             return self.rt.dump_ram(), self.rt.get_state()
         ram = bytes(self.bus.ram)
         core = self.bus.core
@@ -487,17 +483,15 @@ class Console:
     # ── CPU driving ─────────────────────────────────────────────────
 
     def set_nmi(self) -> None:
-        if self.uses_engine_bus:
-            self.rt.set_nmi()
-        else:
+        if isinstance(self.bus, Bus):
             self.bus.set_nmi()
+        else:
+            self.rt.set_nmi()
 
     def _sync_irq(self) -> None:
         action = "set_irq" if self.irq_sources else "clear_irq"
-        if self.uses_engine_bus:
-            getattr(self.rt, action)()
-        else:
-            getattr(self.bus, action)()
+        target = self.bus if isinstance(self.bus, Bus) else self.rt
+        getattr(target, action)()
 
     def set_irq(self, source: str = "mapper") -> None:
         self.irq_sources.add(source)
@@ -521,10 +515,11 @@ class Console:
         """Run the CPU until the console clock reaches target cycles."""
         if self.halted:
             return
-        if self.uses_engine_bus:
+        bus = self.bus
+        if isinstance(bus, EngineBus):
             if target <= self.cycles:
                 return
-            out = self.bus.run(
+            out = bus.run(
                 1 << 60,
                 max_cycles=target - self.cycles,
                 on_pause=lambda out: self.check_interrupt_lines(),
@@ -534,7 +529,6 @@ class Console:
             if out["reason"] in ("halt", "trap"):
                 self.halted = True
         else:
-            bus = self.bus
             while bus.cycles < target and not bus.halted:
                 bus.step()
                 self.check_interrupt_lines()
@@ -552,11 +546,9 @@ class Console:
         # the mapper's scanline IRQ (which also marks the render split).
         # Each PPU status transition invalidates any $2002 read lease.
         self.journal_phase = PHASE_VISIBLE
-        # The event list is dynamic: an IRQ handler may re-arm its target
-        # for a SECOND IRQ later in the same frame (CV3 chains one at the
-        # HUD seam and one a line below doing the real raster switch), so
-        # re-poll the mapper after every delivery.  IRQ lines must strictly
-        # increase within a frame; sprite-0 fires at most once.
+        # An IRQ handler may re-arm a SECOND IRQ in the same frame (CV3's
+        # HUD chain), so re-poll the mapper after every delivery.  IRQ
+        # lines strictly increase per frame; sprite-0 fires at most once.
         fired_sprite0 = False
         last_irq_line = -1
         for _ in range(8):  # safety cap on mid-frame events
@@ -633,7 +625,7 @@ class Console:
 
         if (
             self.checkpoint_tokens
-            and not self.uses_engine_bus
+            and isinstance(self.bus, Bus)
             and not self.halted
             and self.bus.log_tokens >= self.checkpoint_tokens
             and self.bus.checkpoint()

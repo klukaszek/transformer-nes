@@ -25,6 +25,7 @@ def test_exported_weights_run_in_torch(tmp_path):
     assert (tmp_path / "weights.safetensors").exists()
 
     spec = importlib.util.spec_from_file_location("torch_runner", RUNNER)
+    assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules["torch_runner"] = mod
     spec.loader.exec_module(mod)

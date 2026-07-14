@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.evaluator import RUNTIME_READ_DIMS, Cpu6502Runtime
+from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.cpu6502.backends.weights.experts import (
     build_opcode_experts,
     build_sequence_expert,
@@ -31,6 +31,12 @@ from transformer_nes.cpu6502.backends.weights.windows import (
 from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_nes.graph.core import ProgramGraph
+from transformer_nes.model.engine_gen import (
+    GeneratedWeightsEngine,
+    SequenceModule,
+    engine_config_key,
+    seqmod_config_key,
+)
 from transformer_nes.model.weights import build_model
 from transformer_nes.scheduler.milp import asap_schedule
 
@@ -105,11 +111,6 @@ class Cpu6502TransformerMachine:
         # exact fixed-point int32 residual.  The grouped memory lookup keeps
         # K-side address scores below 2^24, so float32 Q/K rounding still
         # distinguishes adjacent high addresses.
-        from transformer_nes.model.engine_gen import (
-            GeneratedWeightsEngine,
-            engine_config_key,
-        )
-
         if expert_schedule not in ("asap", "milp"):
             raise ValueError(f"unknown expert_schedule {expert_schedule!r}")
         self.expert_schedule = expert_schedule
@@ -126,7 +127,7 @@ class Cpu6502TransformerMachine:
         ]
         shapes = tuple(shape_library or ())
         cache_key = None
-        self.engine = None
+        engine = None
         if expert_schedule == "asap":
             expert_bytes = [
                 int(b) for b in (expert_opcodes or ()) if int(b) in OPCODES
@@ -138,10 +139,10 @@ class Cpu6502TransformerMachine:
                 bcd=bcd, expert_bytes=expert_bytes,
                 extra=f"shapes={shape_tag}",
             )
-            self.engine = GeneratedWeightsEngine.from_cache(cache_key)
-            if self.engine is not None:
-                logger.info("engine cache hit (%d experts)", self.engine.n_experts)
-        if self.engine is None:
+            engine = GeneratedWeightsEngine.from_cache(cache_key)
+            if engine is not None:
+                logger.info("engine cache hit (%d experts)", engine.n_experts)
+        if engine is None:
             shapes_meta: list[dict] = []
             experts = build_opcode_experts(
                 self.pg, expert_opcodes,
@@ -151,11 +152,12 @@ class Cpu6502TransformerMachine:
             if shapes:
                 shape_experts, shapes_meta = build_shape_experts(self.pg, shapes)
                 experts.extend(shape_experts)
-            self.engine = GeneratedWeightsEngine(
+            engine = GeneratedWeightsEngine(
                 self.model, step_spec=self.step_spec(),
                 experts=experts, cache_key=cache_key,
                 shapes_meta=shapes_meta,
             )
+        self.engine = engine
         # The ROM's windows land in a tiny per-ROM module attached through
         # the core's function-pointer hook (no core recompile per ROM).
         self.seq_module = None
@@ -221,11 +223,6 @@ class Cpu6502TransformerMachine:
         """Compile-or-load the per-ROM sequence module and attach its window
         dispatch to the core engine.  A new ROM's window set costs one small
         TU (cached by digest); the 43 MB core is never re-emitted for it."""
-        from transformer_nes.model.engine_gen import (
-            SequenceModule,
-            seqmod_config_key,
-        )
-
         key = seqmod_config_key(
             core_digest=self.engine.digest, bcd=bcd, windows=windows
         )
@@ -374,12 +371,8 @@ class Cpu6502TransformerMachine:
         self.insert_write(addr & 0xFFFF, value & 0xFF)
 
     def inject_region(self, base: int, data: bytes):
-        """Bulk injection (mapper bank switches): one native call.
-
-        The engine inserts one WRITE token per byte, so the position
-        mirror advances with it -- a following inject_write in the same
-        pause servicing (MMC2/MMC4 repair the clobbered register byte)
-        must present the engine's exact sequence."""
+        """Bulk injection (mapper bank switches): one WRITE token per byte
+        engine-side, so the position mirror advances by len(data)."""
         base &= 0xFFFF
         data = bytes(data)
         self.ram[base:base + len(data)] = data

@@ -16,6 +16,7 @@ PPU's runtime nametable arrangement, MMC1 encoding: 0/1 single-screen,
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from transformer_nes.nes.cartridge import MIRROR_VERTICAL, Cartridge
 
@@ -37,9 +38,16 @@ def inject_region(mapper, base: int, data: bytes) -> None:
 
 class Mapper:
     """Common contract the console drives every mapper through: whether
-    PRG banks switch at runtime, and this frame's scanline IRQ (if any)."""
+    PRG banks switch at runtime, and this frame's scanline IRQ (if any).
+    The console wires the callbacks after boot/handoff; unwired ones stay
+    None (tests wire only what they observe)."""
 
     banked = False
+    poke: Callable[[int, int], None] | None = None
+    poke_region: Callable[[int, bytes], None] | None = None
+    on_mirroring: Callable[[int], None] | None = None
+    set_chr_banks: Callable | None = None
+    on_irq_ack: Callable[[], None] | None = None
 
     def irq_scanline(self) -> int | None:
         return None
@@ -164,6 +172,7 @@ class Mmc1(Mapper):
         if new_banks[1] != old_banks[1]:
             self.load_bank(0xC000, new_banks[1])
         # The store landed in machine memory before the pause: repair it.
+        assert self.poke is not None  # console-wired
         self.poke(addr, self.rom_byte(addr))
         if (self.control & 3) != old_mirroring and self.on_mirroring is not None:
             self.on_mirroring(self.control & 3)
@@ -280,6 +289,7 @@ class Mmc2(Mapper):
                 self.set_mmc2_banks(self.mmc2_banks())
         elif region == 0xF000 and self.on_mirroring is not None:
             self.on_mirroring(3 if value & 1 else 2)
+        assert self.poke is not None  # console-wired
         self.poke(addr, self.rom_byte(addr))
 
     def load_bank(self, base: int, bank: int) -> None:
@@ -371,6 +381,7 @@ class Mmc3(Mapper):
         elif reg == 0x8001:
             self.regs[self.bank_select & 7] = value
         elif reg == 0xA000:
+            assert self.on_mirroring is not None  # console-wired
             self.on_mirroring(3 if value & 1 else 2)
         elif reg == 0xC000:
             self.irq_latch = value
@@ -387,8 +398,10 @@ class Mmc3(Mapper):
             if old != new:
                 self.load_bank(0x8000 + i * BANK8, new)
         if self.chr_rom and reg in (0x8000, 0x8001):
+            assert self.set_chr_banks is not None  # console-wired
             self.set_chr_banks(self.chr_banks())
         # The store landed in machine memory before the pause: repair it.
+        assert self.poke is not None  # console-wired
         self.poke(addr, self.rom_byte(addr))
 
     def load_bank(self, base: int, bank: int) -> None:
@@ -411,6 +424,7 @@ class Mmc3(Mapper):
         elif reg == 0x8001:
             self.regs[self.bank_select & 7] = value
         elif reg == 0xA000:
+            assert self.on_mirroring is not None  # console-wired
             self.on_mirroring(3 if value & 1 else 2)
         elif reg == 0xC000:
             self.irq_latch = value
@@ -421,6 +435,7 @@ class Mmc3(Mapper):
         elif reg == 0xE001:
             self.irq_enabled = True
         if self.chr_rom and reg in (0x8000, 0x8001):
+            assert self.set_chr_banks is not None  # console-wired
             self.set_chr_banks(self.chr_banks())
 
 
@@ -487,6 +502,7 @@ class Mmc4(Mapper):
                 self.set_mmc4_banks(self.mmc4_banks())
         elif region == 0xF000 and self.on_mirroring is not None:
             self.on_mirroring(3 if value & 1 else 2)
+        assert self.poke is not None  # console-wired
         self.poke(addr, self.rom_byte(addr))
 
 
@@ -659,6 +675,7 @@ class Mmc5(Mapper):
             self.exram_mode = value & 3
         elif addr == 0x5105:
             self.nametable_map = value
+            assert self.on_mirroring is not None  # console-wired
             self.on_mirroring(value)
         elif addr == 0x5106:
             self.fill_tile = value
@@ -706,8 +723,10 @@ class Mmc5(Mapper):
             bank, is_ram = new[i]
             if is_ram and self.ram_writable():
                 self.prg_ram[(bank & 7) * BANK8 + (addr & 0x1FFF)] = value
+                assert self.poke is not None  # console-wired
                 self.poke(addr, value)
             else:
+                assert self.poke is not None  # console-wired
                 self.poke(addr, self.rom_byte(addr))
 
 

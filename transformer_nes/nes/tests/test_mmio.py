@@ -14,7 +14,7 @@ from collections import defaultdict
 
 import pytest
 
-from transformer_nes.cpu6502.backends.evaluator import Cpu6502Runtime
+from transformer_nes.cpu6502.backends.graph import Cpu6502Runtime
 from transformer_nes.cpu6502.backends.reference import Cpu6502
 from transformer_nes.nes.bus import Bus, EngineBus, GraphCore, ReferenceCore
 

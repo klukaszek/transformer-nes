@@ -242,14 +242,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
     dominated by the busiest layer's head/FFN demand rather than by
     liveness.  With balance=True a reverse-topological leveling pass
     re-places every op at the least-loaded legal phase within its
-    dependency window (ties -> latest, which also shortens lifetimes),
-    spreading persists and ReGLUs across the critical path's slack.
-
-    A persist-moving "hygiene sweep" used to follow the leveling; it was
-    excised 2026-07-13 after measurement: its cost priced attention-side
-    passthroughs only, and it LOST on total passthroughs and union
-    d_model once the FFN side was counted (the partial-objective trap,
-    PLAYBOOK lever 15).
+    dependency window (ties -> latest, which also shortens lifetimes).
     """
     log = log or logger.info
 
@@ -339,13 +332,9 @@ def milp_schedule(
 ):
     """Optimal-lifetime schedule: the per-expert certificate.
 
-    Minimizes total dim lifetime (every phase a value stays alive past its
-    producer is one passthrough/erase statement in the emitted engine, on
-    the attention OR FFN side) plus the attention passthrough-persistence
-    sum, under a width cap.  Earlier objectives were excised by
-    measurement 2026-07-13: "width" (the engine is nnz-bound, not
-    width-bound) and attention-only "hygiene" (a wash -- the solver dumped
-    carries into the unpriced FFN pool; PLAYBOOK lever 15).
+    Minimizes total dim lifetime (every phase a value outlives its
+    producer is one emitted passthrough/erase statement, attention or FFN
+    side) plus the attention passthrough sum, under a width cap.
 
     Args:
         max_layers: maximum number of transformer layers.

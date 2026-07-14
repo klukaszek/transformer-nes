@@ -40,6 +40,7 @@ from transformer_nes.attention.runtime import HullAttention, load_hull_ext
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.interpreter import build as build_6502_graph
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
+from transformer_nes.graph import core as graph_core
 from transformer_nes.graph.core import (
     InputDimension,
     LookUpDimension,
@@ -130,17 +131,19 @@ class Cpu6502Runtime:
         # caches that store it: WRITE -> memory reads, start -> start lookup,
         # STATE -> state lookup.
         self.memory_read_lus = []
-        self.start_lu = None
-        self.state_lu = None
+        start_lu = state_lu = None
         for lu in self.all_lookups:
             key_terms = set(lu.key_exprs_2d[0].terms.keys()) | set(lu.key_exprs_2d[1].terms.keys())
             value_first_dims = set(lu.value_exprs[0].terms.keys()) if lu.value_exprs else set()
             if self.byte_value in value_first_dims:
                 self.memory_read_lus.append(lu)
             elif self.is_start in key_terms:
-                self.start_lu = lu
+                start_lu = lu
             elif self.is_state in key_terms:
-                self.state_lu = lu
+                state_lu = lu
+        assert start_lu is not None and state_lu is not None
+        self.start_lu = start_lu
+        self.state_lu = state_lu
 
         self.share_identical_memory_caches()
         self.build_indexed_schedule()
@@ -472,6 +475,7 @@ class Cpu6502Runtime:
             if score > best_score:
                 best_score = score
                 best_name = name
+        assert best_name is not None  # STATE/HALT always compete
         return best_name
 
     def run(self, program: list[int], *, start_pc: int = 0x8000, max_steps: int = 100):
@@ -706,20 +710,15 @@ class Cpu6502Runtime:
 
 
 def graph_all_dims():
-    from transformer_nes.graph.core import graph_dims
-
-    return graph_dims
+    return graph_core.graph_dims
 
 
 def graph_all_lookups():
-    from transformer_nes.graph.core import graph_lookups
-
-    return graph_lookups
+    return graph_core.graph_lookups
 
 
 def find_builtin_dim(name: str):
-    from transformer_nes.graph import core as graph_core
-
+    # Module-attribute access on purpose: ``one`` rebinds at reset_graph.
     return getattr(graph_core, name)
 
 

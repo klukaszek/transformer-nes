@@ -18,6 +18,8 @@ import logging
 import os
 import time
 
+import numpy as np
+
 from transformer_nes.nes import build_dir
 from transformer_nes.nes.console import BUTTONS, Console
 from transformer_nes.nes.ppu import NES_PALETTE
@@ -65,8 +67,6 @@ DUMP_DIR = os.path.join(NES_DIR, "_debug_dumps")
 
 def debug_dump(console: Console) -> None:
     """F1: snapshot the frame + PPU/mapper state for offline analysis."""
-    import numpy as np
-
     os.makedirs(DUMP_DIR, exist_ok=True)
     ppu = console.ppu
     n = console.frame_index
@@ -252,17 +252,10 @@ def main() -> None:
     if record is not None:
         logger.info("recording input tape to %s", args.record)
     title = f"transformer-nes: {os.path.basename(args.rom)} ({args.backend})"
-    stats = run_app(console, title=title, scale=args.scale,
-                    max_frames=args.frames, record=record)
-
-    frames, emu = stats["frames"], stats["emu_seconds"]
-    if frames and emu > 0:
-        logger.info(
-            "%d frames, emulation %.1f ms/frame at 60 Hz pacing "
-            "(%.0f fps; sustained throughput: bench with tapes)%s",
-            frames, 1e3 * emu / frames, frames / emu,
-            " [HALTED]" if console.halted else "",
-        )
+    # Does not return on macOS (the process exits inside sapp_run); the
+    # run stats log from run_app's quit callback.
+    run_app(console, title=title, scale=args.scale,
+            max_frames=args.frames, record=record)
 
 
 if __name__ == "__main__":

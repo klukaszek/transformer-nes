@@ -2,8 +2,12 @@
 
 Any program expressible as an Append-Only Lookup Machine (ALM) can be
 built using these primitives and compiled into a transformer via
-milp_schedule.py + build_model.py.
+scheduler/milp.py + model/weights.py.
 """
+
+from __future__ import annotations
+
+from typing import TypeAlias
 
 BIG = 1e30  # large constant used to effectively zero-out attention keys (clear_key mechanism)
 
@@ -22,7 +26,7 @@ def expr_key(expr):
 class Expression:
     __slots__ = ("terms",)
 
-    def __init__(self, terms=None):
+    def __init__(self, terms: dict | None = None):
         if terms is None:
             self.terms = {}
         elif isinstance(terms, dict):
@@ -30,10 +34,10 @@ class Expression:
         else:
             raise TypeError
 
-    def copy(self):
+    def copy(self) -> Expression:
         return Expression(dict(self.terms))
 
-    def __add__(self, other):
+    def __add__(self, other) -> Expression:
         if isinstance(other, (int, float)):
             if other == 0:
                 return self.copy()
@@ -49,7 +53,7 @@ class Expression:
             return Expression(r)
         return NotImplemented
 
-    def __radd__(self, other):
+    def __radd__(self, other) -> Expression:
         if isinstance(other, (int, float)):
             if other == 0:
                 return self.copy()
@@ -58,7 +62,7 @@ class Expression:
             return Expression({other: 1}) + self
         return NotImplemented
 
-    def __sub__(self, other):
+    def __sub__(self, other) -> Expression:
         if isinstance(other, (int, float)):
             return self + (-other)
         if isinstance(other, Dimension):
@@ -72,7 +76,7 @@ class Expression:
             return Expression(r)
         return NotImplemented
 
-    def __rsub__(self, other):
+    def __rsub__(self, other) -> Expression:
         neg = Expression({d: -c for d, c in self.terms.items()})
         if isinstance(other, (int, float)):
             return neg + other
@@ -82,19 +86,19 @@ class Expression:
             return other + neg
         return NotImplemented
 
-    def __mul__(self, other):
+    def __mul__(self, other) -> Expression:
         if isinstance(other, (int, float)):
             if other == 0:
                 return Expression()
             return Expression({d: c * other for d, c in self.terms.items()})
         return NotImplemented
 
-    def __rmul__(self, other):
+    def __rmul__(self, other) -> Expression:
         if isinstance(other, (int, float)):
             return self.__mul__(other)
         return NotImplemented
 
-    def __neg__(self):
+    def __neg__(self) -> Expression:
         return Expression({d: -c for d, c in self.terms.items()})
 
     def __getitem__(self, dim):
@@ -206,6 +210,7 @@ class LookUp:
         self.query_exprs_2d = query_exprs_2d  # [qx_expr, qy_expr]
         self.key_exprs_2d = key_exprs_2d  # [kx_expr, ky_expr]
         self.tie_break = tie_break
+        self.memory_group: int | None = None  # tagged by memory_at / folds
         self.dims = [LookUpDimension(self, i) for i in range(len(value_exprs))]
         graph_lookups.append(self)
 
@@ -230,7 +235,11 @@ def make_multiply(a, b):
     return result
 
 
-def to_expr(x):
+# What to_expr coerces: the DSL's helpers accept any of these.
+ExprLike: TypeAlias = "Expression | Dimension | float"
+
+
+def to_expr(x: Expression | Dimension | float) -> Expression:
     if isinstance(x, Expression):
         return x
     if isinstance(x, Dimension):

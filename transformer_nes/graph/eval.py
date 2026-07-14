@@ -81,6 +81,7 @@ class ProgramEvaluator:
             if score >= best_score:
                 best_score = score
                 best = tvals
+        assert best is not None  # a non-empty log always has an argmax
         for i, dim in enumerate(lu.dims):
             v[dim] = best[i]
 
