@@ -8,7 +8,7 @@ The construction follows Percepta's WASM-in-a-transformer experiment ([Can LLMs 
 
 - **Python 3.11+**
 - **[uv](https://docs.astral.sh/uv/)** package manager
-- **C++17 compiler** — the hull-attention extension and the generated 6502
+- **C++26 compiler** — the hull-attention extension and the generated 6502
   engine are built via torch's cpp_extension (`clang++` on macOS, `g++` on
   Linux)
 
@@ -27,8 +27,11 @@ uv run 6502-nestest --runner both
 # Lockstep the exact Python graph evaluator against the reference core:
 uv run 6502-klaus --runner graph --graph-steps 20000
 
-# Run an NES ROM (NROM) with the frame-level PPU behind the MMIO bus:
-uv run nes-run path/to/rom.nes --frames 120 --out frame.ppm
+# Run an NES ROM with the native C++ console hardware:
+uv run nes-run path/to/rom.nes
+
+# Replay a captured controller tape headlessly and benchmark it uncapped:
+uv run nes-run path/to/rom.nes --tape tapes/game_tape
 ```
 
 ## CLI Commands
@@ -40,7 +43,7 @@ uv run nes-run path/to/rom.nes --frames 120 --out frame.ppm
 | `6502-klaus` | Klaus Dormann functional test suite (reference / graph / weights) |
 | `6502-nestest` | nestest suite vs the Nintendulator golden log (incl. unofficial opcodes) |
 | `6502-transformer` | Run the 6502 as real transformer weights, lockstep vs the reference |
-| `nes-run` | Run an NES ROM (NROM) on the console layer: PPU, NMI, DMA, controllers |
+| `nes-run` | Run an NES ROM or benchmark a captured input tape on the native console |
 
 The 6502 machine — execution model, the three verified backends, the compilation pipeline, the MMIO/NMI layer, and the numerics rules — is documented in [`transformer_nes/cpu6502/README.md`](transformer_nes/cpu6502/README.md).
 
@@ -53,7 +56,7 @@ Current status and prioritized next steps live in [`ROADMAP.md`](ROADMAP.md).
 | `transformer_nes/graph/` | Computation-graph DSL: Input/ReGLU/Persist/LookUp dimensions, `reglu`/`stepglu` helpers, partial evaluation (`fold.py`) |
 | `transformer_nes/attention/` | O(log n) convex-hull KV cache (`hull2d_cht.h` + pybind11 ext) and the exact-evaluator attention runtime |
 | `transformer_nes/cpu6502/` | The pure 6502: opcode spec, graph interpreter, trace format, `backends/` — the three verified machines (reference oracle, exact evaluator, `weights/` — the transformer itself with its expert builders and window policy) — and `examples/klaus/` (harness + binary) |
-| `transformer_nes/nes/` | NES system layer: MMIO bus, iNES cartridge loader, native C++ frame-level PPU, controllers, and the cycle-budgeted frame loop (`nes-run`) |
+| `transformer_nes/nes/` | Native C++ NES hardware: bus, cartridge, mapper/MMC headers, PPU, APU, console, and tape replay; `app.py` only builds it, adapts a CPU backend, and launches it |
 | `transformer_nes/model/` | Transformer machinery: analytical weight construction (`weights.py`), attention-serving classification (`classify.py`), the generated C++ engine (`engine_gen.py`), safetensors export (`export.py`) |
 | `transformer_nes/scheduler/` | Layer scheduler: load-balanced critical-path default plus the opt-in exact MILP |
 

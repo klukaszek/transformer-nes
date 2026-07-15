@@ -38,7 +38,7 @@ def assert_full_trace_match(image, start_pc, max_steps, *, bcd):
 
 @pytest.mark.slow
 def test_nestest_trace_fields_match_reference():
-    from transformer_nes.nes.examples.nestest import START_PC, load_image
+    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
 
     n = assert_full_trace_match(load_image(), START_PC, 8991, bcd=False)
     assert n == 8991

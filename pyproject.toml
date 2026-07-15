@@ -30,9 +30,9 @@ dev = [
 6502-reference = "transformer_nes.cpu6502.backends.reference:main"
 6502-eval = "transformer_nes.cpu6502.cli:main"
 6502-klaus = "transformer_nes.cpu6502.examples.klaus.harness:main"
-6502-nestest = "transformer_nes.nes.examples.nestest:main"
+6502-nestest = "transformer_nes.cpu6502.examples.nestest:main"
 6502-transformer = "transformer_nes.cpu6502.backends.weights.runner:main"
-nes-run = "transformer_nes.nes.console:main"
+nes-run = "transformer_nes.nes.app:main"
 
 [build-system]
 requires = ["setuptools>=82.0.0"]
@@ -48,7 +48,9 @@ include = ["transformer_nes*"]
     "attention/CMakeLists.txt",
     "cpu6502/examples/klaus/*",
     "nes/examples/nestest.*",
-    "nes/ppu.cpp",
+    "nes/*.cpp",
+    "nes/*.h",
+    "nes/*.m",
 ]
 
 [tool.ruff]

@@ -20,9 +20,10 @@ from transformer_nes.cpu6502.backends.reference import Cpu6502
 
 logger = logging.getLogger(__name__)
 
-# nestest.nes is an NES ROM, so this harness lives in the nes package next to
-# its assets and depends downward on cpu6502 (the one-way nes -> cpu6502 rule).
-NESTEST_DIR = os.path.dirname(__file__)
+# Keep the CPU harness outside nes/; only its ROM and golden log are NES assets.
+NESTEST_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "nes", "examples")
+)
 NESTEST_ROM = os.path.join(NESTEST_DIR, "nestest.nes")
 NESTEST_LOG = os.path.join(NESTEST_DIR, "nestest.log")
 START_PC = 0xC000
@@ -37,7 +38,7 @@ def load_image(rom_path: str = NESTEST_ROM) -> bytearray:
     prg_banks = rom[4]
     if prg_banks != 1:
         raise ValueError(f"expected NROM-128 (1 PRG bank), got {prg_banks}")
-    prg = rom[16:16 + 0x4000]
+    prg = rom[16 : 16 + 0x4000]
     image = bytearray(0x10000)
     image[0x8000:0xC000] = prg
     image[0xC000:0x10000] = prg  # NROM-128 mirrors the single bank
@@ -50,11 +51,11 @@ def load_log(log_path: str = NESTEST_LOG) -> list[tuple[int, int, int, int, int,
     with open(log_path) as f:
         for line in f:
             pc = int(line[0:4], 16)
-            a = int(line[line.index("A:") + 2:][:2], 16)
-            x = int(line[line.index("X:") + 2:][:2], 16)
-            y = int(line[line.index("Y:") + 2:][:2], 16)
-            p = int(line[line.index("P:") + 2:][:2], 16)
-            s = int(line[line.index("SP:") + 3:][:2], 16)
+            a = int(line[line.index("A:") + 2 :][:2], 16)
+            x = int(line[line.index("X:") + 2 :][:2], 16)
+            y = int(line[line.index("Y:") + 2 :][:2], 16)
+            p = int(line[line.index("P:") + 2 :][:2], 16)
+            s = int(line[line.index("SP:") + 3 :][:2], 16)
             rows.append((pc, a, x, y, p, s))
     return rows
 
@@ -77,7 +78,14 @@ def run_reference(image: bytearray, log_rows) -> tuple[bool, int, float]:
         if got != (pc, a, x, y, p, s):
             logger.error(
                 "mismatch at log line %d:\nexpected PC=%04X A=%02X X=%02X Y=%02X P=%02X SP=%02X\ngot      PC=%04X A=%02X X=%02X Y=%02X P=%02X SP=%02X",
-                i + 1, pc, a, x, y, p, s, *got,
+                i + 1,
+                pc,
+                a,
+                x,
+                y,
+                p,
+                s,
+                *got,
             )
             return False, i, time.perf_counter() - start
         cpu.step()
@@ -112,19 +120,36 @@ def run_graph(image: bytearray, log_rows, *, max_steps: int) -> tuple[bool, int,
         ref_row = ref.step()
         s1, s2 = ref_row.state, row.state
         if (
-            s1.pc != s2.pc or s1.a != s2.a or s1.x != s2.x or s1.y != s2.y
-            or s1.s != s2.s or s1.p != s2.p
+            s1.pc != s2.pc
+            or s1.a != s2.a
+            or s1.x != s2.x
+            or s1.y != s2.y
+            or s1.s != s2.s
+            or s1.p != s2.p
         ):
             logger.error(
                 "graph diverged from reference at step %d:\nREF:   PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X\nGRAPH: PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X",
-                i, s1.pc, s1.a, s1.x, s1.y, s1.s, s1.p,
-                s2.pc, s2.a, s2.x, s2.y, s2.s, s2.p,
+                i,
+                s1.pc,
+                s1.a,
+                s1.x,
+                s1.y,
+                s1.s,
+                s1.p,
+                s2.pc,
+                s2.a,
+                s2.x,
+                s2.y,
+                s2.s,
+                s2.p,
             )
             return False, i, build_elapsed, run_elapsed
         if {(w.addr, w.value) for w in ref_row.writes} != {(w.addr, w.value) for w in row.writes}:
             logger.error(
                 "graph writes diverged at step %d: ref=%s graph=%s",
-                i, ref_row.writes, row.writes,
+                i,
+                ref_row.writes,
+                row.writes,
             )
             return False, i, build_elapsed, run_elapsed
     return True, len(graph_trace), build_elapsed, run_elapsed
@@ -157,7 +182,9 @@ def main() -> None:
         "--runner", choices=["reference", "graph", "weights", "both"], default="reference"
     )
     parser.add_argument(
-        "--graph-steps", type=int, default=8991,
+        "--graph-steps",
+        type=int,
+        default=8991,
         help="instruction count for the graph run (default: the full log)",
     )
     args = parser.parse_args()
@@ -169,7 +196,9 @@ def main() -> None:
     if args.runner in ("reference", "both"):
         passed, lines, elapsed = run_reference(image, log_rows)
         status = "PASSED" if passed else "FAILED"
-        logger.info("reference: %s  %d/%d log lines in %.2fs", status, lines, len(log_rows), elapsed)
+        logger.info(
+            "reference: %s  %d/%d log lines in %.2fs", status, lines, len(log_rows), elapsed
+        )
         failed |= not passed
 
     if args.runner in ("graph", "both"):
@@ -178,19 +207,29 @@ def main() -> None:
         rate = steps / run_s if run_s > 0 else 0.0
         logger.info(
             "graph: %s  %d steps in %.2fs (%.0f steps/s), graph build %.2fs",
-            status, steps, run_s, rate, build_s,
+            status,
+            steps,
+            run_s,
+            rate,
+            build_s,
         )
         failed |= not matched
 
     if args.runner == "weights":
         matched, steps, build_s, run_s, mode = run_weights(
-            image, max_steps=args.graph_steps,
+            image,
+            max_steps=args.graph_steps,
         )
         status = "MATCHED" if matched else "DIVERGED"
         rate = steps / run_s if run_s > 0 else 0.0
         logger.info(
             "weights transformer (%s): %s  %d steps in %.1fs (%.1f steps/s), weights build %.1fs",
-            mode, status, steps, run_s, rate, build_s,
+            mode,
+            status,
+            steps,
+            run_s,
+            rate,
+            build_s,
         )
         failed |= not matched
 

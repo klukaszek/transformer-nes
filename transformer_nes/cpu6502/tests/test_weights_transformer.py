@@ -65,7 +65,7 @@ def test_region_ops_keep_write_position_in_sync():
 
 @pytest.mark.slow
 def test_transformer_int32_engine_matches_high_address_nestest_prefix():
-    from transformer_nes.nes.examples.nestest import START_PC, load_image
+    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
 
     image = load_image()
     machine = Cpu6502TransformerMachine(bcd=False)
@@ -90,7 +90,7 @@ def test_run_loop_matches_per_step():
     chunked stream (w_row rebased per chunk) against the single native run."""
     from collections import defaultdict
 
-    from transformer_nes.nes.examples.nestest import START_PC, load_image
+    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
 
     image = load_image()
     n = 120

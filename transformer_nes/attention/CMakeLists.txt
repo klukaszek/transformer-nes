@@ -3,7 +3,7 @@ project(hull_ext CXX)
 
 find_package(pybind11 REQUIRED)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 pybind11_add_module(hull_ext hull_ext.cpp)

@@ -333,11 +333,11 @@ play.  Two pieces landed:
   release) as `<frame> <mask hex> <names>` — a complete tape; `--debug`
   button logs also carry the frame index now.  Recorded tapes live in
   `tapes/` (smb ~83 s, smb3 ~144 s, cv3 ~86 s of real play).
-- **`python -m transformer_nes.nes.tape ROM TAPE`**: headless replay
-  with per-segment fps + instructions/frame (menu and gameplay phases
-  separate cleanly), `--profile MIN` fallback dump, `--ppm-every N`
-  snapshots, and `--compare BACKEND` frame-by-frame lockstep under the
-  same input — the debugging receipt tool.
+- **`nes-run ROM --tape TAPE`**: the tape parser, frame scheduler,
+  controller application, and uncapped replay timer now live in native
+  `tape.cpp`. `app.py` only selects the runtime backend and reports the
+  result; headless tape runs do not initialize the Sokol frontend. Use
+  `--tail N` after the final event and `--frames N` to cap a smoke run.
 
 Gameplay numbers (clean, idle machine): **SMB 418 fps** (segments
 392-475), **SMB3 184** (170-275; 10.3K instr/frame), **CV3 166**
