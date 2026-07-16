@@ -89,7 +89,7 @@ CpuStep Bus::step() {
       if (is_memory_rmw(opcode))
         d->write_rmw(write.addr, original, write.value);
       else
-        d->write(write.addr, write.value);
+        d->write_at(write.addr, write.value, stamp_base_ + cycles_);
       cycles_ += d->take_stall();
     }
   }
@@ -106,12 +106,15 @@ vector<CpuStep> Bus::run(int max_steps, const vector<int>& nmi_at, const vector<
   }
   return out;
 }
-MachineRun Bus::run_cycles(int64_t budget, function<void()> pause) {
+MachineRun Bus::run_cycles(int64_t budget, function<bool()> pause, int64_t cycle_base) {
+  if (!pause)
+    pause = [] { return false; };
   const int64_t start = cycles_;
+  stamp_base_ = cycle_base - start;
   while (!halted() && cycles_ - start < budget) {
     step();
-    if (pause)
-      pause();
+    if (pause())
+      break;
   }
   return {cycles_ - start, halted()};
 }

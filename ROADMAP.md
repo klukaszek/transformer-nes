@@ -53,6 +53,117 @@ other changes warranted; the mid_*-vs-raster_splits duplication in
 ppu.cpp is deliberate (the mid path serves the sprite-0+IRQ combo the
 raster path doesn't model).
 
+**Follow-up (2026-07-16): stamped write rows + full MMC3 counter.**
+Every watched device write pauses the engine in the C++ port (the
+2026-07-13 write journaling was not re-wired -- re-enabling it is the
+recorded perf lever, and needs a wj_cycle stamp when it lands), so each
+drained write already knows its cycle: run_cycles carries a cycle base,
+Device::write_at stamps, and the console converts to a visible-span
+scanline.  The sprite-0 split row now comes from the stamped row of the
+first post-hit scroll write (tile-snapped -- the clock is base-cycles
+only, so stamps are exact for OUR time, a few lines early vs hardware);
+the scanline-slicing scan this replaces is deleted.  MMC3 grew the rest
+of its counter semantics per NESDEV: latch 0 fires next-scanline when
+chained, a mid-frame $C001 anchors the reload at its stamped row
+(begin_frame resets the anchor), and $C000/$C001/$E001 writes raise an
+irq_changed callback -- run_until exits early on it and run_frame
+re-plans its events, so a mid-frame arm can't be run past (suspected
+mechanism of the reported HUD corruption in SMB3's scrolling
+cutscenes, spade-identical but tapeless so far; user-confirmed fixed).
+The early exit's first cut applied to EVERY run_until and truncated
+the end-of-frame vblank run on each MMC3 frame (the NMI writes
+$C000/$C001/$E001), slipping the NMI tail into the next frame's
+visible span -- user-reported as general random flicker, found by
+elimination after a $C001-anchor histogram came back clean (all level
+IRQs at 192/193, zero mid-span reloads).  run_until(target, replan)
+now completes plain runs unconditionally; only the event-planning
+loop's runs stop early.  Receipt: every tape's cycle count returned
+byte-identical to its pre-arc value (SMB3 260464627, spade 310407366,
+LoZ 67156155, SMB 151674636, CV3 157660617).
+
+Third round, from play reports (Zelda room transitions):
+- **Sprite/detection gates use the frame-start mask.**  The live $2001
+  at render time can already be blanked by a spilled NMI whose effect
+  lands after the visible span on hardware; gating the sprite pass and
+  sprite-0 detection on it made Zelda's HUD items vanish on alternating
+  room-draw frames (2,890-px flicker, caught by extending the HUD
+  invariant to the room-draw window) and killed the split on those
+  frames.  All sprite enable/edge gates now use the end_vblank latch.
+- **The post-sprite-0 band renders the split batch's captured scroll**
+  (ctrl/t/fine_x recorded at each post-hit scroll write) instead of the
+  live registers, so a spilled NMI's scroll setup for the NEXT frame
+  cannot clobber the split.  Its mask is the frame-start latch -- the
+  first cut captured the live mask and rendered the band as backdrop
+  (mostly-black transitions, user-caught).
+- **Sprite evaluation's 8-per-scanline limit** (NESDEV sprite
+  evaluation): first eight in-range sprites per line in OAM order take
+  the slots, transparent pixels included; both sprite paths honor it
+  (the ordered MMC2 path also stops fetching after eight -- dropped
+  sprites cannot clock the latches).  Crowded lines now drop out the
+  way OAM-rotating games expect.
+- **Backdrop override** (NESDEV palettes): a fully blanked frame with v
+  parked in $3F00-$3FFF shows that palette entry, not $3F00.
+Receipts: suite/native test/invariants green; room-draw window shows a
+contiguous 3-frame authentic blank instead of oscillation.
+
+Fourth round -- update blanking, settled from side-by-side hardware
+footage (user) + `tapes/tloz_flicker_tape`.  The decisive measurement:
+Zelda writes $2001=00 a few rows INTO the visible span (stamped rows
+2-23) at NMI end whenever the coming vblank carries VRAM work -- ON THE
+REFERENCE BACKEND TOO, so it is game truth, not an engine-shortcut
+artifact.  Model: a span's last on->off row is recorded
+(span_blank_row; an in-span re-enable cancels); a frame that ends
+blanked renders content above that row and backdrop below (post-sprite
+memset, backdrop-override aware).  Partial blanks preserve the HUD rows
+above the cut, exactly like hardware's menu/letter updates; a span that
+STARTS blanked is a whole-frame blank, and leaving a whole-frame blank
+takes one clean span (prev_full_blank holdover) because a load's tail
+can alias one fully-enabled span over a half-drawn nametable -- that
+was the single flicker frame at a room load's end.  Two failed
+intermediate models are recorded here deliberately: ends-blanked ->
+whole-frame-black (30Hz alternation: loads re-enable every vblank) and
+off-observation hysteresis (aliases at every threshold; also blanked
+the sword-cave typewriter, whose letter updates blank every 7th frame).
+Receipt machinery that settled it: flicker_metric.py -- classify every
+frame BLANK/content over a tape, flag short content runs inside blank
+episodes and 1-frame black blinks; multi-frame black holds at loads are
+hardware behavior.
+
+The last flicker (user: cave entry chopped the HUD) was OURS, not the
+game's: Zelda's NMI polls $2002 for the sprite-0 hit before blanking
+BELOW the HUD (reference backend: every load blank stamps row 56; the
+HUD survives, matching hardware footage).  The blank early-outs had
+been resetting sprite0_scanline, so during loads the console scheduled
+no sprite-0 event, the $2002 read lease never refreshed, the poll spun
+to a budget boundary, and the blank landed at rows 2-12 -- through the
+HUD.  Blanked renders now keep the sprite-0 prediction (the rows above
+the blank row still render and hit on hardware).  After the fix the
+weights backend stamps row 56 like the reference; the residual low-row
+blanks are the menu screens (no sprite 0 -- authentic early blanks).
+METHOD, for the next such bug: when weights-vs-hardware behavior
+diverges, replay the same tape on --backend reference (no leases, no
+windows, same base-cycle clock) -- identical rows mean game truth,
+different rows mean an engine-shortcut artifact.  Receipts: both Zelda
+tapes 0 short runs in the flicker metric, cave-entry probe shows HUD
+intact through the load partials with a 3-frame authentic full black
+before the reveal; suite/native test/invariants green; tape cycles:
+spade/CV3 byte-identical, LoZ +1 / SMB -2 (sprite-0 events on blanked
+frames now persist rather than vanish).  Also this round:
+8-per-scanline sprite evaluation validated by TLoZ's deliberate
+masking (dungeon doors hide Link behind 8 earlier-OAM sprites) and
+greyscale ($2001 bit 0).  A forced-blank
+render pass (mask-off rows as backdrop) was tried and REVERTED:
+mid-frame $2001 blank rows inherit a whole frame of accumulated
+base-cycle clock error, the blanks that are invisible on hardware
+(extended-vblank room draws) landed mid-screen, and Zelda transitions
+flickered -- user-verified regression.  Receipts: 69 tests + native
+hardware test (new latch-0/reload-anchor assertions) green, ruff
+clean, HUD/spade invariants green, tapes: spade 580, LoZ 837, SMB
+1040, CV3 552 fps (SMB/LoZ cycle counts unchanged).  Zelda's transient
+transition color errors remain open -- no mid-span palette writes in
+the tape, mirroring flips bracket horizontal scrolls (1-frame class),
+next step needs a precise symptom location from play.
+
 Receipts: 69 Python tests + the native hardware test green (new MMC3
 delta-chain assertions), ruff clean; numeric frame invariants on the
 tapes — Zelda HUD rows 0-63 byte-stable across both transition windows

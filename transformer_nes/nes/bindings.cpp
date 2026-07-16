@@ -92,7 +92,10 @@ public:
   int read_ram(int a) const override { return py::cast<int>(rt_.attr("read_ram")(a)); }
   void poke(int a, int v) override { rt_.attr("inject_write")(a, v); }
   void map_region(int a, span<const uint8_t> d) override { rt_.attr("map_region")(a, to_bytes(d)); }
-  MachineRun run_cycles(int64_t budget, function<void()> pause = {}) override {
+  MachineRun run_cycles(int64_t budget, function<bool()> pause = {},
+                        int64_t cycle_base = 0) override {
+    if (!pause)
+      pause = [] { return false; };
     int64_t cycles = 0;
     bool halted = false;
     while (cycles < budget && !halted) {
@@ -101,20 +104,22 @@ public:
                          .cast<py::dict>();
       cycles += py::cast<int64_t>(out["cycles"]);
       drain_leases(out);
-      cycles += service_writes(out);
+      // A watched write pauses the engine, so the chunk's writes
+      // executed at its end: stamp them with the cycle there.
+      cycles += service_writes(out, cycle_base + cycles);
       string reason = py::cast<string>(out["reason"]);
       if (reason == "watch_read")
         cycles += service_read(py::cast<int>(out["read_addr"]));
-      if (pause)
-        pause();
       halted = reason == "halt" || reason == "trap";
+      if (pause())
+        break;
     }
     return {cycles, halted};
   }
 
 private:
   Device* device_at(int a) const { return devices_.find(a); }
-  int service_writes(const py::dict& out) {
+  int service_writes(const py::dict& out, int64_t cycle) {
     int stalls = 0;
     py::sequence aa = out["hit_addr"], vv = out["hit_value"];
     if (py::len(aa) != py::len(vv))
@@ -123,7 +128,7 @@ private:
       int a = py::cast<int>(aa[i]);
       if (auto* d = device_at(a)) {
         drop_device_leases(d);
-        d->write(a, py::cast<int>(vv[i]));
+        d->write_at(a, py::cast<int>(vv[i]), cycle);
         stalls += d->take_stall();
       }
     }

@@ -1,6 +1,7 @@
 #include "console.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace transformer_nes::nes {
 
@@ -8,18 +9,31 @@ namespace {
 
 constexpr int64_t vblank_start_cycles = 27'394;
 constexpr int64_t frame_cycles = 29'781;
-constexpr int max_frame_events = 8;
-constexpr int max_split_scan_lines = 48;
+constexpr int max_frame_events = 32;
 
 constexpr int64_t scanline_cycle(int line) { return static_cast<int64_t>(line + 1) * 341 / 3; }
+
+// Visible-span scanline containing a console-clock cycle, -1 outside.
+int span_scanline(int64_t cycle, int64_t frame_base) {
+  const int64_t rel = cycle - frame_base;
+  if (rel < 0 || rel >= vblank_start_cycles)
+    return -1;
+  const int row = static_cast<int>(rel * 3 / 341);
+  return row < 240 ? row : -1;
+}
 
 } // namespace
 
 class Console::PpuDevice final : public Device {
 public:
-  explicit PpuDevice(Ppu& ppu) : ppu_(ppu) {}
+  PpuDevice(Ppu& ppu, const int64_t& frame_base) : ppu_(ppu), frame_base_(frame_base) {}
   int read(int address) override { return ppu_.read(address); }
   void write(int address, int value) override { ppu_.write(address, value); }
+  // Stamped writes carry the scanline they executed on (-1 outside the
+  // visible span); the PPU uses it for the mid-frame split row.
+  void write_at(int address, int value, int64_t cycle) override {
+    ppu_.write_stamped(address, value, span_scanline(cycle, frame_base_));
+  }
   ReadLease read_lease(int a) override {
     auto v = ppu_.read_lease(a);
     return v ? ReadLease(*v) : ReadLease{};
@@ -27,6 +41,7 @@ public:
 
 private:
   Ppu& ppu_;
+  const int64_t& frame_base_;
 };
 class Console::ApuDevice final : public Device {
 public:
@@ -39,13 +54,17 @@ private:
 };
 class Console::MapperDevice final : public Device {
 public:
-  explicit MapperDevice(Mapper& m) : m_(m) {}
+  MapperDevice(Mapper& m, const int64_t& frame_base) : m_(m), frame_base_(frame_base) {}
   int read(int a) override { return m_.read(a); }
   void write(int a, int v) override { m_.write(a, v); }
+  void write_at(int a, int v, int64_t cycle) override {
+    m_.write_at(a, v, span_scanline(cycle, frame_base_));
+  }
   void write_rmw(int a, int original, int value) override { m_.write_rmw(a, original, value); }
 
 private:
   Mapper& m_;
+  const int64_t& frame_base_;
 };
 class Console::FrameCounter final : public Device {
 public:
@@ -63,9 +82,9 @@ Console::~Console() = default;
 Console::Console(unique_ptr<Mapper> mapper, unique_ptr<Ppu> ppu, unique_ptr<Apu> apu,
                  ConsoleMachine& machine)
     : mapper_(std::move(mapper)), ppu_(std::move(ppu)), apu_(std::move(apu)), machine_(machine) {
-  ppu_device_ = std::make_unique<PpuDevice>(*ppu_);
+  ppu_device_ = std::make_unique<PpuDevice>(*ppu_, frame_base_);
   apu_device_ = std::make_unique<ApuDevice>(*apu_);
-  mapper_device_ = std::make_unique<MapperDevice>(*mapper_);
+  mapper_device_ = std::make_unique<MapperDevice>(*mapper_, frame_base_);
   frame_counter_ = std::make_unique<FrameCounter>(*apu_);
   dma_ = std::make_unique<OamDma>([this](int a) { return machine_.read_ram(a); },
                                   [this](const auto& page) { ppu_->oam_dma(page); });
@@ -90,6 +109,7 @@ void Console::attach_devices() {
   callbacks.mirroring = [this](int m) { ppu_->set_mirroring(m); };
   callbacks.chr_banks = [this](const auto& banks) { ppu_->set_chr_banks(banks); };
   callbacks.irq_ack = [this] { set_irq(IrqSource::mapper, false); };
+  callbacks.irq_changed = [this] { irq_sched_dirty_ = true; };
   callbacks.mmc2_banks = [this](const auto& banks) { ppu_->set_mmc2_banks(banks); };
   callbacks.mmc4_banks = [this](const auto& banks) { ppu_->set_mmc4_banks(banks); };
   callbacks.mmc5_state = [this](int a, int b, int c, int d, int e) {
@@ -123,45 +143,31 @@ void Console::check_interrupts() {
   if ((irq_sources_ & static_cast<uint8_t>(IrqSource::apu)) != 0 && !apu_->irq_pending())
     set_irq(IrqSource::apu, false);
 }
-void Console::run_until(int64_t target) {
+// A replan run stops early (cycles_ short of target) when a mapper
+// write moved the IRQ schedule: the event-planning loop re-evaluates.
+// Plain runs always complete -- cutting the vblank run short would
+// slip the NMI's tail into the next frame's visible span.
+void Console::run_until(int64_t target, bool replan) {
   if (halted_ || target <= cycles_)
     return;
-  auto out = machine_.run_cycles(target - cycles_, [this] { check_interrupts(); });
+  auto out = machine_.run_cycles(
+      target - cycles_,
+      [this, replan] {
+        check_interrupts();
+        const bool dirty = std::exchange(irq_sched_dirty_, false);
+        return replan && dirty;
+      },
+      cycles_);
   cycles_ += out.cycles;
   halted_ = out.halted;
 }
-// The game's scroll writes land some scanlines after the sprite-0 hit
-// (a poll loop plus a timed wait to its real split edge).  Journaled PPU
-// writes drain at run() returns, so running scanline-sized slices bounds
-// the write batch to one line; the scan stops at the first batch and its
-// line becomes the render split row.  Mapper-IRQ games keep their splits
-// from IRQ delivery instead, and a game that never writes costs at most
-// max_split_scan_lines slices.
-void Console::locate_span_split(int64_t base, int hit_line) {
-  if (mapper_->irq_scanline(-1))
-    return;
-  ppu_->begin_span_watch(); // only post-hit writes can be the split batch
-  const int last = std::min(hit_line + max_split_scan_lines, 238);
-  int found = -1;
-  for (int line = hit_line + 1; line <= last && found < 0; ++line) {
-    run_until(std::min(base + scanline_cycle(line), base + vblank_start_cycles));
-    if (ppu_->span_scroll_seen())
-      found = line;
-  }
-  if (found < 0)
-    return;
-  // One guard slice: a $2006 pair can straddle the slice boundary.
-  run_until(std::min(base + scanline_cycle(found + 1), base + vblank_start_cycles));
-  // Slice attribution is +/- a line and games time split writes to take
-  // effect at a tile-row boundary (Zelda writes during line ~61 for its
-  // row-64 HUD edge): snap up to the next multiple of 8.
-  ppu_->note_span_split((found + 7) & ~7);
-}
 Ppu::Frame Console::run_frame() {
   const int64_t base = frame_base_;
+  const int64_t span_end = base + vblank_start_cycles;
+  mapper_->begin_frame();
   bool fired = false;
   int last_irq = -1;
-  for (int guard = 0; guard < max_frame_events; ++guard) {
+  for (int guard = 0; guard < max_frame_events && cycles_ < span_end && !halted_; ++guard) {
     // Next event: the sprite-0 hit or the mapper IRQ, earliest first
     // (sprite-0 wins a tie -- the SMB-style poll precedes the handler).
     int line = -1, kind = -1;
@@ -174,15 +180,23 @@ Ppu::Frame Console::run_frame() {
       line = *irq;
       kind = 1;
     }
-    if (kind < 0)
-      break;
-    const int64_t at = base + scanline_cycle(line);
-    run_until(std::min(at, base + vblank_start_cycles));
+    if (kind < 0) {
+      // No event pending; a mid-frame arm stops this run early and
+      // re-enters the planning loop.
+      run_until(span_end, true);
+      continue;
+    }
+    const int64_t at = std::min(base + scanline_cycle(line), span_end);
+    run_until(at, true);
+    if (cycles_ < at)
+      continue; // IRQ schedule moved mid-run; re-plan
     machine_.clear_read_lease();
     if (!kind) {
       fired = true;
       ppu_->set_sprite0_hit(true);
-      locate_span_split(base, line);
+      // Only post-hit scroll writes can be the game's split batch; their
+      // rows arrive exactly via the stamped write path.
+      ppu_->begin_span_watch();
       continue;
     }
     // Re-validate with the pre-event context: the delta chain's next
@@ -193,10 +207,10 @@ Ppu::Frame Console::run_frame() {
       ppu_->mark_split(line);
       mapper_->notify_scanline_irq();
       set_irq(IrqSource::mapper, true);
-      run_until(std::min(at + scanline_cycle(1), base + vblank_start_cycles));
+      run_until(std::min(at + scanline_cycle(1), span_end));
     }
   }
-  run_until(base + vblank_start_cycles);
+  run_until(span_end);
   machine_.clear_read_lease();
   auto frame = ppu_->render_frame();
   sprite0_scanline_ = ppu_->sprite0_scanline();

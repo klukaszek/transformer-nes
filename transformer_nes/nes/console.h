@@ -45,8 +45,7 @@ private:
   enum class IrqSource : uint8_t { mapper = 1, apu = 2 };
 
   void attach_devices();
-  void run_until(int64_t);
-  void locate_span_split(int64_t base, int hit_line);
+  void run_until(int64_t target, bool replan = false);
   void set_irq(IrqSource source, bool active);
   void sync_irq();
   void check_interrupts();
@@ -63,6 +62,7 @@ private:
   int64_t cycles_ = 0, frame_base_ = 0;
   int frame_index_ = 0, sprite0_scanline_ = -1;
   bool halted_ = false;
+  bool irq_sched_dirty_ = false;
   uint8_t irq_sources_ = 0;
   vector<float> last_audio_;
 };

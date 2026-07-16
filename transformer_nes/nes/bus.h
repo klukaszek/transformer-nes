@@ -57,6 +57,10 @@ public:
   virtual ~Device() = default;
   virtual int read(int addr) = 0;
   virtual void write(int addr, int value) = 0;
+  // Write with the console-clock cycle it executed at (known because
+  // watched writes pause the engine); devices that model mid-frame
+  // state (the PPU) override this, everything else ignores the stamp.
+  virtual void write_at(int addr, int value, int64_t) { write(addr, value); }
   virtual void write_rmw(int addr, int, int value) { write(addr, value); }
   virtual int take_stall() { return 0; }
   virtual ReadLease read_lease(int) { return {}; }
@@ -92,7 +96,11 @@ public:
   virtual void set_irq() = 0;
   virtual void clear_irq() = 0;
   virtual void clear_read_lease() = 0;
-  virtual MachineRun run_cycles(int64_t, function<void()> = {}) = 0;
+  // cycle_base: the console-clock value at entry, so drained device
+  // writes carry an absolute cycle stamp (write_at).  A true return
+  // from the pause callback stops the run early (the console re-plans
+  // its frame events after a mid-frame IRQ-schedule change).
+  virtual MachineRun run_cycles(int64_t, function<bool()> = {}, int64_t cycle_base = 0) = 0;
   virtual int read_ram(int) const = 0;
   virtual void poke(int, int) = 0;
   virtual void map_region(int, span<const uint8_t>) = 0;
@@ -116,7 +124,8 @@ public:
   vector<CpuStep> run(int max_steps, const vector<int>& nmi_at = {},
                       const vector<int>& irq_at = {});
   void clear_read_lease() override {}
-  MachineRun run_cycles(int64_t budget, function<void()> pause = {}) override;
+  MachineRun run_cycles(int64_t budget, function<bool()> pause = {},
+                        int64_t cycle_base = 0) override;
   int read_ram(int addr) const override { return ram_[address_index(addr)]; }
   void poke(int addr, int value) override {
     runtime_.poke(addr, value);
@@ -135,6 +144,7 @@ private:
   array<uint8_t, 0x10000> ram_{};
   DeviceMap devices_;
   int64_t cycles_ = 0;
+  int64_t stamp_base_ = 0; // console-clock minus cycles_, set per run_cycles
 };
 
 class Controller final : public Device {

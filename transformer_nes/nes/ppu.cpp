@@ -69,13 +69,25 @@ struct Ppu::Impl {
   // Mid-visible-span scroll writes (between end_vblank and the next
   // render): a $2006 second write reloads all 15 bits of v immediately
   // on hardware, so the post-sprite-0 band must pin its y to that load
-  // (Zelda scrolls the playfield under its fixed HUD this way).  The
-  // console discovers the write's scanline and records it here; -1
-  // means "no split row known, fall back to the hit line".
+  // (Zelda scrolls the playfield under its fixed HUD this way).  Rows
+  // arrive exactly via the stamped write path; the watch arms at the
+  // sprite-0 event so only post-hit writes count as the split batch.
   bool in_span = false;
-  bool span_scroll_writes = false;
+  bool span_watch = false;
+  bool prev_full_blank = false; // last render was a whole-frame blank
+  // Row of the span's last rendering on->off write (-1: none); an
+  // in-span re-enable cancels it.  Zelda blanks a few rows into the
+  // span at NMI end whenever the next vblank will carry VRAM updates:
+  // hardware shows content above that row and backdrop below.
+  int span_blank_row = -1;
+  int span_scroll_row = -1;
   int span_v_load = -1;
-  int span_split_line = -1;
+  // Scroll state as of the split batch's last write: the post-split
+  // band renders from this, not from the live registers -- a spilled
+  // NMI (the next frame's setup running past vblank in our compressed
+  // clock) must not clobber the split's scroll.
+  int span_ctrl = 0, span_t = 0, span_fx = 0;
+
 
   // A second mid-frame split (mapper IRQ): the console latches the state
   // at delivery; rows above the split render from it, rows below from
@@ -311,7 +323,7 @@ struct Ppu::Impl {
     return sprite0_hit ? 0x40 : 0;
   }
 
-  void write(int addr, int value) {
+  void write(int addr, int value, int row) {
     const int reg = (addr - 0x2000) & 7;
     value &= 0xFF;
     if (reg == 0) { // PPUCTRL
@@ -321,6 +333,12 @@ struct Ppu::Impl {
       if (rising && vblank)
         nmi_edge = true;
     } else if (reg == 1) { // PPUMASK
+      if (in_span && ((mask ^ value) & 0x18)) {
+        if (!(value & 0x18))
+          span_blank_row = row >= 0 ? row : 0;
+        else
+          span_blank_row = -1;
+      }
       mask = value;
     } else if (reg == 3) { // OAMADDR
       oam_addr = value;
@@ -348,8 +366,13 @@ struct Ppu::Impl {
       vram_write(vram_addr & 0x3FFF, value);
       vram_addr = (vram_addr + increment()) & 0x3FFF;
     }
-    if (in_span && (reg == 0 || reg == 5 || reg == 6))
-      span_scroll_writes = true;
+    if (span_watch && row >= 0 && (reg == 0 || reg == 5 || reg == 6)) {
+      if (span_scroll_row < 0)
+        span_scroll_row = row;
+      span_ctrl = ctrl;
+      span_t = t_addr;
+      span_fx = fine_x;
+    }
   }
 
   // ── Console-side control ────────────────────────────────────────
@@ -374,9 +397,10 @@ struct Ppu::Impl {
     raster_split_count = 0;
     frame_latch_valid = true;
     in_span = true;
-    span_scroll_writes = false;
+    span_watch = false;
+    span_blank_row = (mask & 0x18) ? -1 : 0; // the next span starts blanked
+    span_scroll_row = -1;
     span_v_load = -1;
-    span_split_line = -1;
   }
 
   bool take_nmi_edge() {
@@ -523,6 +547,7 @@ struct Ppu::Impl {
 
   // First scanline where an opaque sprite-0 pixel overlaps opaque bg.
   int detect_sprite0(const size_t* banks) {
+    const int fmask = frame_latch_valid ? frame_mask : mask;
     const bool tall = (ctrl & 0x20) != 0;
     const int y = oam[0], tile = oam[1], attr = oam[2], x = oam[3];
     const int top = y + 1;
@@ -546,7 +571,7 @@ struct Ppu::Impl {
       const int b1 = chr[chr_index(banks, pattern + 8)];
       for (int c = 0; c < cols; ++c) {
         // No hit in the left 8 columns when either side is masked.
-        if (x + c < 8 && (mask & 0x06) != 0x06)
+        if (x + c < 8 && (fmask & 0x06) != 0x06)
           continue;
         const int src_c = (attr & 0x40) ? (7 - c) : c;
         const int bit = 7 - src_c;
@@ -562,10 +587,48 @@ struct Ppu::Impl {
     array<uint8_t, 240 * 256> out{};
     uint8_t* frame = out.data();
 
+    // Sprite enable/edge bits come from the frame-start latch: the live
+    // mask can already be blanked by a spilled NMI whose effect on
+    // hardware lands after the visible span.
+    const int fmask = frame_latch_valid ? frame_mask : mask;
+
+    // Greyscale ($2001 bit 0) masks every color to the grey column.
+    const uint8_t color_mask = (fmask & 0x01) ? 0x30 : 0x3F;
     array<uint8_t, 0x20> pal{};
     for (size_t i = 0; i < pal.size(); ++i)
-      pal[i] = palette[i] & 0x3F;
-    const uint8_t backdrop = pal[0];
+      pal[i] = palette[i] & color_mask;
+
+    uint8_t backdrop = pal[0];
+
+    // A span that ends blanked shows backdrop from the on->off row
+    // down (verified on the reference backend: Zelda blanks a few rows
+    // into the span at NMI end before vblank VRAM updates -- menus and
+    // room loads redraw behind this, and rendering content there leaks
+    // the half-drawn redraw).  The backdrop override (NESDEV PPU
+    // palettes) applies while off with v parked in palette RAM.
+    const bool off_now = !(mask & 0x18);
+    const int blank_from = off_now ? (span_blank_row >= 0 ? span_blank_row : 0) : -1;
+    if (blank_from >= 0 && (vram_addr & 0x3F00) == 0x3F00)
+      backdrop = palette[palette_index(vram_addr)] & color_mask;
+    // Leaving a whole-frame blank takes one clean span: a load's tail
+    // can alias so that one span runs fully enabled over a half-drawn
+    // nametable -- the single flicker frame at a room load's end.
+    const bool full_blank = blank_from == 0 || prev_full_blank;
+    prev_full_blank = blank_from == 0;
+    if (full_blank) {
+      std::memset(frame, backdrop, out.size());
+      // Keep the sprite-0 prediction: rows above the blank row still
+      // render on hardware, and Zelda's NMI polls the hit mid-load to
+      // time its below-HUD blank -- dropping the event would starve
+      // the $2002 lease refresh and pull the blank into the HUD.
+      mid_scanline = -1;
+      return out;
+    }
+    // Partial blank: applied after sprite compositing at every exit.
+    auto apply_blank = [&](uint8_t* f) {
+      if (blank_from > 0)
+        std::memset(f + blank_from * 256, backdrop, static_cast<size_t>(240 - blank_from) * 256);
+    };
 
     // Piecewise state: rows through the sprite-0 hit render from the
     // visible-span-start state, rows through the IRQ split (when the
@@ -624,16 +687,18 @@ struct Ppu::Impl {
         std::fill(std::begin(row), std::end(row), false);
       const bool tall = (ctrl & 0x20) != 0;
       const int h = tall ? 16 : 8;
-      const int sprite_x_min = (mask & 0x04) ? 0 : 8;
+      const int sprite_x_min = (fmask & 0x04) ? 0 : 8;
       for (int y = 0; y < 240; ++y) {
         const BandState& band = (split_s0 >= 0 && y > split_s0) ? live : span;
         render_ordered_bg_row(frame, pal.data(), backdrop, band, y);
-        if (!(mask & 0x10))
+        if (!(fmask & 0x10))
           continue;
-        for (size_t i = 0; i < 64; ++i) {
+        int slots = 0; // sprite evaluation: first eight in-range per line
+        for (size_t i = 0; i < 64 && slots < 8; ++i) {
           const int sy = oam[i * 4] + 1;
           if (y < sy || y >= sy + h)
             continue;
+          ++slots;
           const int tile = oam[i * 4 + 1];
           const int attr = oam[i * 4 + 2];
           const int x = oam[i * 4 + 3];
@@ -656,7 +721,7 @@ struct Ppu::Impl {
             const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
             if (!pix)
               continue;
-            if (i == 0 && bg_opaque[y][px] && !(px < 8 && (mask & 0x06) != 0x06)) {
+            if (i == 0 && bg_opaque[y][px] && !(px < 8 && (fmask & 0x06) != 0x06)) {
               if (sprite0_scanline < 0)
                 sprite0_scanline = y;
             }
@@ -670,6 +735,7 @@ struct Ppu::Impl {
         }
       }
       mid_scanline = -1;
+      apply_blank(frame);
       return out;
     }
 
@@ -687,16 +753,17 @@ struct Ppu::Impl {
     // hit from the wrong set would reshape the render bands.
     const size_t* s0_banks = mmc5.active() ? mmc5.frame_sprite_banks() : span.banks;
     sprite0_scanline = -1;
-    if (!raster_mode && (mask & 0x10))
+    if (!raster_mode && (fmask & 0x10))
       sprite0_scanline = detect_sprite0(s0_banks);
 
     const int s0 = sprite0_scanline;
     const bool have_mid = mid_scanline >= 0 && mid_scanline + 1 < 240;
     // The game's post-hit scroll writes land some scanlines below the
-    // hit (Zelda busy-waits ~15 lines to reach its HUD edge); when the
-    // console located the write row, the split starts there instead of
-    // at the hit line.
-    const int s0_start = span_split_line > s0 ? span_split_line : s0 + 1;
+    // hit (Zelda busy-waits ~15 lines to reach its HUD edge).  The
+    // stamped row is exact for OUR clock, which runs base cycles only;
+    // games time splits to tile-row boundaries, so snap up to one.
+    const int split_row = span_scroll_row >= 0 ? (span_scroll_row + 7) & ~7 : -1;
+    const int s0_start = split_row > s0 ? split_row : s0 + 1;
     // A sprite-0 split only means something ABOVE the IRQ split (the
     // SMB-style poll-then-scroll pattern).  A hit below it is just a
     // status bit -- an ordinary sprite over opaque background (CV3's
@@ -705,9 +772,17 @@ struct Ppu::Impl {
     const bool have_s0 = s0 >= 0 && s0_start < 240 && (!have_mid || s0 < mid_scanline);
     const size_t* mid_banks =
         mmc5.active() ? mmc5.split_background_banks(mid_ctrl) : mid_chr_bank.data();
+    // The pure sprite-0 band renders the split batch's captured scroll
+    // state, but its enable bits come from the frame-start latch: a
+    // spilled NMI may already have blanked the live mask, and that
+    // blank lands after the visible span on hardware.
+    const BandState post_hit =
+        span_scroll_row >= 0
+            ? BandState{span_ctrl, fmask, mirroring, span_t, span_fx, live_y_base, bg_banks}
+            : live;
     const BandState mid_band = have_mid ? BandState{mid_ctrl,   mid_mask, mid_mirroring, mid_t_addr,
                                                     mid_fine_x, -1,       mid_banks}
-                                        : live;
+                                        : post_hit;
 
     // The frame's ordered background bands, each starting at its first
     // row: span from the top, then the post-sprite-0 and post-IRQ
@@ -770,7 +845,7 @@ struct Ppu::Impl {
         const int end = (i + 1 < nseg) ? segs[i + 1].y0 : 240;
         render_bg_rows(frame, pal.data(), backdrop, *segs[i].band, segs[i].y0, end);
       }
-      if (mask & 0x10)
+      if (fmask & 0x10)
         sprite0_scanline = detect_sprite0(s0_banks);
     } else {
       // The initial span was needed to discover a sprite-0 split;
@@ -781,8 +856,10 @@ struct Ppu::Impl {
           render_bg_rows(frame, pal.data(), backdrop, *segs[i].band, segs[i].y0, end);
       }
     }
-    if (!(mask & 0x10))
+    if (!(fmask & 0x10)) {
+      apply_blank(frame);
       return out;
+    }
 
     // Sprite pixels fetch through the banks of the band their row
     // falls in (per-scanline fetches on hardware -- how games blank
@@ -805,9 +882,13 @@ struct Ppu::Impl {
     };
 
     const bool tall = (ctrl & 0x20) != 0;
-    const int sprite_x_min = (mask & 0x04) ? 0 : 8;
+    const int sprite_x_min = (fmask & 0x04) ? 0 : 8;
     for (auto& row : sprite_claimed)
       std::fill(std::begin(row), std::end(row), false);
+    // Sprite evaluation admits the first eight in-range sprites per
+    // scanline in OAM order (transparent pixels still take the slot);
+    // games rotate OAM to spread the dropout -- the hardware flicker.
+    uint8_t row_slots[240] = {};
     // Low index first: the first opaque sprite claims the pixel, and
     // only its priority bit decides front-vs-behind (an obscured
     // behind-background sprite hides higher-index sprites too).
@@ -825,6 +906,9 @@ struct Ppu::Impl {
       if (rows <= 0 || cols <= 0)
         continue;
       for (int r = 0; r < rows; ++r) {
+        if (row_slots[top + r] >= 8)
+          continue;
+        ++row_slots[top + r];
         const int src_r = (attr & 0x80) ? (h - 1 - r) : r;
         int t, prow;
         if (tall) {
@@ -856,6 +940,7 @@ struct Ppu::Impl {
         }
       }
     }
+    apply_blank(frame);
     return out;
   }
 };
@@ -867,19 +952,21 @@ Ppu::Ppu(Ppu&&) noexcept = default;
 Ppu& Ppu::operator=(Ppu&&) noexcept = default;
 
 int Ppu::read(int address) { return impl_->read(address); }
-void Ppu::write(int address, int value) { impl_->write(address, value); }
+void Ppu::write(int address, int value) { impl_->write(address, value, -1); }
+void Ppu::write_stamped(int address, int value, int scanline) {
+  impl_->write(address, value, scanline);
+}
 optional<int> Ppu::read_lease(int address) const { return impl_->read_lease(address); }
 void Ppu::oam_dma(span<const uint8_t, 256> page) { impl_->oam_dma(page); }
 Ppu::Frame Ppu::render_frame() { return impl_->render_frame(); }
 void Ppu::begin_vblank() { impl_->begin_vblank(); }
 void Ppu::end_vblank() { impl_->end_vblank(); }
 void Ppu::mark_split(int scanline) { impl_->mark_split(scanline); }
-bool Ppu::span_scroll_seen() const { return impl_->span_scroll_writes; }
 void Ppu::begin_span_watch() {
-  impl_->span_scroll_writes = false;
+  impl_->span_watch = true;
+  impl_->span_scroll_row = -1;
   impl_->span_v_load = -1;
 }
-void Ppu::note_span_split(int scanline) { impl_->span_split_line = scanline; }
 bool Ppu::take_nmi_edge() { return impl_->take_nmi_edge(); }
 bool Ppu::nmi_enabled() const { return impl_->nmi_enabled(); }
 bool Ppu::rendering_enabled() const { return impl_->rendering_enabled(); }

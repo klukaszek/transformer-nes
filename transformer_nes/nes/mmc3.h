@@ -43,21 +43,28 @@ public:
       std::copy_n(cart_.prg.begin() + b[i] * BANK8, BANK8, image.begin() + 0x8000 + i * BANK8);
     return image;
   }
-  // The counter reloads from the latch at frame start and again on the
-  // line after each expiry, so the latch is a DELTA between IRQs, not an
-  // absolute line: SMB3's spade minigame chains latch=52 handlers to
-  // split its three picture strips and bottom HUD at 32/85/138/191.
+  // The counter reloads from the latch on the line after each expiry
+  // and after a $C001 clear, so the latch is a DELTA from that anchor,
+  // not an absolute line (NESDEV MMC3): SMB3's spade minigame chains
+  // latch=52 handlers to split its strips and HUD at 32/85/138/191.
+  // A vblank reload (anchor -1) fires at the latch's line; latch 0 is
+  // the fire-next-scanline trick and needs a mid-frame anchor.
   optional<int> irq_scanline(int last_fired) const override {
-    if (!irq_enabled || irq_latch <= 0)
+    if (!irq_enabled)
       return std::nullopt;
-    const int line = last_fired < 0 ? irq_latch : last_fired + 1 + irq_latch;
+    const int anchor = std::max(last_fired, reload_line);
+    if (anchor < 0 && irq_latch <= 0)
+      return std::nullopt;
+    const int line = anchor < 0 ? irq_latch : anchor + 1 + irq_latch;
     return line < 240 ? optional<int>(line) : std::nullopt;
   }
   void notify_scanline_irq() override { irq_pending = true; }
-  void write(int addr, int value) override {
+  void begin_frame() override { reload_line = -1; }
+  void write(int addr, int value) override { write_at(addr, value, -1); }
+  void write_at(int addr, int value, int scanline) override {
     auto old = prg_banks();
     int reg = addr & 0xE001;
-    update(reg, value);
+    update(reg, value, scanline);
     auto now = prg_banks();
     for (size_t i = 0; i < old.size(); ++i)
       if (old[i] != now[i])
@@ -70,9 +77,10 @@ private:
   bool chr_rom = false, irq_enabled = false, irq_pending = false;
   uint8_t bank_select = 0;
   int irq_latch = 0;
+  int reload_line = -1; // scanline of a mid-frame $C001 clear (-1: vblank)
   array<uint8_t, 8> regs{0, 2, 4, 5, 6, 7, 0, 1};
   size_t n_prg_ = 0, n_chr_ = 1;
-  void update(int reg, int value) {
+  void update(int reg, int value, int scanline) {
     if (reg == 0x8000)
       bank_select = value;
     else if (reg == 0x8001)
@@ -83,12 +91,16 @@ private:
       callbacks_.mirroring(value & 1 ? 3 : 2);
     } else if (reg == 0xC000)
       irq_latch = value;
+    else if (reg == 0xC001)
+      reload_line = scanline;
     else if (reg == 0xE000) {
       irq_enabled = false;
       if (callbacks_.irq_ack)
         callbacks_.irq_ack();
     } else if (reg == 0xE001)
       irq_enabled = true;
+    if (reg >= 0xC000 && reg != 0xE000 && callbacks_.irq_changed)
+      callbacks_.irq_changed();
   }
   void notify_chr(int reg) {
     if (chr_rom && (reg == 0x8000 || reg == 0x8001)) {

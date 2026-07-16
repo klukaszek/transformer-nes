@@ -84,6 +84,19 @@ static void test_mappers() {
   assert(!mmc3.irq_scanline(-1));
   mmc3.write(0xE001, 0);
   assert(mmc3.irq_scanline(-1) == 2);
+  // Latch 0 = fire-next-scanline, valid only chained or off an anchor.
+  mmc3.write(0xC000, 0);
+  assert(!mmc3.irq_scanline(-1));
+  assert(mmc3.irq_scanline(100) == 101);
+  // A mid-frame $C001 clear anchors the reload at its scanline; the
+  // anchor resets at frame start.
+  mmc3.write(0xC000, 30);
+  mmc3.write_at(0xC001, 0, 120);
+  assert(mmc3.irq_scanline(-1) == 151);
+  assert(mmc3.irq_scanline(90) == 151);
+  assert(mmc3.irq_scanline(160) == 191);
+  mmc3.begin_frame();
+  assert(mmc3.irq_scanline(-1) == 30);
 
   Cartridge c5{banks(32, BANK8), vector<uint8_t>(0x20000), Mirroring::Horizontal, 5};
   Mmc5 mmc5(c5);

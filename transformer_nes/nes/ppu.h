@@ -33,6 +33,9 @@ public:
 
   [[nodiscard]] int read(int address);
   void write(int address, int value);
+  // Register write stamped with the visible-span scanline it executed
+  // on (-1 outside the span): mid-frame split and forced-blank rows.
+  void write_stamped(int address, int value, int scanline);
   [[nodiscard]] optional<int> read_lease(int address) const;
   void oam_dma(span<const uint8_t, 256> page);
 
@@ -41,8 +44,6 @@ public:
   void end_vblank();
   void mark_split(int scanline);
   void begin_span_watch();
-  [[nodiscard]] bool span_scroll_seen() const;
-  void note_span_split(int scanline);
   [[nodiscard]] bool take_nmi_edge();
   [[nodiscard]] bool nmi_enabled() const;
   [[nodiscard]] bool rendering_enabled() const;
