@@ -43,9 +43,15 @@ public:
       std::copy_n(cart_.prg.begin() + b[i] * BANK8, BANK8, image.begin() + 0x8000 + i * BANK8);
     return image;
   }
-  optional<int> irq_scanline() const override {
-    return irq_enabled && irq_latch > 0 && irq_latch < 240 ? optional<int>(irq_latch)
-                                                            : std::nullopt;
+  // The counter reloads from the latch at frame start and again on the
+  // line after each expiry, so the latch is a DELTA between IRQs, not an
+  // absolute line: SMB3's spade minigame chains latch=52 handlers to
+  // split its three picture strips and bottom HUD at 32/85/138/191.
+  optional<int> irq_scanline(int last_fired) const override {
+    if (!irq_enabled || irq_latch <= 0)
+      return std::nullopt;
+    const int line = last_fired < 0 ? irq_latch : last_fired + 1 + irq_latch;
+    return line < 240 ? optional<int>(line) : std::nullopt;
   }
   void notify_scanline_irq() override { irq_pending = true; }
   void write(int addr, int value) override {

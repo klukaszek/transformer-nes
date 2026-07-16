@@ -40,6 +40,9 @@ public:
   void begin_vblank();
   void end_vblank();
   void mark_split(int scanline);
+  void begin_span_watch();
+  [[nodiscard]] bool span_scroll_seen() const;
+  void note_span_split(int scanline);
   [[nodiscard]] bool take_nmi_edge();
   [[nodiscard]] bool nmi_enabled() const;
   [[nodiscard]] bool rendering_enabled() const;

@@ -73,13 +73,17 @@ static void test_mappers() {
   mmc3.write(0xC000, 2);
   mmc3.write(0xC001, 0);
   mmc3.write(0xE001, 0);
-  assert(mmc3.irq_scanline() == 2);
+  assert(mmc3.irq_scanline(-1) == 2);
   mmc3.notify_scanline_irq();
-  assert(mmc3.irq_scanline() == 2);
+  // The latch is a delta from the previous expiry: chained IRQs fire
+  // latch+1 lines apart, and past the visible frame nothing schedules.
+  assert(mmc3.irq_scanline(2) == 5);
+  assert(!mmc3.irq_scanline(237));
   mmc3.write(0xE000, 0);
   assert(irq_acks == 1);
+  assert(!mmc3.irq_scanline(-1));
   mmc3.write(0xE001, 0);
-  assert(mmc3.irq_scanline() == 2);
+  assert(mmc3.irq_scanline(-1) == 2);
 
   Cartridge c5{banks(32, BANK8), vector<uint8_t>(0x20000), Mirroring::Horizontal, 5};
   Mmc5 mmc5(c5);

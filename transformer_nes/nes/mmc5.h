@@ -188,7 +188,7 @@ public:
     }
     return image;
   }
-  optional<int> irq_scanline() const override {
+  optional<int> irq_scanline(int) const override {
     return irq_enabled && irq_target ? optional<int>(irq_target) : std::nullopt;
   }
   void notify_scanline_irq() override { irq_pending = true; }

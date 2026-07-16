@@ -60,7 +60,10 @@ public:
   virtual int read(int) { throw std::runtime_error("mapper range is write-only"); }
   virtual void write(int, int) { throw std::runtime_error("mapper is not writable"); }
   virtual void write_rmw(int addr, int, int value) { write(addr, value); }
-  virtual optional<int> irq_scanline() const { return std::nullopt; }
+  // Next IRQ scanline given the line of the frame's previous IRQ (-1 at
+  // frame start): MMC3-class counters chain in latch-sized deltas from
+  // the previous expiry, MMC5 compares against an absolute line.
+  virtual optional<int> irq_scanline(int) const { return std::nullopt; }
   virtual vector<pair<int, int>> register_ranges() const { return {}; }
   virtual void notify_scanline_irq() {}
 

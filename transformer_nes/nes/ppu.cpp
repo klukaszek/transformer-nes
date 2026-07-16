@@ -66,6 +66,17 @@ struct Ppu::Impl {
   ChrBanks frame_chr_bank{};
   bool frame_latch_valid = false;
 
+  // Mid-visible-span scroll writes (between end_vblank and the next
+  // render): a $2006 second write reloads all 15 bits of v immediately
+  // on hardware, so the post-sprite-0 band must pin its y to that load
+  // (Zelda scrolls the playfield under its fixed HUD this way).  The
+  // console discovers the write's scanline and records it here; -1
+  // means "no split row known, fall back to the hit line".
+  bool in_span = false;
+  bool span_scroll_writes = false;
+  int span_v_load = -1;
+  int span_split_line = -1;
+
   // A second mid-frame split (mapper IRQ): the console latches the state
   // at delivery; rows above the split render from it, rows below from
   // the live (post-IRQ-handler) registers.  Consumed per render.
@@ -327,6 +338,8 @@ struct Ppu::Impl {
       if (write_latch) {
         t_addr = (t_addr & 0x7F00) | value;
         vram_addr = t_addr & 0x3FFF;
+        if (in_span)
+          span_v_load = t_addr; // 15-bit v reload, effective immediately
       } else {
         t_addr = (t_addr & 0x00FF) | ((value & 0x3F) << 8);
       }
@@ -335,13 +348,18 @@ struct Ppu::Impl {
       vram_write(vram_addr & 0x3FFF, value);
       vram_addr = (vram_addr + increment()) & 0x3FFF;
     }
+    if (in_span && (reg == 0 || reg == 5 || reg == 6))
+      span_scroll_writes = true;
   }
 
   // ── Console-side control ────────────────────────────────────────
 
   bool nmi_enabled() const { return (ctrl & 0x80) != 0; }
   bool rendering_enabled() const { return (mask & 0x18) != 0; }
-  void begin_vblank() { vblank = true; }
+  void begin_vblank() {
+    vblank = true;
+    in_span = false;
+  }
   void end_vblank() {
     vblank = false;
     sprite0_hit = false;
@@ -355,6 +373,10 @@ struct Ppu::Impl {
       mmc5.snapshot_frame();
     raster_split_count = 0;
     frame_latch_valid = true;
+    in_span = true;
+    span_scroll_writes = false;
+    span_v_load = -1;
+    span_split_line = -1;
   }
 
   bool take_nmi_edge() {
@@ -556,6 +578,10 @@ struct Ppu::Impl {
     int live_y_base = -1;
     if (mid_scanline >= 0 && (vram_addr & 0x7FFF) != (mid_v_addr & 0x7FFF)) {
       live_y_base = scroll_row_480(vram_addr);
+    } else if (mid_scanline < 0 && span_v_load >= 0) {
+      // No IRQ split, but the visible span reloaded v via a $2006 pair
+      // (sprite-0 y-split): pin the post-split band to the loaded row.
+      live_y_base = scroll_row_480(span_v_load);
     }
     // MMC5 banks the CHR windows mid-frame at the IRQ split just like
     // scroll: rows above the split render from the windows frozen at
@@ -647,7 +673,12 @@ struct Ppu::Impl {
       return out;
     }
 
-    const bool raster_mode = mmc5.active() && raster_split_count != 0;
+    // Ordered raster snapshots serve any mapper that split more than
+    // once this frame (SMB3's spade minigame chains four MMC3 IRQs);
+    // single-split frames keep the mid_* path.  MMC5 always renders
+    // through its snapshots because they carry its CHR windows.
+    const bool raster_mode =
+        raster_split_count != 0 && (mmc5.active() || raster_split_count > 1);
     if (!raster_mode)
       render_bg_rows(frame, pal.data(), backdrop, span, 0, 240);
 
@@ -661,12 +692,17 @@ struct Ppu::Impl {
 
     const int s0 = sprite0_scanline;
     const bool have_mid = mid_scanline >= 0 && mid_scanline + 1 < 240;
+    // The game's post-hit scroll writes land some scanlines below the
+    // hit (Zelda busy-waits ~15 lines to reach its HUD edge); when the
+    // console located the write row, the split starts there instead of
+    // at the hit line.
+    const int s0_start = span_split_line > s0 ? span_split_line : s0 + 1;
     // A sprite-0 split only means something ABOVE the IRQ split (the
     // SMB-style poll-then-scroll pattern).  A hit below it is just a
     // status bit -- an ordinary sprite over opaque background (CV3's
     // player with the MMC5 IRQ at the HUD edge) -- and must not eat
     // the IRQ split.
-    const bool have_s0 = s0 >= 0 && s0 + 1 < 240 && (!have_mid || s0 < mid_scanline);
+    const bool have_s0 = s0 >= 0 && s0_start < 240 && (!have_mid || s0 < mid_scanline);
     const size_t* mid_banks =
         mmc5.active() ? mmc5.split_background_banks(mid_ctrl) : mid_chr_bank.data();
     const BandState mid_band = have_mid ? BandState{mid_ctrl,   mid_mask, mid_mirroring, mid_t_addr,
@@ -699,8 +735,9 @@ struct Ppu::Impl {
           pinned_origin = scroll_row_480(next.v_addr);
           pinned_start = start;
         }
-        const size_t* banks = (next.ctrl & 0x20) ? next.mapper_banks.background.data()
-                                                 : next.mapper_banks.sprite.data();
+        const size_t* banks = !mmc5.active()      ? next.chr_banks.data()
+                              : (next.ctrl & 0x20) ? next.mapper_banks.background.data()
+                                                   : next.mapper_banks.sprite.data();
         raster_bands[i] = BandState{
             next.ctrl,   next.mask,   next.mirroring,
             next.t_addr, next.fine_x, pinned_y ? (pinned_origin + start - pinned_start) % 480 : -1,
@@ -719,7 +756,7 @@ struct Ppu::Impl {
       segs[nseg++] = {live_start, &raster_live};
     } else {
       if (have_s0)
-        segs[nseg++] = {s0 + 1, &mid_band};
+        segs[nseg++] = {s0_start, &mid_band};
       if (have_mid)
         segs[nseg++] = {mid_scanline + 1, &live};
     }
@@ -837,6 +874,12 @@ Ppu::Frame Ppu::render_frame() { return impl_->render_frame(); }
 void Ppu::begin_vblank() { impl_->begin_vblank(); }
 void Ppu::end_vblank() { impl_->end_vblank(); }
 void Ppu::mark_split(int scanline) { impl_->mark_split(scanline); }
+bool Ppu::span_scroll_seen() const { return impl_->span_scroll_writes; }
+void Ppu::begin_span_watch() {
+  impl_->span_scroll_writes = false;
+  impl_->span_v_load = -1;
+}
+void Ppu::note_span_split(int scanline) { impl_->span_split_line = scanline; }
 bool Ppu::take_nmi_edge() { return impl_->take_nmi_edge(); }
 bool Ppu::nmi_enabled() const { return impl_->nmi_enabled(); }
 bool Ppu::rendering_enabled() const { return impl_->rendering_enabled(); }

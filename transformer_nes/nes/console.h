@@ -19,16 +19,6 @@ using std::uint8_t;
 using std::unique_ptr;
 using std::vector;
 
-struct JournalEntry {
-  int frame = 0;
-  int phase = 0;
-  int kind = 0;
-  int line = 0;
-  int value = 0;
-  int pc = -1;
-  int opcode = -1;
-};
-
 class Console {
 public:
   Console(unique_ptr<Mapper>, unique_ptr<Ppu>, unique_ptr<Apu>, ConsoleMachine&);
@@ -38,7 +28,6 @@ public:
   void set_button(size_t index, bool pressed) { controller_.set_button(index, pressed); }
   int read_cpu(int addr) const { return machine_.read_ram(addr); }
   const vector<float>& last_audio() const { return last_audio_; }
-  const vector<JournalEntry>& journal() const { return journal_; }
   const Ppu& ppu() const { return *ppu_; }
   Ppu& ppu() { return *ppu_; }
   const Mapper& mapper() const { return *mapper_; }
@@ -57,10 +46,10 @@ private:
 
   void attach_devices();
   void run_until(int64_t);
+  void locate_span_split(int64_t base, int hit_line);
   void set_irq(IrqSource source, bool active);
   void sync_irq();
   void check_interrupts();
-  void add_event(int phase, int line, int value);
   unique_ptr<Mapper> mapper_;
   unique_ptr<Ppu> ppu_;
   unique_ptr<Apu> apu_;
@@ -76,7 +65,6 @@ private:
   bool halted_ = false;
   uint8_t irq_sources_ = 0;
   vector<float> last_audio_;
-  vector<JournalEntry> journal_;
 };
 
 } // namespace transformer_nes::nes

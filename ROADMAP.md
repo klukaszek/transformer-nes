@@ -6,6 +6,65 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
+## 2026-07-16 PPU raster fidelity — Zelda vertical scroll + SMB3 spade minigame
+
+Two frame-model defects, both reported from play and reproduced on input
+tapes (`tapes/loz_tape`, `tapes/smb3_spade`), both diagnosed from
+env-gated PPU/mapper register text logs (added temporarily, removed):
+
+- **Sprite-0 splits now honor the mid-span $2006 v reload and the real
+  write row.**  Zelda scrolls its playfield under the fixed HUD by
+  reloading all 15 bits of v after the sprite-0 hit; the render's live
+  band ignored the load (y came from t, relative to screen row 0) and
+  started at the hit line (48) instead of the write row (~64) — vertical
+  room transitions tore the HUD bottom and showed the wrong playfield
+  rows.  The PPU now records visible-span scroll writes and the last
+  $2006 pair's 15-bit load; after a sprite-0 event (only when no mapper
+  IRQ is scheduled) the console runs scanline-sized slices until the
+  journal drains the game's post-hit write batch, then snaps that line
+  up to the next tile-row boundary (slice attribution is ±a line; games
+  time splits to tile edges: Zelda 61→64).  The live band starts there,
+  y pinned to the loaded row.  SMB-class immediate writers stop the scan
+  after 1-2 slices; a game that never writes costs at most 48 slices.
+- **MMC3 IRQ latch is a delta, not an absolute line.**  The counter
+  reloads from the latch on the line after each expiry, so chained
+  same-frame IRQs fire latch+1 apart.  SMB3's spade minigame arms
+  latch=0x20 in the NMI and each handler re-arms latch=0x34: the chain
+  fires 32/85/138/191 (three 53-row picture strips + bottom HUD at 192).
+  The old model read the latch as an absolute scanline, so the chain
+  died after two fires and rows 53-239 (strips 2-3 AND the lower HUD)
+  shared one band — the reported garbage.  `irq_scanline(last_fired)`
+  now takes the previous expiry line (-1 at frame start; MMC5 ignores it,
+  its $5203 compare is absolute).  Level frames still fire once at
+  latch=192/193.
+- **Ordered raster snapshots serve every mapper.**  The per-split
+  journal (`raster_splits`, captured in mark_split for all mappers since
+  the CV3 arc) was only consumed when MMC5 was active; non-MMC5 frames
+  with >1 split now render through it too, each band fetching through
+  its snapshot's CHR banks (single-split frames keep the mid_* path
+  byte-identical).
+
+Same-day cleanup pass over the fresh C++ console port: the consumer-less
+event journal (JournalEntry/add_event, grew unboundedly and was never
+read) and the F1 BTN_DEBUG bit (its app.py debug-dump consumer left in
+the port) are gone; run_frame's event picking is two scalars instead of
+a per-iteration vector+sort.  bus.cpp/tape.cpp/app.cpp reviewed, no
+other changes warranted; the mid_*-vs-raster_splits duplication in
+ppu.cpp is deliberate (the mid path serves the sprite-0+IRQ combo the
+raster path doesn't model).
+
+Receipts: 69 Python tests + the native hardware test green (new MMC3
+delta-chain assertions), ruff clean; numeric frame invariants on the
+tapes — Zelda HUD rows 0-63 byte-stable across both transition windows
+(and the check fails if row 64 joins it: the split lands exactly at the
+HUD edge), spade header rows 0-30 + HUD rows 193-239 byte-stable while
+all three strips scroll every frame.  Tape fps (post-C++-console-port
+baselines; the port itself landed unlogged the day before): SMB 1037,
+SMB3 563-572, spade 563, CV3 546, LoZ 809; smokes: Punch-Out 522,
+Zelda2 743, MM6 822, FF 970.  Diagnosis rule that worked: a transient
+glitch that settles correctly is mid-frame split state, not steady-state
+logic.
+
 **START HERE (2026-07-13, fused memory reads — the construction diet):**
 
 - The census that reordered everything: ~80% of a median opcode expert's
