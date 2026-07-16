@@ -41,8 +41,7 @@ constexpr int view_height = 224;
 // NTSC: 29,781 CPU cycles per frame at 1.789773 MHz.
 constexpr double nes_frame_seconds = 29'781.0 / 1'789'772.727272727;
 
-// Button bit i == console.BUTTONS[i].  Bit 8 is the F1 debug-dump
-// request, consumed by app.py rather than the controller.
+// Button bit i == console.BUTTONS[i].
 enum Button : uint32_t {
   BTN_A = 1 << 0,
   BTN_B = 1 << 1,
@@ -52,7 +51,6 @@ enum Button : uint32_t {
   BTN_DOWN = 1 << 5,
   BTN_LEFT = 1 << 6,
   BTN_RIGHT = 1 << 7,
-  BTN_DEBUG = 1 << 8,
 };
 
 constexpr char vertex_shader_source[] = R"(
@@ -264,9 +262,6 @@ void app_event(const sapp_event* e) {
     break;
   case SAPP_KEYCODE_RIGHT:
     bit = BTN_RIGHT;
-    break;
-  case SAPP_KEYCODE_F1:
-    bit = BTN_DEBUG;
     break;
   default:
     return;

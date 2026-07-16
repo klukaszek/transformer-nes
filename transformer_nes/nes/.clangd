@@ -1,2 +1,2 @@
 CompileFlags:
-  Add: [-std=c++26, -Wall, -Wextra, -Wpedantic]
+  Add: [-std=c++26, -Wall, -Wextra, -Wpedantic, -I../../vendor/sokol]
