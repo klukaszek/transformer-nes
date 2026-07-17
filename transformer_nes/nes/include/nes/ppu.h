@@ -55,8 +55,7 @@ public:
 
   void set_mirroring(int value);
   void set_chr_banks(const array<size_t, 8>& banks);
-  void set_mmc2_banks(const array<size_t, 4>& banks);
-  void set_mmc4_banks(const array<size_t, 4>& banks);
+  void set_chr_latch_banks(const array<size_t, 4>& banks, bool wide_low);
   void set_mmc5_state(int exram_mode, int nametable_map, int fill_tile, int fill_color,
                       int chr_upper);
   void set_mmc5_exram(int address, int value);

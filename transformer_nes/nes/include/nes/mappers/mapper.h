@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nes/cartridge.h"
+#include "nes/chr.h"
 
 #include <algorithm>
 #include <array>
@@ -26,17 +27,6 @@ using std::vector;
 
 constexpr size_t BANK8 = 0x2000;
 constexpr size_t BANK16 = 0x4000;
-using ChrBanks = array<size_t, 8>;
-using ChrLatchBanks = array<size_t, 4>;
-
-class ChrLatchMapper {
-public:
-  virtual ~ChrLatchMapper() = default;
-  virtual void configure(const ChrLatchBanks& banks_4k, size_t chr_size) = 0;
-  virtual size_t map(size_t address) const = 0;
-  virtual void after_fetch(size_t address) = 0;
-  virtual array<bool, 2> latches() const = 0;
-};
 
 struct MapperCallbacks {
   function<void(int, int)> poke;
@@ -48,8 +38,7 @@ struct MapperCallbacks {
   // console re-evaluates its frame events instead of running past a
   // mid-frame arm.
   function<void()> irq_changed;
-  function<void(const ChrLatchBanks&)> mmc2_banks;
-  function<void(const ChrLatchBanks&)> mmc4_banks;
+  function<void(const ChrLatchBanks&, bool wide_low)> chr_latch_banks;
   function<void(int, int, int, int, int)> mmc5_state;
   function<void(int, int)> mmc5_exram;
   function<void(const ChrBanks&, const ChrBanks&)> mmc5_chr;

@@ -14,9 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "nes/mappers/mmc2.h"
-#include "nes/mappers/mmc4.h"
-#include "nes/mappers/mmc5.h"
+#include "nes/chr.h"
 #include "nes/ppu.h"
 
 namespace transformer_nes::nes {
@@ -27,9 +25,8 @@ struct Ppu::Impl {
   // the PPU's $0000-$1FFF window maps through eight 1 KiB bank slots.
   vector<uint8_t> chr;
   ChrBanks chr_bank{};
-  Mmc2Chr mmc2;
-  Mmc4Chr mmc4;
-  ChrLatchMapper* chr_latch = nullptr;
+  ChrLatch chr_latch;
+  bool chr_latch_active = false;
   Mmc5Ppu mmc5;
   bool chr_writable;
   // Nametable arrangement, runtime-switchable by mappers (MMC1
@@ -216,36 +213,16 @@ struct Ppu::Impl {
     mmc5.configure_chr(sprite, background);
   }
 
-  // The PPU-side ExRAM (nametable/attribute data written via $2007) and
-  // the live exram mode -- for debugging MMC5 background substitution.
-  array<uint8_t, 0x400> mmc5_exram() const { return mmc5.exram(); }
-  int mmc5_exram_mode() const { return mmc5.exram_mode(); }
-
-  // The CHR windows frozen at the last IRQ split (bank indices), for
-  // debugging mid-frame swaps; stale until a split occurs.
-  array<int, 8> mmc5_split_bg() const {
-    array<int, 8> v{};
-    for (size_t i = 0; i < v.size(); ++i)
-      v[i] = mmc5.split_background_banks()[i] / 0x400;
-    return v;
-  }
-  array<int, 8> mmc5_split_sprite() const {
-    array<int, 8> v{};
-    for (size_t i = 0; i < v.size(); ++i)
-      v[i] = mmc5.split_sprite_banks()[i] / 0x400;
-    return v;
-  }
-
   size_t chr_index(const size_t* banks, size_t address) const {
-    if (chr_latch)
-      return chr_latch->map(address);
+    if (chr_latch_active)
+      return chr_latch.map(address);
     return banks[(address >> 10) & 7] + (address & 0x3FF);
   }
 
   int chr_at(int addr) {
     const int value = chr[chr_index(chr_bank.data(), addr)];
-    if (chr_latch)
-      chr_latch->after_fetch(addr);
+    if (chr_latch_active)
+      chr_latch.after_fetch(addr);
     return value;
   }
 
@@ -255,14 +232,10 @@ struct Ppu::Impl {
       chr_bank[i] = (banks_1k[i] % count) * 0x400;
   }
 
-  void set_mmc2_banks(const ChrLatchBanks& banks_4k) {
-    chr_latch = &mmc2;
-    chr_latch->configure(banks_4k, chr.size());
-  }
-
-  void set_mmc4_banks(const ChrLatchBanks& banks_4k) {
-    chr_latch = &mmc4;
-    chr_latch->configure(banks_4k, chr.size());
+  void set_chr_latch_banks(const ChrLatchBanks& banks_4k, bool wide_low) {
+    chr_latch_active = true;
+    chr_latch.wide_low = wide_low;
+    chr_latch.configure(banks_4k, chr.size());
   }
 
   int vram_read(int addr) {
@@ -424,13 +397,13 @@ struct Ppu::Impl {
     return b0 | (b1 << 1);
   }
 
-  pair<uint8_t, uint8_t> fetch_pattern_pair(int pattern_addr) {
+  std::pair<uint8_t, uint8_t> fetch_pattern_pair(int pattern_addr) {
     const uint8_t b0 = chr[chr_index(chr_bank.data(), pattern_addr)];
     const uint8_t b1 = chr[chr_index(chr_bank.data(), pattern_addr + 8)];
     // The switching tile itself uses the old bank. Both pattern bytes
     // are fetched before the latch affects subsequent PPU reads.
-    chr_latch->after_fetch(pattern_addr);
-    chr_latch->after_fetch(pattern_addr + 8);
+    chr_latch.after_fetch(pattern_addr);
+    chr_latch.after_fetch(pattern_addr + 8);
     return {b0, b1};
   }
 
@@ -681,7 +654,7 @@ struct Ppu::Impl {
     // fixed-bank pixels are order-independent; PxROM cannot. Render it
     // scanline by scanline (background fetches, then OAM-order sprite
     // fetches) so the next row and next frame inherit the right latch.
-    if (chr_latch) {
+    if (chr_latch_active) {
       const int split_s0 = sprite0_scanline; // prediction from prior frame
       sprite0_scanline = -1;
       for (auto& row : sprite_claimed)
@@ -976,8 +949,9 @@ void Ppu::set_sprite0_hit(bool value) { impl_->sprite0_hit = value; }
 void Ppu::set_sprite_limit(bool enabled) { impl_->sprite_limit = enabled; }
 void Ppu::set_mirroring(int value) { impl_->mirroring = value; }
 void Ppu::set_chr_banks(const ChrBanks& banks) { impl_->set_chr_banks(banks); }
-void Ppu::set_mmc2_banks(const ChrLatchBanks& banks) { impl_->set_mmc2_banks(banks); }
-void Ppu::set_mmc4_banks(const ChrLatchBanks& banks) { impl_->set_mmc4_banks(banks); }
+void Ppu::set_chr_latch_banks(const ChrLatchBanks& banks, bool wide_low) {
+  impl_->set_chr_latch_banks(banks, wide_low);
+}
 void Ppu::set_mmc5_state(int exram_mode, int nametable_map, int fill_tile, int fill_color,
                          int chr_upper) {
   impl_->set_mmc5_state(exram_mode, nametable_map, fill_tile, fill_color, chr_upper);

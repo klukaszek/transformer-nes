@@ -110,8 +110,9 @@ void Console::attach_devices() {
   callbacks.chr_banks = [this](const auto& banks) { ppu_->set_chr_banks(banks); };
   callbacks.irq_ack = [this] { set_irq(IrqSource::mapper, false); };
   callbacks.irq_changed = [this] { irq_sched_dirty_ = true; };
-  callbacks.mmc2_banks = [this](const auto& banks) { ppu_->set_mmc2_banks(banks); };
-  callbacks.mmc4_banks = [this](const auto& banks) { ppu_->set_mmc4_banks(banks); };
+  callbacks.chr_latch_banks = [this](const auto& banks, bool wide_low) {
+    ppu_->set_chr_latch_banks(banks, wide_low);
+  };
   callbacks.mmc5_state = [this](int a, int b, int c, int d, int e) {
     ppu_->set_mmc5_state(a, b, c, d, e);
   };

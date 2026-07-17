@@ -25,6 +25,9 @@ vendor/sokol/
 vendor/imgui/
 vendor/pybind11/
 
+# Battery saves are user data, written next to the ROM
+*.sav
+
 # Commercial ROMs stay local (test ROMs like nestest are tracked)
 transformer_nes/nes/examples/smb.nes
 transformer_nes/nes/examples/smb3.nes

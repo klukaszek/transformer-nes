@@ -2,9 +2,8 @@
 
 #include "nes/mappers/mapper.h"
 #include "nes/mappers/mmc1.h"
-#include "nes/mappers/mmc2.h"
+#include "nes/mappers/mmc2_mmc4.h"
 #include "nes/mappers/mmc3.h"
-#include "nes/mappers/mmc4.h"
 #include "nes/mappers/mmc5.h"
 
 #include <memory>
