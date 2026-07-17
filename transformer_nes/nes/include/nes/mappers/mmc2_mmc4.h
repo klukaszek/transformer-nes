@@ -51,10 +51,9 @@ public:
         map_region(0x8000, region(cart_.prg, prg_bank(0) * unit_, unit_));
     } else if (reg >= 0xB000 && reg <= 0xE000) {
       chr_regs_[(reg - 0xB000) >> 12] = value & 0x1F;
-      if (callbacks_.chr_latch_banks)
-        callbacks_.chr_latch_banks(latch_banks(), wide_low_);
-    } else if (reg == 0xF000 && callbacks_.mirroring)
-      callbacks_.mirroring(value & 1 ? 3 : 2);
+      host_.ppu->set_chr_latch_banks(latch_banks(), wide_low_);
+    } else if (reg == 0xF000)
+      host_.ppu->mirroring = value & 1 ? 3 : 2;
     repair(addr, rom_byte(addr));
   }
 
@@ -67,10 +66,7 @@ private:
 
   size_t slots() const { return 0x8000 / unit_; }
 
-  void on_connected() override {
-    if (callbacks_.chr_latch_banks)
-      callbacks_.chr_latch_banks(latch_banks(), wide_low_);
-  }
+  void on_connected() override { host_.ppu->set_chr_latch_banks(latch_banks(), wide_low_); }
 };
 
 class Mmc2 final : public LatchMapper {

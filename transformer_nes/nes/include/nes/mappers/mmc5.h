@@ -89,8 +89,7 @@ public:
     if (addr == 0x5204) {
       int out = (irq_pending ? 0x80 : 0) | 0x40;
       irq_pending = false;
-      if (callbacks_.irq_ack)
-        callbacks_.irq_ack();
+      host_.irq->set(IRQ_MAPPER, false);
       return out;
     }
     if (addr == 0x5205)
@@ -116,8 +115,7 @@ public:
       exram_mode = value & 3;
     else if (addr == 0x5105) {
       nametable_map = value;
-      if (callbacks_.mirroring)
-        callbacks_.mirroring(value);
+      host_.ppu->mirroring = value;
     } else if (addr == 0x5106)
       fill_tile = value;
     else if (addr == 0x5107)
@@ -142,12 +140,11 @@ public:
       mul_b = value;
     else if (addr >= 0x5C00 && addr <= 0x5FFF) {
       exram[addr - 0x5C00] = static_cast<uint8_t>(value);
-      if (callbacks_.mmc5_exram)
-        callbacks_.mmc5_exram(addr - 0x5C00, value);
+      host_.ppu->set_mmc5_exram(addr - 0x5C00, value);
     } else if (addr >= 0x6000 && addr <= 0x7FFF && ram_writable())
       prg_ram[(prg_ram_bank & 7) * BANK8 + (addr & 0x1FFF)] = static_cast<uint8_t>(value);
-    if (((addr >= 0x5104 && addr <= 0x5107) || addr == 0x5130) && callbacks_.mmc5_state)
-      callbacks_.mmc5_state(exram_mode, nametable_map, fill_tile, fill_color, chr_upper);
+    if ((addr >= 0x5104 && addr <= 0x5107) || addr == 0x5130)
+      host_.ppu->set_mmc5_state(exram_mode, nametable_map, fill_tile, fill_color, chr_upper);
     auto now = prg_layout();
     for (size_t i = 0; i < old.size(); ++i)
       if (old[i] != now[i])
@@ -208,15 +205,12 @@ private:
     return out;
   }
   void sync_chr() {
-    if (callbacks_.chr_banks)
-      callbacks_.chr_banks(chr_banks());
-    if (callbacks_.mmc5_chr)
-      callbacks_.mmc5_chr(chr_banks(), background_chr_banks());
+    host_.ppu->set_chr_banks(chr_banks());
+    host_.ppu->set_mmc5_chr(chr_banks(), background_chr_banks());
   }
 
   void on_connected() override {
-    if (callbacks_.mmc5_state)
-      callbacks_.mmc5_state(exram_mode, nametable_map, fill_tile, fill_color, chr_upper);
+    host_.ppu->set_mmc5_state(exram_mode, nametable_map, fill_tile, fill_color, chr_upper);
     sync_chr();
   }
 };

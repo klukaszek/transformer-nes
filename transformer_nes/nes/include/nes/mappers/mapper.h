@@ -1,13 +1,14 @@
 #pragma once
 
+#include "nes/bus.h"
 #include "nes/cartridge.h"
 #include "nes/chr.h"
+#include "nes/ppu.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -17,7 +18,6 @@
 namespace transformer_nes::nes {
 
 using std::array;
-using std::function;
 using std::optional;
 using std::pair;
 using std::size_t;
@@ -28,20 +28,14 @@ using std::vector;
 constexpr size_t BANK8 = 0x2000;
 constexpr size_t BANK16 = 0x4000;
 
-struct MapperCallbacks {
-  function<void(int, int)> poke;
-  function<void(int, span<const uint8_t>)> map_region;
-  function<void(int)> mirroring;
-  function<void(const ChrBanks&)> chr_banks;
-  function<void()> irq_ack;
-  // The IRQ schedule may have moved (latch/reload/enable writes): the
-  // console re-evaluates its frame events instead of running past a
-  // mid-frame arm.
-  function<void()> irq_changed;
-  function<void(const ChrLatchBanks&, bool wide_low)> chr_latch_banks;
-  function<void(int, int, int, int, int)> mmc5_state;
-  function<void(int, int)> mmc5_exram;
-  function<void(const ChrBanks&, const ChrBanks&)> mmc5_chr;
+// Everything a mapper drives outside its own cartridge state: the PPU
+// (mirroring, CHR banks, MMC5 substitution state), the machine image
+// (repair pokes, bank region maps), and the shared IRQ line (acks +
+// the sched_dirty re-plan signal).
+struct MapperHost {
+  Ppu* ppu = nullptr;
+  ConsoleMachine* machine = nullptr;
+  IrqLine* irq = nullptr;
 };
 
 class Mapper {
@@ -63,8 +57,8 @@ public:
   virtual void notify_scanline_irq() {}
   virtual void begin_frame() {}
 
-  void connect(MapperCallbacks callbacks) {
-    callbacks_ = std::move(callbacks);
+  void connect(MapperHost host) {
+    host_ = host;
     on_connected();
   }
 
@@ -72,25 +66,12 @@ public:
 
 protected:
   Cartridge cart_;
-  MapperCallbacks callbacks_;
+  MapperHost host_;
 
   virtual void on_connected() {}
 
-  void repair(int addr, int value) {
-    if (!callbacks_.poke)
-      throw std::logic_error("mapper poke callback not attached");
-    callbacks_.poke(addr, value & 0xFF);
-  }
-  void map_region(int base, span<const uint8_t> data) {
-    if (callbacks_.map_region)
-      callbacks_.map_region(base, data);
-    else {
-      if (!callbacks_.poke)
-        throw std::logic_error("mapper callback not attached");
-      for (size_t i = 0; i < data.size(); ++i)
-        callbacks_.poke(base + static_cast<int>(i), data[i]);
-    }
-  }
+  void repair(int addr, int value) { host_.machine->poke(addr, value & 0xFF); }
+  void map_region(int base, span<const uint8_t> data) { host_.machine->map_region(base, data); }
   static span<const uint8_t> region(span<const uint8_t> data, size_t offset, size_t size) {
     return data.subspan(offset, size);
   }

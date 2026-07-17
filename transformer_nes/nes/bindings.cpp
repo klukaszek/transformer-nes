@@ -209,8 +209,8 @@ public:
     OpcodeTable opcodes{};
     for (size_t i = 0; i < opcode_values.size(); ++i)
       opcodes[i] = {opcode_values[i].first, opcode_values[i].second};
-    auto ppu = std::make_unique<Ppu>(cart.chr.empty() ? vector<uint8_t>(0x2000) : cart.chr,
-                                     cart.chr.empty(), cart.mirroring == Mirroring::Vertical);
+    Ppu ppu(cart.chr.empty() ? vector<uint8_t>(0x2000) : cart.chr, cart.chr.empty(),
+            cart.mirroring == Mirroring::Vertical);
     auto mapper = make_mapper(std::move(cart));
     auto image = mapper->cpu_image();
     int start = image[0xFFFC] | (image[0xFFFD] << 8);
@@ -225,9 +225,8 @@ public:
       stepped_ = std::make_unique<PythonSteppedRuntime>(runtime);
       machine_ = std::make_unique<Bus>(*stepped_, image, opcodes);
     }
-    auto apu = std::make_unique<Apu>(sample_rate);
     console_ =
-        std::make_unique<Console>(std::move(mapper), std::move(ppu), std::move(apu), *machine_);
+        std::make_unique<Console>(std::move(mapper), std::move(ppu), Apu(sample_rate), *machine_);
   }
   py::array_t<uint8_t> run_frame() {
     auto frame = console_->run_frame();
@@ -254,7 +253,7 @@ public:
       throw std::invalid_argument("battery image must be 8192 bytes");
     machine_->map_region(0x6000, span(reinterpret_cast<const uint8_t*>(s.data()), s.size()));
   }
-  void set_sprite_limit(bool enabled) { console_->ppu().sprite_limit = enabled; }
+  void set_sprite_limit(bool enabled) { console_->ppu.sprite_limit = enabled; }
   py::dict run_tape(const string& path, int tail_frames, int max_frames) {
     const auto result = replay_tape(*console_, InputTape::load(path), tail_frames, max_frames);
     py::dict out;
@@ -262,7 +261,7 @@ public:
     out["seconds"] = result.seconds;
     out["fps"] = result.seconds > 0.0 ? result.frames / result.seconds : 0.0;
     out["halted"] = result.halted;
-    out["cycles"] = console_->cycles();
+    out["cycles"] = console_->cycles;
     return out;
   }
   Console& console() { return *console_; }
@@ -314,11 +313,11 @@ PYBIND11_MODULE(nes_hardware, m) {
       .def("load_prg_ram", &ConsoleHost::load_prg_ram, py::arg("data"))
       .def("set_sprite_limit", &ConsoleHost::set_sprite_limit, py::arg("enabled"))
       .def_property_readonly("frame_index",
-                             [](ConsoleHost& h) { return h.console().frame_index(); })
-      .def_property_readonly("cycles", [](ConsoleHost& h) { return h.console().cycles(); })
-      .def_property_readonly("halted", [](ConsoleHost& h) { return h.console().halted(); })
+                             [](ConsoleHost& h) { return h.console().frame_index; })
+      .def_property_readonly("cycles", [](ConsoleHost& h) { return h.console().cycles; })
+      .def_property_readonly("halted", [](ConsoleHost& h) { return h.console().halted; })
       .def_property_readonly("last_audio", [](ConsoleHost& h) {
-        const auto& a = h.console().last_audio();
+        const auto& a = h.console().last_audio;
         py::array_t<float> out(a.size());
         std::copy(a.begin(), a.end(), out.mutable_data());
         return out;

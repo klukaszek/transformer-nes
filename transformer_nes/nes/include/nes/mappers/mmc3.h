@@ -84,34 +84,31 @@ private:
       bank_select = value;
     else if (reg == 0x8001)
       regs[bank_select & 7] = value;
-    else if (reg == 0xA000) {
-      if (!callbacks_.mirroring)
-        throw std::logic_error("mirroring callback not attached");
-      callbacks_.mirroring(value & 1 ? 3 : 2);
-    } else if (reg == 0xC000)
+    else if (reg == 0xA000)
+      host_.ppu->mirroring = value & 1 ? 3 : 2;
+    else if (reg == 0xC000)
       irq_latch = value;
     else if (reg == 0xC001)
       reload_line = scanline;
     else if (reg == 0xE000) {
       irq_enabled = false;
-      if (callbacks_.irq_ack)
-        callbacks_.irq_ack();
+      host_.irq->set(IRQ_MAPPER, false);
     } else if (reg == 0xE001)
       irq_enabled = true;
-    if (reg >= 0xC000 && reg != 0xE000 && callbacks_.irq_changed)
-      callbacks_.irq_changed();
+    // The IRQ schedule may have moved (latch/reload/enable writes): the
+    // console re-evaluates its frame events instead of running past a
+    // mid-frame arm.
+    if (reg >= 0xC000 && reg != 0xE000)
+      host_.irq->sched_dirty = true;
   }
   void notify_chr(int reg) {
-    if (chr_rom && (reg == 0x8000 || reg == 0x8001)) {
-      if (!callbacks_.chr_banks)
-        throw std::logic_error("CHR callback not attached");
-      callbacks_.chr_banks(chr_banks());
-    }
+    if (chr_rom && (reg == 0x8000 || reg == 0x8001))
+      host_.ppu->set_chr_banks(chr_banks());
   }
 
   void on_connected() override {
-    if (chr_rom && callbacks_.chr_banks)
-      callbacks_.chr_banks(chr_banks());
+    if (chr_rom)
+      host_.ppu->set_chr_banks(chr_banks());
   }
 };
 

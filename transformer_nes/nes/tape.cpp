@@ -65,20 +65,20 @@ TapeBenchmark replay_tape(Console& console, const InputTape& tape, int tail_fram
                           int max_frames) {
   if (tail_frames < 0 || max_frames < 0)
     throw std::invalid_argument("frame counts cannot be negative");
-  const int start_frame = console.frame_index();
+  const int start_frame = console.frame_index;
   int stop_frame = tape.last_frame() + 1 + tail_frames;
   if (max_frames)
     stop_frame = std::min(stop_frame, start_frame + max_frames);
   const auto start = std::chrono::steady_clock::now();
-  while (!console.halted() && console.frame_index() < stop_frame) {
-    const uint8_t buttons = tape.buttons_at(console.frame_index());
+  while (!console.halted && console.frame_index < stop_frame) {
+    const uint8_t buttons = tape.buttons_at(console.frame_index);
     for (int button = 0; button < 8; ++button)
       console.set_button(button, (buttons >> button) & 1);
     console.run_frame();
   }
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  return {console.frame_index() - start_frame, seconds, console.halted()};
+  return {console.frame_index - start_frame, seconds, console.halted};
 }
 
 } // namespace transformer_nes::nes

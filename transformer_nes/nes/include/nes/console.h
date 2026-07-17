@@ -6,7 +6,6 @@
 #include "nes/mappers/mappers.h"
 #include "nes/ppu.h"
 
-#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -19,52 +18,104 @@ using std::uint8_t;
 using std::unique_ptr;
 using std::vector;
 
+// NTSC frame timing in CPU cycles at 1.789773 MHz.
+constexpr int64_t vblank_start_cycles = 27'394;
+constexpr int64_t frame_cycles = 29'781;
+constexpr int64_t scanline_cycle(int line) { return static_cast<int64_t>(line + 1) * 341 / 3; }
+
+// Visible-span scanline containing a console-clock cycle, -1 outside.
+constexpr int span_scanline(int64_t cycle, int64_t frame_base) {
+  const int64_t rel = cycle - frame_base;
+  if (rel < 0 || rel >= vblank_start_cycles)
+    return -1;
+  const int row = static_cast<int>(rel * 3 / 341);
+  return row < 240 ? row : -1;
+}
+
 class Console {
 public:
-  Console(unique_ptr<Mapper>, unique_ptr<Ppu>, unique_ptr<Apu>, ConsoleMachine&);
-  ~Console();
+  Console(unique_ptr<Mapper> mapper, Ppu ppu, Apu apu, ConsoleMachine& machine);
   Ppu::Frame run_frame();
   Ppu::Frame run(int frames);
-  void set_button(size_t index, bool pressed) { controller_.set_button(index, pressed); }
-  int read_cpu(int addr) const { return machine_.read_ram(addr); }
-  const vector<float>& last_audio() const { return last_audio_; }
-  const Ppu& ppu() const { return *ppu_; }
-  Ppu& ppu() { return *ppu_; }
-  const Mapper& mapper() const { return *mapper_; }
-  Mapper& mapper() { return *mapper_; }
-  long long cycles() const { return cycles_; }
-  int frame_index() const { return frame_index_; }
-  bool halted() const { return halted_; }
-  int sprite0_scanline() const { return sprite0_scanline_; }
+  void set_button(size_t index, bool pressed) { controller.set_button(index, pressed); }
+
+  unique_ptr<Mapper> mapper;
+  Ppu ppu;
+  Apu apu;
+  ConsoleMachine& machine;
+  Controller controller;
+  vector<float> last_audio;
+  int64_t cycles = 0;
+  int frame_index = 0;
+  bool halted = false;
 
 private:
-  class PpuDevice;
-  class ApuDevice;
-  class MapperDevice;
-  class FrameCounter;
-  enum class IrqSource : uint8_t { mapper = 1, apu = 2 };
+  // Device-table adapters: route MMIO ranges to the owning chip and
+  // convert the write's cycle stamp to a visible-span scanline (the
+  // frame_base reference tracks the console's live frame origin).
+  class PpuDevice final : public Device {
+  public:
+    PpuDevice(Ppu& ppu, const int64_t& frame_base) : ppu_(ppu), frame_base_(frame_base) {}
+    int read(int address) override { return ppu_.read(address); }
+    void write(int address, int value, int64_t cycle) override {
+      ppu_.write(address, value, span_scanline(cycle, frame_base_));
+    }
+    ReadLease read_lease(int a) override {
+      auto v = ppu_.read_lease(a);
+      return v ? ReadLease(*v) : ReadLease{};
+    }
+
+  private:
+    Ppu& ppu_;
+    const int64_t& frame_base_;
+  };
+  class ApuDevice final : public Device {
+  public:
+    explicit ApuDevice(Apu& apu) : apu_(apu) {}
+    int read(int address) override { return apu_.read(address); }
+    void write(int address, int value, int64_t) override { apu_.write(address, value); }
+
+  private:
+    Apu& apu_;
+  };
+  class MapperDevice final : public Device {
+  public:
+    MapperDevice(Mapper& m, const int64_t& frame_base) : m_(m), frame_base_(frame_base) {}
+    int read(int a) override { return m_.read(a); }
+    void write(int a, int v, int64_t cycle) override {
+      m_.write(a, v, span_scanline(cycle, frame_base_));
+    }
+    void write_rmw(int a, int original, int value) override { m_.write_rmw(a, original, value); }
+
+  private:
+    Mapper& m_;
+    const int64_t& frame_base_;
+  };
+  // $4017 read is the APU frame counter (open-bus 0x40 leases);
+  // writes program the frame sequencer.
+  class FrameCounter final : public Device {
+  public:
+    explicit FrameCounter(Apu& apu) : apu_(apu) {}
+    int read(int address) override { return apu_.read(address); }
+    void write(int address, int value, int64_t) override { apu_.write(address, value); }
+    ReadLease read_lease(int) override { return 0x40; }
+
+  private:
+    Apu& apu_;
+  };
 
   void attach_devices();
   void run_until(int64_t target, bool replan = false);
-  void set_irq(IrqSource source, bool active);
-  void sync_irq();
   void check_interrupts();
-  unique_ptr<Mapper> mapper_;
-  unique_ptr<Ppu> ppu_;
-  unique_ptr<Apu> apu_;
-  ConsoleMachine& machine_;
-  Controller controller_;
-  unique_ptr<OamDma> dma_;
-  unique_ptr<PpuDevice> ppu_device_;
-  unique_ptr<ApuDevice> apu_device_;
-  unique_ptr<MapperDevice> mapper_device_;
-  unique_ptr<FrameCounter> frame_counter_;
-  int64_t cycles_ = 0, frame_base_ = 0;
-  int frame_index_ = 0, sprite0_scanline_ = -1;
-  bool halted_ = false;
-  bool irq_sched_dirty_ = false;
-  uint8_t irq_sources_ = 0;
-  vector<float> last_audio_;
+
+  IrqLine irq_;
+  int64_t frame_base_ = 0;
+  int sprite0_scanline_ = -1;
+  OamDma dma_;
+  PpuDevice ppu_device_;
+  ApuDevice apu_device_;
+  MapperDevice mapper_device_;
+  FrameCounter frame_counter_;
 };
 
 } // namespace transformer_nes::nes

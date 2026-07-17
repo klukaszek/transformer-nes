@@ -96,13 +96,36 @@ public:
   virtual void clear_irq() = 0;
   virtual void clear_read_lease() = 0;
   // cycle_base: the console-clock value at entry, so drained device
-  // writes carry an absolute cycle stamp (write_at).  A true return
-  // from the pause callback stops the run early (the console re-plans
-  // its frame events after a mid-frame IRQ-schedule change).
+  // writes carry an absolute cycle stamp.  A true return from the
+  // pause callback stops the run early (the console re-plans its
+  // frame events after a mid-frame IRQ-schedule change).
   virtual MachineRun run_cycles(int64_t, function<bool()> = {}, int64_t cycle_base = 0) = 0;
   virtual int read_ram(int) const = 0;
   virtual void poke(int, int) = 0;
   virtual void map_region(int, span<const uint8_t>) = 0;
+};
+
+// The shared level-sensitive IRQ line: sources OR onto the machine's
+// one line, so acking one source cannot clear another's pending level.
+// sched_dirty is the mapper's "my IRQ schedule moved" signal; the
+// console's frame-event planning loop consumes it.
+constexpr uint8_t IRQ_MAPPER = 1;
+constexpr uint8_t IRQ_APU = 2;
+struct IrqLine {
+  ConsoleMachine* machine = nullptr;
+  uint8_t sources = 0;
+  bool sched_dirty = false;
+
+  void set(uint8_t bit, bool active) {
+    if (active)
+      sources |= bit;
+    else
+      sources &= static_cast<uint8_t>(~bit);
+    if (sources == 0)
+      machine->clear_irq();
+    else
+      machine->set_irq();
+  }
 };
 
 struct OpcodeInfo {

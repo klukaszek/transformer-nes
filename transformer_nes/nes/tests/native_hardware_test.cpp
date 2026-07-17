@@ -15,67 +15,79 @@ static vector<uint8_t> banks(size_t count, size_t bank_size) {
   return out;
 }
 
-static void wire(Mapper& mapper, array<uint8_t, 0x10000>& memory) {
+// Backs the mapper's host with a plain 64 KiB array: pokes and region
+// maps land in `memory`, the machine IRQ line is a no-op.
+class ImageMachine final : public ConsoleMachine {
+public:
+  explicit ImageMachine(array<uint8_t, 0x10000>& memory) : memory_(memory) {}
+  void attach(Device&, int, int, bool) override {}
+  void set_nmi() override {}
+  void set_irq() override {}
+  void clear_irq() override {}
+  void clear_read_lease() override {}
+  MachineRun run_cycles(int64_t, function<bool()>, int64_t) override { return {}; }
+  int read_ram(int a) const override { return memory_[static_cast<size_t>(a)]; }
+  void poke(int a, int v) override { memory_[static_cast<size_t>(a)] = static_cast<uint8_t>(v); }
+  void map_region(int base, span<const uint8_t> data) override {
+    std::copy(data.begin(), data.end(), memory_.begin() + base);
+  }
+
+private:
+  array<uint8_t, 0x10000>& memory_;
+};
+
+static void wire(Mapper& mapper, array<uint8_t, 0x10000>& memory, ImageMachine& machine, Ppu& ppu,
+                 IrqLine& irq) {
   auto image = mapper.cpu_image();
   std::copy(image.begin(), image.end(), memory.begin());
-  MapperCallbacks callbacks;
-  callbacks.poke = [&](int addr, int value) { memory[addr] = static_cast<uint8_t>(value); };
-  callbacks.map_region = [&](int base, span<const uint8_t> data) {
-    std::copy(data.begin(), data.end(), memory.begin() + base);
-  };
-  mapper.connect(std::move(callbacks));
+  irq.machine = &machine;
+  mapper.connect({&ppu, &machine, &irq});
 }
 
 static void test_mappers() {
+  array<uint8_t, 0x10000> memory{};
+  ImageMachine machine(memory);
+  Ppu ppu(vector<uint8_t>(0x2000), true, false);
+  IrqLine irq;
+
   Cartridge c1{banks(16, BANK16), {}, Mirroring::Horizontal, 1};
   Mmc1 mmc1(c1);
-  array<uint8_t, 0x10000> memory{};
-  wire(mmc1, memory);
+  wire(mmc1, memory, machine, ppu, irq);
   for (int bit = 0; bit < 5; ++bit)
     mmc1.write(0xE000, (5 >> bit) & 1, -1);
   assert((mmc1.prg_banks() == array<size_t, 2>{5, 15}));
   assert(memory[0x8000] == 5 && memory[0xE000] == 15);
 
   Mmc1 mmc1_rmw(c1);
-  wire(mmc1_rmw, memory);
+  wire(mmc1_rmw, memory, machine, ppu, irq);
   for (int bit = 0; bit < 5; ++bit)
     mmc1_rmw.write_rmw(0xE000, (3 >> bit) & 1, ((3 >> bit) & 1) ^ 1);
   assert((mmc1_rmw.prg_banks() == array<size_t, 2>{3, 15}));
 
   Cartridge c3{banks(32, BANK8), vector<uint8_t>(0x20000), Mirroring::Horizontal, 4};
   Mmc3 mmc3(c3);
-  wire(mmc3, memory);
-  MapperCallbacks callbacks;
-  callbacks.poke = [&](int addr, int value) { memory[addr] = static_cast<uint8_t>(value); };
-  callbacks.map_region = [&](int base, span<const uint8_t> data) {
-    std::copy(data.begin(), data.end(), memory.begin() + base);
-  };
-  callbacks.chr_banks = [](const ChrBanks&) {};
-  int mirroring = -1;
-  int irq_acks = 0;
-  callbacks.mirroring = [&](int value) { mirroring = value; };
-  callbacks.irq_ack = [&] { ++irq_acks; };
-  mmc3.connect(std::move(callbacks));
+  wire(mmc3, memory, machine, ppu, irq);
   mmc3.write(0x8000, 6, -1);
   mmc3.write(0x8001, 12, -1);
   assert((mmc3.prg_banks() == array<size_t, 4>{12, 1, 30, 31}));
   assert(memory[0x8000] == 12 && memory[0xE000] == 31);
   mmc3.write(0xA000, 0, -1);
-  assert(mirroring == 2);
+  assert(ppu.mirroring == 2);
   mmc3.write(0xA000, 1, -1);
-  assert(mirroring == 3);
+  assert(ppu.mirroring == 3);
 
   mmc3.write(0xC000, 2, -1);
   mmc3.write(0xC001, 0, -1);
   mmc3.write(0xE001, 0, -1);
   assert(mmc3.irq_scanline(-1) == 2);
   mmc3.notify_scanline_irq();
+  irq.set(IRQ_MAPPER, true);
   // The latch is a delta from the previous expiry: chained IRQs fire
   // latch+1 lines apart, and past the visible frame nothing schedules.
   assert(mmc3.irq_scanline(2) == 5);
   assert(!mmc3.irq_scanline(237));
-  mmc3.write(0xE000, 0, -1);
-  assert(irq_acks == 1);
+  mmc3.write(0xE000, 0, -1); // $E000 disable also acks the line
+  assert(irq.sources == 0);
   assert(!mmc3.irq_scanline(-1));
   mmc3.write(0xE001, 0, -1);
   assert(mmc3.irq_scanline(-1) == 2);
@@ -95,7 +107,7 @@ static void test_mappers() {
 
   Cartridge c5{banks(32, BANK8), vector<uint8_t>(0x20000), Mirroring::Horizontal, 5};
   Mmc5 mmc5(c5);
-  wire(mmc5, memory);
+  wire(mmc5, memory, machine, ppu, irq);
   mmc5.write(0x5100, 2, -1);
   mmc5.write(0x5115, 0x98, -1);
   mmc5.write(0x5116, 0x9E, -1);

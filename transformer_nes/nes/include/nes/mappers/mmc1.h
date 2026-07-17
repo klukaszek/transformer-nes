@@ -94,16 +94,16 @@ private:
     shift = 0x10;
   }
   void notify(int old_mirror, const ChrBanks& old_chr) {
-    if ((control & 3) != old_mirror && callbacks_.mirroring)
-      callbacks_.mirroring(control & 3);
+    if ((control & 3) != old_mirror)
+      host_.ppu->mirroring = control & 3;
     auto now = chr_banks();
-    if (chr_rom && now != old_chr && callbacks_.chr_banks)
-      callbacks_.chr_banks(now);
+    if (chr_rom && now != old_chr)
+      host_.ppu->set_chr_banks(now);
   }
 
   void on_connected() override {
-    if (chr_rom && callbacks_.chr_banks)
-      callbacks_.chr_banks(chr_banks());
+    if (chr_rom)
+      host_.ppu->set_chr_banks(chr_banks());
   }
 };
 
