@@ -101,7 +101,7 @@ public:
       return exram[addr - 0x5C00];
     return 0;
   }
-  void write(int addr, int value) override {
+  void write(int addr, int value, int) override {
     value &= 0xFF;
     auto old = prg_layout();
     if (addr == 0x5100)

@@ -32,7 +32,7 @@ static void test_mappers() {
   array<uint8_t, 0x10000> memory{};
   wire(mmc1, memory);
   for (int bit = 0; bit < 5; ++bit)
-    mmc1.write(0xE000, (5 >> bit) & 1);
+    mmc1.write(0xE000, (5 >> bit) & 1, -1);
   assert((mmc1.prg_banks() == array<size_t, 2>{5, 15}));
   assert(memory[0x8000] == 5 && memory[0xE000] == 15);
 
@@ -56,37 +56,37 @@ static void test_mappers() {
   callbacks.mirroring = [&](int value) { mirroring = value; };
   callbacks.irq_ack = [&] { ++irq_acks; };
   mmc3.connect(std::move(callbacks));
-  mmc3.write(0x8000, 6);
-  mmc3.write(0x8001, 12);
+  mmc3.write(0x8000, 6, -1);
+  mmc3.write(0x8001, 12, -1);
   assert((mmc3.prg_banks() == array<size_t, 4>{12, 1, 30, 31}));
   assert(memory[0x8000] == 12 && memory[0xE000] == 31);
-  mmc3.write(0xA000, 0);
+  mmc3.write(0xA000, 0, -1);
   assert(mirroring == 2);
-  mmc3.write(0xA000, 1);
+  mmc3.write(0xA000, 1, -1);
   assert(mirroring == 3);
 
-  mmc3.write(0xC000, 2);
-  mmc3.write(0xC001, 0);
-  mmc3.write(0xE001, 0);
+  mmc3.write(0xC000, 2, -1);
+  mmc3.write(0xC001, 0, -1);
+  mmc3.write(0xE001, 0, -1);
   assert(mmc3.irq_scanline(-1) == 2);
   mmc3.notify_scanline_irq();
   // The latch is a delta from the previous expiry: chained IRQs fire
   // latch+1 lines apart, and past the visible frame nothing schedules.
   assert(mmc3.irq_scanline(2) == 5);
   assert(!mmc3.irq_scanline(237));
-  mmc3.write(0xE000, 0);
+  mmc3.write(0xE000, 0, -1);
   assert(irq_acks == 1);
   assert(!mmc3.irq_scanline(-1));
-  mmc3.write(0xE001, 0);
+  mmc3.write(0xE001, 0, -1);
   assert(mmc3.irq_scanline(-1) == 2);
   // Latch 0 = fire-next-scanline, valid only chained or off an anchor.
-  mmc3.write(0xC000, 0);
+  mmc3.write(0xC000, 0, -1);
   assert(!mmc3.irq_scanline(-1));
   assert(mmc3.irq_scanline(100) == 101);
   // A mid-frame $C001 clear anchors the reload at its scanline; the
   // anchor resets at frame start.
-  mmc3.write(0xC000, 30);
-  mmc3.write_at(0xC001, 0, 120);
+  mmc3.write(0xC000, 30, -1);
+  mmc3.write(0xC001, 0, 120);
   assert(mmc3.irq_scanline(-1) == 151);
   assert(mmc3.irq_scanline(90) == 151);
   assert(mmc3.irq_scanline(160) == 191);
@@ -96,12 +96,12 @@ static void test_mappers() {
   Cartridge c5{banks(32, BANK8), vector<uint8_t>(0x20000), Mirroring::Horizontal, 5};
   Mmc5 mmc5(c5);
   wire(mmc5, memory);
-  mmc5.write(0x5100, 2);
-  mmc5.write(0x5115, 0x98);
-  mmc5.write(0x5116, 0x9E);
+  mmc5.write(0x5100, 2, -1);
+  mmc5.write(0x5115, 0x98, -1);
+  mmc5.write(0x5116, 0x9E, -1);
   assert((mmc5.prg_banks() == array<size_t, 4>{24, 25, 30, 127}));
-  mmc5.write(0x5205, 13);
-  mmc5.write(0x5206, 17);
+  mmc5.write(0x5205, 13, -1);
+  mmc5.write(0x5206, 17, -1);
   assert(mmc5.read(0x5205) == 221 && mmc5.read(0x5206) == 0);
 }
 
@@ -135,7 +135,7 @@ public:
 class CounterDevice final : public Device {
 public:
   int read(int) override { return ++value; }
-  void write(int, int next) override { value = next; }
+  void write(int, int next, int64_t) override { value = next; }
   void write_rmw(int, int original, int next) override {
     rmw_original = original;
     value = next;
@@ -174,8 +174,8 @@ static void test_bus_and_controller() {
 
   Controller controller;
   controller.set_button(0, true);
-  controller.write(0x4016, 1);
-  controller.write(0x4016, 0);
+  controller.write(0x4016, 1, 0);
+  controller.write(0x4016, 0, 0);
   assert(controller.read(0x4016) == 0x41);
   assert(controller.read(0x4016) == 0x40);
 }

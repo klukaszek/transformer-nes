@@ -129,7 +129,7 @@ private:
       int a = py::cast<int>(aa[i]);
       if (auto* d = device_at(a)) {
         drop_device_leases(d);
-        d->write_at(a, py::cast<int>(vv[i]), cycle);
+        d->write(a, py::cast<int>(vv[i]), cycle);
         stalls += d->take_stall();
       }
     }

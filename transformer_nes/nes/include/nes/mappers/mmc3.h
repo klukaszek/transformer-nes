@@ -60,8 +60,7 @@ public:
   }
   void notify_scanline_irq() override { irq_pending = true; }
   void begin_frame() override { reload_line = -1; }
-  void write(int addr, int value) override { write_at(addr, value, -1); }
-  void write_at(int addr, int value, int scanline) override {
+  void write(int addr, int value, int scanline) override {
     auto old = prg_banks();
     int reg = addr & 0xE001;
     update(reg, value, scanline);

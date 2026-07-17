@@ -56,12 +56,11 @@ class Device {
 public:
   virtual ~Device() = default;
   virtual int read(int addr) = 0;
-  virtual void write(int addr, int value) = 0;
-  // Write with the console-clock cycle it executed at (known because
-  // watched writes pause the engine); devices that model mid-frame
-  // state (the PPU) override this, everything else ignores the stamp.
-  virtual void write_at(int addr, int value, int64_t) { write(addr, value); }
-  virtual void write_rmw(int addr, int, int value) { write(addr, value); }
+  // cycle: the console-clock stamp the write executed at (known because
+  // watched writes pause the engine, -1 when no stamp exists); devices
+  // that model mid-frame state (the PPU) use it, the rest ignore it.
+  virtual void write(int addr, int value, int64_t cycle) = 0;
+  virtual void write_rmw(int addr, int, int value) { write(addr, value, -1); }
   virtual int take_stall() { return 0; }
   virtual ReadLease read_lease(int) { return {}; }
   virtual void lease_consumed(int, int) {}
@@ -151,7 +150,7 @@ class Controller final : public Device {
 public:
   void set_button(size_t index, bool pressed);
   int read(int addr) override;
-  void write(int addr, int value) override;
+  void write(int addr, int value, int64_t) override;
   ReadLease read_lease(int addr) override;
   void lease_consumed(int addr, int count) override;
 
@@ -166,7 +165,7 @@ public:
   OamDma(function<int(int)> read_cpu, function<void(span<const uint8_t, 256>)> write_oam)
       : read_cpu_(std::move(read_cpu)), write_oam_(std::move(write_oam)) {}
   int read(int) override { return 0; }
-  void write(int, int value) override;
+  void write(int, int value, int64_t) override;
   int take_stall() override {
     int out = stall_;
     stall_ = 0;

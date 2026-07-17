@@ -28,10 +28,9 @@ class Console::PpuDevice final : public Device {
 public:
   PpuDevice(Ppu& ppu, const int64_t& frame_base) : ppu_(ppu), frame_base_(frame_base) {}
   int read(int address) override { return ppu_.read(address); }
-  void write(int address, int value) override { ppu_.write(address, value); }
-  // Stamped writes carry the scanline they executed on (-1 outside the
-  // visible span); the PPU uses it for the mid-frame split row.
-  void write_at(int address, int value, int64_t cycle) override {
+  // The cycle stamp becomes the visible-span scanline the write
+  // executed on (-1 outside): the PPU's mid-frame split row.
+  void write(int address, int value, int64_t cycle) override {
     ppu_.write(address, value, span_scanline(cycle, frame_base_));
   }
   ReadLease read_lease(int a) override {
@@ -47,7 +46,7 @@ class Console::ApuDevice final : public Device {
 public:
   explicit ApuDevice(Apu& apu) : apu_(apu) {}
   int read(int address) override { return apu_.read(address); }
-  void write(int address, int value) override { apu_.write(address, value); }
+  void write(int address, int value, int64_t) override { apu_.write(address, value); }
 
 private:
   Apu& apu_;
@@ -56,9 +55,8 @@ class Console::MapperDevice final : public Device {
 public:
   MapperDevice(Mapper& m, const int64_t& frame_base) : m_(m), frame_base_(frame_base) {}
   int read(int a) override { return m_.read(a); }
-  void write(int a, int v) override { m_.write(a, v); }
-  void write_at(int a, int v, int64_t cycle) override {
-    m_.write_at(a, v, span_scanline(cycle, frame_base_));
+  void write(int a, int v, int64_t cycle) override {
+    m_.write(a, v, span_scanline(cycle, frame_base_));
   }
   void write_rmw(int a, int original, int value) override { m_.write_rmw(a, original, value); }
 
@@ -70,7 +68,7 @@ class Console::FrameCounter final : public Device {
 public:
   explicit FrameCounter(Apu& apu) : apu_(apu) {}
   int read(int address) override { return apu_.read(address); }
-  void write(int address, int value) override { apu_.write(address, value); }
+  void write(int address, int value, int64_t) override { apu_.write(address, value); }
   ReadLease read_lease(int) override { return 0x40; }
 
 private:

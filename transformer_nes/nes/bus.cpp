@@ -89,7 +89,7 @@ CpuStep Bus::step() {
       if (is_memory_rmw(opcode))
         d->write_rmw(write.addr, original, write.value);
       else
-        d->write_at(write.addr, write.value, stamp_base_ + cycles_);
+        d->write(write.addr, write.value, stamp_base_ + cycles_);
       cycles_ += d->take_stall();
     }
   }
@@ -136,7 +136,7 @@ int Controller::read(int addr) {
     return 0x41;
   return 0x40 | buttons_[index_++];
 }
-void Controller::write(int addr, int value) {
+void Controller::write(int addr, int value, int64_t) {
   if (addr != 0x4016)
     return;
   bool next = (value & 1) != 0;
@@ -160,7 +160,7 @@ void Controller::lease_consumed(int addr, int count) {
   if (addr == 0x4016 && !strobe_ && count > 0)
     index_ = std::min(buttons_.size(), index_ + static_cast<size_t>(count));
 }
-void OamDma::write(int, int value) {
+void OamDma::write(int, int value, int64_t) {
   array<uint8_t, 256> page{};
   int base = (value & 0xFF) << 8;
   for (size_t i = 0; i < page.size(); ++i)

@@ -51,11 +51,10 @@ public:
   virtual bool banked() const { return false; }
   virtual vector<uint8_t> cpu_image() const = 0;
   virtual int read(int) { throw std::runtime_error("mapper range is write-only"); }
-  virtual void write(int, int) { throw std::runtime_error("mapper is not writable"); }
-  // Write with the visible-span scanline it executed on (-1 outside);
-  // MMC3 anchors mid-frame $C001 reloads to it.
-  virtual void write_at(int addr, int value, int) { write(addr, value); }
-  virtual void write_rmw(int addr, int, int value) { write(addr, value); }
+  // scanline: the visible-span row the write executed on (-1 outside
+  // or unknown); MMC3 anchors mid-frame $C001 reloads to it.
+  virtual void write(int, int, int) { throw std::runtime_error("mapper is not writable"); }
+  virtual void write_rmw(int addr, int, int value) { write(addr, value, -1); }
   // Next IRQ scanline given the line of the frame's previous IRQ (-1 at
   // frame start): MMC3-class counters chain in latch-sized deltas from
   // the previous expiry, MMC5 compares against an absolute line.

@@ -50,7 +50,7 @@ public:
     std::copy_n(cart_.prg.begin() + b[1] * BANK16, BANK16, image.begin() + 0xC000);
     return image;
   }
-  void write(int addr, int value) override {
+  void write(int addr, int value, int) override {
     auto old_prg = prg_banks();
     int old_mirror = control & 3;
     auto old_chr = chr_banks();
@@ -64,9 +64,9 @@ public:
     notify(old_mirror, old_chr);
   }
   void write_rmw(int addr, int original, int value) override {
-    write(addr, original);
+    write(addr, original, -1);
     if (value & 0x80)
-      write(addr, value);
+      write(addr, value, -1);
   }
 
 private:
