@@ -141,8 +141,14 @@ public:
     else if (addr >= 0x5C00 && addr <= 0x5FFF) {
       exram[addr - 0x5C00] = static_cast<uint8_t>(value);
       host_.ppu->set_mmc5_exram(addr - 0x5C00, value);
-    } else if (addr >= 0x6000 && addr <= 0x7FFF && ram_writable())
-      prg_ram[(prg_ram_bank & 7) * BANK8 + (addr & 0x1FFF)] = static_cast<uint8_t>(value);
+    } else if (addr >= 0x6000 && addr <= 0x7FFF) {
+      // A locked write still landed in the machine image before this
+      // dispatch; restore the byte the CPU should keep seeing.
+      if (ram_writable())
+        prg_ram[(prg_ram_bank & 7) * BANK8 + (addr & 0x1FFF)] = static_cast<uint8_t>(value);
+      else
+        repair(addr, prg_ram[(prg_ram_bank & 7) * BANK8 + (addr & 0x1FFF)]);
+    }
     if ((addr >= 0x5104 && addr <= 0x5107) || addr == 0x5130)
       host_.ppu->set_mmc5_state(exram_mode, nametable_map, fill_tile, fill_color, chr_upper);
     auto now = prg_layout();

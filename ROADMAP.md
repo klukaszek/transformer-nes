@@ -6,6 +6,116 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
+## 2026-07-17 weights-console correctness pass — audit + three seam fixes
+
+Full audit of the C++ runtime's weights-backend seams, per explicit
+user call: confirm the transformer drives all CPU/memory state and no
+native code bridges gaps.  Verdict: clean — step_core is the emitted
+forward (state embed → layer stack → readout → WRITE tokens into the
+memory-attention structures), every C++-side mutation routes through
+the engine protocol (inject_write / map_region / poke), and the C++
+side owns only hardware: frame timing, MMIO devices, DMA, IRQ line
+levels (delivery itself runs in the weights).  Three seams tightened,
+none observed misbehaving on the tapes:
+
+- **Undrained journal writes now throw.**  PythonEngineMachine never
+  consumed wj_addr/wj_value; the native write journal and PRG banking
+  are dormant (no callers anywhere), but re-arming them would have
+  silently dropped mapper CHR/IRQ/mirroring side effects.  run_cycles
+  fails loudly instead; wiring a real drain (with a wj_cycle stamp)
+  stays the recorded perf lever.
+- **RMW device writes reach write_rmw on the engine path.**  Only
+  Bus::step routed RMW opcodes to write_rmw, so an MMC1 game doing INC
+  on $8000-$FFFF got the final value clocked into the serial port
+  instead of hardware's first write (the original bus byte).  run()
+  now returns the pausing step's opcode (pause_ir — "ir" was taken by
+  the per-step trace array); service_writes routes through write_rmw
+  when is_memory_rmw (moved to bus.h).  The original parameter left
+  the whole chain: Mmc1 computes it as rom_byte(addr), provably the
+  pre-write byte since repairs keep the image ROM-accurate, and
+  write_rmw carries the cycle stamp instead — MMC3-class RMW register
+  writes now stamp like plain writes on both paths.
+- **MMC5 locked $6000-$7FFF writes repair the machine image.**  The
+  stray byte landed engine-side before the pause and was only healed
+  by watched reads; OAM DMA and shadow decode read the image directly
+  and would have seen it.
+
+Known by-design, documented not changed: the base-cycle CYCLES table
+is shared by all backends (no branch/page-cross penalties — the
+console clock was never transformer-derived), leases are
+receipt-verified invisible, shadow decode only decides pausing.
+Stale "EngineBus" references in run_protocol.py/runner.py updated to
+PythonEngineMachine (nes/bindings.cpp), its actual consumer.
+
+Coverage: new nes/tests/test_console_backends.py — 90-frame scripted
+reference-vs-weights lockstep through the native console (SMB and
+Zelda: frames, cycles, and RAM byte-equal) plus an MMC1 RMW quirk
+regression on a synthetic cart (five INC $E000s must select the ROM
+byte's bank), run on both backends.  The suite previously never drove
+Console(weights) at all.
+
+Receipts: 74 tests green (was 70), native hardware test green (RMW
+asserts reworked: ROM-byte clocking, stamped write_rmw), ruff clean;
+all five tape cycle counts byte-identical post-change — LoZ
+67,156,156, SMB 151,674,634, SMB3 260,464,627, spade 310,407,366, CV3
+157,660,617; LoZ reference-backend replay matches weights exactly
+(2255 frames, same cycles).
+
+## 2026-07-17 NES C++ runtime de-OO pass — behavior-identical
+
+Handmade-hero-lens refactor of the native runtime, per explicit user
+call.  Five commits, each independently suite-green; net -305 lines
+across 22 files.  Nothing behavioral: every stage's receipt is the
+unchanged test suites, and the arc's receipt is tape cycle identity.
+
+- **nes/chr.h owns the PPU-side mapper halves**: the ChrBanks types,
+  Mmc5Ppu, and one plain ChrLatch struct replacing the virtual
+  ChrLatchMapper interface and its two near-identical implementations
+  (wide_low selects MMC4's full-row trigger ranges) — devirtualizing
+  chr_index in the render inner loops.  Mmc2/Mmc4 themselves share one
+  LatchMapper class (mappers/mmc2_mmc4.h; mmc2.h/mmc4.h deleted).
+- **pImpl removed from Ppu and Apu**: state is plain public fields,
+  ~100 forwarding stubs and the heap hop are gone; accessor pairs
+  (sprite0_scanline/sprite0_hit/sprite_limit/mirroring, the
+  nametables/palette/oam span getters) became field access.  APU
+  channel structs and tables moved to apu.h unchanged.
+- **One stamped write per layer**: Device::write(addr, value, cycle)
+  and Mapper::write(addr, value, scanline) replace the write/write_at/
+  write_stamped triple (-1 = no stamp); every dispatch site already
+  carried the stamp, so the unstamped names were dead.
+- **MapperCallbacks (11 std::function slots, five named after specific
+  mappers — the "generic" layer knew every concrete type on both sides)
+  replaced by MapperHost{Ppu*, ConsoleMachine*, IrqLine*}**: mappers
+  call the PPU and machine directly.  IrqLine is a small value type in
+  bus.h owning the shared level-sensitive line's source bits plus the
+  mapper's sched-dirty replan signal; Console's set_irq/sync_irq
+  bookkeeping dissolved into it.  Console holds Ppu/Apu/adapters/OamDma
+  by value (seven unique_ptrs gone) and exposes cycles/frame_index/
+  halted/last_audio/ppu/mapper as fields.  Dead code deleted along the
+  way: Console::read_cpu/mapper()/sprite0_scanline(), Ppu tile_pixel/
+  scroll_px_x/scroll_px_y, the F1-era MMC5 exram/split-bank debug
+  accessors, ChrLatchMapper::latches().
+- **std::function trims**: OamDma is a console adapter with direct
+  ConsoleMachine&/Ppu& (was two std::function hops per DMA'd byte); the
+  APU DMC memory reader threads through as a parameter (member +
+  exception-guard struct gone, same frame-scoped lifetime); InputTape
+  is a plain struct; the 8x16/8x8 sprite pattern decode is one function
+  (was written out three times in ppu.cpp).
+- **Kept virtual deliberately**: ConsoleMachine (Bus vs
+  PythonEngineMachine — two real machines), Mapper (real hardware
+  variance; only its callback channel was rotten), Device
+  (address-dispatched MMIO + the native test's seam), SteppedRuntime
+  (Python core + test fake).
+- `*.sav` is gitignored now: battery saves are user data next to the
+  ROM, and a working-copy snapshot had silently swept the live Zelda
+  save into a commit mid-refactor (extracted, bytes preserved on disk).
+
+Receipts: 70 Python tests + the native hardware test green after every
+stage, ruff clean; all five recorded tape cycle counts byte-identical
+post-refactor — LoZ 67,156,156 (861 fps), SMB 151,674,634 (1139 fps),
+SMB3 260,464,627 (584 fps), spade 310,407,366 (585 fps), CV3
+157,660,617 (561 fps).
+
 ## 2026-07-17 debug overlay + battery saves + frontend portability
 
 QoL/debug infrastructure arc, motivated by the MM6 investigation below

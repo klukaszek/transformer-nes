@@ -29,6 +29,13 @@ struct CpuWrite {
   int value = 0;
 };
 
+// Read-modify-write opcodes issue two bus writes (original then result);
+// devices that care (MMC1's serial port) get them via write_rmw.
+constexpr bool is_memory_rmw(uint8_t opcode) {
+  const bool alu_rmw_family = (opcode & 0x80) == 0 || (opcode & 0x40) != 0;
+  return alu_rmw_family && (opcode & 3) >= 2;
+}
+
 struct CpuStep {
   int pc = 0, a = 0, x = 0, y = 0, s = 0, p = 0;
   bool halted = false;
@@ -60,7 +67,7 @@ public:
   // watched writes pause the engine, -1 when no stamp exists); devices
   // that model mid-frame state (the PPU) use it, the rest ignore it.
   virtual void write(int addr, int value, int64_t cycle) = 0;
-  virtual void write_rmw(int addr, int, int value) { write(addr, value, -1); }
+  virtual void write_rmw(int addr, int value, int64_t cycle) { write(addr, value, cycle); }
   virtual int take_stall() { return 0; }
   virtual ReadLease read_lease(int) { return {}; }
   virtual void lease_consumed(int, int) {}

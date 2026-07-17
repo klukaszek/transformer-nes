@@ -85,7 +85,9 @@ private:
     void write(int a, int v, int64_t cycle) override {
       m_.write(a, v, span_scanline(cycle, frame_base_));
     }
-    void write_rmw(int a, int original, int value) override { m_.write_rmw(a, original, value); }
+    void write_rmw(int a, int value, int64_t cycle) override {
+      m_.write_rmw(a, value, span_scanline(cycle, frame_base_));
+    }
 
   private:
     Mapper& m_;

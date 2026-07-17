@@ -2,8 +2,9 @@
 
 model/engine_gen.py emits this persistent-machine protocol into the
 generated engine: one exact memory structure, one shadow decoder, one run
-loop (watch/lease/trace/budget), one machine API.  The EngineBus contract
-is the spec; keeping the blocks here keeps the protocol reviewable in one place.
+loop (watch/lease/trace/budget), one machine API.  The consumer is the
+native console's PythonEngineMachine (nes/bindings.cpp); keeping the
+blocks here keeps the protocol reviewable in one place.
 """
 
 from __future__ import annotations
@@ -412,8 +413,8 @@ MACHINE_API_CPP = """\
 RUN_LOOP_TEMPLATE = """\
     // Run up to max_steps instructions natively, pausing back to
     // Python only on halt / jump-to-self trap / watched device
-    // access / cycle budget.  One protocol and result dict for both
-    // generated engine; the EngineBus contract is the spec.
+    // access / cycle budget.  One protocol and result dict, consumed
+    // by the native console's PythonEngineMachine (nes/bindings.cpp).
     // trace=false skips the per-step trace/write arrays (the console's
     // gameplay path reads only steps/hits/reason/cycles).
     py::dict run(long max_steps, bool stop_on_trap, long max_cycles, bool trace) {

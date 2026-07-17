@@ -5,15 +5,6 @@
 
 namespace transformer_nes::nes {
 
-namespace {
-
-constexpr bool is_memory_rmw(uint8_t opcode) {
-  const bool alu_rmw_family = (opcode & 0x80) == 0 || (opcode & 0x40) != 0;
-  return alu_rmw_family && (opcode & 3) >= 2;
-}
-
-} // namespace
-
 void DeviceMap::attach(Device& device, int first, int last, bool writes_only) {
   if (first < 0 || last > 0xFFFF || first > last)
     throw std::invalid_argument("invalid device address range");
@@ -83,11 +74,10 @@ CpuStep Bus::step() {
   }
   CpuStep row = runtime_.step();
   for (const auto& write : row.writes) {
-    const int original = ram_[address_index(write.addr)];
     ram_[address_index(write.addr)] = static_cast<uint8_t>(write.value);
     if (auto* d = devices_.find(write.addr)) {
       if (is_memory_rmw(opcode))
-        d->write_rmw(write.addr, original, write.value);
+        d->write_rmw(write.addr, write.value, stamp_base_ + cycles_);
       else
         d->write(write.addr, write.value, stamp_base_ + cycles_);
       cycles_ += d->take_stall();

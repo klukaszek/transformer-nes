@@ -63,7 +63,11 @@ public:
     repair(addr, rom_byte(addr));
     notify(old_mirror, old_chr);
   }
-  void write_rmw(int addr, int original, int value) override {
+  // Consecutive-cycle writes: the serial port sees only the first, which
+  // for an RMW is the original bus byte -- the mapped ROM byte here (the
+  // image is repair-maintained); bit 7 of the second still resets.
+  void write_rmw(int addr, int value, int) override {
+    const int original = rom_byte(addr);
     write(addr, original, -1);
     if (value & 0x80)
       write(addr, value, -1);

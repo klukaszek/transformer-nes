@@ -48,7 +48,7 @@ public:
   // scanline: the visible-span row the write executed on (-1 outside
   // or unknown); MMC3 anchors mid-frame $C001 reloads to it.
   virtual void write(int, int, int) { throw std::runtime_error("mapper is not writable"); }
-  virtual void write_rmw(int addr, int, int value) { write(addr, value, -1); }
+  virtual void write_rmw(int addr, int value, int scanline) { write(addr, value, scanline); }
   // Next IRQ scanline given the line of the frame's previous IRQ (-1 at
   // frame start): MMC3-class counters chain in latch-sized deltas from
   // the previous expiry, MMC5 compares against an absolute line.

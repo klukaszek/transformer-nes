@@ -60,9 +60,11 @@ static void test_mappers() {
 
   Mmc1 mmc1_rmw(c1);
   wire(mmc1_rmw, memory, machine, ppu, irq);
+  // RMW clocks the serial port with the mapped ROM byte (bank 15, bit
+  // 1), not the CPU's final value (bit 0).
   for (int bit = 0; bit < 5; ++bit)
-    mmc1_rmw.write_rmw(0xE000, (3 >> bit) & 1, ((3 >> bit) & 1) ^ 1);
-  assert((mmc1_rmw.prg_banks() == array<size_t, 2>{3, 15}));
+    mmc1_rmw.write_rmw(0xE000, 0, -1);
+  assert((mmc1_rmw.prg_banks() == array<size_t, 2>{15, 15}));
 
   Cartridge c3{banks(32, BANK8), vector<uint8_t>(0x20000), Mirroring::Horizontal, 4};
   Mmc3 mmc3(c3);
@@ -148,12 +150,12 @@ class CounterDevice final : public Device {
 public:
   int read(int) override { return ++value; }
   void write(int, int next, int64_t) override { value = next; }
-  void write_rmw(int, int original, int next) override {
-    rmw_original = original;
+  void write_rmw(int, int next, int64_t cycle) override {
+    rmw_cycle = cycle;
     value = next;
   }
   int value = 0;
-  int rmw_original = -1;
+  int64_t rmw_cycle = -1;
 };
 
 static void test_bus_and_controller() {
@@ -182,7 +184,7 @@ static void test_bus_and_controller() {
   rmw_runtime.next_writes.push_back({0xD000, 0x42});
   rmw_bus.attach(rmw_device, 0xD000, 0xD000, true);
   rmw_bus.step();
-  assert(rmw_device.rmw_original == 0x41 && rmw_device.value == 0x42);
+  assert(rmw_device.rmw_cycle == 6 && rmw_device.value == 0x42);
 
   Controller controller;
   controller.set_button(0, true);

@@ -456,8 +456,8 @@ class Cpu6502TransformerMachine:
                 break
         return trace
 
-    # ── C++ run loop (KernelBus shape) ──────────────────────────────
-    # Native streaming API used by Klaus, nestest, and EngineBus.
+    # ── C++ run loop ────────────────────────────────────────────────
+    # Native streaming API used by Klaus, nestest, and the NES console.
 
     @property
     def supports_run_loop(self) -> bool:
@@ -531,10 +531,10 @@ class Cpu6502TransformerMachine:
                 break
         self.pull_run_state()
 
-    # ── Machine API (lets EngineBus drive the run loop) ──────────────
-    # The run-protocol machine surface: the NES bus's EngineBus adapter
-    # drives the weights engine natively, pausing back to
-    # Python only for MMIO (run_protocol.py).
+    # ── Machine API (lets the NES console drive the run loop) ────────
+    # The run-protocol machine surface: the native console's
+    # PythonEngineMachine (nes/bindings.cpp) drives the weights engine,
+    # pausing back to Python only for MMIO (run_protocol.py).
 
     def load_image(self, memory_image, *, start_pc: int) -> None:
         self.boot_image(list(memory_image), start_pc=start_pc)
@@ -546,6 +546,9 @@ class Cpu6502TransformerMachine:
         (no reboot), pausing on halt/trap/watch/cycle budget."""
         out = self.engine.run(max_steps, stop_on_trap, max_cycles, trace)
         self.pull_run_state()
+        # A watch_write pause ends on the step that wrote, so this is the
+        # writing opcode: the bus routes RMW writes through write_rmw.
+        out["pause_ir"] = self.mstate["ir"]
         self.jit_tick()
         return out
 

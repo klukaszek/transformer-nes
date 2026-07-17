@@ -102,6 +102,10 @@ public:
                                      py::arg("trace") = false)
                          .cast<py::dict>();
       cycles += py::cast<int64_t>(out["cycles"]);
+      // The native write journal / PRG banking are not wired to this
+      // console; fail loudly rather than drop mapper side effects.
+      if (py::len(out["wj_addr"]) != 0)
+        throw std::runtime_error("engine returned journaled writes but no drain is wired");
       drain_leases(out);
       // A watched write pauses the engine, so the chunk's writes
       // executed at its end: stamp them with the cycle there.
@@ -123,11 +127,19 @@ private:
     py::sequence aa = out["hit_addr"], vv = out["hit_value"];
     if (py::len(aa) != py::len(vv))
       throw std::runtime_error("CPU engine returned mismatched write arrays");
+    if (py::len(aa) == 0)
+      return 0;
+    // Watched writes pause the step that made them, so pause_ir is that
+    // step's opcode: RMW writes route through write_rmw (MMC1's quirk).
+    const bool rmw = is_memory_rmw(static_cast<uint8_t>(py::cast<int>(out["pause_ir"])));
     for (py::size_t i = 0; i < py::len(aa); ++i) {
       int a = py::cast<int>(aa[i]);
       if (auto* d = device_at(a)) {
         drop_device_leases(d);
-        d->write(a, py::cast<int>(vv[i]), cycle);
+        if (rmw)
+          d->write_rmw(a, py::cast<int>(vv[i]), cycle);
+        else
+          d->write(a, py::cast<int>(vv[i]), cycle);
         stalls += d->take_stall();
       }
     }
