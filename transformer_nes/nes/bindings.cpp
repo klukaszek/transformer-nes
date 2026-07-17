@@ -254,7 +254,7 @@ public:
       throw std::invalid_argument("battery image must be 8192 bytes");
     machine_->map_region(0x6000, span(reinterpret_cast<const uint8_t*>(s.data()), s.size()));
   }
-  void set_sprite_limit(bool enabled) { console_->ppu().set_sprite_limit(enabled); }
+  void set_sprite_limit(bool enabled) { console_->ppu().sprite_limit = enabled; }
   py::dict run_tape(const string& path, int tail_frames, int max_frames) {
     const auto result = replay_tape(*console_, InputTape::load(path), tail_frames, max_frames);
     py::dict out;

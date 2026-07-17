@@ -32,7 +32,7 @@ public:
   // Stamped writes carry the scanline they executed on (-1 outside the
   // visible span); the PPU uses it for the mid-frame split row.
   void write_at(int address, int value, int64_t cycle) override {
-    ppu_.write_stamped(address, value, span_scanline(cycle, frame_base_));
+    ppu_.write(address, value, span_scanline(cycle, frame_base_));
   }
   ReadLease read_lease(int a) override {
     auto v = ppu_.read_lease(a);
@@ -106,7 +106,7 @@ void Console::attach_devices() {
   MapperCallbacks callbacks;
   callbacks.poke = [this](int a, int v) { machine_.poke(a, v); };
   callbacks.map_region = [this](int a, const auto& d) { machine_.map_region(a, d); };
-  callbacks.mirroring = [this](int m) { ppu_->set_mirroring(m); };
+  callbacks.mirroring = [this](int m) { ppu_->mirroring = m; };
   callbacks.chr_banks = [this](const auto& banks) { ppu_->set_chr_banks(banks); };
   callbacks.irq_ack = [this] { set_irq(IrqSource::mapper, false); };
   callbacks.irq_changed = [this] { irq_sched_dirty_ = true; };
@@ -194,7 +194,7 @@ Ppu::Frame Console::run_frame() {
     machine_.clear_read_lease();
     if (!kind) {
       fired = true;
-      ppu_->set_sprite0_hit(true);
+      ppu_->sprite0_hit = true;
       // Only post-hit scroll writes can be the game's split batch; their
       // rows arrive exactly via the stamped write path.
       ppu_->begin_span_watch();
@@ -214,7 +214,7 @@ Ppu::Frame Console::run_frame() {
   run_until(span_end);
   machine_.clear_read_lease();
   auto frame = ppu_->render_frame();
-  sprite0_scanline_ = ppu_->sprite0_scanline();
+  sprite0_scanline_ = ppu_->sprite0_scanline;
   ppu_->begin_vblank();
   if (ppu_->nmi_enabled())
     machine_.set_nmi();

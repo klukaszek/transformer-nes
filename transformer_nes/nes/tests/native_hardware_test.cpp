@@ -185,11 +185,11 @@ static void test_ppu_and_apu() {
   ppu.write(0x2006, 0x3F);
   ppu.write(0x2006, 0x00);
   ppu.write(0x2007, 0x21);
-  assert(ppu.palette()[0] == 0x21);
+  assert(ppu.palette[0] == 0x21);
   array<uint8_t, 256> dma{};
   dma[0] = 0x12;
   ppu.oam_dma(dma);
-  assert(ppu.oam()[0] == 0x12);
+  assert(ppu.oam[0] == 0x12);
   auto frame = ppu.render_frame();
   assert(frame.size() == 240 * 256);
 
