@@ -19,6 +19,19 @@
 
 namespace transformer_nes::nes {
 
+namespace {
+
+// Pattern byte address for a sprite row: 8x16 sprites take their bank
+// from tile bit 0 and the tile pair from the remaining bits; 8x8 take
+// the bank from ctrl bit 3.
+int sprite_pattern_addr(int ctrl, int tile, int src_r, bool tall) {
+  if (tall)
+    return ((tile & 1) * 256 + (tile & 0xFE) + (src_r >> 3)) * 16 + (src_r & 7);
+  return (((ctrl & 0x08) ? 256 : 0) + tile) * 16 + src_r;
+}
+
+} // namespace
+
 Ppu::Ppu(vector<uint8_t> chr_data, bool writable, bool vertical_mirroring)
     : chr(std::move(chr_data)), chr_writable(writable), mirroring(vertical_mirroring ? 2 : 3) {
   if (chr.size() < 0x2000)
@@ -374,15 +387,7 @@ int Ppu::detect_sprite0(const size_t* banks) {
   const int cols = (256 - x) < 8 ? (256 - x) : 8;
   for (int r = 0; r < rows; ++r) {
     const int src_r = (attr & 0x80) ? (h - 1 - r) : r;
-    int t, prow;
-    if (tall) {
-      t = (tile & 1) * 256 + (tile & 0xFE) + (src_r >> 3);
-      prow = src_r & 7;
-    } else {
-      t = ((ctrl & 0x08) ? 256 : 0) + tile;
-      prow = src_r;
-    }
-    const int pattern = t * 16 + prow;
+    const int pattern = sprite_pattern_addr(ctrl, tile, src_r, tall);
     const int b0 = chr[chr_index(banks, pattern)];
     const int b1 = chr[chr_index(banks, pattern + 8)];
     for (int c = 0; c < cols; ++c) {
@@ -520,15 +525,7 @@ Ppu::Frame Ppu::render_frame() {
         const int x = oam[i * 4 + 3];
         const int src_r0 = y - sy;
         const int src_r = (attr & 0x80) ? (h - 1 - src_r0) : src_r0;
-        int t, prow;
-        if (tall) {
-          t = (tile & 1) * 256 + (tile & 0xFE) + (src_r >> 3);
-          prow = src_r & 7;
-        } else {
-          t = ((ctrl & 0x08) ? 256 : 0) + tile;
-          prow = src_r;
-        }
-        const auto [b0, b1] = fetch_pattern_pair(t * 16 + prow);
+        const auto [b0, b1] = fetch_pattern_pair(sprite_pattern_addr(ctrl, tile, src_r, tall));
         const int cols = (256 - x) < 8 ? (256 - x) : 8;
         for (int c = 0; c < cols; ++c) {
           const int px = x + c;
@@ -725,17 +722,9 @@ Ppu::Frame Ppu::render_frame() {
         continue;
       ++row_slots[top + r];
       const int src_r = (attr & 0x80) ? (h - 1 - r) : r;
-      int t, prow;
-      if (tall) {
-        t = (tile & 1) * 256 + (tile & 0xFE) + (src_r >> 3);
-        prow = src_r & 7;
-      } else {
-        t = ((ctrl & 0x08) ? 256 : 0) + tile;
-        prow = src_r;
-      }
       const size_t* sbanks =
           mmc5.active() ? mmc5_sprite_banks_for_row(top + r) : banks_for_row(top + r);
-      const int pattern = t * 16 + prow;
+      const int pattern = sprite_pattern_addr(ctrl, tile, src_r, tall);
       const int b0 = chr[chr_index(sbanks, pattern)];
       const int b1 = chr[chr_index(sbanks, pattern + 8)];
       for (int c = 0; c < cols; ++c) {

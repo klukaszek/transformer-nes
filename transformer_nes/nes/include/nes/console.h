@@ -103,6 +103,31 @@ private:
   private:
     Apu& apu_;
   };
+  // $4014: copy a 256-byte CPU page into OAM, stalling the CPU 513
+  // cycles (charged through take_stall at the dispatching write).
+  class OamDma final : public Device {
+  public:
+    OamDma(ConsoleMachine& machine, Ppu& ppu) : machine_(machine), ppu_(ppu) {}
+    int read(int) override { return 0; }
+    void write(int, int value, int64_t) override {
+      array<uint8_t, 256> page{};
+      const int base = (value & 0xFF) << 8;
+      for (size_t i = 0; i < page.size(); ++i)
+        page[i] = static_cast<uint8_t>(machine_.read_ram(base + static_cast<int>(i)));
+      ppu_.oam_dma(page);
+      stall_ += 513;
+    }
+    int take_stall() override {
+      const int out = stall_;
+      stall_ = 0;
+      return out;
+    }
+
+  private:
+    ConsoleMachine& machine_;
+    Ppu& ppu_;
+    int stall_ = 0;
+  };
 
   void attach_devices();
   void run_until(int64_t target, bool replan = false);

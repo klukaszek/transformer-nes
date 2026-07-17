@@ -266,18 +266,17 @@ public:
   double cycles_per_sample = 0.0;
   double sample_accum = 0.0;
   double hp_prev_in = 0.0, hp_prev_out = 0.0; // DC-blocker state
-  MemoryReader memory_reader;
   int dma_stall = 0;
 
 private:
-  void fill_dmc_buffer();
-  void clock_dmc();
+  void fill_dmc_buffer(const MemoryReader& reader);
+  void clock_dmc(const MemoryReader& reader);
   void clock_quarter();
   void clock_half();
   void clock_frame_sequencer();
   double mix_level() const;
   float sample();
-  void clock_cycle();
+  void clock_cycle(const MemoryReader& reader);
 };
 
 } // namespace transformer_nes::nes

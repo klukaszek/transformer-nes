@@ -14,7 +14,6 @@
 // stalls are reported to the console for clock accounting.
 
 #include <algorithm>
-#include <utility>
 
 #include "nes/apu.h"
 
@@ -164,10 +163,10 @@ void Apu::write(int addr, int value) {
   }
 }
 
-void Apu::fill_dmc_buffer() {
-  if (!dmc.buffer_empty || dmc.bytes_remaining == 0 || !memory_reader)
+void Apu::fill_dmc_buffer(const MemoryReader& reader) {
+  if (!dmc.buffer_empty || dmc.bytes_remaining == 0 || !reader)
     return;
-  dmc.sample_buffer = memory_reader(dmc.current_address) & 0xFF;
+  dmc.sample_buffer = reader(dmc.current_address) & 0xFF;
   dmc.buffer_empty = false;
   dma_stall += 4;
   dmc.current_address = dmc.current_address == 0xFFFF ? 0x8000 : uint16_t(dmc.current_address + 1);
@@ -179,8 +178,8 @@ void Apu::fill_dmc_buffer() {
   }
 }
 
-void Apu::clock_dmc() {
-  fill_dmc_buffer();
+void Apu::clock_dmc(const MemoryReader& reader) {
+  fill_dmc_buffer(reader);
   if (dmc.timer_counter-- > 0)
     return;
   dmc.timer_counter = dmc.period - 1;
@@ -274,9 +273,9 @@ float Apu::sample() {
 
 // Advance every channel by one CPU cycle (triangle each cycle; the
 // others at APU rate, every other cycle).
-void Apu::clock_cycle() {
+void Apu::clock_cycle(const MemoryReader& reader) {
   triangle.clock_timer();
-  clock_dmc();
+  clock_dmc(reader);
   apu_tick = !apu_tick;
   if (apu_tick) {
     pulse[0].clock_timer();
@@ -287,11 +286,6 @@ void Apu::clock_cycle() {
 }
 
 vector<float> Apu::end_frame(int cpu_cycles, MemoryReader reader) {
-  memory_reader = std::move(reader);
-  struct ResetReader {
-    function<int(int)>& reader;
-    ~ResetReader() { reader = {}; }
-  } reset_reader{memory_reader};
   // sample_accum is kept in [0, cycles_per_sample), so this is the
   // exact number the loop below will emit.  Write straight into the
   // exact result size instead of growing the vector during every frame.
@@ -299,7 +293,7 @@ vector<float> Apu::end_frame(int cpu_cycles, MemoryReader reader) {
   vector<float> out(sample_count);
   size_t written = 0;
   for (int i = 0; i < cpu_cycles; ++i) {
-    clock_cycle();
+    clock_cycle(reader);
     if (++sample_accum >= cycles_per_sample) {
       sample_accum -= cycles_per_sample;
       out[written++] = sample();

@@ -95,8 +95,6 @@ public:
   void map_region(int a, span<const uint8_t> d) override { rt_.attr("map_region")(a, to_bytes(d)); }
   MachineRun run_cycles(int64_t budget, function<bool()> pause = {},
                         int64_t cycle_base = 0) override {
-    if (!pause)
-      pause = [] { return false; };
     int64_t cycles = 0;
     bool halted = false;
     while (cycles < budget && !halted) {
@@ -112,7 +110,7 @@ public:
       if (reason == "watch_read")
         cycles += service_read(py::cast<int>(out["read_addr"]));
       halted = reason == "halt" || reason == "trap";
-      if (pause())
+      if (pause && pause())
         break;
     }
     return {cycles, halted};

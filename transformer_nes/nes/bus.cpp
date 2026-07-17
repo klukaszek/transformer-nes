@@ -107,13 +107,11 @@ vector<CpuStep> Bus::run(int max_steps, const vector<int>& nmi_at, const vector<
   return out;
 }
 MachineRun Bus::run_cycles(int64_t budget, function<bool()> pause, int64_t cycle_base) {
-  if (!pause)
-    pause = [] { return false; };
   const int64_t start = cycles_;
   stamp_base_ = cycle_base - start;
   while (!halted() && cycles_ - start < budget) {
     step();
-    if (pause())
+    if (pause && pause())
       break;
   }
   return {cycles_ - start, halted()};
@@ -160,13 +158,4 @@ void Controller::lease_consumed(int addr, int count) {
   if (addr == 0x4016 && !strobe_ && count > 0)
     index_ = std::min(buttons_.size(), index_ + static_cast<size_t>(count));
 }
-void OamDma::write(int, int value, int64_t) {
-  array<uint8_t, 256> page{};
-  int base = (value & 0xFF) << 8;
-  for (size_t i = 0; i < page.size(); ++i)
-    page[i] = static_cast<uint8_t>(read_cpu_(base + static_cast<int>(i)));
-  write_oam_(page);
-  stall_ += 513;
-}
-
 } // namespace transformer_nes::nes

@@ -13,11 +13,8 @@ constexpr int max_frame_events = 32;
 
 Console::Console(unique_ptr<Mapper> mapper_in, Ppu ppu_in, Apu apu_in, ConsoleMachine& machine_in)
     : mapper(std::move(mapper_in)), ppu(std::move(ppu_in)), apu(std::move(apu_in)),
-      machine(machine_in),
-      dma_([this](int a) { return machine.read_ram(a); },
-           [this](const auto& page) { ppu.oam_dma(page); }),
-      ppu_device_(ppu, frame_base_), apu_device_(apu), mapper_device_(*mapper, frame_base_),
-      frame_counter_(apu) {
+      machine(machine_in), dma_(machine, ppu), ppu_device_(ppu, frame_base_), apu_device_(apu),
+      mapper_device_(*mapper, frame_base_), frame_counter_(apu) {
   irq_.machine = &machine;
   attach_devices();
 }

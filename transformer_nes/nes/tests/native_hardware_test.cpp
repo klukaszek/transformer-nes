@@ -215,7 +215,7 @@ static void test_ppu_and_apu() {
 static void test_tape() {
   auto tape = InputTape::parse("2 08 start\n5 00 (none)\n9 81 a+right\n");
   assert(tape.last_frame() == 9);
-  assert(tape.events().size() == 3);
+  assert(tape.events.size() == 3);
   assert(tape.buttons_at(0) == 0);
   assert(tape.buttons_at(2) == 0x08);
   assert(tape.buttons_at(8) == 0);

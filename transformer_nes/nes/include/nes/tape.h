@@ -19,19 +19,13 @@ struct TapeEvent {
   uint8_t buttons = 0;
 };
 
-class InputTape {
-public:
+struct InputTape {
+  vector<TapeEvent> events;
+
   static InputTape load(const string& path);
   static InputTape parse(string_view text);
-
   uint8_t buttons_at(int frame) const;
-  int last_frame() const { return events_.empty() ? -1 : events_.back().frame; }
-  const vector<TapeEvent>& events() const { return events_; }
-
-private:
-  explicit InputTape(vector<TapeEvent> events) : events_(std::move(events)) {}
-
-  vector<TapeEvent> events_;
+  int last_frame() const { return events.empty() ? -1 : events.back().frame; }
 };
 
 struct TapeBenchmark {

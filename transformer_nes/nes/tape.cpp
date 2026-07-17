@@ -51,14 +51,14 @@ InputTape InputTape::parse(string_view text) {
   if (!std::is_sorted(events.begin(), events.end(),
                       [](const auto& a, const auto& b) { return a.frame < b.frame; }))
     throw std::runtime_error("input tape frames must be ordered");
-  return InputTape(std::move(events));
+  return {std::move(events)};
 }
 
 uint8_t InputTape::buttons_at(int frame) const {
   auto next =
-      std::upper_bound(events_.begin(), events_.end(), frame,
+      std::upper_bound(events.begin(), events.end(), frame,
                        [](int value, const TapeEvent& event) { return value < event.frame; });
-  return next == events_.begin() ? 0 : std::prev(next)->buttons;
+  return next == events.begin() ? 0 : std::prev(next)->buttons;
 }
 
 TapeBenchmark replay_tape(Console& console, const InputTape& tape, int tail_frames,

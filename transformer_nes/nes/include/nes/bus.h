@@ -183,22 +183,4 @@ private:
   size_t index_ = 0;
 };
 
-class OamDma final : public Device {
-public:
-  OamDma(function<int(int)> read_cpu, function<void(span<const uint8_t, 256>)> write_oam)
-      : read_cpu_(std::move(read_cpu)), write_oam_(std::move(write_oam)) {}
-  int read(int) override { return 0; }
-  void write(int, int value, int64_t) override;
-  int take_stall() override {
-    int out = stall_;
-    stall_ = 0;
-    return out;
-  }
-
-private:
-  function<int(int)> read_cpu_;
-  function<void(span<const uint8_t, 256>)> write_oam_;
-  int stall_ = 0;
-};
-
 } // namespace transformer_nes::nes
