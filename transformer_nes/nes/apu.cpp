@@ -18,9 +18,8 @@
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
-#include <vector>
 
-#include "apu.h"
+#include "nes/apu.h"
 
 namespace transformer_nes::nes {
 

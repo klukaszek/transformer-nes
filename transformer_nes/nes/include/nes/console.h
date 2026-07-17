@@ -1,10 +1,10 @@
 #pragma once
 
-#include "apu.h"
-#include "bus.h"
-#include "cartridge.h"
-#include "mappers.h"
-#include "ppu.h"
+#include "nes/apu.h"
+#include "nes/bus.h"
+#include "nes/cartridge.h"
+#include "nes/mappers/mappers.h"
+#include "nes/ppu.h"
 
 #include <array>
 #include <cstdint>

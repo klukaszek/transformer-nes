@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cartridge.h"
+#include "nes/cartridge.h"
 
 #include <algorithm>
 #include <array>

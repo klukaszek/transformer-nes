@@ -18,11 +18,12 @@ build/
 transformer
 _kernel_cache/
 _engine_cache/
-_nes_cache/
+/bin/
 
 # Vendored deps are fetched by vendor/install_deps.sh
 vendor/sokol/
 vendor/imgui/
+vendor/pybind11/
 
 # Commercial ROMs stay local (test ROMs like nestest are tracked)
 transformer_nes/nes/examples/smb.nes

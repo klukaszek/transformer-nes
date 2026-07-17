@@ -1,4 +1,4 @@
-#include "console.h"
+#include "nes/console.h"
 
 #include <algorithm>
 #include <utility>

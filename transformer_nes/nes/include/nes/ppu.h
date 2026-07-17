@@ -49,6 +49,9 @@ public:
   [[nodiscard]] bool rendering_enabled() const;
   [[nodiscard]] int sprite0_scanline() const;
   void set_sprite0_hit(bool value);
+  // Debug/QoL: lift the hardware 8-per-scanline sprite cap.  Default is
+  // hardware-exact; TLoZ's door masking depends on the cap staying on.
+  void set_sprite_limit(bool enabled);
 
   void set_mirroring(int value);
   void set_chr_banks(const array<size_t, 8>& banks);

@@ -1,4 +1,4 @@
-#include "bus.h"
+#include "nes/bus.h"
 
 #include <algorithm>
 #include <stdexcept>

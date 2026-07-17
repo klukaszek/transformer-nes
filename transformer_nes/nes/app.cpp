@@ -1,8 +1,8 @@
 // Native NES app: a Sokol window over the console frame loop.  The
 // window, input, and one textured quad live here; each display frame
 // calls back into Python (Console.run_frame via app.py) at the NTSC
-// rate and blits the returned 256x240 RGB frame.  macOS/Metal only for
-// now; compiled as Objective-C++ and cached by content digest.
+// rate and blits the returned 256x240 RGB frame.  Metal on Apple, GL
+// elsewhere (ui/sokol_platform.h); cached by content digest.
 
 #include <array>
 #include <chrono>
@@ -12,16 +12,22 @@
 #include <memory>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
-#define SOKOL_METAL
-#define SOKOL_NO_ENTRY
+#include "ui/sokol_platform.h"
+
 #include "sokol_app.h"
 #include "sokol_audio.h"
 #include "sokol_gfx.h"
 #include "sokol_glue.h"
 #include "sokol_log.h"
+
+#include "nes/palette.h"
+#include "ui/debug_ui.h"
 
 namespace py = pybind11;
 
@@ -53,7 +59,12 @@ enum Button : uint32_t {
   BTN_RIGHT = 1 << 7,
 };
 
-constexpr char vertex_shader_source[] = R"(
+// The blit samples a sub-rectangle of the framebuffer texture, passed
+// as a uniform (uv' = rect.xy + uv * rect.zw) so the NTSC overscan crop
+// is a runtime toggle.  One source pair per sokol backend.
+#if defined(SOKOL_METAL)
+
+constexpr char vertex_shader_source[] = /* MSL */ R"(
 #include <metal_stdlib>
 using namespace metal;
 struct vs_out { float4 pos [[position]]; float2 uv; };
@@ -66,19 +77,44 @@ vertex vs_out vs_main(uint vid [[vertex_id]]) {
 }
 )";
 
-constexpr char fragment_shader_source[] = R"(
+constexpr char fragment_shader_source[] = /* MSL */ R"(
 #include <metal_stdlib>
 using namespace metal;
 struct vs_out { float4 pos [[position]]; float2 uv; };
+struct fs_params { float4 rect; };
 fragment float4 fs_main(vs_out in [[stage_in]],
+                        constant fs_params& params [[buffer(0)]],
                         texture2d<float> tex [[texture(0)]],
                         sampler smp [[sampler(0)]]) {
-    // NTSC overscan: crop the 8-pixel border a CRT never showed (games
-    // mask the left column and stream tiles through the right one).
-    return tex.sample(smp, float2((8.0 + in.uv.x * 240.0) / 256.0,
-                                  (8.0 + in.uv.y * 224.0) / 240.0));
+    return tex.sample(smp, params.rect.xy + in.uv * params.rect.zw);
 }
 )";
+
+#elif defined(SOKOL_GLCORE)
+
+constexpr char vertex_shader_source[] = /* GLSL */ R"(
+#version 410
+out vec2 uv;
+void main() {
+    uv = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+)";
+
+constexpr char fragment_shader_source[] = /* GLSL */ R"(
+#version 410
+uniform vec4 rect;
+uniform sampler2D tex_smp;
+in vec2 uv;
+out vec4 frag_color;
+void main() {
+    frag_color = texture(tex_smp, rect.xy + uv * rect.zw);
+}
+)";
+
+#else
+#error "unsupported sokol backend: expected SOKOL_METAL or SOKOL_GLCORE"
+#endif
 
 struct AppState {
   py::object frame_cb;
@@ -87,12 +123,13 @@ struct AppState {
   uint32_t buttons = 0;
   double acc = 0.0;
   bool have_frame = false;
-  array<uint8_t, 64 * 3> palette{};
   array<uint8_t, frame_height * frame_width * 4> rgba{};
   sg_image image{};
   sg_view view{};
   sg_sampler sampler{};
   sg_pipeline pipeline{};
+  transformer_nes::ui::UiState ui;
+  transformer_nes::ui::DebugHooks hooks;
 };
 AppState* state = nullptr;
 
@@ -123,25 +160,35 @@ void app_init() {
 
   sg_shader_desc shd{};
   shd.vertex_func.source = vertex_shader_source;
-  shd.vertex_func.entry = "vs_main";
   shd.fragment_func.source = fragment_shader_source;
-  shd.fragment_func.entry = "fs_main";
   shd.views[0].texture.stage = SG_SHADERSTAGE_FRAGMENT;
   shd.views[0].texture.image_type = SG_IMAGETYPE_2D;
   shd.views[0].texture.sample_type = SG_IMAGESAMPLETYPE_FLOAT;
-  shd.views[0].texture.msl_texture_n = 0;
   shd.samplers[0].stage = SG_SHADERSTAGE_FRAGMENT;
   shd.samplers[0].sampler_type = SG_SAMPLERTYPE_FILTERING;
-  shd.samplers[0].msl_sampler_n = 0;
   shd.texture_sampler_pairs[0].stage = SG_SHADERSTAGE_FRAGMENT;
   shd.texture_sampler_pairs[0].view_slot = 0;
   shd.texture_sampler_pairs[0].sampler_slot = 0;
+  shd.uniform_blocks[0].stage = SG_SHADERSTAGE_FRAGMENT;
+  shd.uniform_blocks[0].size = 4 * sizeof(float);
+#if defined(SOKOL_METAL)
+  shd.vertex_func.entry = "vs_main";
+  shd.fragment_func.entry = "fs_main";
+  shd.views[0].texture.msl_texture_n = 0;
+  shd.samplers[0].msl_sampler_n = 0;
+  shd.uniform_blocks[0].msl_buffer_n = 0;
+#else
+  shd.texture_sampler_pairs[0].glsl_name = "tex_smp";
+  shd.uniform_blocks[0].glsl_uniforms[0].type = SG_UNIFORMTYPE_FLOAT4;
+  shd.uniform_blocks[0].glsl_uniforms[0].glsl_name = "rect";
+#endif
   shd.label = "nes-blit";
 
   sg_pipeline_desc pip{};
   pip.shader = sg_make_shader(&shd);
   pip.label = "nes-blit";
   state->pipeline = sg_make_pipeline(&pip);
+  transformer_nes::ui::setup();
 }
 
 // One emulated frame: cb(buttons) -> (240, 256) uint8 palette indices, or None.
@@ -158,7 +205,7 @@ bool emulate_frame() {
   const uint8_t* src = arr.data();
   uint8_t* dst = state->rgba.data();
   for (int i = 0; i < frame_width * frame_height; ++i) {
-    const uint8_t* color = state->palette.data() + (src[i] & 0x3F) * 3;
+    const uint8_t* color = transformer_nes::nes::NES_PALETTE.data() + (src[i] & 0x3F) * 3;
     dst[4 * i + 0] = color[0];
     dst[4 * i + 1] = color[1];
     dst[4 * i + 2] = color[2];
@@ -204,18 +251,31 @@ void app_frame() {
     state->have_frame = true;
   }
 
+  // Build the overlay's ImGui frame before the pass (font/texture
+  // updates are illegal inside one); submit it inside the pass below.
+  try {
+    transformer_nes::ui::draw(state->ui, state->hooks);
+  } catch (py::error_already_set& e) {
+    std::fprintf(stderr, "debug overlay raised:\n%s\n", e.what());
+    state->error = std::make_unique<py::error_already_set>(std::move(e));
+    sapp_request_quit();
+  }
+
   sg_pass pass{};
   pass.swapchain = sglue_swapchain();
   pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
   pass.action.colors[0].clear_value = {0.0f, 0.0f, 0.0f, 1.0f};
   sg_begin_pass(&pass);
   if (state->have_frame) {
-    // Letterbox to the cropped frame's 256:224.
+    const bool crop = state->ui.crop;
+    const int src_w = crop ? view_width : frame_width;
+    const int src_h = crop ? view_height : frame_height;
+    // Letterbox to the (possibly cropped) frame's aspect.
     int w = sapp_width(), h = sapp_height();
-    int vw = w, vh = w * view_height / view_width;
+    int vw = w, vh = w * src_h / src_w;
     if (vh > h) {
       vh = h;
-      vw = h * view_width / view_height;
+      vw = h * src_w / src_h;
     }
     sg_apply_viewport((w - vw) / 2, (h - vh) / 2, vw, vh, true);
     sg_apply_pipeline(state->pipeline);
@@ -223,13 +283,21 @@ void app_frame() {
     bind.views[0] = state->view;
     bind.samplers[0] = state->sampler;
     sg_apply_bindings(&bind);
+    const float rect[4] = {crop ? 8.0f / frame_width : 0.0f, crop ? 8.0f / frame_height : 0.0f,
+                           float(src_w) / frame_width, float(src_h) / frame_height};
+    sg_apply_uniforms(0, SG_RANGE(rect));
     sg_draw(0, 3, 1);
   }
+  transformer_nes::ui::render(state->ui);
   sg_end_pass();
   sg_commit();
 }
 
 void app_event(const sapp_event* e) {
+  if (transformer_nes::ui::handle_event(e, state->ui)) {
+    state->buttons = 0; // keys released into the overlay must not stick
+    return;
+  }
   if (e->type != SAPP_EVENTTYPE_KEY_DOWN && e->type != SAPP_EVENTTYPE_KEY_UP) {
     return;
   }
@@ -305,17 +373,37 @@ void app_cleanup() {
       e.discard_as_unraisable("nes app quit callback");
     }
   }
+  transformer_nes::ui::shutdown();
   saudio_shutdown();
   sg_shutdown();
 }
 
+// Wrap the Python debug bridge (app.py DebugBridge) as plain functions;
+// they run inside the frame/event callbacks, GIL already held.
+transformer_nes::ui::DebugHooks make_hooks(py::object bridge) {
+  transformer_nes::ui::DebugHooks hooks;
+  if (bridge.is_none())
+    return hooks;
+  hooks.read_mem = [bridge](uint32_t start, uint32_t count) {
+    return py::cast<std::string>(bridge.attr("read_mem")(start, count));
+  };
+  hooks.stats = [bridge] {
+    return py::cast<std::vector<std::pair<std::string, std::string>>>(bridge.attr("stats")());
+  };
+  hooks.options = [bridge] {
+    return py::cast<std::vector<std::pair<std::string, bool>>>(bridge.attr("options")());
+  };
+  hooks.set_option = [bridge](const std::string& name, bool value) {
+    bridge.attr("set_option")(name, value);
+  };
+  hooks.step_frame = [bridge] { bridge.attr("step_frame")(); };
+  return hooks;
+}
+
 // Blocks until the window closes.  The callbacks run on this thread
 // inside sapp_run, so the GIL held by this call covers every frame.
-void run(const string& title, int scale, py::object frame_cb,
-         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> palette,
-         py::object quit_cb) {
-  if (palette.ndim() != 2 || palette.shape(0) != 64 || palette.shape(1) != 3)
-    throw std::runtime_error("palette must have shape (64, 3)");
+void run(const string& title, int scale, py::object frame_cb, py::object quit_cb,
+         py::object debug) {
   if (scale <= 0)
     throw std::invalid_argument("window scale must be positive");
   if (!PyCallable_Check(frame_cb.ptr()))
@@ -323,7 +411,7 @@ void run(const string& title, int scale, py::object frame_cb,
   AppState st;
   st.frame_cb = frame_cb;
   st.quit_cb = quit_cb;
-  std::memcpy(st.palette.data(), palette.data(), st.palette.size());
+  st.hooks = make_hooks(debug);
   state = &st;
   sapp_desc desc{};
   desc.init_cb = app_init;
@@ -339,6 +427,7 @@ void run(const string& title, int scale, py::object frame_cb,
   sapp_run(&desc);
   state = nullptr;
   st.frame_cb = py::object();
+  st.hooks = {};
   if (st.error) {
     throw *st.error;
   }
@@ -346,11 +435,12 @@ void run(const string& title, int scale, py::object frame_cb,
 
 } // namespace
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("run", &run, py::arg("title"), py::arg("scale"), py::arg("frame_cb"), py::arg("palette"),
-        py::arg("quit_cb") = py::none(),
+PYBIND11_MODULE(nes_app, m) {
+  m.def("run", &run, py::arg("title"), py::arg("scale"), py::arg("frame_cb"),
+        py::arg("quit_cb") = py::none(), py::arg("debug") = py::none(),
         "Open the window and drive frame_cb(buttons) until quit; on macOS "
-        "the process exits inside run, with quit_cb the last Python to run.");
+        "the process exits inside run, with quit_cb the last Python to run. "
+        "debug is the tilde overlay's bridge (read_mem/stats/options/...).");
   m.def("audio_setup", &audio_setup,
         "Open the audio device (mono push mode); returns the sample rate.");
   m.def("push_audio", &push_audio, py::arg("samples"),

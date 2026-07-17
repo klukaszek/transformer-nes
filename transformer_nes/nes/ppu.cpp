@@ -14,10 +14,10 @@
 #include <utility>
 #include <vector>
 
-#include "mmc2.h"
-#include "mmc4.h"
-#include "mmc5.h"
-#include "ppu.h"
+#include "nes/mappers/mmc2.h"
+#include "nes/mappers/mmc4.h"
+#include "nes/mappers/mmc5.h"
+#include "nes/ppu.h"
 
 namespace transformer_nes::nes {
 
@@ -52,6 +52,7 @@ struct Ppu::Impl {
   int read_buffer = 0;
 
   bool vblank = false, sprite0_hit = false, nmi_edge = false;
+  bool sprite_limit = true; // hardware 8-per-scanline cap (debug toggle)
   int sprite0_scanline = -1; // -1: none
   bool bg_opaque[240][256]{};
   // Per-pixel sprite ownership: the lowest-index opaque sprite claims
@@ -694,7 +695,7 @@ struct Ppu::Impl {
         if (!(fmask & 0x10))
           continue;
         int slots = 0; // sprite evaluation: first eight in-range per line
-        for (size_t i = 0; i < 64 && slots < 8; ++i) {
+        for (size_t i = 0; i < 64 && (!sprite_limit || slots < 8); ++i) {
           const int sy = oam[i * 4] + 1;
           if (y < sy || y >= sy + h)
             continue;
@@ -906,7 +907,7 @@ struct Ppu::Impl {
       if (rows <= 0 || cols <= 0)
         continue;
       for (int r = 0; r < rows; ++r) {
-        if (row_slots[top + r] >= 8)
+        if (sprite_limit && row_slots[top + r] >= 8)
           continue;
         ++row_slots[top + r];
         const int src_r = (attr & 0x80) ? (h - 1 - r) : r;
@@ -972,6 +973,7 @@ bool Ppu::nmi_enabled() const { return impl_->nmi_enabled(); }
 bool Ppu::rendering_enabled() const { return impl_->rendering_enabled(); }
 int Ppu::sprite0_scanline() const { return impl_->sprite0_scanline; }
 void Ppu::set_sprite0_hit(bool value) { impl_->sprite0_hit = value; }
+void Ppu::set_sprite_limit(bool enabled) { impl_->sprite_limit = enabled; }
 void Ppu::set_mirroring(int value) { impl_->mirroring = value; }
 void Ppu::set_chr_banks(const ChrBanks& banks) { impl_->set_chr_banks(banks); }
 void Ppu::set_mmc2_banks(const ChrLatchBanks& banks) { impl_->set_mmc2_banks(banks); }

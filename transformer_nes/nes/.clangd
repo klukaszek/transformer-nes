@@ -1,2 +1,13 @@
+# Relative -I entries resolve against the edited file's directory, so
+# each repo path appears at both depths (nes/*.cpp and nes/ui|tests/*).
+# Python.h has no in-repo home (uv keeps CPython headers outside the
+# venv); refresh that one absolute path when the Python version moves.
 CompileFlags:
-  Add: [-std=c++26, -Wall, -Wextra, -Wpedantic, -I../../vendor/sokol]
+  Add: [
+    -std=c++26, -Wall, -Wextra, -Wpedantic,
+    -I., -Iinclude, -I../../vendor/sokol, -I../../vendor/imgui,
+    -I../../vendor/pybind11/include,
+    -I.., -I../include, -I../../../vendor/sokol, -I../../../vendor/imgui,
+    -I../../../vendor/pybind11/include,
+    -I/Users/kylelukaszek/.local/share/uv/python/cpython-3.13.7-macos-aarch64-none/include/python3.13,
+  ]

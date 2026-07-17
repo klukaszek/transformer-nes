@@ -2,13 +2,14 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "apu.h"
-#include "bus.h"
-#include "cartridge.h"
-#include "console.h"
-#include "mappers.h"
-#include "ppu.h"
-#include "tape.h"
+#include "nes/apu.h"
+#include "nes/bus.h"
+#include "nes/cartridge.h"
+#include "nes/console.h"
+#include "nes/mappers/mappers.h"
+#include "nes/palette.h"
+#include "nes/ppu.h"
+#include "nes/tape.h"
 
 #include <memory>
 #include <stdexcept>
@@ -124,7 +125,7 @@ private:
     py::sequence aa = out["hit_addr"], vv = out["hit_value"];
     if (py::len(aa) != py::len(vv))
       throw std::runtime_error("CPU engine returned mismatched write arrays");
-    for (py::ssize_t i = 0; i < py::len(aa); ++i) {
+    for (py::size_t i = 0; i < py::len(aa); ++i) {
       int a = py::cast<int>(aa[i]);
       if (auto* d = device_at(a)) {
         drop_device_leases(d);
@@ -170,7 +171,7 @@ private:
     py::sequence addresses = out["ls_addr"], served = out["ls_served"];
     if (py::len(addresses) != py::len(served))
       throw std::runtime_error("CPU engine returned mismatched lease arrays");
-    for (py::ssize_t i = 0; i < py::len(addresses); ++i) {
+    for (py::size_t i = 0; i < py::len(addresses); ++i) {
       int addr = py::cast<int>(addresses[i]);
       auto owner = lease_owners_.find(addr);
       if (lease_queues_.erase(addr) && owner != lease_owners_.end())
@@ -238,6 +239,22 @@ public:
     for (int i = 0; i < 8; ++i)
       console_->set_button(i, ((mask >> i) & 1) != 0);
   }
+  py::bytes read_ram(int start, int count) {
+    vector<uint8_t> out(static_cast<size_t>(count));
+    for (int i = 0; i < count; ++i)
+      out[static_cast<size_t>(i)] = static_cast<uint8_t>(machine_->read_ram((start + i) & 0xFFFF));
+    return to_bytes(out);
+  }
+  // Battery-backed PRG RAM ($6000-$7FFF): one native region map in, one
+  // bulk read out -- no per-byte pokes, no engine WRITE tokens.
+  py::bytes prg_ram() { return read_ram(0x6000, 0x2000); }
+  void load_prg_ram(const py::bytes& data) {
+    string s = data;
+    if (s.size() != 0x2000)
+      throw std::invalid_argument("battery image must be 8192 bytes");
+    machine_->map_region(0x6000, span(reinterpret_cast<const uint8_t*>(s.data()), s.size()));
+  }
+  void set_sprite_limit(bool enabled) { console_->ppu().set_sprite_limit(enabled); }
   py::dict run_tape(const string& path, int tail_frames, int max_frames) {
     const auto result = replay_tape(*console_, InputTape::load(path), tail_frames, max_frames);
     py::dict out;
@@ -258,7 +275,12 @@ private:
 
 } // namespace
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+PYBIND11_MODULE(nes_hardware, m) {
+  // The NTSC palette (include/nes/palette.h) as a (64, 3) uint8 array,
+  // for Python-side frame rendering (tape analysis, debug dumps).
+  py::array_t<uint8_t> pal({64, 3});
+  std::copy(NES_PALETTE.begin(), NES_PALETTE.end(), pal.mutable_data());
+  m.attr("NES_PALETTE") = pal;
   py::class_<Cartridge>(m, "Cartridge")
       .def_static("load", &Cartridge::load)
       .def_static("parse",
@@ -277,7 +299,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                                return py::bytes(reinterpret_cast<const char*>(c.chr.data()),
                                                 c.chr.size());
                              })
-      .def_readonly("mapper", &Cartridge::mapper);
+      .def_readonly("mapper", &Cartridge::mapper)
+      .def_readonly("battery", &Cartridge::battery);
   py::class_<ConsoleHost>(m, "Console")
       .def(py::init<Cartridge, py::object, const vector<pair<int, int>>&, double>(),
            py::arg("cartridge"), py::arg("backend_factory"), py::arg("opcodes"),
@@ -286,6 +309,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_buttons", &ConsoleHost::set_buttons)
       .def("run_tape", &ConsoleHost::run_tape, py::arg("path"), py::arg("tail_frames") = 120,
            py::arg("max_frames") = 0)
+      .def("read_ram", &ConsoleHost::read_ram, py::arg("start"), py::arg("count"))
+      .def("prg_ram", &ConsoleHost::prg_ram)
+      .def("load_prg_ram", &ConsoleHost::load_prg_ram, py::arg("data"))
+      .def("set_sprite_limit", &ConsoleHost::set_sprite_limit, py::arg("enabled"))
       .def_property_readonly("frame_index",
                              [](ConsoleHost& h) { return h.console().frame_index(); })
       .def_property_readonly("cycles", [](ConsoleHost& h) { return h.console().cycles(); })

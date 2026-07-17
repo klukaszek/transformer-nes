@@ -1,6 +1,6 @@
-#include "tape.h"
+#include "nes/tape.h"
 
-#include "console.h"
+#include "nes/console.h"
 
 #include <algorithm>
 #include <charconv>

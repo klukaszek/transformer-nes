@@ -6,6 +6,128 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
+## 2026-07-17 debug overlay + battery saves + frontend portability
+
+QoL/debug infrastructure arc, motivated by the MM6 investigation below
+(hardware-verified authentic — these tools make the next report cheaper
+to chase):
+
+- **Tilde debug overlay** (`nes/ui/debug_ui.{h,cpp}`, Dear ImGui via
+  sokol_imgui; both vendored since 2026-07-11, now compiled in).  `~`
+  toggles; Esc closes; game input is suppressed while open.  Contents:
+  display fps + emulation ms/frame (last/EMA), frame index, cycles,
+  backend; QoL toggles — pause + single-frame step, remove the
+  8-per-scanline sprite cap (Ppu::set_sprite_limit; default stays
+  hardware-exact because TLoZ's door masking NEEDS the cap), overscan
+  crop on/off (the blit now samples a uniform sub-rectangle, so full
+  256x240 is one checkbox), mute; and a clipper-based hex inspector
+  over the CPU address space (enter a hex address to jump).  app.cpp
+  wraps a Python `DebugBridge` (app.py) as std::function hooks; the
+  overlay TU is pybind-free.  Gotcha that cost one crash: app.cpp casts
+  the bridge's list-of-tuples returns to `std::vector<std::pair<...>>`,
+  which silently does nothing without `#include <pybind11/stl.h>`.
+- **Battery saves**: iNES flag6 bit 1 was already parsed; now exposed.
+  Interactive runs load `<rom>.sav` into $6000-$7FFF before the first
+  frame (one native map_region — no engine WRITE tokens) and write it
+  back from the quit callback.  Tape runs stay save-blind on purpose: a
+  .sav at boot would desync recorded inputs.  Receipt:
+  `test_battery_prg_ram_round_trip` + a live Zelda save/load cycle.
+- **Header tree**: `nes/include/nes/{*.h}` + `nes/include/nes/mappers/`,
+  includes are `"nes/..."`-qualified, app.py passes the include dir;
+  `.clangd` carries each repo -I at both depths (relative flags resolve
+  against the edited file's directory).  pybind11 v3.0.1 (torch's
+  bundled version) is vendored via install_deps.sh for clangd — builds
+  still compile against torch's copy; only Python.h remains an absolute
+  machine path (uv keeps CPython headers outside the venv).
+- **Frontend portability**: backend selection lives in
+  `ui/sokol_platform.h` (`__APPLE__` → SOKOL_METAL, else SOKOL_GLCORE);
+  app.cpp carries #ifdef'd MSL and GLSL 410 shader pairs and
+  backend-conditional reflection; app.py compiles sokol_impl as ObjC on
+  darwin / plain C elsewhere and links GL/X11 libs on the else-branch.
+  The Linux path is plumbed but UNTESTED (no Linux machine here).
+
+**Same-day follow-up — Makefile build to bin/, torch out of the NES
+build.**  Vendoring pybind11 removed the last thing
+torch.utils.cpp_extension supplied (pybind includes, module naming,
+digest caching), so the NES extensions now build from the repo-root
+Makefile: `make hardware` → bin/nes_hardware.so, `make frontend` →
+bin/nes_app.so (imgui objects warning-silent, sokol_impl as
+ObjC/darwin or C/else), `make test-native` builds and runs the native
+hardware test; -MMD dependency files replace content digests, and the
+PYBIND11_MODULE names are literal (no TORCH_EXTENSION_NAME).  app.py's
+loaders are now one quiet `make` (PYTHON=sys.executable; the Makefile
+defaults to .venv/bin/python for bare `make`) plus a plain extension
+import from bin/ — _nes_cache is gone.  vendor/pybind11 joined
+sokol/imgui in .gitignore (fetched by install_deps.sh, untracked).
+Only Python.h stays a machine path anywhere (.clangd): pybind11 wraps
+the CPython C API, and uv keeps those headers outside the repo.
+GNU-make gotcha for next time: `%` never matches an empty stem, so
+`imgui%.o` cannot build imgui.o — the vendor rule is a plain `%.o`
+pattern, applied only where vendor/imgui/%.cpp exists.
+The weights-engine codegen build (model/_engine_cache) stays
+torch-driven, untouched.  app.py then split along its seams: build.py
+(make + extension import), backends.py (core adapters,
+backend_factory, OPCODES_NATIVE), debug.py (DebugBridge); app.py
+keeps only run_app + main (the nes-run entry point).  The NTSC
+palette moved to include/nes/palette.h outright — it only ever
+traveled Python → run() → memcpy (a fossil of app.py owning
+presentation data), so the numpy round trip, the (64,3) validation,
+and run()'s palette parameter are gone.  Python-side access is a
+binding, not a copy: `nes_hardware.NES_PALETTE` exports the header
+table as a (64, 3) uint8 array for frame-analysis scripts.
+
+Receipts: 70 Python tests green (69 + battery), native hardware test
+green (also via make test-native), ruff clean; LoZ tape
+cycle-identical (67,156,156), MM6 tape clean at 570 fps; app boots,
+runs, and quits cleanly through the new init/overlay/cleanup path with
+the sprite-limit default verified inert (render paths identical when
+the cap is on); post-Makefile re-receipts: suite 70 green, LoZ
+67,156,156 again, app smoke 3.0 ms/frame, no-op `make` is silent.
+
+## 2026-07-17 MM6 sprite reports — both symptoms are game truth, no engine change
+
+Two play reports on Mega Man 6 (`tapes/megaman6_tape`, Wind Man stage),
+both reproduced with numpy frame analysis and diagnosed from the
+temporary env-gated PPU register/OAM logs (added, used, removed;
+ppu.cpp byte-identical after).  NOTHING was changed — both are
+authentic hardware behavior:
+
+- **Left-edge garbage sliver.**  The stage scrolls horizontally under
+  HORIZONTAL mirroring (MMC3 $A000=1; the register log shows mirr=3,
+  mask=$18 throughout), so the nametable is a 256-px cylinder: the
+  column streamed for the right edge is the SAME column leaving the
+  left edge, and its tile+attribute writes land while 8−fine_x pixels
+  are still visible past the left-8 mask.  Fingerprint receipt: on
+  every glitch frame the sliver width equals 8−fine_x exactly (fx=6 →
+  2 px, fx=7 → 1 px, 11/11 frames); the periodicity is one glitch per
+  tile crossing, and the recolored tail is the shared attribute byte
+  (2x2-tile granularity forces recoloring the old columns).  Real
+  hardware shows the identical sliver in the first visible pixels;
+  deep CRT overscan hid it — our 8-px crop is a tight CRT.  The whole
+  Mega Man series does this.
+- **Big-sprite flicker when the player shares scanlines.**  Two stacked
+  mechanisms, both authentic.  (1) The GAME hides whole objects: on the
+  panda mini-boss's blink frames the OAM dump has 32 live sprites vs
+  43 — Mega Man's ten entries are simply absent (software flicker
+  manager, 2-on/2-off), and single-frame enemy vanishes coincide with
+  buster hits (damage blink).  (2) On the crowded frames, recomputing
+  NESDEV first-8-per-scanline evaluation over the dumped OAM predicts
+  exactly the dropped half-tile slivers in the render (panda rows are
+  5-6 sprites wide; player+bullet push lines past 8).  Emulation-side
+  levers that could have skewed the game's own flicker decision were
+  checked: the OAM-DMA 513-cycle stall is charged on the engine path
+  (bindings take_stall), and the $2002 overflow flag (which we don't
+  set) is broken silicon no game relies on.
+- METHOD, for the next sprite report: dump OAM at render time and
+  compare against the drawn frame — sprites missing FROM OAM are the
+  game's choice (authentic), sprites in OAM but not drawn must be
+  explained by first-8/priority/clip rules or it's our bug.  And the
+  seam-authenticity fingerprint is width == 8−fine_x.
+- A "no 8-sprite limit" toggle was considered and NOT added: TLoZ
+  depends on the limit for its dungeon-door masking (2026-07-16 round
+  3), so lifting it globally is a known regression; if ever wanted it
+  must be per-ROM opt-in.
+
 ## 2026-07-16 PPU raster fidelity — Zelda vertical scroll + SMB3 spade minigame
 
 Two frame-model defects, both reported from play and reproduced on input

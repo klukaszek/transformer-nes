@@ -1,13 +1,13 @@
-#include "../apu.h"
-#include "../bus.h"
-#include "../mappers.h"
-#include "../mmc1.h"
-#include "../mmc2.h"
-#include "../mmc3.h"
-#include "../mmc4.h"
-#include "../mmc5.h"
-#include "../ppu.h"
-#include "../tape.h"
+#include "nes/apu.h"
+#include "nes/bus.h"
+#include "nes/mappers/mappers.h"
+#include "nes/mappers/mmc1.h"
+#include "nes/mappers/mmc2.h"
+#include "nes/mappers/mmc3.h"
+#include "nes/mappers/mmc4.h"
+#include "nes/mappers/mmc5.h"
+#include "nes/ppu.h"
+#include "nes/tape.h"
 
 #include <cassert>
 

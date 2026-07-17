@@ -3,7 +3,7 @@
 #include <array>
 #include <cstdint>
 
-#include "mapper.h"
+#include "nes/mappers/mapper.h"
 
 namespace transformer_nes::nes {
 
