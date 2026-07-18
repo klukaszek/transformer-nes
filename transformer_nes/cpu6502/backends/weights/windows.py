@@ -131,6 +131,84 @@ def propose_window(read, pc: int, *, max_len: int = MAX_INSTRUCTIONS):
     return (pc, bytes(code), 1)
 
 
+STACK_OPERATIONS = frozenset({"pha", "php", "pla", "plp", "jsr", "rts"})
+
+
+def propose_trace_window(read, written, pc: int, *, max_len: int = 10,
+                         spec_ok=None):
+    """Flow-following window candidate anchored at a hot pc.
+
+    Decodes the executed path through JSR/RTS/JMP with a simulated return
+    stack.  A branch ends the window as its final (live) instruction
+    unless ``spec_ok(pc, fall_through_pc)`` approves speculating past it
+    (runtime-verified by the dispatching kernel, which commits the exact
+    prefix before the first violation) -- profitable only for branches
+    the profile shows almost never taken, since a rollback wastes the
+    rest of the forward.  ``written`` is the profile's written-address
+    set: a written opcode byte ends the window, written operand bytes
+    are reported symbolic (the fold reads them through the live memory
+    structure).  Safety is the trace builder's licenses, not this
+    proposal.  Returns (steps, symbolic, uses_stack) or None.
+    """
+    steps: list[tuple[int, bytes]] = []
+    symbolic: set[int] = set()
+    uses_stack = False
+    frame: list[int] = []
+    seen: set[int] = set()
+    cur = pc
+    while len(steps) < max_len:
+        if cur in seen or cur + 3 > 0x10000:
+            break
+        op = OPCODES.get(read(cur))
+        if op is None or cur in written or op.operation in ("brk", "rti"):
+            break
+        if op.operation == "jmp" and op.mode == "ind":
+            break
+        body = bytes(read(cur + j) for j in range(op.length))
+        operand_written = [
+            (cur + j) for j in range(1, op.length) if (cur + j) in written
+        ]
+        uses_stack |= op.operation in STACK_OPERATIONS
+        if op.operation in BRANCH_OPERATIONS:
+            steps.append((cur, body))
+            symbolic.update(operand_written)
+            if spec_ok is None or not spec_ok(cur, cur + op.length):
+                break
+            seen.add(cur)
+            cur += op.length
+            continue
+        if op.operation == "jsr":
+            if operand_written:
+                break
+            steps.append((cur, body))
+            seen.add(cur)
+            frame.append(cur + 3)
+            cur = body[1] | (body[2] << 8)
+            continue
+        if op.operation == "rts":
+            steps.append((cur, body))
+            seen.add(cur)
+            if not frame:
+                break
+            cur = frame.pop()
+            continue
+        if op.operation == "jmp":
+            steps.append((cur, body))
+            seen.add(cur)
+            if operand_written:
+                symbolic.update(operand_written)
+                break
+            cur = body[1] | (body[2] << 8)
+            continue
+        steps.append((cur, body))
+        symbolic.update(operand_written)
+        seen.add(cur)
+        cur += op.length
+    if len(steps) < 2:
+        return None
+    return steps, frozenset(symbolic), uses_stack
+
+
 def iter_ops(code: bytes):
     off = 0
     while off < len(code):

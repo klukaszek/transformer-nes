@@ -13,6 +13,12 @@ across folds.  That contract is checked, not assumed: a lookup whose
 insert-side expressions can reach a pin is reported in
 ``FoldResult.insert_side_hazards`` for the caller to refuse.
 
+The optional ``inline_linear`` construction substitutes pure linear
+persists into their consumers to exchange row width for dependency depth.
+Lookup operands and annotated memory reads remain materialized so
+exact-structure classification and fused-read rebuilding keep their
+structural licenses.
+
 NOTE: materialization calls ``reset_graph()``, so the module-level graph
 context afterwards holds the *folded* graph; the union survives through
 the folder's ProgramGraph snapshot, and any later construction must call
@@ -36,6 +42,15 @@ from transformer_nes.graph.core import (
     reset_graph,
     stepglu,
 )
+
+
+class SequenceRejection(RuntimeError):
+    """A sequence/trace fold license failure at a known step, so callers
+    can retry with the window truncated before it."""
+
+    def __init__(self, msg: str, step: int | None = None):
+        super().__init__(msg)
+        self.step = step
 
 
 def const_of(expr: Expression, one: Dimension) -> float | None:
@@ -127,7 +142,7 @@ class GraphMaterializer:
 
     def materialize(self, all_dims, live, val, folded, lookup_exprs, sub, tr,
                     *, name_of=lambda n: n, is_leaf=None,
-                    hazards=frozenset()) -> None:
+                    hazards=frozenset(), resolve_read=None) -> None:
         made = set()
         for d in all_dims:
             if d in val or d not in live:
@@ -143,6 +158,16 @@ class GraphMaterializer:
             elif isinstance(d, PersistDimension):
                 site = getattr(d, "memory_read", None)
                 if site is not None:
+                    fwd = resolve_read(d, site, tr) if resolve_read else None
+                    if fwd is not None:
+                        # Store-to-load forwarding: an in-window write at a
+                        # provably identical address supplies the value; the
+                        # lookup fabric never materializes.
+                        nd = PersistDimension(fwd, name=name_of(d.name))
+                        sub[d] = Expression({nd: 1})
+                        self.n_persists += 1
+                        self.n_terms += len(nd.expr.terms)
+                        continue
                     marks = len(graph.graph_dims), len(graph.graph_lookups)
                     expr = masked_exact_read(
                         tr(site["address"]), tr(site["byte_value"]),
@@ -192,15 +217,23 @@ def masked_exact_read(addr, byte_value, write_addr, is_write) -> Expression:
     exact-address mask.  Identical output to the union's 16-group sum
     (the mask keeps exact hits only, and an exact hit answers from its
     own group either way); the group split exists for the exported
-    artifact's f32 score range, which expert engines never compute."""
+    artifact's f32 score range, which expert engines never compute.
+
+    The mask is depth-lean: for integer diff, [diff > 0] is
+    relu(diff) - relu(diff - 1), so the exact indicator is a LINEAR
+    combination of four ReGLUs (no intermediate persists) and the gated
+    result is one ReGLU -- three layers past the lookup instead of the
+    seven the abs/step/multiply chain cost, on every window read's
+    critical path."""
     value, found = graph.fetch([byte_value, write_addr], query=addr,
                                key=write_addr, clear_key=1 - is_write,
                                tie_break="latest")
     value.lookup.memory_group = graph.MEMORY_GROUP_FUSED
     diff = addr - Expression({found: 1})
-    abs_diff = graph.persist(graph.reglu(diff, diff) + graph.reglu(-diff, -diff))
-    exact = graph.stepglu(Expression({graph.one: 1}), -abs_diff)
-    return graph.make_multiply(Expression({value: 1}), exact)
+    exact = (Expression({graph.one: 1})
+             - graph.reglu(1, diff) + graph.reglu(1, diff - 1)
+             - graph.reglu(1, -diff) + graph.reglu(1, -diff - 1))
+    return graph.reglu(Expression({value: 1}), exact)
 
 
 @dataclass
@@ -228,6 +261,9 @@ class FoldResult:
     # Sequence folds: number of composed steps (root/readout names carry a
     # __s<k> suffix per step; step-0 input dims keep their canonical names).
     n_steps: int = 1
+    # forward_stores folds: one (step, union read name, const address |
+    # None, forwarded) row per surviving memory read, for read licenses.
+    read_log: tuple = field(default=())
 
 
 class GraphFolder:
@@ -241,6 +277,17 @@ class GraphFolder:
     def __init__(self, program_graph: ProgramGraph, root_names=()):
         self.pg = program_graph
         self.root_names = tuple(root_names)
+        # The O(1) attention backends classify lookup rows structurally.
+        # Keep direct linear lookup operands as residual coordinates rather
+        # than expanding (for example) an exact clear-gate coordinate back
+        # into ``1e30 * is_state - 1e30 * one``.
+        self.lookup_persists = {
+            d
+            for lu in program_graph.all_lookups
+            for e in (lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs)
+            for d in e.terms
+            if isinstance(d, PersistDimension)
+        }
         self.by_name: dict[str, Dimension] = {}
         for d in program_graph.all_dims:
             self.by_name.setdefault(d.name, d)
@@ -251,7 +298,10 @@ class GraphFolder:
 
     # ── Partial evaluation ───────────────────────────────────────────
 
-    def partial_eval(self, pins: dict[str, float], frozen: frozenset = frozenset()):
+    def partial_eval(self, pins: dict[str, float], frozen: frozenset = frozenset(),
+                     *, inline_linear: bool = False,
+                     preserve: frozenset = frozenset(),
+                     resolve_site=None, inline_budget: int | None = None):
         pg = self.pg
         one = pg.one
         val: dict = {one: Expression({one: 1.0})}
@@ -264,6 +314,17 @@ class GraphFolder:
             if isinstance(d, PersistDimension) and d.name in pins:
                 val[d] = Expression({one: float(pins[d.name])})
                 continue
+            if resolve_site is not None and isinstance(d, PersistDimension):
+                site = getattr(d, "memory_read", None)
+                if site is not None:
+                    c = resolve_site(d, site, val)
+                    if c is not None:
+                        # Constant store-to-load forward: the read IS the
+                        # in-window written constant, visible to all
+                        # downstream constant folding (an RTS return
+                        # address must reach next_pc as a constant).
+                        val[d] = Expression({one: float(c)})
+                        continue
             if isinstance(d, ReGLUDimension):
                 a = subst(d.a_expr, val)
                 b = subst(d.b_expr, val)
@@ -284,6 +345,21 @@ class GraphFolder:
                 c = const_of(e, one)
                 if c is not None:
                     val[d] = Expression({one: c})
+                elif (
+                    inline_linear
+                    and d not in self.lookup_persists
+                    and d not in preserve
+                    and getattr(d, "memory_read", None) is None
+                    and (inline_budget is None or len(e.terms) <= inline_budget)
+                ):
+                    # A persist is a pure linear map.  Expert folds may
+                    # substitute it into its consumers to trade wider rows
+                    # for a shorter dependency chain; inline_budget bounds
+                    # the substituted width so wide fan-outs (a symbolic
+                    # PLP flag decode) stay materialized.  Keep annotated
+                    # memory reads materialized so their grouped fabric can
+                    # still be rebuilt as one fused lookup below.
+                    val[d] = e
                 else:
                     folded[d] = (e,)
         lookup_exprs: dict = {}
@@ -339,10 +415,13 @@ class GraphFolder:
 
     # ── Fold ──────────────────────────────────────────────────────────
 
-    def fold(self, pins: dict[str, float], label: str = "") -> FoldResult:
+    def fold(self, pins: dict[str, float], label: str = "", *,
+             inline_linear: bool = False) -> FoldResult:
         pg = self.pg
         pins = dict(pins)
-        val, folded, lookup_exprs = self.partial_eval(pins)
+        val, folded, lookup_exprs = self.partial_eval(
+            pins, inline_linear=inline_linear,
+        )
         hazards = self.insert_hazards(frozenset(pins))
 
         # Folded output-token expressions (they seed liveness and become the
@@ -443,7 +522,10 @@ class GraphFolder:
 
     def fold_sequence(self, pin_list, feedback, label: str = "",
                       keep_alive_token: str = "READOUT",
-                      pc_offsets=None) -> FoldResult:
+                      pc_offsets=None, *, inline_linear: bool = False,
+                      forward_stores: bool = False,
+                      read_bounds=None,
+                      inline_budget: int | None = None) -> FoldResult:
         """Fold a K-step composition of the union graph into ONE graph.
 
         pin_list[k] pins step k (the router supplies them: pc, instruction
@@ -465,6 +547,20 @@ class GraphFolder:
         head the router matches.  License (checked by the caller): the
         window must not wrap $FFFF, and intermediate control flow must
         actually be pc + offset (verify folded next_pc__sk).
+
+        forward_stores enables store-to-load forwarding: every step's store
+        roots must fold to constant flags and (when storing) constant
+        addresses; a later step's memory read at a matching constant
+        address takes the written value expression instead of a lookup, and
+        a read at a distinct constant address keeps the global lookup (the
+        engine's ordered post-forward writes cannot alter it).  Anything
+        unprovable -- a non-constant store flag or address, or a
+        non-constant read address while writes are pending -- raises, so
+        callers treat it as a license rejection.  A non-constant read
+        with pending writes is admitted only when ``read_bounds``
+        (caller-certified (step, read name) -> (lo, hi) address bounds)
+        proves it disjoint from every pending store.  Surviving reads are
+        recorded in FoldResult.read_log for the caller's range licenses.
         """
         pg = self.pg
         one = pg.one
@@ -494,6 +590,11 @@ class GraphFolder:
         fb_expr: dict[str, Expression] = {}  # prev step's outputs, new-graph space
         fb_const: dict[str, float] = {}
         new_outputs = None
+        # forward_stores state: earlier steps' (const address, const value |
+        # None, new-graph value expr | None), latest last, plus the read
+        # disposition log.
+        pending_writes: list[tuple[int, float | None, Expression | None]] = []
+        read_log: list[tuple[int, str, int | None, bool]] = []
 
         pc_names = ("current_pc_lo", "current_pc_hi")
         pc_exprs = None  # step-0 (head) pc byte expressions, new-graph space
@@ -530,7 +631,32 @@ class GraphFolder:
             for name, v in pins.items():
                 all_pins[f"s{k}:{name}"] = v
 
-            val, folded, lookup_exprs = self.partial_eval(pins, frozenset(frozen))
+            fwd_expr_of: dict = {}
+
+            def resolve_site(d, site, val, *, k=k, fwd_expr_of=fwd_expr_of):
+                ae = subst(site["address"], val)
+                c = const_of(ae, one)
+                if c is None:
+                    return None  # live reads are arbitrated at materialize
+                a = int(round(c)) & 0xFFFF
+                for pa, pconst, pexpr in reversed(pending_writes):
+                    if pa != a:
+                        continue
+                    if pconst is not None:
+                        read_log.append((k, d.name, a, True))
+                        return pconst
+                    fwd_expr_of[d] = pexpr
+                    return None
+                return None
+
+            val, folded, lookup_exprs = self.partial_eval(
+                pins, frozenset(frozen), inline_linear=inline_linear,
+                preserve=frozenset(
+                    self.by_name[n] for n in pc_names
+                ) if pc_offsets is not None and k == 0 else frozenset(),
+                resolve_site=resolve_site if forward_stores else None,
+                inline_budget=inline_budget,
+            )
             insert_side_hazards |= {
                 lu.name or f"lookup_{lu.id}"
                 for lu in self.insert_hazards(frozenset(pins))
@@ -606,8 +732,34 @@ class GraphFolder:
             def sname(name, *, k=k):
                 return f"{name}__s{k}" if name else None
 
+            def resolve_read(d, site, tr, *, k=k, fwd_expr_of=fwd_expr_of):
+                pv = fwd_expr_of.get(d)
+                if pv is not None:
+                    read_log.append((k, d.name, None, True))
+                    return pv
+                addr = tr(site["address"])
+                c = const_of(addr, graph.one)
+                if c is None:
+                    b = read_bounds.get((k, d.name)) if read_bounds else None
+                    disjoint = b is not None and all(
+                        not (b[0] <= pa <= b[1])
+                        for pa, _pc, _pe in pending_writes
+                    )
+                    if pending_writes and not disjoint:
+                        raise SequenceRejection(
+                            f"fold_sequence({label}) s{k}: memory read "
+                            f"{d.name!r} has a non-constant address after "
+                            "in-window stores", step=k,
+                        )
+                    read_log.append((k, d.name, None, False))
+                    return None
+                read_log.append((k, d.name, int(round(c)) & 0xFFFF, False))
+                return None
+
             mat.materialize(pg.all_dims, live, val, folded, lookup_exprs,
-                            sub, tr, name_of=sname, is_leaf=is_leaf)
+                            sub, tr, name_of=sname, is_leaf=is_leaf,
+                            resolve_read=resolve_read if forward_stores
+                            else None)
 
             # Roots: every step's readout set, suffixed; folded-away roots
             # come back as named persists (same contract as fold()).
@@ -624,6 +776,41 @@ class GraphFolder:
                 pc_exprs = tuple(
                     tr(Expression({self.by_name[n]: 1})) for n in pc_names
                 )
+
+            if forward_stores:
+                for flag_n, addr_n, val_n in (
+                    ("is_store", "write_addr_out", "write_value_out"),
+                    ("is_store2", "write_addr2_out", "write_value2_out"),
+                    ("is_store3", "write_addr3_out", "write_value3_out"),
+                ):
+                    fe = val.get(self.by_name[flag_n])
+                    fc = None if fe is None else const_of(fe, one)
+                    if fc is None:
+                        raise SequenceRejection(
+                            f"fold_sequence({label}) s{k}: {flag_n} did not "
+                            "fold to a constant", step=k,
+                        )
+                    if int(round(fc)) == 0:
+                        continue
+                    ae = val.get(self.by_name[addr_n])
+                    ac = None if ae is None else const_of(ae, one)
+                    if ac is None:
+                        raise SequenceRejection(
+                            f"fold_sequence({label}) s{k}: {addr_n} did not "
+                            "fold to a constant", step=k,
+                        )
+                    # Constant values forward through partial_eval (an RTS
+                    # return address must reach next_pc as a constant);
+                    # live values forward as the already-materialized root
+                    # persist, shared by every later reader.
+                    ve = val.get(self.by_name[val_n])
+                    vc = None if ve is None else const_of(ve, one)
+                    pending_writes.append((
+                        int(round(ac)) & 0xFFFF,
+                        vc,
+                        None if vc is not None
+                        else tr(Expression({self.by_name[val_n]: 1})),
+                    ))
 
             fb_const, fb_expr = {}, {}
             for out in set(feedback.values()):
@@ -672,6 +859,7 @@ class GraphFolder:
             n_terms=mat.n_terms,
             folded_roots=tuple(folded_roots),
             n_steps=n_steps,
+            read_log=tuple(read_log),
         )
 
 

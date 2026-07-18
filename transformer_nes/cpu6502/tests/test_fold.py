@@ -24,6 +24,7 @@ import pytest
 
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS
+from transformer_nes.cpu6502.backends.weights.experts import build_shape_experts
 from transformer_nes.cpu6502.backends.weights.runner import VERIFY_START, verify_program
 from transformer_nes.cpu6502.interpreter import build
 from transformer_nes.cpu6502.spec import OPCODES
@@ -346,7 +347,12 @@ def poll_run(union_pg):
     ],
     ids=["poll-trio", "jmp-spin-x3"],
 )
-def test_sequence_fold_shadows_union(folder, poll_run, head, code, repeat):
+@pytest.mark.parametrize(
+    "inline_linear", [False, True], ids=["materialized", "linear-inlined"],
+)
+def test_sequence_fold_shadows_union(
+    folder, poll_run, head, code, repeat, inline_linear,
+):
     """One sequence forward must reproduce the union's K consecutive step
     readouts exactly whenever the router would dispatch it (pc == head; the
     window bytes are pinned).  Intermediate STATE tokens are not fed to the
@@ -354,7 +360,8 @@ def test_sequence_fold_shadows_union(folder, poll_run, head, code, repeat):
     pin_list = sequence_pins(head, code, OPCODES) * repeat
     n_steps = len(pin_list)
     r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
-                             label=f"seq@{head:04X}")
+                             label=f"seq@{head:04X}",
+                             inline_linear=inline_linear)
     assert r.n_steps == n_steps
     assert not r.insert_side_hazards
     ev = ProgramEvaluator(r.program_graph)
@@ -399,11 +406,17 @@ def test_sequence_fold_shadows_union(folder, poll_run, head, code, repeat):
 
 
 @pytest.mark.parametrize("byte", SHADOW_OPCODES)
-def test_folded_expert_shadows_union(folder, union_run, byte):
+@pytest.mark.parametrize(
+    "inline_linear", [False, True], ids=["materialized", "linear-inlined"],
+)
+def test_folded_expert_shadows_union(folder, union_run, byte, inline_linear):
     """Replay the union's token stream through the folded expert graph; on
     every step whose fetched opcode matches the pin, all runtime readouts
     must agree exactly -- the engine's routed-dispatch contract."""
-    r = folder.fold(opcode_pins(byte, OPCODES), label=f"{byte:02X}")
+    r = folder.fold(
+        opcode_pins(byte, OPCODES), label=f"{byte:02X}",
+        inline_linear=inline_linear,
+    )
     ev = ProgramEvaluator(r.program_graph)
     state_expr = r.program_graph.output_tokens["STATE"]
     halt_expr = r.program_graph.output_tokens["HALT"]
@@ -531,7 +544,12 @@ def shape_run(union_pg):
     ],
     ids=["dex-bne", "poll-trio"],
 )
-def test_shape_fold_shadows_union(folder, shape_run, shape_id, code):
+@pytest.mark.parametrize(
+    "inline_linear", [False, True], ids=["materialized", "linear-inlined"],
+)
+def test_shape_fold_shadows_union(
+    folder, shape_run, shape_id, code, inline_linear,
+):
     """ONE fold of a canonical shape (pc and every operand byte symbolic --
     only the opcode bytes are pinned) must reproduce the union's K-step
     readouts at BOTH instantiations, page-cross and both branch outcomes
@@ -541,7 +559,8 @@ def test_shape_fold_shadows_union(folder, shape_run, shape_id, code):
     pin_list, offsets = sequence_shape_pins(code, OPCODES)
     n_steps = len(pin_list)
     r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
-                             label=f"shape_{shape_id}", pc_offsets=offsets)
+                             label=f"shape_{shape_id}", pc_offsets=offsets,
+                             inline_linear=inline_linear)
     assert r.n_steps == n_steps
     assert not r.insert_side_hazards
     ev = ProgramEvaluator(r.program_graph)
@@ -577,3 +596,20 @@ def test_shape_fold_shadows_union(folder, shape_run, shape_id, code):
         idx += 1
     for head, n in dispatched.items():
         assert n >= 2, f"head {head:04X} never dispatched twice"
+
+
+def test_shape_absolute_store_requires_runtime_guard(union_pg):
+    """A symbolic absolute store is admitted only with the narrow router
+    license and reports the live operand offset that Metal must guard."""
+    shape = ("lda_sta_abs", bytes.fromhex("a9008d0000"), 1)
+    with pytest.raises(RuntimeError, match="not provably below"):
+        build_shape_experts(
+            union_pg, [shape], inline_linear=True, allow_stores=True,
+        )
+    experts, _meta = build_shape_experts(
+        union_pg, [shape], inline_linear=True, allow_stores=True,
+        allow_runtime_store_guard=True,
+    )
+    assert experts[0]["has_stores"]
+    assert experts[0]["store_bounds"] is None
+    assert experts[0]["store_guard_offset"] == 3

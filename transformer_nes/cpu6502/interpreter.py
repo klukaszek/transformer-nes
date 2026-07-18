@@ -193,6 +193,46 @@ def extract_bits(value: ExprLike, name: str) -> list[Expression]:
     return bits
 
 
+def extract_bits_wide(value: ExprLike, name: str) -> list[Expression]:
+    """extract_bits, depth-lean: split on the high nibble, then two
+    persist-free 15-step ladders ([v >= k] = relu(v-k+1) - relu(v-k),
+    exact for integer bytes).  Bits land ~4 layers after the value
+    instead of 8, at ~60 ReGLUs of width -- the trade the GPU mapping
+    wants (depth is what a single-threadgroup forward pays for) and the
+    emitted C++ engine does not (its cost is unit count).  The nibble
+    values are wrapped in unit-gated ReGLUs so linear inlining cannot
+    smear their ladder sums into every consumer row."""
+    v = to_expr(value)
+    hi_sum = Expression()
+    for k in range(1, 16):
+        hi_sum = hi_sum + reglu(1, v - (16 * k - 1)) - reglu(1, v - 16 * k)
+    hi = reglu(hi_sum, 1)
+    lo = reglu(v - 16 * hi_sum, 1)
+
+    def nibble_bits(nv):
+        ge = {
+            k: reglu(1, nv - (k - 1)) - reglu(1, nv - k)
+            for k in range(1, 16)
+        }
+        out = []
+        for b in range(4):
+            r = Expression()
+            for start in range(1 << b, 16, 1 << (b + 1)):
+                r = r + ge[start]
+                if start + (1 << b) < 16:
+                    r = r - ge[start + (1 << b)]
+            out.append(r)
+        return out  # bit 0..3 expressions
+
+    lo_bits = nibble_bits(lo)
+    hi_bits = nibble_bits(hi)
+    bits = []
+    for b in range(7, -1, -1):
+        src = hi_bits[b - 4] if b >= 4 else lo_bits[b]
+        bits.append(persist(src, name=f"{name}bit{b}"))
+    return bits
+
+
 def pulled_flag_bits(value: ExprLike, name: str) -> dict[int, Expression]:
     """All eight bits of an 8-bit value from ONE shared threshold ladder.
 
@@ -215,10 +255,14 @@ def pulled_flag_bits(value: ExprLike, name: str) -> dict[int, Expression]:
 # ── Main graph builder ─────────────────────────────────────────────
 
 
-def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Expression]]:
+def build(*, bcd: bool = True, wide_bits: bool = False,
+          ) -> tuple[dict[str, Expression], dict[str, Expression]]:
     """Build the 6502 graph.  See the module docstring for the construction
-    contract; bcd=False builds the NES 2A03 variant (no decimal mode)."""
+    contract; bcd=False builds the NES 2A03 variant (no decimal mode).
+    wide_bits swaps the serial bit extractions for the depth-lean ladder
+    (extract_bits_wide) -- for GPU-mapped engines only."""
     one = graph.one
+    bits_of = extract_bits_wide if wide_bits else extract_bits
 
     # ── Input dimensions ────────────────────────────────────────────
     global byte_value, is_memory_write, addr_lo, addr_hi, is_start, is_state
@@ -618,8 +662,8 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
     operand = persist(operand, name="operand")
 
     # ── Bit extraction for bitwise / shift ops ────────────────────────
-    a_bits = extract_bits(current_a, "a")
-    operand_bits = extract_bits(operand, "operand")
+    a_bits = bits_of(current_a, "a")
+    operand_bits = bits_of(operand, "operand")
 
     # ── ALU operations ──────────────────────────────────────────────
     carry_in = current_p_c
@@ -749,7 +793,7 @@ def build(*, bcd: bool = True) -> tuple[dict[str, Expression], dict[str, Express
 
     # ── Unofficial opcode ALU ───────────────────────────────────────
     # SAX stores A & X.
-    x_bits = extract_bits(current_x, "x")
+    x_bits = bits_of(current_x, "x")
     sax_result = 0
     for j in range(8):
         sax_result = sax_result + (1 << (7 - j)) * multiply(a_bits[j], x_bits[j])

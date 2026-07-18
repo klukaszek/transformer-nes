@@ -46,14 +46,14 @@ class TorchMachine:
         m = self.meta
         self.d = m["d_model"]
         self.n_layers = m["n_layers"]
-        self.d_ffn = m["d_ffn"]
+        self.layer_heads = m["layer_heads"]
+        self.layer_ffn = m["layer_ffn"]
         self.slots = m["input_slots"]
         self.readout = m["readout_slots"]
 
         def csr(name, shape):
-            # Storage may be f32 (the GPU-portable default) or f64; this
-            # reference runner always executes in f64 -- the artifact's
-            # precision contract lives in meta["format"].
+            # Storage is f32 (exact by the artifact's precision contract,
+            # meta["format"]); this reference runner executes in f64.
             return torch.sparse_csr_tensor(
                 torch.from_numpy(t[f"{name}.indptr"].astype(np.int64)),
                 torch.from_numpy(t[f"{name}.indices"].astype(np.int64)),
@@ -61,15 +61,17 @@ class TorchMachine:
                 size=shape,
             )
 
-        d, f = self.d, self.d_ffn
+        d = self.d
+        # Layers are ragged: layer li carries only its live heads/units.
         self.layers = [
             {
-                "in_proj": csr(f"L{li}.in_proj", (3 * d, d)),
-                "out_proj": csr(f"L{li}.out_proj", (d, d)),
-                "ff_in": csr(f"L{li}.ff_in", (2 * f, d)),
-                "ff_out": csr(f"L{li}.ff_out", (d, f)),
+                "in_proj": csr(f"L{li}.in_proj", (6 * h, d)),
+                "out_proj": csr(f"L{li}.out_proj", (d, 2 * h)),
+                "ff_in": csr(f"L{li}.ff_in", (2 * f, d)) if f else None,
+                "ff_out": csr(f"L{li}.ff_out", (d, f)) if f else None,
             }
-            for li in range(self.n_layers)
+            for li, (h, f) in enumerate(
+                zip(self.layer_heads, self.layer_ffn, strict=True))
         ]
         head = torch.from_numpy(t["head"].astype(np.float64))
         self.state_head = head[m["state_row"]]
@@ -91,27 +93,29 @@ class TorchMachine:
         self.pos += 1
 
         for li, lay in enumerate(self.layers):
+            h2 = 2 * self.layer_heads[li]
             qkv = lay["in_proj"] @ x
-            d = self.d
-            q, k, v = qkv[:d], qkv[d:2 * d], qkv[2 * d:]
+            q, k, v = qkv[:h2], qkv[h2:2 * h2], qkv[2 * h2:]
             self.k_log[li].append(k)
             self.v_log[li].append(v)
-            keys = torch.stack(self.k_log[li])    # (T, d): kx/ky interleaved
+            keys = torch.stack(self.k_log[li])    # (T, 2H): kx/ky interleaved
             vals = torch.stack(self.v_log[li])
             # Hardmax attention, every head at once: score each token by
             # qx*kx + qy*ky; exact ties go to the LATEST token (flip +
             # argmax picks the first of the reversed log).
             scores = keys[:, 0::2] * q[0::2] + keys[:, 1::2] * q[1::2]  # (T, H)
             latest = scores.shape[0] - 1 - torch.argmax(scores.flip(0), dim=0)
-            o = torch.empty(d, dtype=torch.float64)
-            o[0::2] = vals[latest, torch.arange(d // 2) * 2]
-            o[1::2] = vals[latest, torch.arange(d // 2) * 2 + 1]
+            o = torch.empty(h2, dtype=torch.float64)
+            o[0::2] = vals[latest, torch.arange(h2 // 2) * 2]
+            o[1::2] = vals[latest, torch.arange(h2 // 2) * 2 + 1]
             x = x + lay["out_proj"] @ o
 
-            z = lay["ff_in"] @ x
-            gate, val = z[:self.d_ffn], z[self.d_ffn:]
-            act = torch.where(gate > 0, gate * val, torch.zeros(()))
-            x = x + lay["ff_out"] @ act
+            if lay["ff_in"] is not None:
+                z = lay["ff_in"] @ x
+                f = self.layer_ffn[li]
+                gate, val = z[:f], z[f:]
+                act = torch.where(gate > 0, gate * val, torch.zeros(()))
+                x = x + lay["ff_out"] @ act
         return x
 
     # ── 6502 machine protocol ────────────────────────────────────────

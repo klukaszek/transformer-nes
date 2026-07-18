@@ -8,6 +8,7 @@ engine cache; this module owns folds, licenses, and model construction.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 
@@ -29,6 +30,7 @@ from transformer_nes.graph.core import (
 from transformer_nes.graph.fold import (
     SEQUENCE_FEEDBACK,
     GraphFolder,
+    SequenceRejection,
     opcode_pins,
     sequence_pins,
     sequence_shape_pins,
@@ -103,10 +105,16 @@ def eval_over_heads(fold_result, dim, length):
     value depends on anything else -- the straight-line license needs
     next_pc to be a pure function of pc."""
     heads = np.arange(0x10000 - length + 1, dtype=np.float64)
-    memo: dict = {
-        fold_result.dim_of_name["current_pc_lo__s0"]: heads % 256.0,
-        fold_result.dim_of_name["current_pc_hi__s0"]: heads // 256.0,
-    }
+    if "current_pc_lo__s0" in fold_result.dim_of_name:
+        memo: dict = {
+            fold_result.dim_of_name["current_pc_lo__s0"]: heads % 256.0,
+            fold_result.dim_of_name["current_pc_hi__s0"]: heads // 256.0,
+        }
+    else:
+        # Linear-inlined shape folds may substitute the byte persists into
+        # the already-combined address while retaining the same symbolic
+        # head license.
+        memo = {fold_result.dim_of_name["current_pc__s0"]: heads}
 
     def ev(d):
         r = memo.get(d)
@@ -212,7 +220,14 @@ def interval_of(fold_result, dim) -> tuple[float, float]:
                 r = (min(0.0, alo * bhi, ahi * bhi),
                      max(0.0, alo * bhi, ahi * bhi))
         elif isinstance(d, PersistDimension):
-            r = evx(d.expr)
+            # These named fetch results come from byte-valued RAM even when
+            # their exact masked-read circuit has a very loose naive
+            # interval. Preserve that semantic range for symbolic shapes.
+            r = (
+                (0.0, 255.0)
+                if (d.name or "").startswith("fetched_operand_")
+                else evx(d.expr)
+            )
         elif isinstance(d, LookUpDimension):
             # A lookup returns one of its insert-side values (registers
             # come in via state attention, so this is the live data
@@ -243,7 +258,8 @@ STORE_SLOTS = (
 
 
 def check_writes_licensed(fold_result, n_steps: int, label: str, *,
-                          window_range: tuple[int, int] | None = None) -> bool:
+                          window_range: tuple[int, int] | None = None,
+                          return_bounds: bool = False):
     """Stores are licensed when the folded write address provably stays
     below $2000 -- the console only ever watches registers at or above it,
     and dispatch additionally requires no watch range below $2000, so a
@@ -251,8 +267,10 @@ def check_writes_licensed(fold_result, n_steps: int, label: str, *,
     (pinned windows) additionally forbids overlap with the window's own
     code bytes: the fold pinned them, so a self-modifying store would
     execute stale semantics.  Every step must still be non-halting.
-    Returns whether any step stores."""
+    Returns whether any step stores, or ``(has_stores, bounds)`` when
+    ``return_bounds`` is requested."""
     has_stores = False
+    store_lo, store_hi = float("inf"), float("-inf")
     for k in range(n_steps):
         for store, addr in STORE_SLOTS:
             if const_root(fold_result, store, k, label) == 0:
@@ -268,6 +286,7 @@ def check_writes_licensed(fold_result, n_steps: int, label: str, *,
                     f"{label} step {k}: store target bound [{lo:.0f}, {hi:.0f}]"
                     " is not provably below $2000"
                 )
+            store_lo, store_hi = min(store_lo, lo), max(store_hi, hi)
             if window_range is not None:
                 w_lo, w_hi = window_range
                 if hi >= w_lo and lo < w_hi:
@@ -277,6 +296,9 @@ def check_writes_licensed(fold_result, n_steps: int, label: str, *,
                     )
         if const_root(fold_result, "new_halted", k, label) != 0:
             raise RuntimeError(f"{label} step {k}: may halt")
+    if return_bounds:
+        bounds = None if not has_stores else (int(store_lo), int(store_hi))
+        return has_stores, bounds
     return has_stores
 
 
@@ -288,7 +310,8 @@ def schedule_and_build(fold_result):
 
 
 def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
-                         milp_seconds: int = 900) -> list[dict]:
+                         milp_seconds: int = 900,
+                         inline_linear: bool = False) -> list[dict]:
     """Rebuilt per-opcode expert models for the opcode-routed engine.
 
     For each expert opcode, the union graph is partially evaluated with the
@@ -310,7 +333,10 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
     folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
     experts = []
     for byte in opcodes:
-        r = folder.fold(opcode_pins(byte, OPCODES), label=f"{byte:02X}")
+        r = folder.fold(
+            opcode_pins(byte, OPCODES), label=f"{byte:02X}",
+            inline_linear=inline_linear,
+        )
         if r.insert_side_hazards:
             raise RuntimeError(
                 f"expert {byte:02X}: decode pins reach insert-side "
@@ -352,7 +378,9 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
     return experts
 
 
-def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
+def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
+                          inline_linear: bool = False,
+                          assume_taken_steps=()) -> dict:
     """One sequence expert: a K-instruction window folded as ONE forward.
 
     The router guarantees pc == head, the window's bytes, no pending NMI,
@@ -361,14 +389,29 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     bounded below $2000 (check_writes_licensed), control flow
     straight-line inside the window (folded next_pc == the next step's
     pinned pc), and later reads proven outside watched device ranges.
+    ``assume_taken_steps`` is for a router with an independently certified
+    state guard: those branch steps are pinned taken during construction,
+    while all other branch decisions remain live.
     """
     label = f"sequence @{head:04X}"
     pin_list = sequence_pins(head, code, OPCODES) * repeat
     n_steps = len(pin_list)
     ops = decode_ops(code) * repeat
+    assume_taken_steps = tuple(sorted(set(int(k) for k in assume_taken_steps)))
+    for k in assume_taken_steps:
+        if k < 0 or k >= n_steps:
+            raise ValueError(f"{label}: assumed-taken step {k} is out of range")
+        if ops[k].operation not in BRANCH_OPERATIONS:
+            raise ValueError(
+                f"{label}: assumed-taken step {k} is {ops[k].mnemonic}, "
+                "not a branch"
+            )
+        pin_list[k] = dict(pin_list[k])
+        pin_list[k]["branch_taken"] = 1.0
     folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
     r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
-                             label=f"seq_{head:04X}")
+                             label=f"seq_{head:04X}",
+                             inline_linear=inline_linear)
     if r.insert_side_hazards:
         raise RuntimeError(
             f"{label}: pins reach insert-side expressions "
@@ -400,11 +443,251 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
         "step_spec": fold_step_spec(r, model, tok_to_idx, info,
                                     n_steps=n_steps),
         "union_lookup_of": r.union_lookup_of,
+        "assume_taken_steps": assume_taken_steps,
         "layers": info.n_layers, "_d": info.d_model,
     }
 
 
-def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
+# Union read name -> the persist carrying its address, for licensing
+# non-constant surviving reads by interval.
+READ_ADDR_DIMS = {
+    "mem_A": "addrA", "mem_B": "addrB", "mem_C": "addrC",
+    "operand_mem": "ea",
+}
+
+# Width policy for trace windows.  inline_linear trades depth for row
+# width; a symbolic PLP byte fans its extracted flags into every
+# downstream consumer and can blow one layer to ~10K terms (measured
+# ~10x slower than the whole rest of the forward at 32 lanes).  Oversized
+# inline builds fall back to the materialized fold; still-oversized
+# windows are rejected outright.
+INLINE_WORST_NNZ = 1200
+MATERIALIZED_WORST_NNZ = 2600
+
+
+def trace_read_bounds(k: int, op, body: bytes, operand_pinned: bool) -> dict:
+    """Architecture-certified address bounds for step k's memory reads,
+    keyed (step, union read name).  Sound by the 6502's addressing modes
+    under a pinned opcode: zp,X/zp,Y and indirect pointer reads wrap in
+    page zero; abs,X/abs,Y add at most 255 to a PINNED base; pulls stay in
+    page one.  Used to prove non-constant reads disjoint from pending
+    in-window stores, and to license their address range."""
+    bounds: dict[tuple[int, str], tuple[int, int]] = {}
+    if op.mode in ("zpx", "zpy"):
+        bounds[(k, "operand_mem")] = (0x00, 0xFF)
+    elif op.mode in ("abx", "aby") and operand_pinned:
+        base = body[1] | (body[2] << 8)
+        if base + 0xFF <= 0xFFFF:
+            bounds[(k, "operand_mem")] = (base, base + 0xFF)
+    elif op.mode in ("idx", "idy"):
+        bounds[(k, "mem_A")] = (0x00, 0xFF)
+        bounds[(k, "mem_B")] = (0x00, 0xFF)
+    if op.operation in ("pla", "plp", "rts", "rti"):
+        for nm in ("mem_A", "mem_B", "mem_C"):
+            bounds[(k, nm)] = (0x100, 0x1FF)
+    return bounds
+
+
+def worst_layer_nnz(model, n_layers: int) -> int:
+    return max(
+        int(
+            np.count_nonzero(model.attn[li].in_proj_weight)
+            + np.count_nonzero(model.attn[li].out_proj.weight)
+            + np.count_nonzero(model.ff_in[li].weight)
+            + np.count_nonzero(model.ff_out[li].weight)
+        )
+        for li in range(n_layers)
+    )
+
+
+def build_trace_window_expert(pg, steps, *, s_pin: int | None = None,
+                              symbolic=frozenset(),
+                              inline_linear: bool = False) -> dict:
+    """One flow-following window: K profiled instructions as ONE forward.
+
+    ``steps`` is [(pc, instruction bytes)] along the executed control flow
+    -- JSR/RTS/JMP transfers included, so the window need not be
+    contiguous.  Every executed opcode byte is pinned and must be
+    dispatch-checked; bytes at addresses in ``symbolic`` (the profile saw
+    them written) stay live and are read through the memory structure,
+    with store-to-load forwarding resolving in-window writers.  ``s_pin``
+    pins the entering stack pointer -- dispatch must guard S == s_pin --
+    which folds every stack push/pull address to a constant the
+    forwarding license can decide.
+
+    Licenses, all checked: pins reach no insert-side expressions; every
+    interior next_pc folds to the next step's pinned pc (JSR targets are
+    static, RTS return addresses fold through forwarded pushes); no step
+    halts; every store has a constant address below $2000 that overlaps
+    no pinned byte; every surviving memory read is forwarded, at a
+    constant RAM/ROM address, or interval-bounded inside RAM/ROM.
+    """
+    head = steps[0][0]
+    label = f"trace @{head:04X}"
+    pinned: dict[int, int] = {}
+    for pc, body in steps:
+        for j, byte in enumerate(body):
+            addr = (pc + j) & 0xFFFF
+            if addr in symbolic:
+                continue
+            if pinned.setdefault(addr, byte) != byte:
+                raise RuntimeError(
+                    f"{label}: byte {addr:04X} pinned twice with different "
+                    "values"
+                )
+    ops = []
+    pin_list = []
+    read_bounds: dict[tuple[int, str], tuple[int, int]] = {}
+    for k, (pc, body) in enumerate(steps):
+        op = OPCODES.get(body[0])
+        if op is None or len(body) != op.length:
+            raise RuntimeError(f"{label} s{k}: bad instruction at {pc:04X}")
+        if pc not in pinned:
+            raise RuntimeError(f"{label} s{k}: opcode byte is symbolic")
+        ops.append(op)
+        pins = opcode_pins(op.byte, OPCODES)
+        pins["current_pc_lo"] = float(pc & 0xFF)
+        pins["current_pc_hi"] = float((pc >> 8) & 0xFF)
+        pins["current_halted"] = 0.0
+        lo, hi = (pc + 1) & 0xFFFF, (pc + 2) & 0xFFFF
+        if lo in pinned:
+            pins["fetched_operand_lo_all"] = float(pinned[lo])
+        if hi in pinned:
+            pins["fetched_operand_hi_all"] = float(pinned[hi])
+        if k == 0 and s_pin is not None:
+            pins["current_s"] = float(s_pin)
+        pin_list.append(pins)
+        operand_pinned = all(
+            (pc + j) in pinned for j in range(1, op.length)
+        )
+        read_bounds.update(trace_read_bounds(k, op, body, operand_pinned))
+
+    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
+
+    def fold_and_license(inline: bool):
+        r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
+                                 label=f"trace_{head:04X}",
+                                 inline_linear=inline,
+                                 forward_stores=True,
+                                 read_bounds=read_bounds)
+        spec = license_trace_fold(r, steps, pinned, label, read_bounds)
+        return r, spec, *schedule_and_build(r)
+
+    # Width ladder: full inlining (depth-optimal), then the materialized
+    # fold.  A term-budgeted middle rung (inline_budget=16: inline depth,
+    # materialized width) measured SLOWER than the deep/narrow fold at
+    # 128 threads and was removed -- wide layers are what this mapping
+    # pays for once threads cover the row count.
+    r, spec_next, model, _tokens, tok_to_idx, info = fold_and_license(
+        inline_linear
+    )
+    if inline_linear and worst_layer_nnz(model, info.n_layers) > INLINE_WORST_NNZ:
+        r, spec_next, model, _tokens, tok_to_idx, info = fold_and_license(
+            False
+        )
+    if worst_layer_nnz(model, info.n_layers) > MATERIALIZED_WORST_NNZ:
+        raise RuntimeError(
+            f"{label}: worst layer exceeds the width budget "
+            f"({worst_layer_nnz(model, info.n_layers)} nnz)"
+        )
+    cycles = sum(op.cycles for op in ops)
+    digest = hashlib.sha1(
+        repr((tuple(steps), s_pin)).encode()
+    ).hexdigest()[:8]
+    return {
+        "kind": "trace", "name": f"trace_{head:04X}_{digest}", "head": head,
+        "n_steps": len(steps), "cycles": cycles,
+        "cycles_prefix": cycles - ops[-1].cycles,
+        "checks": sorted((a - head, b) for a, b in pinned.items()),
+        "span": (min(pinned), max(pinned) + 1),
+        "s_pin": s_pin, "spec_next": spec_next, "model": model,
+        "step_spec": fold_step_spec(r, model, tok_to_idx, info,
+                                    n_steps=len(steps)),
+        "union_lookup_of": r.union_lookup_of,
+        "layers": info.n_layers, "_d": info.d_model,
+    }
+
+
+def license_trace_fold(r, steps, pinned, label, read_bounds) -> list[int]:
+    """The trace-window licenses over one fold result (see
+    build_trace_window_expert).  Returns spec_next: for every step whose
+    next_pc could not be proven constant (a speculated branch), the pc the
+    trace assumed comes next -- the dispatching kernel MUST verify the
+    step's next_pc readout against it and commit only the prefix before
+    the first violation; -1 marks proven or final steps."""
+    if r.insert_side_hazards:
+        raise RuntimeError(
+            f"{label}: pins reach insert-side expressions "
+            f"of {r.insert_side_hazards}"
+        )
+    n_steps = len(steps)
+    spec_next = [-1] * n_steps
+    for k in range(n_steps - 1):
+        try:
+            got = const_root(r, "next_pc", k, label)
+        except RuntimeError:
+            got = None
+        if got is None:
+            if OPCODES[steps[k][1][0]].operation not in BRANCH_OPERATIONS:
+                raise SequenceRejection(
+                    f"{label} s{k}: non-branch control flow is not constant",
+                    step=k,
+                )
+            spec_next[k] = steps[k + 1][0]
+        elif got != steps[k + 1][0]:
+            raise SequenceRejection(
+                f"{label} s{k}: control flow deviates from the trace",
+                step=k,
+            )
+    for k in range(n_steps):
+        if const_root(r, "new_halted", k, label) != 0:
+            raise SequenceRejection(f"{label} s{k}: may halt", step=k)
+        for store, addr in STORE_SLOTS:
+            if const_root(r, store, k, label) == 0:
+                continue
+            a = const_root(r, addr, k, label)
+            if not 0 <= a < 0x2000:
+                raise SequenceRejection(
+                    f"{label} s{k}: store at {a:04X} is not below $2000",
+                    step=k,
+                )
+            if a in pinned:
+                raise SequenceRejection(
+                    f"{label} s{k}: store hits pinned byte {a:04X}", step=k,
+                )
+    for k, name, a, forwarded in r.read_log:
+        if forwarded:
+            continue
+        if a is not None:
+            if a < 0x2000 or a >= 0x8000:
+                continue
+            raise SequenceRejection(
+                f"{label} s{k}: read {name} at {a:04X} may reach a device",
+                step=k,
+            )
+        b = read_bounds.get((k, name))
+        if b is not None and (b[1] < 0x2000 or b[0] >= 0x8000):
+            continue
+        addr_dim = READ_ADDR_DIMS.get(name)
+        dim = r.dim_of_name.get(f"{addr_dim}__s{k}") if addr_dim else None
+        if dim is None:
+            raise SequenceRejection(
+                f"{label} s{k}: unbounded read {name}", step=k,
+            )
+        lo, hi = interval_of(r, dim)
+        if not (hi < 0x2000 or lo >= 0x8000):
+            raise SequenceRejection(
+                f"{label} s{k}: read {name} bound [{lo:.0f}, {hi:.0f}] "
+                "may reach a device", step=k,
+            )
+    return spec_next
+
+
+def build_shape_experts(pg, shapes, *,
+                        inline_linear: bool = False,
+                        allow_stores: bool = False,
+                        allow_runtime_store_guard: bool = False,
+                        ) -> tuple[list[dict], list[dict]]:
     """Canonical shape experts for the runtime window table.
 
     Each shape folds ONCE with pc and every operand byte symbolic
@@ -415,8 +698,11 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
     head the window fits at, which is possible exactly because the folded
     expression may depend on nothing but the pc bytes.  The JMP self-spin's
     closure is a dispatch property instead (the router compares the operand
-    bytes to the head).  A library shape that fails its license is a hard
-    error: the library is code.
+    bytes to the head). Stores remain rejected by default. Opt-in routers
+    may accept statically bounded stores, or one structurally certified
+    direct absolute store when they enforce the returned live-address
+    guard. A library shape that fails its selected license is a hard error:
+    the library is code.
     """
     folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
     experts: list[dict] = []
@@ -433,23 +719,53 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
         )
         if repeat > 1 and not self_target:
             raise RuntimeError(f"{label}: only a JMP self-spin may repeat")
-        if not self_target and ops[-1].operation not in BRANCH_OPERATIONS:
-            raise RuntimeError(f"{label}: window must close via its last op")
-
         pins, offsets = sequence_shape_pins(template, OPCODES)
         pin_list = pins * repeat
         pc_offsets = offsets * repeat
         n_steps = len(pin_list)
         r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
-                                 label=f"shape_{name}", pc_offsets=pc_offsets)
+                                 label=f"shape_{name}", pc_offsets=pc_offsets,
+                                 inline_linear=inline_linear)
         if r.insert_side_hazards:
             raise RuntimeError(
                 f"{label}: pins reach insert-side expressions "
                 f"of {r.insert_side_hazards}"
             )
         check_reads_licensed(r, ops * repeat, label)
-        has_stores = check_writes_licensed(r, n_steps, label)
-        if has_stores:
+        store_guard_offset = None
+        direct_abs = [
+            (k, offs[k] + 1)
+            for k, op in enumerate(ops)
+            if op.operation in {"store_a", "store_x", "store_y"}
+            and op.mode == "abs"
+        ]
+        try:
+            has_stores, store_bounds = check_writes_licensed(
+                r, n_steps, label, return_bounds=True,
+            )
+        except RuntimeError as exc:
+            if not allow_runtime_store_guard or len(direct_abs) != 1:
+                raise
+            store_step, store_guard_offset = direct_abs[0]
+            # Narrow structural certificate: one ordinary absolute store,
+            # with no other write roots. Dispatch will bound and separate
+            # its live operand-derived address.
+            for k in range(n_steps):
+                expected = int(k == store_step)
+                if const_root(r, "is_store", k, label) != expected:
+                    raise RuntimeError(
+                        f"{label}: runtime store guard does not cover step {k}"
+                    ) from exc
+                if (
+                    const_root(r, "is_store2", k, label)
+                    or const_root(r, "is_store3", k, label)
+                    or const_root(r, "new_halted", k, label)
+                ):
+                    raise RuntimeError(
+                        f"{label}: runtime store guard has extra writes or halt"
+                    ) from exc
+            has_stores, store_bounds = True, None
+        if has_stores and not allow_stores:
             # A shape's head is symbolic, so store disjointness from the
             # window's own bytes cannot be proven; store idioms stay
             # pinned-window-only until a head-range dispatch guard exists.
@@ -472,7 +788,8 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
             "kind": "shape", "name": f"shape_{name}", "shape_id": sid,
             "opcode_checks": checks, "length": len(template),
             "self_target": self_target, "n_steps": n_steps,
-            "has_stores": has_stores,
+            "has_stores": has_stores, "store_bounds": store_bounds,
+            "store_guard_offset": store_guard_offset,
             "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
             "step_spec": fold_step_spec(r, model, tok_to_idx, info,
                                         n_steps=n_steps),
@@ -482,7 +799,11 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
         meta.append({
             "id": sid, "name": name, "sig": [[o, b] for o, b in checks],
             "length": len(template), "repeat": repeat,
-            "close": "jmp" if self_target else "branch",
+            "close": (
+                "jmp" if self_target
+                else "branch" if ops[-1].operation in BRANCH_OPERATIONS
+                else "none"
+            ),
         })
     if experts:
         logger.info(

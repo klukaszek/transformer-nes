@@ -73,9 +73,10 @@ RUNTIME_READ_DIMS = (
 class Cpu6502Runtime:
     """Graph evaluator for the 6502 CPU graph."""
 
-    def __init__(self, *, bcd: bool = True):
+    def __init__(self, *, bcd: bool = True, wide_bits: bool = False):
         reset_graph()
-        self.input_tokens, self.output_tokens = build_6502_graph(bcd=bcd)
+        self.input_tokens, self.output_tokens = build_6502_graph(
+            bcd=bcd, wide_bits=wide_bits)
         self.all_dims = list(graph_all_dims())
         self.all_lookups = list(graph_all_lookups())
         self.dim_id_by_name: dict[str, int] = {}

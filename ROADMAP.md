@@ -6,6 +6,781 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
+## 2026-07-18 construction v13 — critical-path circuit diet,
+93.0K Klaus / 82.7K nestest
+
+The v12 decomposition said the layer stack is ~83% of GPU step time, so
+this rung attacked the folded circuits themselves.  A critical-path
+census over three representative trace-window folds (walk the folded
+graph, ASAP depth per dim, witness longest chain) showed one consistent
+shape: ~10 layers of masked-read fabric, then 8 layers of serial
+extract_bits, then ~4 layers of actual instruction logic.  Two exact
+rewrites landed:
+
+- **Depth-lean exact-address mask** (fold.py masked_exact_read, shared
+  by every expert/window rebuild on BOTH backends).  For integer diff,
+  [diff > 0] is relu(diff) - relu(diff - 1), so the exact-hit indicator
+  is a LINEAR combination of four ReGLUs with no intermediate persists,
+  and the masked value is one gated ReGLU (the mask is 0/1, so
+  reglu(value, exact) is the product exactly).  Three layers past the
+  lookup instead of seven, and fewer units than the old
+  abs-square/step/multiply chain — the C++ tier wins on both axes.
+  Window graph depths 22/25/22 → 18/21/18; Klaus 86.7K → 91.0K
+  (adjacent A/B).
+- **Nibble-hybrid bit extraction** (interpreter extract_bits_wide,
+  behind a `wide_bits` build flag the GPU union opts into; the C++
+  engine keeps the 8-unit serial form because its cost is unit count).
+  Split on the high nibble via a persist-free 15-step relu-difference
+  ladder, then two 15-step nibble ladders: bits land ~4 layers after
+  the value instead of 8, at ~60 ReGLUs.  The nibble values are wrapped
+  in unit-gated ReGLUs so linear inlining cannot smear their 30-term
+  ladder sums into every consumer row.  Depths fall to 12/15/12.
+  Measured against the alternatives on Klaus 1M, adjacent runs:
+  serial 91.0K, nibble-hybrid **93.0K**, and the full 255-step ladder
+  (depth 11/14/11 but ~500 ReGLUs per live site) **66.0K** — a hard
+  rejection that sharpens the cost model: past ~4-8 rows/lane the walk
+  length dominates, so depth trades are only profitable while the added
+  width stays under roughly a hundred units per site.
+
+**RESULT:** three heated 1M Klaus runs at t=128: **93,029 / 93,019 /
+93,020, mean 93,023 (10.8 µs/instruction)** — +10.3% over v12's 84.3K,
+**2.05x over v11's 45.3K record from the same morning**.  Nestest moves
+to **82,848 / 82,710 / 82,608, mean 82,722 (12.1 µs)** at t=128, +8.0%
+over its long-standing 76.6-76.9K plateau (the shallower bitwise
+experts pay there too; t=32 gives 82.1K, so the thin-model/one-simdgroup
+era is over on both suites).  CORRECTNESS: verify + bench +
+cache-invalidation programs lockstep-exact at t=32 AND t=128; full
+nestest and the FULL 1M Klaus trace lockstep-exact (the wide-bits union
+is exercised end-to-end by both suites); suite 85 green (the mask
+rewrite is also covered by the C++ expert tests); ruff clean.
+
+The census probe (scratchpad probe_critpath.py) is the reusable method:
+witness chains name the circuit family to attack next.  What remains on
+the path is the lookup fabric itself plus genuine instruction
+serialization (ADC→flags→CMP chains), and the ~17% non-layer floor —
+diminishing structural room at this tier without a different execution
+mapping.
+
+## 2026-07-18 megakernel v12 — store-to-load forwarding + PGO trace
+windows, 84.3K Klaus (+86%)
+
+The v11 conclusion ("broader certified cross-step composition") landed as
+store-to-load forwarding in the fold plus flow-following PGO windows.  A
+weights-engine profile (iter_run_arrays; the Python reference is for
+lockstep checks only) showed Klaus's real structure: **94.5% of 1M steps
+sit in 213 pcs** — one ~160-instruction straight-line check-macro block
+plus its caller loop and two JSR trampolines — and the block is dense
+with exactly what windows could not cross: PHP/PLA/PLP stack idioms,
+reads-after-writes, JSR/RTS, and a self-modifying `STA $0212` that
+rewrites a trampoline's ADC immediate before calling it.  Neither suite
+has any hot self-closing loop, so v10-style guarded repetition has zero
+representative coverage; composition had to come from forwarding.
+
+- **fold_sequence(forward_stores=True)**: every step's store roots must
+  fold to constant flags/addresses; a later read at a matching constant
+  address takes the written value instead of a lookup.  Constant values
+  forward through partial_eval itself, so a JSR/RTS round trip folds the
+  return address into a constant next_pc (the license needs it);
+  live values forward as the already-materialized write-value root
+  persist.  Reads at distinct constant addresses keep the global lookup;
+  non-constant reads with pending writes are admitted only when
+  caller-certified mode bounds (zp,X and indirect pointers wrap in page
+  zero, pulls stay in page one, abs,X adds ≤255 to a pinned base) prove
+  disjointness.  Everything else raises a step-tagged SequenceRejection.
+- **Trace windows** (build_trace_window_expert + propose_trace_window):
+  K profiled instructions along the executed control flow, JSR/RTS/JMP
+  crossed with non-contiguous signed-offset byte checks.  Pinning the
+  profiled entering S (unique at every hot head; dispatch guards
+  S == pin, SEQ_GUARD_S) folds every stack address to a constant.
+  Profile-written operand bytes stay symbolic and read through the live
+  memory structure — the self-modifying trampoline folds through
+  forwarding exactly.  seqtab rows grew 8 → 11 ints: span_lo/span_len
+  bound cache invalidation for non-contiguous code, plus a speculation
+  table offset.  PGO builds experts inside the proposal loop (a rejected
+  head must not shadow proposals at its interior pcs) and retries with
+  the window truncated before the failing step, so an aliasing read
+  splits a segment into two licensed windows instead of killing it.
+- **Width policy, measured the hard way.**  The first full pack REGRESSED
+  Klaus to 27.7K: a mid-window symbolic PLP fans its extracted flags
+  into every downstream consumer under inline_linear, blowing one layer
+  to 10,570 nnz (41,447 total, ~25x its peers) — ~10x the cost of the
+  whole rest of the forward.  Policy now: full inline, fall back to the
+  materialized fold when the worst layer exceeds 1,200 nnz, reject past
+  2,600.  The PLP windows land at 29 layers / 2,076 worst.  A budgeted
+  middle rung (inline only persists ≤16 terms: 18 layers at 2,350 worst)
+  measured SLOWER than deep/narrow at t=128 and was removed.
+- **Speculated interior branches: built, exact, default-off.**  The
+  block's never-taken `BNE $fe` traps invited crossing: interior next_pc
+  that folds non-constant is licensed for branches, the kernel verifies
+  each speculated step's next_pc readout against the trace and commits
+  exactly the prefix before the first violation (rollback retires what a
+  branch-final window would have).  Full 1M lockstep-exact — and
+  consistently ~12-15% SLOWER than branch-final windows at every window
+  length (73-78K vs 86.5K): rollbacks waste deep forwards on ~50/50
+  branches, and trap-crossing de-aligns window boundaries and pushes PLP
+  decodes mid-window into materialized builds.  Kept behind
+  --spec-min (default disables); the machinery is the right primitive
+  for workloads with genuinely-never-taken guards.
+- **Threads re-laddered.**  Trace-window Klaus: 73.5K / 80.7K / 86.4K /
+  79.6K at t=32/64/128/256 — the wide window models moved the optimum to
+  FOUR simdgroups, retiring v7's "one simdgroup is optimal" for this
+  tier.  Nestest (thin shapes, no trace windows) stays best at t=32.
+
+**RESULT:** three heated 1M Klaus runs at t=128 with 51 trace windows
+(~97% of steps retired by windows): **84,390 / 84,443 / 84,202
+steps/s, mean 84,345 (11.9 µs/instruction) — +86% over v11's 45,312.**
+Session ladder: 42.9K shapes-only → 27.7K naive pack → 51.3K width
+policy → 57.4K read bounds → 61.9K deeper PGO cap → 73.5K truncate-retry
+(t=32) → 84-86K at t=128.  Nestest is unchanged at **76,415 / 76,689 /
+76,606, mean 76,570** (its hottest pc runs 10 times; PGO correctly
+proposes nothing).  CORRECTNESS: verify + bench + cache-invalidation
+programs lockstep-exact at t=32 AND t=128; full 8,991-step nestest and
+the FULL 1M-step Klaus trace lockstep-exact with all 51 windows live;
+suite 85 green; ruff clean.
+
+**Same-day follow-up — post-commit micro-rungs, 86.8K Klaus.**  Three
+adjacent A/B experiments after the v12 commit: (1) rejecting the two
+wide PLP windows outright (width cap 2,600 → 1,500) so their interiors
+re-propose as thin windows regressed 86.3K → 64.6K — the wide windows
+earn their keep, REVERTED; (2) the lane-0 readout's per-slot RO loads
+were the last serial device chains per forward — gathering
+rint(x[RO[i]]) across all lanes into a threadgroup staging array before
+lane 0's ordered commit gained +1.8%, KEPT; (3) 4-wide batching of the
+dispatch byte-check loads measured flat (+0.1%) and was reverted.
+Receipts after the kept change: verify + bench + invalidation programs
+exact at t=32 AND t=128, nestest 8,991 and Klaus 200K lockstep-exact;
+three heated 1M Klaus runs **86,831 / 86,777 / 86,801, mean 86,803
+(11.5 µs/instruction, +92% over v11)**; nestest 76,311 / 75,621 /
+75,975 (mean 75,969, within noise); ruff clean.
+
+**Decomposition receipt (same day, replay probe — added, measured,
+removed).**  A temporary kernel mode replayed each committed step's
+routed layer stack with results discarded (x is re-embedded every
+dispatch; register updates suppressed), so the adjacent A/B delta
+isolates the layer stack on the REAL Klaus trajectory: normal 11.54s vs
+replay 21.14s over 1M steps.  **The layer stack is ~9.6 µs of the
+11.5 µs step — ~83% (warm-biased, so a floor); dispatch + verification
++ embed + readout + writes are ~17% combined.**  This settles the
+direction: kernel fixed costs cap at +20% even if zeroed, so the next
+representative gain must come from shallower/cheaper folded circuits —
+the check macro's serial ADC→flags→CMP chains — on the construction
+side.  Post-probe restore verified: verify programs exact, re-bench
+86,727 (matches the 86.6-86.8K receipts).
+
+Two operational notes for future sessions.  Sustained back-to-back
+benching thermally throttles the SoC: identical configs read 86.4K cold
+and 75.6K hot, so only adjacent runs compare — the receipts above were
+run consecutively on a rested machine.  And the remaining rejected
+families are principled, not accidental: indirect (zp,X)/(zp),Y data
+reads are unbounded before dispatch, and abs,X reads whose pinned base
+overlaps the stack page genuinely may alias in-window pushes.  The
+next depth lever is the window models themselves (~3-4 layers per
+retired instruction; the macro's serial ADC→flags→CMP chains bound it),
+not coverage — and 84K is still ~7x from realtime NES.
+
+## 2026-07-18 megakernel v11 — symbolic shape routing,
+76.9K nestest / 45.3K Klaus PGO
+
+The next representative gain comes from circuit depth, not another table
+tweak. Canonical shape experts from the emitted C++ backend now run in the
+Metal megakernel: one fold keeps PC and operand bytes symbolic, compiles one
+model, and shares it across every matching code address. Metal's
+`inline_linear` construction was extended to shape folds while preserving
+the symbolic PC bytes needed by the exhaustive interior-control-flow
+license. This changes the original hand-written shape library from mostly
+unprofitable (for example DEX/BNE 11 layers versus 10 cumulative opcode
+layers) to consistently profitable (8 versus 10).
+
+Representative profiles selected common opcode shapes rather than hot
+addresses. The main coverage is compare/branch pairs at hundreds of
+nestest PCs, `CMP zp/BNE` at 60 Klaus PCs, and six straight DEX operations
+per forward. Longer setup/store and NOP shapes fill nestest's repeated
+conformance scaffolding. Every image head is indexed through the existing
+O(1) sequence-head table. Dispatch descriptors now hold compact
+`(offset, expected opcode)` checks: concrete windows verify every byte,
+while symbolic shapes verify only opcodes and read operands live.
+
+Store shapes gained two explicit licenses:
+
+- statically bounded RAM/stack stores carry their certified address interval,
+  and the packer admits only heads disjoint from the entire interval;
+- one direct absolute store may carry a live operand-offset guard. The
+  builder proves it is the only write root and every step is non-halting;
+  dispatch reconstructs the target from resident bytes and requires
+  `target < $2000` and no overlap with the shape's code.
+
+Both licenses preserve the existing default CPU policy—stores remain
+rejected unless a router explicitly opts into and enforces the proof.
+Full nestest and a 1M-step Klaus trace exercise the routed models
+lockstep-exactly.
+
+**RESULT:** three heated full nestest runs with canonical shapes and no
+concrete windows are **76,886 / 76,667 / 77,162 steps/s**, mean **76,905
+(13.0 µs/instruction)**. That is **+10.3%** over v10's packed-stream
+69,755 baseline and +12.6% over the original 68.3K representative
+correction. Three 1M-step Klaus shape-only runs are **43,058 / 43,090 /
+43,107**, mean **43,085 (23.2 µs/instruction)**, +5.6% over the packed
+40,815 baseline. Composing the existing eight operand-pinned PGO windows
+with the symbolic shapes gives **45,312 / 45,319 / 45,306**, mean
+**45,312 (22.1 µs/instruction)**: **+11.0%** over packed v10 and +12.9%
+over the first 40.1K Klaus baseline. The current 200K combined route is
+lockstep-exact.
+
+Measured limits remain important. Expanding the profitable catalog past
+the concentrated families has sharply diminishing returns. A 16-DEX shape
+reduced forwards but regressed Klaus; its extra model width/depth outweighed
+dispatch savings. Threads 16 and 64 regress full nestest to 67.7K and
+75.0K, so one 32-lane simdgroup remains optimal. Static concrete-loop
+scanning stays disabled for representative defaults: it had no suite
+coverage win; concrete models enter only through the measured 512-hit PGO
+policy.
+
+This is a real cross-suite construction gain, but **45-77K is still nowhere
+near realtime NES throughput**. The remaining route is broader certified
+cross-step composition or a different execution mapping—not more sparse
+metadata compression.
+
+## 2026-07-18 megakernel v10 — guarded countdown superwindows,
+311K microbenchmark; representative suites 40.8-69.8K
+
+The next circuit-depth lever landed as guarded cross-step overlap.  A closed
+`DEX/BNE` or `DEY/BNE` window now gets 4-iteration and 2-iteration variants
+in addition to its original one-iteration expert.  For an R-iteration
+variant, construction pins only the R-1 interior BNE decisions to taken; the
+final BNE remains live, so one expert handles both loop continuation and the
+exit exactly.  Dispatch proves the assumption from the resident byte state:
+the entering counter must be zero (wraparound) or at least R.  It still
+re-verifies the window bytes, NMI and step-budget conditions exactly as
+before, and falls through 4x -> 2x -> 1x near the exit.
+
+This turns four independent executions of the old 2-instruction / 4-layer
+window into one 8-instruction / 7-layer forward.  The 2x cleanup expert is
+4 instructions / 5 layers.  A temporary route-count probe caught one
+important cache interaction: after a loop exit, the positive cache retained
+the unguarded 1x fallback across the surrounding `JMP/LDX` and prevented the
+guarded variants from being reconsidered on re-entry.  The cache now expires
+as soon as execution leaves its cached head.  That keeps the hot in-loop hit
+while restoring priority on every re-entry.
+
+**RESULT:** three heated 100K-step runs are **311,449 / 311,850 / 311,454
+steps/s = 3.207-3.211 µs/instruction**, versus the exact v9 construction's
+**210,885 / 211,145 / 210,880 = 4.736-4.742 µs/instruction**: a stable
+**1.48x** gain.  The repeat ladder mapped the width/depth crossover:
+2x ~282K, 3x ~305K, **4x ~311K**, 5x ~293K, 8x ~266K, and 16x ~190K.
+More speculative depth eventually loses to the wider streams, so production
+keeps only 4x and 2x.
+
+Correctness receipts: verify program, 3,000-step full-byte countdown loop,
+and 24-step self-modifying cache invalidation are lockstep-exact at t=32 and
+t=128; full suite **82 passed**; ruff clean.  This is deliberately a narrow,
+certified first instance of cross-step overlap.  The next extension should
+look for other loop idioms with a cheap resident-state guard rather than
+blindly increasing repeat.
+
+**Representative correction (same day, after explicit user challenge):**
+the headline above is a DEX/BNE tier, not a general megakernel speed.  Full
+8,991-step nestest is lockstep-exact but runs only **~68.3K steps/s
+(14.6 µs/instruction)** with all opcode experts and no windows.  Its six
+licensed static windows slightly regress to ~67.7K; all DEX/DEY countdown
+loops in that ROM write `$2007` and are correctly rejected as NES MMIO, so
+v10 has zero nestest coverage.  Nestest deliberately executes 225/227
+opcodes: packing exactly those 225 is flat, top-64 falls to 28.5K, and
+top-16 to 7.3K because 75-layer union fallbacks dominate.
+
+Klaus required a newly exposed BCD-enabled Metal construction.  A 200K
+prefix is lockstep-exact; three heated 1M-step no-window runs are
+**40,139 / 40,087 / 40,142 steps/s (~24.9 µs/instruction)**.  Klaus's hot
+loops use compare/BCS shapes, not v10's decrement/BNE guard, so v10 has zero
+coverage there too.  The full 30.6M timing was stopped after 16M at the
+user's request once its cumulative rate had converged to ~39.1K/s.
+
+Mining the emitted C++ backend did produce one representative win:
+
+- Metal's sequence router linearly scanned every descriptor on every miss;
+  the C++ sequence module instead uses a 64K pc-to-range index.  Porting that
+  O(1) head index recovered most of nestest's static-window penalty and makes
+  larger window sets viable.
+- The C++ runner's next-boot PGO policy transfers when its **512-hit**
+  profitability threshold is preserved.  Eight concrete Klaus prefixes,
+  each seen ~4,656 times in the 1M profile, are 200K-prefix lockstep-exact
+  and improve three 1M runs to **42,324 / 42,340 / 42,326 steps/s**:
+  **+5.5%** over no windows.  The same policy proposes zero nestest windows
+  (its hottest eligible pc appears only 10 times), correctly avoiding
+  pollution.  `metal_runner.py --suite {nestest,klaus} --check` now makes
+  the representative receipts routine; `--pgo-windows N` performs the
+  two-pass, next-boot-style construction.
+
+The next C++-construction pass found a second, workload-independent win.
+The all-expert Metal pack contains 30,510 attention, 36,963 FFN-output, and
+88,372 gate terms.  Their largest destination/source indices are only
+1,019/1,111, so carrying two 32-bit indices per coefficient was pure traffic.
+Packing `(dst, col)` as two certified 16-bit fields cuts every sparse term
+from 12 to 8 bytes without adding a dependent load or per-layer decision.
+Three full no-window nestest runs are now **69,843 / 69,759 / 69,662
+steps/s (mean 69,755, +2.1%)**, with the checked 8,991-step run lockstep
+exact.  Three 1M-step Klaus runs are **40,791 / 40,823 / 40,830 steps/s
+(mean 40,815, +1.7%)**, with one full 1M trace lockstep exact.  The existing
+eight-window Klaus PGO path composes with the layout win at **43,045
+steps/s**; its 200K checked prefix is exact.
+
+Rejected constructions sharpen the GPU cost model.  Compact 16-bit segment
+bounds were neutral/slightly slower and were removed.  C++-style row
+accumulation regressed nestest to 65.0K because dynamic row transitions cost
+more than repeated threadgroup updates at only 1.3 terms/row.  Specializing
+26,497 pure `x += -x` rows into zero assignments required per-layer erase
+metadata/control and regressed to 63.8K even with O(1) packed offsets.
+Finally, folding the 624 distinct coefficients into each 32-bit term halved
+the stream again but its dependent coefficient-table load reduced nestest
+to ~69.0K.  The retained lesson is precise: reduce independent stream loads;
+do not add dependent loads or per-layer control to save static footprint.
+
+The standing conclusion is therefore not “311K viable NES.”  It is:
+guarded overlap works when it has coverage, while representative performance
+is currently **40.8-69.8K instructions/s**.  The next GPU construction work
+should extend high-value guarded shapes from real profiles and keep the
+C++ backend's profitability/isolation rules, rather than adding generic
+windows to the global table.
+
+## 2026-07-18 megakernel v9 — table-free register rows + cached windows,
+208K steps/s
+
+Construction v8 changed the four-layer sequence path enough to justify a
+fresh kernel decomposition and one more measured ladder.  Two changes landed:
+
+- **Table-free affine register lookups.**  A full all-model census proved
+  that every one of the 2,749 register rows has exactly two score terms with
+  coefficients `[2, -1]`, one exact-zero gate coordinate, and zero/one
+  coefficient-1 term for each returned value.  More strongly, all 230 layers
+  containing register rows are affine runs: one shared score/gate triple per
+  layer, consecutive value pairs, consecutive union-register IDs, consecutive
+  `ho` pairs, and (for every 12-row run) only the final second value absent.
+  The packer now certifies those invariants loudly and stores four bases/counts
+  in the layer descriptor.  The kernel's five CSR chains + metadata table,
+  then its intermediate fixed-width row table, are gone entirely: a register
+  row performs **zero device-table loads**.  The temporary decomposition's
+  lookup component fell from ~1.52 to ~1.09 µs/instr after the first compact
+  rung; the final affine form is smaller again.
+- **Positive sequence-dispatch cache.**  Once a window's pc/bytes are
+  verified, the persistent kernel retains its head/K/descriptor/length in
+  lane-0 scalars and reuses them while pc matches and the remaining step
+  budget covers K.  Any GPU RAM write overlapping the cached byte range
+  invalidates it immediately; a new verification receipt warms a DEX/BNE
+  cache, overwrites DEX with NOP through `STA`, jumps back, and remains
+  lockstep-exact.  Cache lifetime is one dispatch, so host boot or external
+  mutation cannot bypass verification.
+
+**RESULT:** heated DEX/BNE is **4.8 µs/instr = 209,602 steps/s**, versus
+construction v8's 5.4 µs / 185,309 (**1.13x**).  No-windows is
+**10.0 µs = 100,344 steps/s**, versus 10.6 µs / 93,966 (**1.07x**).
+The combined construction-v8 + kernel-v9 jump over v7 is
+123,969 → 209,602 (**1.69x**) windowed and ~66K → 100K (**1.52x**)
+per-instruction.
+
+Measured rejections stayed out: simdgroup-parallel readout was
+lockstep-exact but regressed 5.4→5.6 µs (the extra rendezvous costs more than
+44 lane-0 threadgroup loads); caching the routed `(lay0, NL, D)` descriptor
+in per-lane registers was flat at 200.4K vs 200.6K; spelling each existing
+12-byte triple as a Metal `packed_int3` load regressed 209.6K→204.8K.
+Temporary walks-off probes perturbed compiler scheduling (removing walks made
+the kernel slower) and were removed after isolating the useful lookup delta.
+
+Receipts: verify program, 3,000-step loop, and the 24-step self-modifying
+cache-invalidation program lockstep-exact at t=32 AND t=128; full suite
+**82 passed**; ruff clean.  Standing tiers: DEX/BNE window 210K,
+per-instruction 100K, prior JMP-spin baseline 225K (not remeasured in this
+rung).  The four-layer window's remaining dependency chain is genuinely
+nonlinear (state lookup followed by three chained ReGLU layers); the next
+large lever is construction/circuit depth or cross-step overlap, not another
+metadata cache.
+
+## 2026-07-18 construction v8 — linear persist inlining, 185K steps/s
+
+The first construction-side depth diet landed immediately after the v7
+megakernel floor was mapped.  Expert folds now have an opt-in
+`inline_linear` mode that substitutes pure linear `PersistDimension`s into
+their consumers before scheduling.  This trades row width for dependency
+depth — exactly the GPU cost model, where 32 lanes sit mostly idle but every
+layer pays several serial device-load chains.  Direct lookup operands stay
+materialized because the O(1) attention backends classify those residual
+coordinates structurally (in particular, expanding a clear-gate coordinate
+back into `1e30 * gate - 1e30 * one` destroys the integer-score license).
+Annotated memory-read persists also stay materialized so the fold can still
+rebuild their 16-group fabric as one fused lookup.  CPU expert construction
+is unchanged; the Metal packer opts into the depth-shaped fold for opcode and
+sequence experts.
+
+- **Depth result:** across all 227 opcode experts, min/median/max layers
+  **4/20/36 → 2/11/26**, mean **19.15 → 11.76**.  The bench opcodes move
+  CA **8→3**, D0 **11→7**, 4C **10→7**, and A2 **19→6**.  Residual width
+  stays essentially flat (the four probes remain d_model 52-54), while
+  folded term counts also fall.  The DEX/BNE sequence expert falls
+  **10→4 layers**, d_model 60→56.
+- **RESULT:** heated DEX/BNE bench with the K=2 window is
+  **5.4 µs/instr = 185,309 steps/s**, up from v7's 8.1 µs / 123,969
+  (**1.49x**).  Per-instruction/no-windows is **10.6 µs = 93,966
+  steps/s**, up from 15.2 µs / ~66K (**1.43x**).  This validates the v7
+  conclusion directly: depth, not stream width or barrier count, is what
+  this single-simdgroup GPU mapping pays for.
+- **CORRECTNESS:** the full all-opcode Metal pack succeeds under the O(1)
+  attention licenses; verify program + 3,000-step bench loop are
+  lockstep-exact at both t=32 and t=128.  Fold receipts now exercise both
+  materialized and linear-inlined opcode/sequence graphs (23 focused tests
+  green); ruff clean.
+
+Next megakernel baseline is 5.4 µs/instr windowed / 10.6 no-windows.  Kernel
+work should now target the fixed/layer-independent tail and the four-layer
+sequence expert specifically: after construction removed six of ten layers,
+old phase-chain decompositions are stale and must be remeasured before
+choosing the next load/layout change.
+
+## 2026-07-18 megakernel v7 — seg hoist landed, the chain floor mapped,
+window-K optimum found
+
+Systematic pass over the remaining kernel structure, one measured rung
+at a time (each verified lockstep + heated-benched against the 9.0/17.1
+v5 baselines):
+
+- **LANDED: per-layer seg-bound hoist (+12%).**  All three stream
+  phases' seg loads (bounds + nonempty flags, pure functions of li) now
+  issue at the layer top and fly during phase A; each phase starts at
+  its barrier with bounds in registers.  DEX bench 9.0 → **8.1 µs/instr
+  (123,969 steps/s — arc total 2,840 → 124K = 43.6x)**; no-windows
+  17.1 → 15.2.  The walk was also restructured into Trip4/load4 +
+  STREAM_APPLY (byte-equivalent semantics, same perf, cleaner).
+- **REJECTED, measured: phase fusion** (act inlined into SRC_FFN, acc
+  zero into phase A, x=xa commit overlapped with the gate walk — 6 → 4
+  phases/layer): −1.5%.  The fused phases carried NO device chains —
+  copies/act were nearly free all along, and the inline doubled acc
+  reads.  Confirms v6's lesson from the other side: neither barriers
+  nor copy phases are the wall.
+- **REJECTED, measured: first-batch triple prefetch + software-
+  pipelined walk** (batch n+1 loads issued before batch n applies):
+  −5%.  Suspected compiler load-sinking defeats the hoist while the 36
+  always-issued loads per layer are real cost.
+- **The decomposition, from two temporary probe modes (walks-off,
+  walks+lookups-off; added, measured, removed):** no-windows 15.2
+  µs/instr = **walks 7.4 + lookups 1.3 + copies/fences/seg 4.8 +
+  fixed 1.7**.  Combined with the fusion/v6 null results, the model is:
+  every phase pays a ~0.25 µs dependent-access chain (threadgroup and
+  L1/L2 latency in ONE non-latency-hiding simdgroup), and nothing
+  inside the phase structure moves it — three independent probes this
+  session tried (register residency, fusion, prefetch) and all measured
+  flat-to-negative.
+- **Window-K optimum: K≈4.**  Spin unroll ladder (repeat 4/8/16):
+  4.43 / 4.68 / 5.25 µs/instr — the folded model's depth grows faster
+  with K than the amortization pays.  Spin tier stands at **225,812
+  steps/s**; raising repeat is NOT a lever.
+
+Standing tiers after this pass: DEX/BNE micro-loop 124K, JMP spin
+225K, per-instruction (no windows) 66K.  A wait-heavy real mix (SMB is
+~78% spin+poll) sits at ~4-6 µs/instr ≈ 150-250K — half-speed-playable
+territory; full-speed NES (~592K instr/s) needs ~3x more, and the
+measured chain floor says that will NOT come from kernel
+micro-structure.  The levers that remain are construction-side —
+fewer layers per instruction (expert depth diet, per the standing
+focus-weights-construction directive; depth is the ONLY thing the GPU
+pays for, width is free at 32 idle lanes) — or a different execution
+mapping (cross-step speculation overlapping forwards).  Receipts:
+verify + bench lockstep-exact at t=32 AND t=128 after every rung and
+after probe removal; ruff clean.
+
+## 2026-07-17 megakernel v5 — sequence windows on GPU + the clock-state
+measurement trap, 39x cumulative
+
+Second rung of the GPU expert arc, same session as v4: sequence-window
+experts (fold_sequence via `build_sequence_expert`, the C++ tier's own
+machinery) are packed like any model plus a 5-int seq router entry
+(head, K, descriptor, window bytes); the kernel checks windows before
+opcode dispatch — pc == head, bytes re-verified from RAM (stale windows
+inert, self-modifying code safe), whole window inside the step budget
+(boundary falls back to per-instruction, step-for-step equivalence) —
+and one forward retires K instructions: K trace rows, ordered writes,
+final state, `step += K`.
+
+- **RESULT: DEX/BNE bench 9.0 µs/instr = 110,500 steps/s** (the CA D0 FD
+  window, K=2), t=128 within 1%; JMP-self spin (K=4 unroll) 4.9 µs/instr
+  = **205,800 steps/s**.  Session ladder: 2,840 → 58,900 (v4 routing) →
+  110,500 (v5 windows) = **39x**, spin tier 205K.  CORRECTNESS: verify
+  program + 3,000-step bench loop lockstep-exact vs reference with
+  windows live (trace rows per instruction, boundary chunks included).
+- **THE MEASUREMENT TRAP, now understood and fixed — READ THIS BEFORE
+  ANY FUTURE SINGLE-STREAM GPU BENCH.**  A one-threadgroup kernel is ~1%
+  GPU utilization, so macOS NEVER ramps the GPU clock for it: identical
+  runs swing 2-3x with whatever ran before (47 vs 18 µs cold/warm; the
+  user reproduced 21.4 vs 9.1 back-to-back).  An in-kernel warmup loop
+  does NOT fix it — the load is still invisible to the governor.  Fix:
+  `gpu_heat()` saturates the GPU with 2 s of MPS matmuls (that load DOES
+  ramp), then measure; three-run reproducibility after the heater is
+  0.01%.  A whole probe round mid-session (staging "regression", seq
+  "regression", 46.7 µs inert-window readings) was clock artifacts.
+- **Phase-count economics, measured.**  Cost ≈ 1.6 µs/forward fixed +
+  ~0.4 µs per NON-EMPTY phase (empty stream phases skip barrier and
+  walk).  Non-empty phase totals: union 381; singles CA 38 / D0 53 /
+  4C 48 / A2 90; seq DEX/BNE 46 for TWO instructions; seq spin 40 for
+  FOUR.  The seq DEX/BNE model is structurally identical to one single
+  expert (379 triples, 10 layers, 12 register rows, same score/gate/
+  value table sizes) while retiring 2 instructions — phase count per
+  instruction is the entire cost model; layers, triples, and d_model
+  are all non-predictive at this scale.
+- Next rungs, ranked by that model: (1) **register-resident residual**
+  — expert d_model ≈ 50-60 ≤ 2 floats/lane at t=32, so x/xa fit in
+  simdgroup registers with simd_shuffle for column reads; within one
+  simdgroup the phase barriers dissolve entirely, leaving the triple
+  streams' cache-hot loads (est 3-5x: DEX ~300-500K, spin ~1M — the
+  jump that would pass the C++ per-instruction tier); (2) act-phase
+  inlining + copy diet (6 → 4-5 phases/layer, bounded ~1.3x);
+  (3) window coverage: the scanner already finds any ROM's idioms;
+  repeat-unrolling stays spin-only (a mid-window branch exit is a
+  license rejection, correctly).  Null probe note: probe modes now skip
+  the halt compare (a layerless forward's garbage readout halted the
+  timing loop at step one).
+
+**Same-session follow-up (2026-07-18) — register-resident residual (v6)
+BUILT, MEASURED, REJECTED, REVERTED.**  Rung (1) above was implemented
+in full: narrow models (d ≤ 64 at t=32) held x in two registers/lane,
+attn/ffn rows packed to owner lanes (dst mod 32), column reads via
+simd_shuffle, phase barriers replaced by simdgroup lockstep, ReGLU
+inlined into the ffn walk.  It reached lockstep-exactness (verify +
+bench programs, all experts + windows) and then measured **1.7x
+SLOWER** than the threadgroup path: no-windows 28.5 vs 17.1 µs/instr,
+windowed 15.2 vs 9.0.  The projection above was WRONG about the wall:
+removing every barrier and threadgroup-residual read bought nothing —
+synchronization was never the cost — while the register form made the
+real cost (device table loads) worse: its walks stall load→use per
+triple (the wide path's 4x batching is the fix the narrow walk gave
+up), and its 12 register-lookup rows run SEQUENTIALLY (redundant on
+all lanes, shuffles need everyone converged) where the wide path does
+all rows in parallel across lanes.  Verdict: attack DEVICE LOADS, not
+synchronization; the threadgroup path stays.  Two hard-won findings
+recorded for any future Metal work:
+- **The divergent-shuffle law**: a simd_shuffle inside a branch that
+  differs per lane reads from lanes that took the other branch —
+  inactive there, result undefined (observed zero).  The correct form
+  computes every shuffle unconditionally on all lanes and selects
+  among the RESULTS.  This produced a wrong-but-plausible forward
+  (state passthroughs silently zeroed) that survived until a
+  slot-by-slot residual diff against a numpy replay of the same
+  tables.
+- **Debug-harness discipline**: two full rounds of divergence analysis
+  were invalidated by the harness itself — script `replace()` patches
+  that silently no-op on stale text (every patch must assert its match
+  count) and debug dumps sharing trace-buffer regions (each probe
+  needs its own range, verified).  The numpy table-replay oracle plus
+  binary-search-by-dump was what actually found both real bugs.
+Receipts after revert: verify + bench lockstep-exact at t=32 AND
+t=128; heated bench 110.4K windowed / 58.4K no-windows — the v5
+records, byte-identical behavior.  metal_host gained a `trace_raw`
+debug accessor (kept; the kernel carries no debug code).
+
+## 2026-07-17 megakernel v4 — expert routing on GPU, 21x
+
+The recorded "expert-fold-on-GPU arc" landed in one rung: the fold/plan
+machinery is now in the Metal packer
+(`experiments/gpu_single/{metal_runner.py, kernel.metal}`), and the
+megakernel routes every step to a per-opcode expert model.
+
+- **Mechanics.**  `build_opcode_experts` (the C++ engine's own fold →
+  asap → build_model pipeline, unchanged) supplies all 227 rebuilt
+  models; the packer packs union + experts into the SAME global streams
+  and layer table (layers indexed globally), one 12-int descriptor per
+  model (layer range, d_model, one_slot, embed/readout slot tables,
+  STATE/HALT head rows) and a 256-entry opcode→descriptor table.  The
+  kernel reads the fetched byte ram[st_pc] masked by the written bit
+  (exactly the graph's memory read) and runs that expert's layer range;
+  NMI and non-expert bytes fall back to the union (descriptor 0).
+  Expert register heads resolve onto the union's running-argmax
+  allocation through the fold's lookup provenance (never allocate —
+  engine_gen's rule); expert memory heads are the folds' fused 64K-span
+  reads (group base −1 beside the union's 4K group dispatch).  Whole
+  build (union + 227 folds + pack) ≈ 8 s post-diet.
+- **RESULT: 2,840 → 58,900 steps/s (17.0 µs/step) on the DEX/BNE
+  bench**, t=32 and t=128 within noise of each other — the
+  single-simdgroup question dissolved with the phase count.  Steady
+  state runs experts of 8-11 layers / d_model ~52 (CA 8, D0 11, 4C 10)
+  vs the union's 75/632; expert stats overall: 4-36 layers, median 20.
+  Null-model probe (loop+embed+dispatch+readout, no layers) 1.6 µs/step.
+  CORRECTNESS: verify program (40 steps) + bench loop (3,000 steps)
+  lockstep-exact vs reference at t=32 AND t=128 with all experts routed;
+  --experts none reproduces v3 exactly (2.0K steps/s at t=32).
+- **Threadgroup staging probed and REJECTED** (the recorded rung (b)):
+  three variants — triples staged, batched bulk copy, seg tables +
+  triples staged (whole expert ≈ 6.5 KB median, fits the 32 KB budget)
+  — measured 18.5-19.5 µs vs 17.0 unstaged, lockstep-exact throughout,
+  reverted.  Diagnosis: a 2-3 opcode loop keeps the routed experts'
+  tables cache-hot after the first iteration, so the per-phase
+  "device chains" are mostly L1 hits and the copy is pure added cost.
+  The v2 lesson generalizes: traffic dieting loses whenever the wall is
+  latency to WARM lines, and routing already shrank the working set to
+  cache size.
+- Remaining structure at 17 µs: ~60 phases across ~10 layers ≈
+  0.26 µs/phase (chains through warm cache + barrier + in-order
+  restart), plus the 1.6 µs serial lane-0 embed/readout tail.  Next
+  rungs, in expected order: sequence experts on the GPU (fold the whole
+  micro-loop as ONE forward — the C++ tier that took this same loop to
+  15.8M; the packer now has everything it needs), in-place phase fusion
+  (~3 phases/layer), and the lane-0 tail only after those.  Real-time
+  NES (~592K instr/s) is now 10x away, not 200x.
+
+## 2026-07-17 weight census + export integerization — block sparsity measured and rejected
+
+Structural census of the union model's weights (d_model=632, 75 layers,
+316 heads, d_ffn=686), toward GPU-shaped weights, per explicit user
+call.  The numbers that decide everything:
+
+- **41,012 nonzeros across 217M dense layer-matrix entries (99.98%
+  zeros)**; value alphabet 82% ±1, four ±0.5, the rest small integers
+  plus (pre-fix) the query temperatures below.
+- **93.5% of (head, layer) slots are completely unused** — 125 lookup
+  heads + 1,423 passthroughs in the whole stack; FFN unit-layer slots
+  88.8% unused; the median layer touches 89 of 632 residual slots
+  (min 38, max 484).  Head/FFN allocation is peaked: median 13 used
+  heads/layer, max 137.
+- **Block sparsity: measured, rejected.**  Even under a bipartite-RCM
+  reordering upper bound, 8x8 blocks reach only ~8-14% fill (16x16
+  ~4-7%) — a block-sparse kernel would do ~10x wasted work.  The nnz is
+  scattered circuit wiring, not clustered structure.
+- The exact structural lever instead: **ragged per-layer compaction**
+  (live slots × used heads/units) is 5.3M dense entries = **2.4% of the
+  allocated shapes**.  A batched GPU runner would gather live slots, run
+  small dense per-layer matmuls over the batch, scatter back.
+
+**Ragged pruning LANDED in the export** (`prune_layer`): the artifact's
+layers now carry only live heads and FFN units — layer li has
+H=layer_heads[li] heads (in_proj (6H, D), out_proj (D, 2H)) and
+F=layer_ffn[li] units (ff_in (2F, D), ff_out (D, F)); d_model stays the
+global 632 (the residual is shared across layers — slot compaction is a
+runner-side gather, not an artifact shape).  Kept: 1,548 of 23,700
+allocated head slots, 5,747 of 51,450 FFN unit slots; declared dense
+shapes 217M → 18.7M entries (11.6x), torch_runner's per-token K/V cache
+94,800 → 6,192 values (15.3x), artifact 0.87 MB.  The pruning license is
+pattern-exact, not classification-based: a head is dead iff its V rows
+OR out_proj columns are all zero (zero contribution either way; zero-Q/K
+heads with live V are passthroughs and stay), an FFN unit iff its gate
+row, value row, or ff_out column is all zero — and this found the kinds
+tables OVER-approximating: L44 unit 14 is kind 1 with a zero gate row
+(gate ≡ 0 never passes ReGLU's strict >), so pattern-pruning drops 2
+units classification keeps.  The export asserts one-directionally that
+everything KEPT is kinds-live; pruning more is legitimate.
+
+Export integerization landed on the back of the census
+(`model/export.py:rescale_head_queries`): each head's Q row pair is
+stored divided by its hardmax temperature — a positive per-head score
+scale, invisible to the argmax and its exact ties (the generated engine
+already runs the divided-out integer queries, Klaus-verified).  The
+artifact prose's "every coefficient is an integer or ±0.5" claim was
+previously FALSE: 3,262 non-integer coefficients survived in in_proj Q
+rows (C = 1e10·√2 on 3,097 entries plus a ±C·group_lo ladder for the
+16 memory-group bases).  Now enforced by an export-time assertion.
+Preconditions verified before the change: all 125 −1e30 clear gates are
+K-side (never rescaled, only need to lose the argmax), every head passes
+the integer-quotient guard, and the max non-clear coefficient
+post-rescale is 122,880 < 2^24 — so **f32 storage is genuinely exact**,
+and the recorded "GPU blocked on f64 score construction / key
+rescaling" item is retired artifact-side.  The f64 export mode was
+dropped entirely (user call: no reason to keep it once f32 is exact);
+torch_runner still executes in f64 internally.
+
+Receipts: full suite 74 green (incl. `test_export` lockstep: export →
+standalone TorchMachine vs reference, 40 instructions, through the
+ragged shapes); ruff clean.  Census scripts live in the session
+scratchpad (weight_census{,2}.py, check_qk_sides.py).
+**Same-day follow-up — single-machine GPU runner, measured
+(`experiments/gpu_single/gpu_runner.py`), per explicit user call: ONE
+6502 on the GPU (latency), not a batch.**  The runner lifts the
+generated engine's O(1) attention forms to torch tensors, licensed by
+model/classify.py exactly as engine_gen is: passthrough heads compose
+into per-layer (I + attn_direct) matrices, kind-2 FFN units into
+(I + ffn_direct), memory heads become a RAM-tensor gather
+((ram[addr], addr) on a written in-group hit, else (0,0) = the
+empty-group result), constant-query heads become running-argmax
+registers, and WRITE tokens are scatters, never forwards.  All 125
+union lookup heads licensed (zero hull heads).  CORRECTNESS: 40-step
+verify program lockstep-exact on cpu AND mps; 2,000 bench steps
+lockstep-checked vs reference ON MPS IN f32 — the rescaled artifact
+semantics are demonstrably f32/GPU-exact end-to-end, not just by
+argument.  PERFORMANCE (DEX/BNE micro-loop, M-series): mps eager 73
+steps/s (13.6 ms/step), cpu eager 295, torch.compile: inductor-metal
+fails shader codegen (experimental), cpu-inductor 88 (slower than
+eager — guard overhead beats fusion at these sizes).  The C++ engine
+on the SAME loop: 15.8M steps/s (its boot scan folds the loop into a
+sequence window); union per-instruction tier ~420K (full Klaus).
+DIAGNOSIS: a step is ~40K FLOPs across ~450 tiny sequential kernels —
+>99.9% of GPU time is launch latency, and the math is smaller than one
+launch.  The 2026-07-04 "GPU is the wrong tool for ONE stream" verdict
+SURVIVES the fp64-blocker retirement: even a hand-fused Metal
+megakernel with a GPU-resident run loop (one dispatch per run(), the
+only remaining single-stream design) is bounded by one-threadgroup
+execution — ~75 layers × barrier latency ≈ 30-60 µs/step ≈ 15-35K
+steps/s, an order below the CPU engine and below real-time NES
+(~592K instr/s).  Single-machine stays on the C++ engine; the GPU's
+lane is batch, where the same O(1)-forms runner design applies
+unchanged (state tensors gain a leading batch dim).
+
+**Same-day follow-up 2 — Metal megakernel prototype, the GPU-resident
+run loop (`experiments/gpu_single/{metal_runner.py, kernel.metal,
+metal_host.mm}`), per user call ("will we just have to generate
+megakernels like the cpp engine?" — yes, and here is rung one).**  One
+Metal dispatch executes up to max_steps WHOLE instructions in a single
+threadgroup: STATE embed, all 75 layers, readout with half-even rint,
+RAM writes, next state — RAM/registers/state persist in device buffers
+(the C++ engine's run() protocol minus MMIO).  Data-driven: CSR tables
+walked from device memory; the host is a ~200-line pybind ObjC++
+extension compiling kernel.metal at runtime (built via clang++ per the
+Makefile's conventions, cached by source digest in _build/).
+CORRECTNESS: verify program (40 steps) + bench loop (3,000 steps)
+lockstep-exact vs reference, executed inside single dispatches.
+PERFORMANCE ladder on the DEX/BNE loop: torch eager MPS 73 →
+megakernel v1 (row-major CSR incl. identity diagonals) 2,193 →
+traffic-lean v2 (identity as threadgroup copy, live-row lists, x/ho
+and xa/act columns fused per row) 2,746 steps/s (364 µs/step; threads
+512≈256>128).  The v1→v2 diet cutting ~6x traffic but only 20% of time
+is the diagnosis: the wall is DEPENDENT-LOAD LATENCY (ptr→col→val
+chains from device memory, one non-latency-hiding threadgroup) plus
+the ~300-barrier/step sequential floor — not bandwidth.  Recorded next
+rungs with estimates: (1) engine_gen-style Metal CODEGEN — coefficients
+and slots as instruction immediates, no table loads (est 3-8x);
+(2) single-simdgroup execution — simdgroup_barrier ≈ free vs
+~0.3-0.5 µs threadgroup barriers (kills the barrier floor; only pays
+after codegen shrinks per-phase work); (3) expert routing on GPU
+(median expert ~16 layers → ~4x fewer barriers).  Combined projection
+~100-200K steps/s — plausibly real-time-NES capable, still at-or-below
+the CPU engine; the megakernel arc is a thesis/coolness artifact, not
+a perf win over CPU.
+
+**Same-day follow-up 3 — megakernel v3 (per-lane triple streams) + the
+probe series that found the REAL wall.**  User call: continue the GPU
+arc for its own sake.  First, a SIMT correction to the recorded codegen
+plan: per-lane straight-line code with immediates DIVERGES and
+serializes on a GPU — the SIMT-correct analogue of engine_gen's
+codegen is a pack-time pre-scheduled per-lane TRIPLE STREAM (dst, col,
+coeff interleaved 12B, whole rows per lane so no races, greedy
+load-balanced, one contiguous segment per (layer, phase, lane)), plus
+single-simdgroup execution turning barriers into simdgroup_barrier.
+Landed as kernel v3 with 4x-batched loads (in-order GPUs stall
+load→use per term otherwise).  Lockstep-exact as ever (verify 40 +
+bench 3,000 steps).  RESULT: 2,840 steps/s at t=128 (352 µs/step) —
+BARELY better than v2's CSR, and t=32 single-simd is WORSE (498 µs).
+Probe series (do_trace modes 2/3, kept in the kernel): null model
+(loop+embed+readout, no layers) 0.1-1.2 µs/step; barriers-only +450
+barriers ≈ +1-2.6 µs — a barrier is ~2-6 ns, NOT the wall; three
+disjoint table layouts within 10% of each other.  DIAGNOSIS, now
+measured not guessed: each of the ~500 phases/step pays ONE unhidden
+device-memory latency chain (~0.7 µs) reaching its tables (seg +
+first triples); a single threadgroup has no other warps to hide
+latency behind, and in-order lanes can't run ahead through a barrier.
+Next rungs, re-ranked by this evidence: (a) FEWER PHASES — in-place
+phase fusion using the engine's capture/apply conflict analysis
+(~3 phases/layer, ~1.5-2x) and above all EXPERT ROUTING (median
+expert ~16 layers → ~5x fewer phases AND less work) + sequence
+windows (K instructions per forward); (b) threadgroup-staged seg
+tables (ushort, fits at t=32 only, ~1.3x); (c) per-layer table
+prefetch past barriers (loads are barrier-independent constants).
+Realistic union-tier ceiling ~30-80 µs/step (12-30K steps/s);
+expert+sequence tiers maybe 100-200K on hot mixes.  The GPU 6502 is
+real and exact today at 2.8K steps/s; making it respectable is the
+expert-fold-on-GPU arc (port the fold/plan machinery into the Metal
+packer), a fresh session's work.
+
 ## 2026-07-17 weights-console correctness pass — audit + three seam fixes
 
 Full audit of the C++ runtime's weights-backend seams, per explicit
