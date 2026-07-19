@@ -754,7 +754,9 @@ def build_shape_experts(pg, shapes, *,
                          structural_reads=structural_reads)
     experts: list[dict] = []
     meta: list[dict] = []
-    for sid, (name, template, repeat) in enumerate(shapes):
+    for sid, shape in enumerate(shapes):
+        name, template, repeat = shape[:3]
+        speculate_branches = bool(shape[3]) if len(shape) > 3 else False
         label = f"shape {name}"
         ops = decode_ops(template)
         offs = [0]
@@ -819,12 +821,25 @@ def build_shape_experts(pg, shapes, *,
             # window's own bytes cannot be proven; store idioms stay
             # pinned-window-only until a head-range dispatch guard exists.
             raise RuntimeError(f"{label}: store shapes are not licensed")
+        spec_offsets = [-1] * n_steps
         if not self_target:
             for k in range(n_steps - 1):
-                heads, got = eval_over_heads(
-                    r, r.dim_of_name[f"next_pc__s{k}"], len(template)
-                )
-                if not np.array_equal(got, heads + pc_offsets[k + 1]):
+                expected = pc_offsets[k + 1]
+                try:
+                    heads, got = eval_over_heads(
+                        r, r.dim_of_name[f"next_pc__s{k}"], len(template)
+                    )
+                    proven = np.array_equal(got, heads + expected)
+                except RuntimeError:
+                    proven = False
+                if (
+                    not proven
+                    and speculate_branches
+                    and ops[k].operation in BRANCH_OPERATIONS
+                ):
+                    spec_offsets[k] = expected
+                    continue
+                if not proven:
                     raise RuntimeError(
                         f"{label} step {k}: interior next_pc is not "
                         "head + offset for every head"
@@ -839,6 +854,7 @@ def build_shape_experts(pg, shapes, *,
             "self_target": self_target, "n_steps": n_steps,
             "has_stores": has_stores, "store_bounds": store_bounds,
             "store_guard_offset": store_guard_offset,
+            "spec_offsets": spec_offsets,
             "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
             "step_spec": fold_step_spec(r, model, tok_to_idx, info,
                                         n_steps=n_steps),
