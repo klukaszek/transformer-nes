@@ -6,6 +6,123 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
+## 2026-07-18 construction v15 — flag-circuit flattening + constant-side
+multiply fold, 315.7K Klaus (3.2 µs) / 144.5K nestest
+
+Same session as v14; the census (now 5/7/4 after v14) named the last
+serial stages and three exact rewrites removed them:
+
+- **Constant-side multiply fold** (core.make_multiply tags its persist
+  with `multiply_of`; fold.py partial_eval, structural folds only).
+  `make_multiply(a, b)` is `a·relu(b) − a·relu(−b)`, and partial_eval
+  only had a rule for constant b — so every `multiply(gate, data)` with
+  the GATE in the a-position (all of v14's gated bit selects, plus the
+  interpreter's `multiply(op_adc, carry)`-style flag updates and
+  data_ref sums) survived as a two-ReGLU identity: one wasted layer and
+  width at every site.  The tagged fold collapses the product to an
+  exact linear map when EITHER side pins.  Census 7/8/7 → 5/7/4.
+- **Flat N/Z/V flag circuits** (interpreter flat_nz / overflow_wide,
+  wide_bits builds only).  N and Z of `wrap8(raw)` are parallel step
+  ladders on the PRE-wrap difference (N = [raw≥128] + [−128≤raw<0]),
+  so CMP/CPX/CPY/DCP flags land one stage after their operands instead
+  of serially behind wrap8.  ADC/SBC overflow computes in ONE stage
+  from the served sign bits: V = [s<−128] + [s>127] on the signed sum
+  s = raw − 256·(a7 + b7) — the old sign-of-wrapped-result chain was
+  the 4-serial-reglu tail of every arithmetic window.
+- **Pruned bit-state feedback** (fold_sequence bit_feedback_until;
+  builders compute last_a_bit_step from the window's opcodes).  Feedback
+  outputs were seeded live at every step, which kept v14's arithmetic
+  bit ladder alive even when no later step consumed A's bits.  Seeding
+  stops after the last consuming opcode; wrong pruning fails loudly at
+  build (tr KeyError), never silently.
+
+Census 12/15/12 (v13) → **4/5/4**: a window's critical path is now
+read (lookup + value persist) → one ALU stage → one flag stage → P
+assembly — the structural floor for serial dependent reads.
+
+**RESULT:** heated 1M Klaus at t=256: **315,681 steps/s
+(3.2 µs/instruction)** — 3.39x v13's 93.0K in ONE session, and above
+v10's 311K DEX/BNE MICROBENCHMARK tier on the real representative
+suite.  t=128 measures flat (314.0K adjacent); t=256 stays the
+default.  Nestest **144,520 (6.9 µs)** at t=128 (t=32 flat at 144.2K),
++75% on the session.  CORRECTNESS: FULL 1M Klaus trace lockstep-exact
+(49 trace windows + flag pins live); full 8,991-step nestest
+lockstep-exact; both suites exact at t=32 AND t=128/256; suite 85
+green; ruff clean.
+
+Nestest is now the laggard tier (6.9 vs 3.2 µs): it has zero trace
+windows (its hottest pc runs 10 times — PGO correctly proposes
+nothing), so it retires 1-3 instructions per forward through shapes and
+opcode experts and pays the per-forward fixed cost.  The next
+representative levers are therefore (a) the per-forward floor itself
+(dispatch/embed/readout, ~1.6 µs of every forward) and (b) longer
+certified composition for shape-tier workloads.  Real-time NES
+(~592K instr/s) is now less than 2x away on Klaus-shaped code.
+
+## 2026-07-18 construction v14 — structural serving,
+188.7K Klaus / 138.6K nestest (2.0x in one session)
+
+The v13 census said the remaining path was "the lookup fabric itself";
+this rung noticed the fabric is REDUNDANT on the GPU: the Metal kernel
+executes every fused read structurally (`h0 = wr[addr] ? ram[addr] : 0`)
+and embeds the current state directly, so graph circuits that re-derive
+what the kernel already serves exactly are pure critical-path drag.
+Four rungs landed, all behind fold/build flags the metal packer opts
+into (`structural_reads`, plus the existing GPU-only `wide_bits`); the
+C++ tier and every default build are byte-identical (suite 85 green).
+
+- **Structural reads** (fold.py masked_exact_read(structural=True)).
+  The exact-address mask (2 layers) is dropped — the kernel's fused
+  read already returns the exact masked value — and the lookup carries
+  EMPTY key rows, so the scheduler stops serializing every read behind
+  the key-square coordinate (`make_multiply(k, k)`, 2 more layers) that
+  no structural backend computes.  A read now lands in the residual at
+  its lookup's own layer.  Census 12/15/12 → 8/11/8; Klaus 93.0 → 107.8K.
+- **Flag-pinned trace windows** (PIN_FLAGS, seqtab p_guard, 12th row
+  int).  Housekeeping P bits (I/D/B/U) whose profiled entering value is
+  constant at a window head pin at fold time; dispatch guards
+  (P & mask) == values, mirroring the S pin.  A D=0 pin deletes the
+  decimal ADC/SBC circuit and its operand bit extraction from the whole
+  window (35B7: 11 → 9).  Width regressions from pin-shifted inlining
+  fall back to the unpinned build per head.
+- **State-fetch bypass** (LookUp.state_fetch tag).  The latest-STATE
+  fetch is an identity on the kernel (the embed IS the latest state),
+  but its key-square coordinate held every step-0 consumer 3 layers
+  deep.  Structural folds substitute the fetch's values with the raw
+  state inputs; expert models now contain ZERO register rows.  Census
+  8/8/8; Klaus ~124K.
+- **Served bits** (wide_bits interpreter + kernel embed/read contract).
+  Bits of any embedded or loaded byte are pure scalar work for the
+  kernel, so they cost zero graph depth at the source: STATE embeds A's
+  bits (31 embed values), fused reads serve their byte's bits as extra
+  value outputs (WRITE-token wbit dims; mem_meta gains a value count and
+  the kernel writes the bit ho slots), and A's bits flow as state
+  (new_a_bit* fed back like new_a; gated sums pick each writer's natural
+  bit list, arithmetic shares one ladder on new_a that liveness prunes).
+  PLP's 255-step ladder and the operand/pull nibble ladders leave every
+  structural fold; bit-annotated ladder persists stay materialized so
+  the annotation survives inline_linear, and pinned operand bytes still
+  const-fold their bits without keeping the raw read alive.  Census
+  7/8/7 — critical paths now START at a served bit value.
+
+**RESULT:** heated 1M Klaus at t=256: **188,738 steps/s
+(5.3 µs/instruction)** — 2.03x v13's 93.0K record in one session;
+nestest **138,614 (7.2 µs)**, +68% over 82.7K.  The thread optimum
+moved again: Klaus t=256 (t=128 96.8→87.5→102.3 bracketed by t=256 hot;
+t=512 regresses), nestest stays t=128.  CORRECTNESS: the FULL 1M-step
+Klaus trace lockstep-exact with all 51 trace windows + flag pins live;
+full 8,991-step nestest lockstep-exact; both suites exact at t=32 AND
+t=128/256; suite 85 green; ruff clean.  Same-session thermal note
+confirmed again: back-to-back 1M runs throttle ~15%; only adjacent runs
+compare.
+
+What remains on the path per the census: the read→ALU→flags→branch
+chains themselves (wrap8/carry stepglus and the branch mux) — genuine
+instruction serialization, ~5 reglu stages per window — plus the
+non-layer floor.  The next depth lever is likely cross-instruction
+carry/flag composition inside the fold, or serving more derived scalars
+(nibbles, carry chains) from the kernel the way bits are served now.
+
 ## 2026-07-18 construction v13 — critical-path circuit diet,
 93.0K Klaus / 82.7K nestest
 

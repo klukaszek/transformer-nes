@@ -41,6 +41,7 @@ from transformer_nes.graph.core import (
     ReGLUDimension,
     reset_graph,
     stepglu,
+    to_2d_query,
 )
 
 
@@ -89,10 +90,12 @@ def graph_delta(start_d: int, start_l: int) -> tuple[int, int, int, int]:
     return nr, np_, nl, nt
 
 
-def walk_live(seeds, val, folded, lookup_exprs, is_leaf) -> set:
+def walk_live(seeds, val, folded, lookup_exprs, is_leaf, bit_leaf=None) -> set:
     """Backward liveness over folded union dims.  A memory-read persist
     walks only its raw ingredients (its group fabric dies); a live lookup
-    produces all of its value dims."""
+    produces all of its value dims.  ``bit_leaf(d)`` returns the read-site
+    persist when d is a bit persist the site's fused read will serve --
+    then only the site stays live and the ladder circuit dies."""
     live: set = set()
     stack = [d for d in seeds if d not in val and not is_leaf(d)]
     while stack:
@@ -106,9 +109,12 @@ def walk_live(seeds, val, folded, lookup_exprs, is_leaf) -> set:
             deps = set(a.terms) | set(b.terms)
         elif isinstance(d, PersistDimension):
             site = getattr(d, "memory_read", None)
+            served_site = bit_leaf(d) if bit_leaf is not None else None
             if site is not None:
-                for e in site.values():
-                    deps |= set(subst(e, val).terms)
+                for key in ("address", "byte_value", "write_addr", "is_write"):
+                    deps |= set(subst(site[key], val).terms)
+            elif served_site is not None:
+                deps = {served_site}
             else:
                 (e,) = folded[d]
                 deps = set(e.terms)
@@ -131,7 +137,8 @@ class GraphMaterializer:
     (lookup_of_union keeps the last instance); the same-lookup dedup is
     per call, so each sequence step gets its own lookup instances."""
 
-    def __init__(self):
+    def __init__(self, structural_reads: bool = False):
+        self.structural_reads = structural_reads
         self.union_lookup_of: dict[int, int] = {}
         self.lookup_of_union: dict[int, LookUp] = {}
         self.insert_side_hazards: list[str] = []
@@ -144,6 +151,7 @@ class GraphMaterializer:
                     *, name_of=lambda n: n, is_leaf=None,
                     hazards=frozenset(), resolve_read=None) -> None:
         made = set()
+        fused_reads: dict = {}  # union site persist -> its fused LookUp
         for d in all_dims:
             if d in val or d not in live:
                 continue
@@ -169,10 +177,19 @@ class GraphMaterializer:
                         self.n_terms += len(nd.expr.terms)
                         continue
                     marks = len(graph.graph_dims), len(graph.graph_lookups)
+                    want_bits = self.structural_reads and any(
+                        b in live for b in getattr(d, "read_bit_dims", ())
+                    )
                     expr = masked_exact_read(
                         tr(site["address"]), tr(site["byte_value"]),
                         tr(site["write_addr"]), tr(site["is_write"]),
+                        structural=self.structural_reads,
+                        bit_values=[tr(Expression({wb: 1}))
+                                    for wb in site["bit_values"]]
+                        if want_bits else (),
                     )
+                    if want_bits:
+                        fused_reads[d] = next(iter(expr.terms)).lookup
                     nd = PersistDimension(expr, name=name_of(d.name))
                     sub[d] = Expression({nd: 1})
                     dr, dp, dl, dt = graph_delta(*marks)
@@ -180,6 +197,13 @@ class GraphMaterializer:
                     self.n_persists += dp
                     self.n_lookups += dl
                     self.n_terms += dt
+                    continue
+                rb = getattr(d, "read_bit", None)
+                if rb is not None and rb[0] in fused_reads:
+                    # This bit's read serves it directly: substitute the
+                    # fused lookup's bit value; the ladder never builds.
+                    lu = fused_reads[rb[0]]
+                    sub[d] = Expression({lu.dims[2 + rb[1]]: 1})
                     continue
                 (e,) = folded[d]
                 nd = PersistDimension(tr(e), name=name_of(d.name))
@@ -192,6 +216,16 @@ class GraphMaterializer:
                     continue
                 made.add(lu)
                 fx = lookup_exprs[lu]
+                if self.structural_reads and lu.state_fetch:
+                    # The structural backend embeds the latest state, so
+                    # this fetch is an identity: each value substitutes
+                    # directly (its raw state-input expression), and no
+                    # attention head or register materializes.  Only the
+                    # first step of a sequence keeps the fetch live; later
+                    # steps resolve through feedback pins.
+                    for ud, ve in zip(lu.dims, fx["values"], strict=True):
+                        sub[ud] = tr(ve)
+                    continue
                 nlu = LookUp(
                     [tr(e) for e in fx["values"]],
                     [tr(e) for e in fx["query"]],
@@ -212,7 +246,8 @@ class GraphMaterializer:
                     self.n_terms += len(e.terms)
 
 
-def masked_exact_read(addr, byte_value, write_addr, is_write) -> Expression:
+def masked_exact_read(addr, byte_value, write_addr, is_write, *,
+                      structural: bool = False, bit_values=()) -> Expression:
     """A memory_at site rebuilt flat: one 64K-span lookup plus the
     exact-address mask.  Identical output to the union's 16-group sum
     (the mask keeps exact hits only, and an exact hit answers from its
@@ -224,7 +259,20 @@ def masked_exact_read(addr, byte_value, write_addr, is_write) -> Expression:
     combination of four ReGLUs (no intermediate persists) and the gated
     result is one ReGLU -- three layers past the lookup instead of the
     seven the abs/step/multiply chain cost, on every window read's
-    critical path."""
+    critical path.
+
+    ``structural`` targets backends that serve the fused read exactly
+    (the Metal kernel: value at addr when written and in range, else 0).
+    The mask is redundant there, and the key side exists only for token
+    attention, so the lookup carries empty key rows -- nothing schedules
+    after the key-square coordinate and the value lands with the lookup."""
+    if structural:
+        # bit_values (wide_bits WRITE-token bit dims, MSB first) ride as
+        # extra value outputs: the kernel serves them from the read byte.
+        lu = LookUp([byte_value, write_addr, *bit_values], to_2d_query(addr),
+                    [Expression(), Expression()], tie_break="latest")
+        lu.memory_group = graph.MEMORY_GROUP_FUSED
+        return Expression({lu.dims[0]: 1})
     value, found = graph.fetch([byte_value, write_addr], query=addr,
                                key=write_addr, clear_key=1 - is_write,
                                tie_break="latest")
@@ -274,9 +322,14 @@ class GraphFolder:
     contract -- pass ``RUNTIME_READ_DIMS`` for the 6502 machine).
     """
 
-    def __init__(self, program_graph: ProgramGraph, root_names=()):
+    def __init__(self, program_graph: ProgramGraph, root_names=(), *,
+                 structural_reads: bool = False):
         self.pg = program_graph
         self.root_names = tuple(root_names)
+        # Surviving memory reads rebuild without the exact mask or key
+        # rows -- only for backends whose lookup execution is itself
+        # exact (the Metal kernel); token-attention backends need both.
+        self.structural_reads = structural_reads
         # The O(1) attention backends classify lookup rows structurally.
         # Keep direct linear lookup operands as residual coordinates rather
         # than expanding (for example) an exact clear-gate coordinate back
@@ -341,6 +394,20 @@ class GraphFolder:
                 else:
                     folded[d] = (a, b)
             elif isinstance(d, PersistDimension):
+                mo = getattr(d, "multiply_of", None) if self.structural_reads \
+                    else None
+                if mo is not None:
+                    # A tagged product folds to an exact linear map when
+                    # either factor pins to a constant; its ReGLU pair
+                    # (which only folds on a constant b) goes dead.
+                    ma, mb = subst(mo[0], val), subst(mo[1], val)
+                    mac, mbc = const_of(ma, one), const_of(mb, one)
+                    if mac is not None:
+                        val[d] = mb * mac
+                        continue
+                    if mbc is not None:
+                        val[d] = ma * mbc
+                        continue
                 e = subst(d.expr, val)
                 c = const_of(e, one)
                 if c is not None:
@@ -350,6 +417,8 @@ class GraphFolder:
                     and d not in self.lookup_persists
                     and d not in preserve
                     and getattr(d, "memory_read", None) is None
+                    and (not self.structural_reads
+                         or getattr(d, "read_bit", None) is None)
                     and (inline_budget is None or len(e.terms) <= inline_budget)
                 ):
                     # A persist is a pure linear map.  Expert folds may
@@ -445,9 +514,14 @@ class GraphFolder:
         for d in root_dims:
             seeds |= set(val[d].terms) if d in val else {d}
 
+        def bit_leaf(d):
+            rb = getattr(d, "read_bit", None)
+            return rb[0] if rb is not None and self.structural_reads else None
+
         live = walk_live(
             seeds, val, folded, lookup_exprs,
             lambda d: isinstance(d, InputDimension),
+            bit_leaf=bit_leaf,
         )
 
         # ── Materialize the new graph ─────────────────────────────────
@@ -473,7 +547,7 @@ class GraphFolder:
                 out = out + s * c
             return out
 
-        mat = GraphMaterializer()
+        mat = GraphMaterializer(structural_reads=self.structural_reads)
         mat.materialize(pg.all_dims, live, val, folded, lookup_exprs, sub, tr,
                         hazards=hazards)
 
@@ -525,7 +599,8 @@ class GraphFolder:
                       pc_offsets=None, *, inline_linear: bool = False,
                       forward_stores: bool = False,
                       read_bounds=None,
-                      inline_budget: int | None = None) -> FoldResult:
+                      inline_budget: int | None = None,
+                      bit_feedback_until: int | None = None) -> FoldResult:
         """Fold a K-step composition of the union graph into ONE graph.
 
         pin_list[k] pins step k (the router supplies them: pc, instruction
@@ -567,6 +642,18 @@ class GraphFolder:
         n_steps = len(pin_list)
         root_dims = [self.by_name[n] for n in self.root_names]
         feedback = dict(feedback)
+        # Bit-state feedback (wide_bits graphs only): A's bits chain like
+        # A itself, so a load/pull's served bits reach later steps free.
+        # ``bit_feedback_until`` prunes the chain past the last step whose
+        # opcode consumes A bits (callers know the ops): unseeded steps
+        # drop the arith bit ladder instead of keeping it live for a
+        # feedback nothing reads.  Wrong pruning fails loudly in tr().
+        bit_ins, bit_outs = set(), set()
+        for b in range(8):
+            if f"new_a_bit{b}" in self.by_name:
+                feedback.setdefault(f"current_a_bit{b}", f"new_a_bit{b}")
+                bit_ins.add(f"current_a_bit{b}")
+                bit_outs.add(f"new_a_bit{b}")
         for out in feedback.values():
             if isinstance(out, (int, float)):
                 continue  # constant feedback (e.g. the always-1 U flag)
@@ -583,7 +670,9 @@ class GraphFolder:
                 base_sub[d] = Expression({InputDimension(d.name): 1})
 
         all_pins: dict[str, float] = {}
-        mat = GraphMaterializer()  # counters/provenance accumulate per step
+        mat = GraphMaterializer(  # counters/provenance accumulate per step
+            structural_reads=self.structural_reads,
+        )
         insert_side_hazards: set[str] = set()
         folded_roots: list[str] = []
         keep_alive = Expression()
@@ -628,6 +717,10 @@ class GraphFolder:
                         pins[in_name] = c
                     else:
                         frozen.add(in_name)
+                        if in_name in bit_ins and out not in fb_expr:
+                            # Pruned bit feedback: leave unbound; a live
+                            # reader fails loudly in tr().
+                            unbound.add(in_name)
             for name, v in pins.items():
                 all_pins[f"s{k}:{name}"] = v
 
@@ -664,9 +757,12 @@ class GraphFolder:
 
             # Liveness seeds: this step's roots, the outputs the next step
             # feeds on, and (final step) the graph's output tokens.
+            seed_bits = bit_feedback_until is None or k < bit_feedback_until
             fb_dims = [
                 self.by_name[o[0] if isinstance(o, tuple) else o]
-                for o in feedback.values() if not isinstance(o, (int, float))
+                for o in feedback.values()
+                if not isinstance(o, (int, float))
+                and (seed_bits or o not in bit_outs)
             ] if k + 1 < n_steps else []
             fout = {}
             if k + 1 == n_steps:
@@ -688,7 +784,14 @@ class GraphFolder:
                     or (isinstance(d, PersistDimension) and d.name in frozen)
                 )
 
-            live = walk_live(seeds, val, folded, lookup_exprs, is_leaf)
+            def bit_leaf(d, *, fwd_expr_of=fwd_expr_of):
+                rb = getattr(d, "read_bit", None)
+                if rb is None or not self.structural_reads:
+                    return None
+                return None if rb[0] in fwd_expr_of else rb[0]
+
+            live = walk_live(seeds, val, folded, lookup_exprs, is_leaf,
+                             bit_leaf=bit_leaf)
 
             # Materialize this step (fresh sub: the same union dim holds a
             # different value per step); frozen persists resolve to the
@@ -813,17 +916,22 @@ class GraphFolder:
                     ))
 
             fb_const, fb_expr = {}, {}
-            for out in set(feedback.values()):
-                if isinstance(out, (int, float)):
-                    continue
-                out_name = out[0] if isinstance(out, tuple) else out
-                d = self.by_name[out_name]
-                src = val.get(d, Expression({d: 1}))
-                c = const_of(src, one)
-                if c is not None:
-                    fb_const[out_name] = c
-                else:
-                    fb_expr[out_name] = tr(src)
+            if k + 1 < n_steps:
+                # The last step feeds nothing; non-root feedback outputs
+                # (bit state) are not kept live there, so tr would fail.
+                for out in set(feedback.values()):
+                    if isinstance(out, (int, float)):
+                        continue
+                    out_name = out[0] if isinstance(out, tuple) else out
+                    if out_name in bit_outs and not seed_bits:
+                        continue
+                    d = self.by_name[out_name]
+                    src = val.get(d, Expression({d: 1}))
+                    c = const_of(src, one)
+                    if c is not None:
+                        fb_const[out_name] = c
+                    else:
+                        fb_expr[out_name] = tr(src)
 
             if k + 1 == n_steps:
                 new_inputs = {

@@ -8,6 +8,7 @@ engine cache; this module owns folds, licenses, and model construction.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import time
@@ -57,6 +58,11 @@ P_FLAG_NAMES = (
     ("in_p_b", reference.FLAG_B), ("in_p_u", reference.FLAG_U),
     ("in_p_v", reference.FLAG_V), ("in_p_n", reference.FLAG_N),
 )
+# wide_bits builds only (absent from other graphs, so added when present):
+# served A-bit state inputs, MSB first.
+OPTIONAL_INPUT_SLOT_NAMES = {
+    f"a_bit{b}": f"in_a_bit{b}" for b in range(7, -1, -1)
+}
 
 
 def head_row(model, row: int) -> tuple[list[int], list[float]]:
@@ -69,10 +75,14 @@ def head_row(model, row: int) -> tuple[list[int], list[float]]:
 def step_spec_base(slot) -> dict:
     """The input/p_flag half of a generated step spec; ``slot`` maps a graph
     dimension name to its residual slot."""
-    return {
+    spec = {
         "inputs": {key: slot(name) for key, name in INPUT_SLOT_NAMES.items()},
         "p_flags": [(slot(name), mask) for name, mask in P_FLAG_NAMES],
     }
+    for key, name in OPTIONAL_INPUT_SLOT_NAMES.items():
+        with contextlib.suppress(KeyError):
+            spec["inputs"][key] = slot(name)
+    return spec
 
 
 def fold_step_spec(fold_result, model, tok_to_idx, info, *,
@@ -143,6 +153,25 @@ def eval_over_heads(fold_result, dim, length):
         return acc
 
     return heads, np.asarray(ev(dim))
+
+
+# Operations whose folded circuits read A's bit state (wide_bits builds):
+# logical/bitwise families, ADC/SBC (served-sign overflow + decimal
+# nibbles), and any accumulator-mode shift (operand bits mux to A's).
+A_BIT_OPERATIONS = frozenset({
+    "and", "ora", "eor", "bit", "sax", "slo", "rla", "sre", "adc", "sbc",
+})
+
+
+def last_a_bit_step(ops) -> int:
+    """Index of the last step consuming A's bit state; the fold seeds the
+    bit feedback chain only strictly before it (wrong pruning fails
+    loudly at build, not silently)."""
+    last = -1
+    for k, op in enumerate(ops):
+        if op.operation in A_BIT_OPERATIONS or op.mode == "acc":
+            last = k
+    return last
 
 
 def decode_ops(code: bytes) -> list:
@@ -311,7 +340,8 @@ def schedule_and_build(fold_result):
 
 def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
                          milp_seconds: int = 900,
-                         inline_linear: bool = False) -> list[dict]:
+                         inline_linear: bool = False,
+                         structural_reads: bool = False) -> list[dict]:
     """Rebuilt per-opcode expert models for the opcode-routed engine.
 
     For each expert opcode, the union graph is partially evaluated with the
@@ -330,7 +360,8 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
     if not opcodes:
         return []
 
-    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
+    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS,
+                         structural_reads=structural_reads)
     experts = []
     for byte in opcodes:
         r = folder.fold(
@@ -380,6 +411,7 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
 
 def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                           inline_linear: bool = False,
+                          structural_reads: bool = False,
                           assume_taken_steps=()) -> dict:
     """One sequence expert: a K-instruction window folded as ONE forward.
 
@@ -408,10 +440,12 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
             )
         pin_list[k] = dict(pin_list[k])
         pin_list[k]["branch_taken"] = 1.0
-    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
+    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS,
+                         structural_reads=structural_reads)
     r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
                              label=f"seq_{head:04X}",
-                             inline_linear=inline_linear)
+                             inline_linear=inline_linear,
+                             bit_feedback_until=last_a_bit_step(ops))
     if r.insert_side_hazards:
         raise RuntimeError(
             f"{label}: pins reach insert-side expressions "
@@ -502,7 +536,9 @@ def worst_layer_nnz(model, n_layers: int) -> int:
 
 def build_trace_window_expert(pg, steps, *, s_pin: int | None = None,
                               symbolic=frozenset(),
-                              inline_linear: bool = False) -> dict:
+                              inline_linear: bool = False,
+                              structural_reads: bool = False,
+                              flag_pins=None) -> dict:
     """One flow-following window: K profiled instructions as ONE forward.
 
     ``steps`` is [(pc, instruction bytes)] along the executed control flow
@@ -513,7 +549,11 @@ def build_trace_window_expert(pg, steps, *, s_pin: int | None = None,
     with store-to-load forwarding resolving in-window writers.  ``s_pin``
     pins the entering stack pointer -- dispatch must guard S == s_pin --
     which folds every stack push/pull address to a constant the
-    forwarding license can decide.
+    forwarding license can decide.  ``flag_pins`` pins entering P bits
+    the profile saw constant at this head (state-input name -> 0/1);
+    dispatch must guard the live P against exactly those bits, and the
+    fold's feedback propagates them (a D pin of 0 deletes the decimal
+    ADC/SBC circuit and its operand bit extraction from every step).
 
     Licenses, all checked: pins reach no insert-side expressions; every
     interior next_pc folds to the next step's pinned pc (JSR targets are
@@ -556,20 +596,24 @@ def build_trace_window_expert(pg, steps, *, s_pin: int | None = None,
             pins["fetched_operand_hi_all"] = float(pinned[hi])
         if k == 0 and s_pin is not None:
             pins["current_s"] = float(s_pin)
+        if k == 0 and flag_pins:
+            pins.update({n: float(v) for n, v in flag_pins.items()})
         pin_list.append(pins)
         operand_pinned = all(
             (pc + j) in pinned for j in range(1, op.length)
         )
         read_bounds.update(trace_read_bounds(k, op, body, operand_pinned))
 
-    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
+    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS,
+                         structural_reads=structural_reads)
 
     def fold_and_license(inline: bool):
         r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
                                  label=f"trace_{head:04X}",
                                  inline_linear=inline,
                                  forward_stores=True,
-                                 read_bounds=read_bounds)
+                                 read_bounds=read_bounds,
+                                 bit_feedback_until=last_a_bit_step(ops))
         spec = license_trace_fold(r, steps, pinned, label, read_bounds)
         return r, spec, *schedule_and_build(r)
 
@@ -592,7 +636,7 @@ def build_trace_window_expert(pg, steps, *, s_pin: int | None = None,
         )
     cycles = sum(op.cycles for op in ops)
     digest = hashlib.sha1(
-        repr((tuple(steps), s_pin)).encode()
+        repr((tuple(steps), s_pin, sorted((flag_pins or {}).items()))).encode()
     ).hexdigest()[:8]
     return {
         "kind": "trace", "name": f"trace_{head:04X}_{digest}", "head": head,
@@ -600,7 +644,8 @@ def build_trace_window_expert(pg, steps, *, s_pin: int | None = None,
         "cycles_prefix": cycles - ops[-1].cycles,
         "checks": sorted((a - head, b) for a, b in pinned.items()),
         "span": (min(pinned), max(pinned) + 1),
-        "s_pin": s_pin, "spec_next": spec_next, "model": model,
+        "s_pin": s_pin, "flag_pins": dict(flag_pins or {}),
+        "spec_next": spec_next, "model": model,
         "step_spec": fold_step_spec(r, model, tok_to_idx, info,
                                     n_steps=len(steps)),
         "union_lookup_of": r.union_lookup_of,
@@ -685,6 +730,7 @@ def license_trace_fold(r, steps, pinned, label, read_bounds) -> list[int]:
 
 def build_shape_experts(pg, shapes, *,
                         inline_linear: bool = False,
+                        structural_reads: bool = False,
                         allow_stores: bool = False,
                         allow_runtime_store_guard: bool = False,
                         ) -> tuple[list[dict], list[dict]]:
@@ -704,7 +750,8 @@ def build_shape_experts(pg, shapes, *,
     guard. A library shape that fails its selected license is a hard error:
     the library is code.
     """
-    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS)
+    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS,
+                         structural_reads=structural_reads)
     experts: list[dict] = []
     meta: list[dict] = []
     for sid, (name, template, repeat) in enumerate(shapes):
@@ -725,7 +772,9 @@ def build_shape_experts(pg, shapes, *,
         n_steps = len(pin_list)
         r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
                                  label=f"shape_{name}", pc_offsets=pc_offsets,
-                                 inline_linear=inline_linear)
+                                 inline_linear=inline_linear,
+                                 bit_feedback_until=last_a_bit_step(
+                                     ops * repeat))
         if r.insert_side_hazards:
             raise RuntimeError(
                 f"{label}: pins reach insert-side expressions "

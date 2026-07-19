@@ -63,6 +63,9 @@ addr_lo = cast("InputDimension", None)
 addr_hi = cast("InputDimension", None)
 is_start = cast("InputDimension", None)
 is_state = cast("InputDimension", None)
+# wide_bits builds: WRITE tokens also carry the byte's bits (MSB first),
+# so structural folds can serve a read's bits with the read itself.
+write_bits = cast("tuple", ())
 
 
 # ── Low-level gating helpers ───────────────────────────────────────
@@ -159,6 +162,7 @@ def memory_at(address: ExprLike, name: str) -> Expression:
         "byte_value": to_expr(byte_value),
         "write_addr": write_addr_expr,
         "is_write": to_expr(is_memory_write),
+        "bit_values": write_bits,
     }
     return result
 
@@ -175,6 +179,26 @@ def overflow(a: ExprLike, b: ExprLike, r: ExprLike) -> Expression:
     same_sign = 1 - multiply(a_sign - b_sign, a_sign - b_sign)
     diff_from_result = multiply(a_sign - r_sign, a_sign - r_sign)
     return multiply(same_sign, diff_from_result)
+
+
+def overflow_wide(a_bit7: ExprLike, b_bit7: ExprLike, raw: ExprLike) -> Expression:
+    """Signed-overflow flag in ONE parallel stage from served sign bits:
+    the signed sum s = raw - 256*(a7 + b7) is in [-256, 255], and
+    V = [s < -128] + [s > 127].  Exact for integer inputs."""
+    one = graph.one
+    s = raw - 256 * to_expr(a_bit7) - 256 * to_expr(b_bit7)
+    return (1 - stepglu(one, s + 128)) + stepglu(one, s - 128)
+
+
+def flat_nz(raw: ExprLike) -> tuple[Expression, Expression]:
+    """(N, Z) of wrap8(raw) for raw in [-255, 255], each ONE parallel
+    stage on raw itself -- no serial wrap8 before the flag thresholds.
+    N: result >= 128 iff raw >= 128 or -128 <= raw < 0; Z: raw == 0."""
+    one = graph.one
+    n = (stepglu(one, raw - 128) + stepglu(one, raw + 128)
+         - stepglu(one, raw))
+    z = stepglu(one, raw) + stepglu(one, -raw) - 1
+    return n, z
 
 
 def extract_bits(value: ExprLike, name: str) -> list[Expression]:
@@ -233,6 +257,26 @@ def extract_bits_wide(value: ExprLike, name: str) -> list[Expression]:
     return bits
 
 
+def read_bits(value: Expression, name: str,
+              site_of: Expression | None = None) -> list[Expression]:
+    """Bits of a memory-read value (MSB first), annotated with the read
+    site so structural folds serve them from the fused read itself (the
+    kernel computes bits at read time, zero extra depth).  Non-structural
+    folds and the union keep the ladder circuit built here.  ``site_of``
+    names the raw read when the ladder runs on a later persist of it
+    (a pinned persist then const-folds the bits without keeping the raw
+    read alive)."""
+    site = next(iter((site_of if site_of is not None else value).terms))
+    bits = extract_bits_wide(value, name)
+    dims = []
+    for j, b in enumerate(bits):
+        d = next(iter(b.terms))
+        d.read_bit = (site, j)
+        dims.append(d)
+    site.read_bit_dims = tuple(dims)
+    return bits
+
+
 def pulled_flag_bits(value: ExprLike, name: str) -> dict[int, Expression]:
     """All eight bits of an 8-bit value from ONE shared threshold ladder.
 
@@ -266,12 +310,22 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
 
     # ── Input dimensions ────────────────────────────────────────────
     global byte_value, is_memory_write, addr_lo, addr_hi, is_start, is_state
+    global write_bits
     byte_value = InputDimension("byte_value")
     is_memory_write = InputDimension("is_memory_write")
     addr_lo = InputDimension("addr_lo")
     addr_hi = InputDimension("addr_hi")
     is_start = InputDimension("is_start")
     is_state = InputDimension("is_state")
+    # wide_bits: WRITE tokens carry the byte's bits and STATE tokens carry
+    # A's bits (MSB first) -- the structural backend computes both in
+    # scalar code, so bit extraction costs zero graph depth at the source.
+    write_bits = tuple(
+        InputDimension(f"wbit{b}") for b in range(7, -1, -1)
+    ) if wide_bits else ()
+    in_a_bits = [
+        InputDimension(f"in_a_bit{b}") for b in range(7, -1, -1)
+    ] if wide_bits else []
 
     in_pc_lo = InputDimension("in_pc_lo")
     in_pc_hi = InputDimension("in_pc_hi")
@@ -324,9 +378,13 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         + in_nmi
         + in_irq
         + is_state
+        + sum((to_expr(d) for d in in_a_bits), Expression())
     )
 
-    input_tokens["WRITE"] = is_memory_write + addr_lo + 256 * addr_hi + byte_value
+    input_tokens["WRITE"] = (
+        is_memory_write + addr_lo + 256 * addr_hi + byte_value
+        + sum((to_expr(d) for d in write_bits), Expression())
+    )
     input_tokens["HALT"] = 0 * one
 
     start_pc_lo = InputDimension("start_pc_lo")
@@ -364,6 +422,9 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         clear_key=1 - is_state,
         tie_break="latest",
     )
+    # Structural backends embed the latest state directly, so this fetch
+    # is an identity there; the tag lets structural folds bypass it.
+    latest_state[0].lookup.state_fetch = True
     latest_state = tuple(
         persist(v, name=n)
         for v, n in zip(latest_state, state_field_names, strict=True)
@@ -396,12 +457,20 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     current_ea = current_ea_lo + 256 * current_ea_hi
     current_ea = persist(current_ea, name="current_ea")
 
+    # wide_bits: A's bits are state (embedded by the structural backend,
+    # fed back per step as new_a_bit*), so bitwise consumers never ladder.
+    current_a_bits = [
+        persist(in_a_bits[j], name=f"current_a_bit{7 - j}")
+        for j in range(8)
+    ] if wide_bits else None
+
     # ── Instruction fetch ───────────────────────────────────────────
     # Code and data share the attention-backed memory, so instruction fetch
     # is three memory reads at PC, PC+1, PC+2.
     fetched_opcode = memory_at(current_pc, "fetched_opcode_raw")
     fetched_operand_lo = memory_at(wrap16(current_pc + 1), "fetched_operand_lo_raw")
     fetched_operand_hi = memory_at(wrap16(current_pc + 2), "fetched_operand_hi_raw")
+    oplo_read = fetched_operand_lo  # raw read expr, for served operand bits
 
     fetched_opcode = persist(fetched_opcode, name="fetched_opcode")
     # Raw operand bytes, used by the addressing machinery below.  The trace
@@ -618,6 +687,9 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     mem_A = memory_at(addrA, "mem_A")
     mem_B = memory_at(addrB, "mem_B")
     mem_C = memory_at(addrC, "mem_C")
+    # Served bits of the mem_A read (stack pulls): PLA's new A bits and
+    # PLP/RTI's flag bits, with no ladder on the structural backend.
+    pull_srv_bits = read_bits(mem_A, "pullsrv") if wide_bits else None
 
     idx_lo = mem_A
     idx_hi = mem_B
@@ -662,8 +734,22 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     operand = persist(operand, name="operand")
 
     # ── Bit extraction for bitwise / shift ops ────────────────────────
-    a_bits = bits_of(current_a, "a")
-    operand_bits = bits_of(operand, "operand")
+    if wide_bits:
+        # Served bits: A's from state, reads' from the fused read; the
+        # operand mux mirrors operand's own gating exactly, and the mode
+        # gates fold in every routed expert, leaving a linear passthrough.
+        a_bits = current_a_bits
+        opmem_bits = read_bits(operand_mem, "opmemsrv")
+        oplo_bits = read_bits(fetched_operand_lo, "oplosrv", site_of=oplo_read)
+        is_mem_operand = 1 - is_imm - is_acc
+        operand_bits = [
+            multiply(is_imm, oplo_bits[j]) + multiply(is_acc, a_bits[j])
+            + multiply(is_mem_operand, opmem_bits[j])
+            for j in range(8)
+        ]
+    else:
+        a_bits = bits_of(current_a, "a")
+        operand_bits = bits_of(operand, "operand")
 
     # ── ALU operations ──────────────────────────────────────────────
     carry_in = current_p_c
@@ -672,14 +758,22 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     adc_raw = current_a + operand + carry_in
     adc_carry = stepglu(one, adc_raw - 256)
     adc_result = wrap8(adc_raw)
-    adc_overflow = overflow(current_a, operand, adc_result)
+    if wide_bits:
+        # One parallel stage from the served sign bits, instead of the
+        # serial sign-of-wrapped-result chain.
+        adc_overflow = overflow_wide(a_bits[0], operand_bits[0], adc_raw)
+    else:
+        adc_overflow = overflow(current_a, operand, adc_result)
 
     # Binary SBC
     sbc_operand = 255 - operand
     sbc_raw = current_a + sbc_operand + carry_in
     sbc_carry = stepglu(one, sbc_raw - 256)
     sbc_result = wrap8(sbc_raw)
-    sbc_overflow = overflow(current_a, sbc_operand, sbc_result)
+    if wide_bits:
+        sbc_overflow = overflow_wide(a_bits[0], 1 - operand_bits[0], sbc_raw)
+    else:
+        sbc_overflow = overflow(current_a, sbc_operand, sbc_result)
 
     if bcd:
         # Nibbles for decimal mode (bits[0] = bit 7, bits[4] = bit 3, bits[7] = bit 0)
@@ -725,35 +819,52 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         decimal_sbc = persist(sbc_result, name="decimal_sbc")
         decimal_sbc_carry = sbc_carry
 
-    # Compare operations (A/M/X/Y - operand)
+    # Compare operations (A/M/X/Y - operand).  wide_bits: N/Z in one
+    # parallel stage on the pre-wrap difference (flat_nz); the wrapped
+    # result survives only for the trace's data field.
     cmp_raw = current_a - operand
     cmp_carry = stepglu(one, cmp_raw)
     cmp_result = wrap8(cmp_raw)
-    cmp_n = stepglu(one, cmp_result - 128)
-    cmp_z = 1 - stepglu(one, cmp_result - 1)
+    if wide_bits:
+        cmp_n, cmp_z = flat_nz(cmp_raw)
+    else:
+        cmp_n = stepglu(one, cmp_result - 128)
+        cmp_z = 1 - stepglu(one, cmp_result - 1)
 
     cpx_raw = current_x - operand
     cpx_carry = stepglu(one, cpx_raw)
     cpx_result = wrap8(cpx_raw)
-    cpx_n = stepglu(one, cpx_result - 128)
-    cpx_z = 1 - stepglu(one, cpx_result - 1)
+    if wide_bits:
+        cpx_n, cpx_z = flat_nz(cpx_raw)
+    else:
+        cpx_n = stepglu(one, cpx_result - 128)
+        cpx_z = 1 - stepglu(one, cpx_result - 1)
 
     cpy_raw = current_y - operand
     cpy_carry = stepglu(one, cpy_raw)
     cpy_result = wrap8(cpy_raw)
-    cpy_n = stepglu(one, cpy_result - 128)
-    cpy_z = 1 - stepglu(one, cpy_result - 1)
+    if wide_bits:
+        cpy_n, cpy_z = flat_nz(cpy_raw)
+    else:
+        cpy_n = stepglu(one, cpy_result - 128)
+        cpy_z = 1 - stepglu(one, cpy_result - 1)
 
-    # Logical operations
+    # Logical operations (bit lists retained MSB-first for new_a_bits)
     and_result = 0
     ora_result = 0
     eor_result = 0
+    and_bit_list: list = [None] * 8
+    or_bit_list: list = [None] * 8
+    xor_bit_list: list = [None] * 8
     for i in range(8):
         a_bit = a_bits[7 - i]
         m_bit = operand_bits[7 - i]
         bit_and = multiply(a_bit, m_bit)
         bit_or = a_bit + m_bit - bit_and
         bit_xor = a_bit + m_bit - 2 * bit_and
+        and_bit_list[7 - i] = bit_and
+        or_bit_list[7 - i] = bit_or
+        xor_bit_list[7 - i] = bit_xor
         and_result = and_result + (1 << i) * bit_and
         ora_result = ora_result + (1 << i) * bit_or
         eor_result = eor_result + (1 << i) * bit_xor
@@ -832,8 +943,11 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     dcp_raw = current_a - dec_result
     dcp_carry = stepglu(one, dcp_raw)
     dcp_cmp = wrap8(dcp_raw)
-    dcp_n = stepglu(one, dcp_cmp - 128)
-    dcp_z = 1 - stepglu(one, dcp_cmp - 1)
+    if wide_bits:
+        dcp_n, dcp_z = flat_nz(dcp_raw)
+    else:
+        dcp_n = stepglu(one, dcp_cmp - 128)
+        dcp_z = 1 - stepglu(one, dcp_cmp - 1)
 
     # ISB: INC memory then SBC; RRA: ROR memory then ADC with the shifted-out
     # carry.  Both are modeled in binary only -- neither Klaus (official
@@ -874,6 +988,39 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     new_a = mux(is_acc, shift_result, new_a)
     new_a = mux(is_int, current_a, new_a)
     new_a = persist(new_a, name="new_a")
+
+    if wide_bits:
+        # A's bits as state: each writer family contributes its bit list
+        # (free for loads/logic/pulls/acc-shifts); arithmetic shares one
+        # ladder on the muxed new_a that liveness prunes whenever no later
+        # step does bitwise work on A.  Gates are the same one-hots as
+        # new_a's own muxes, so the sum is exact.
+        arith_a = (op_adc + op_sbc + op_tya + op_slo + op_rla + op_sre
+                   + op_rra + op_isb)
+        arith_a_bits = extract_bits_wide(new_a, "newa_arith")
+        writes_a = (op_load_a + op_lax + op_and + op_ora + op_eor + op_pla
+                    + op_txa + is_acc + arith_a)
+        ror_bit_list = [carry_in] + operand_bits[:-1]
+        for j in range(8):
+            shift_sel = (
+                multiply(op_rol, rla_bits[j]) + multiply(op_ror, ror_bit_list[j])
+            )
+            if asl_bits[j] is not None:
+                shift_sel = shift_sel + multiply(op_asl, asl_bits[j])
+            if lsr_bits[j] is not None:
+                shift_sel = shift_sel + multiply(op_lsr, lsr_bits[j])
+            expr = (
+                multiply(op_load_a + op_lax, operand_bits[j])
+                + multiply(op_and, and_bit_list[j])
+                + multiply(op_ora, or_bit_list[j])
+                + multiply(op_eor, xor_bit_list[j])
+                + multiply(op_pla, pull_srv_bits[j])
+                + multiply(op_txa, x_bits[j])
+                + multiply(is_acc, shift_sel)
+                + multiply(arith_a, arith_a_bits[j])
+                + multiply(1 - writes_a, a_bits[j])
+            )
+            persist(mux(is_int, a_bits[j], expr), name=f"new_a_bit{7 - j}")
 
     new_x = current_x
     new_x = mux(op_load_x + op_lax, operand, new_x)
@@ -1037,9 +1184,14 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     new_p_n = persist(new_p_n, name="new_p_n_bit")
     new_p_z = persist(new_p_z, name="new_p_z_bit")
 
-    # PLP/RTI update all flags from the pulled byte (B cleared, U set)
+    # PLP/RTI update all flags from the pulled byte (B cleared, U set).
+    # wide_bits: the flag bits are the mem_A read's served bits -- the
+    # 255-step shared ladder (and its fan-out width) never builds.
     op_pull_p = op_plp + op_rti
-    pull_bits = pulled_flag_bits(stack_pull_byte, "pullp")
+    if wide_bits:
+        pull_bits = {1 << b: pull_srv_bits[7 - b] for b in range(8)}
+    else:
+        pull_bits = pulled_flag_bits(stack_pull_byte, "pullp")
     new_p_c = mux(op_pull_p, pull_bits[FLAG_C], new_p_c)
     new_p_z = mux(op_pull_p, pull_bits[FLAG_Z], new_p_z)
     new_p_i = mux(op_pull_p, pull_bits[FLAG_I], new_p_i)

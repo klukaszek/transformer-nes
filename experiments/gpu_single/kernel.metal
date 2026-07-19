@@ -123,6 +123,7 @@ kernel void run6502(
     int seq_guard = 0, seq_guard_min = 0;
     int seq_span_lo = 0, seq_span_len = 0;
     int seq_spec = -1, cur_spec = -1;
+    int seq_pguard = 0;
     while (step < max_steps) {
         // ── dispatch + STATE embed ──
         for (int i = tid; i < TG_D; i += T) x[i] = 0.0f;
@@ -145,6 +146,9 @@ kernel void run6502(
                     || cached_counter == 0 || cached_counter >= seq_guard_min;
                 if (seq_guard == SEQ_GUARD_S)
                     cached_guard_ok = st[4] == seq_guard_min;
+                if (seq_pguard && (st[5] & (seq_pguard >> 8))
+                        != (seq_pguard & 0xFF))
+                    cached_guard_ok = false;
                 if (seq_guard == SEQ_GUARD_STORE_ABS) {
                     const int alo = seq_head + seq_guard_min;
                     const int lo = wr[alo] != 0.0f ? (int)ram[alo] : 0;
@@ -188,6 +192,9 @@ kernel void run6502(
                         }
                         if (!guard_ok)
                             continue;
+                        if (SQ[11] && (st[5] & (SQ[11] >> 8))
+                                != (SQ[11] & 0xFF))
+                            continue;
                         device const int* wb = I + SQ[4];
                         bool ok = true;
                         for (int j = 0; j < SQ[5]; ++j) {
@@ -214,6 +221,7 @@ kernel void run6502(
                             seq_span_len = SQ[9];
                             seq_spec = SQ[10];
                             cur_spec = SQ[10];
+                            seq_pguard = SQ[11];
                         }
                     }
                 }
@@ -235,7 +243,7 @@ kernel void run6502(
             const int ophi = st[8], ea = st[9], data = st[10];
             const int hl = st[11], nmi = st[12];
             device const int* SL = I + XD[4];
-            const float vals[23] = {
+            const float vals[31] = {
                 (float)(pc & 0xFF), (float)((pc >> 8) & 0xFF),
                 (float)a, (float)xr, (float)y, (float)sp,
                 (float)(p & 1), (float)((p >> 1) & 1), (float)((p >> 2) & 1),
@@ -244,8 +252,13 @@ kernel void run6502(
                 (float)((p >> 7) & 1),
                 (float)ir, (float)oplo, (float)ophi,
                 (float)(ea & 0xFF), (float)((ea >> 8) & 0xFF),
-                (float)data, (float)hl, (float)nmi, 1.0f};
-            for (int i = 0; i < 23; ++i) x[SL[i]] = vals[i];
+                (float)data, (float)hl, (float)nmi, 1.0f,
+                // Served A bits, MSB first: state carries its own bits.
+                (float)((a >> 7) & 1), (float)((a >> 6) & 1),
+                (float)((a >> 5) & 1), (float)((a >> 4) & 1),
+                (float)((a >> 3) & 1), (float)((a >> 2) & 1),
+                (float)((a >> 1) & 1), (float)(a & 1)};
+            for (int i = 0; i < 31; ++i) x[SL[i]] = vals[i];
             x[XD[3]] = 1.0f;
         }
         BARRIER();
@@ -284,7 +297,7 @@ kernel void run6502(
                     device const int* mp = I + P[10];
                     const float q = csr_dot(I + P[11], F + P[12],
                                             mp[row], mp[row + 1], x);
-                    device const int* MM = I + P[14] + 2 * row;
+                    device const int* MM = I + P[14] + 3 * row;
                     const int qi = (int)rint(q);
                     const int base = MM[0];
                     // base -1: fused 64K-span read (expert folds) -- qi IS
@@ -299,6 +312,12 @@ kernel void run6502(
                     }
                     ho[MM[1]] = h0;
                     ho[MM[1] + 1] = h1;
+                    // Served bits (MSB first): pure functions of the read
+                    // byte, computed here so the graph never ladders them.
+                    const int nv = MM[2];
+                    const int v = (int)h0;
+                    for (int j = 0; j + 2 < nv; ++j)
+                        ho[MM[1] + 2 + j] = (float)((v >> (7 - j)) & 1);
                 }
                 for (int ri = tid; ri < nreg; ri += T) {
                     const float s = 2.0f * x[reg_c0] - x[reg_c1];

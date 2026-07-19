@@ -211,6 +211,8 @@ class LookUp:
         self.key_exprs_2d = key_exprs_2d  # [kx_expr, ky_expr]
         self.tie_break = tie_break
         self.memory_group: int | None = None  # tagged by memory_at / folds
+        self.state_fetch = False  # latest-STATE fetch: an identity for
+        # structural backends, which embed the current state directly
         self.dims = [LookUpDimension(self, i) for i in range(len(value_exprs))]
         graph_lookups.append(self)
 
@@ -231,6 +233,9 @@ def make_multiply(a, b):
     r1 = ReGLUDimension(a, b)
     r2 = ReGLUDimension(a, neg_b)
     result = persist(Expression({r1: 1, r2: -1}))
+    # Folds use this to collapse the product to a linear map when either
+    # side pins to a constant (the ReGLU pair only has a rule for b).
+    next(iter(result.terms)).multiply_of = (a, b)
     multiply_cache[key] = result
     return result
 

@@ -129,12 +129,21 @@ READOUT_ORDER = (
 )
 
 COUNTDOWN_REPEATS = (4, 2)
-SEQ_ROW = 11
+SEQ_ROW = 12
 SEQ_GUARD_NONE = 0
 SEQ_GUARD_X = 1
 SEQ_GUARD_Y = 2
 SEQ_GUARD_STORE_ABS = 3
 SEQ_GUARD_S = 4
+
+# P bits a trace window may pin when the profiled entering value is
+# constant at its head (housekeeping bits only -- C/Z/V/N are data flow
+# and would thrash the guard).  seqtab carries (mask << 8) | values;
+# dispatch requires (P & mask) == values.
+PIN_FLAGS = (
+    ("current_p_i", 0x04), ("current_p_d", 0x08),
+    ("current_p_b", 0x10), ("current_p_u", 0x20),
+)
 
 # Profile-derived canonical opcode shapes, ordered longest/most profitable
 # first when several match one head. PCs and operands remain symbolic; the
@@ -254,13 +263,14 @@ class Stream:
 
 
 def spec_state_slots(spec) -> list[int]:
-    """A fold's step-spec inputs in the kernel's 23-value embed order
-    (STATE_FIELDS + is_state; the p_flags list is c..n, matching)."""
+    """A fold's step-spec inputs in the kernel's 31-value embed order
+    (STATE_FIELDS + is_state + served A bits; p_flags is c..n, matching)."""
     ins = spec["inputs"]
     pf = [s for s, _m in spec["p_flags"]]
     return ([ins[n] for n in ("pc_lo", "pc_hi", "a", "x", "y", "s")] + pf +
             [ins[n] for n in ("ir", "oplo", "ophi", "ea_lo", "ea_hi",
-                              "data", "halted", "nmi", "is_state")])
+                              "data", "halted", "nmi", "is_state")] +
+            [ins[f"a_bit{b}"] for b in range(7, -1, -1)])
 
 
 def countdown_guard(head: int, code: bytes) -> int:
@@ -373,11 +383,19 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
             gstream.add_layer(grows)
 
             mem0, reg0 = len(mem_meta), len(reg_meta)
+            lu_ids = mdl.head_lookup_ids[li]
+            lu_head_count: dict[int, int] = {}
+            for h in lookup:
+                lu_head_count[lu_ids[h]] = lu_head_count.get(lu_ids[h], 0) + 1
             for pos, h in enumerate(lookup):
                 qx = [(c, i) for i, c in enumerate(ip[2 * h]) if c]
                 qy = [(c, i) for i, c in enumerate(ip[2 * h + 1]) if c]
                 g = mdl.head_memory_groups[li][h]
                 if g >= 0 or g == MEMORY_GROUP_FUSED:
+                    if g == MEMORY_GROUP_FUSED and mdl.head_pairs[li][h]:
+                        # Bit-serving pairs of a fused read: the pair-0
+                        # row writes every ho slot in one kernel serve.
+                        continue
                     terms = memory_query(qx, qy, one_id=mdl.one_slot)
                     if terms is None:
                         raise RuntimeError(
@@ -389,7 +407,8 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                     mem_rows.append(([i for _c, i in terms],
                                      [c for c, _i in terms]))
                     mem_meta.append((-1 if g == MEMORY_GROUP_FUSED
-                                     else g * 4096, 2 * pos))
+                                     else g * 4096, 2 * pos,
+                                     2 * lu_head_count[lu_ids[h]]))
                     continue
                 rq = register_query(qx, qy, one_id=mdl.one_slot,
                                     latest=bool(mdl.head_tiebreak[li][h]))
@@ -465,13 +484,15 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
 
     pack_model(
         model, info.n_layers, "union",
-        [input_slots[n] for n, _ in STATE_FIELDS] + [input_slots["is_state"]],
+        [input_slots[n] for n, _ in STATE_FIELDS] + [input_slots["is_state"]]
+        + [input_slots[f"in_a_bit{b}"] for b in range(7, -1, -1)],
         [readout_slots[n] for n in READOUT_ORDER],
         head_row(model, tok_to_idx["STATE"]), head_row(model, tok_to_idx["HALT"]))
 
     optab = [0] * 256
     for e in build_opcode_experts(
         pg, sorted(expert_opcodes), inline_linear=True,
+        structural_reads=True,
     ):
         spec = e["step_spec"]
         optab[e["byte"]] = pack_model(
@@ -502,6 +523,7 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
             try:
                 e = build_sequence_expert(
                     pg, head, bytes(code), variant_repeat, inline_linear=True,
+                    structural_reads=True,
                     assume_taken_steps=taken_steps,
                 )
             except RuntimeError:
@@ -526,7 +548,7 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                     for offset, byte in enumerate(e["window"])
                 ]),
                 len(e["window"]), guard_kind, guard_min,
-                head, len(e["window"]), -1,
+                head, len(e["window"]), -1, 0,
             ])
 
     # Canonical shapes compile once with symbolic PC/operands, then share
@@ -535,8 +557,8 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
     shape_matches = 0
     if shapes:
         shape_experts, shape_meta = build_shape_experts(
-            pg, shapes, inline_linear=True, allow_stores=True,
-            allow_runtime_store_guard=True,
+            pg, shapes, inline_linear=True, structural_reads=True,
+            allow_stores=True, allow_runtime_store_guard=True,
         )
         shape_desc = []
         shape_checks = []
@@ -582,7 +604,7 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                 SEQ_GUARD_STORE_ABS if store_guard is not None
                 else SEQ_GUARD_NONE,
                 0 if store_guard is None else store_guard,
-                head, meta["length"], -1,
+                head, meta["length"], -1, 0,
             ])
             shape_matches += 1
 
@@ -599,7 +621,8 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                 e = build_trace_window_expert(
                     pg, tw["steps"], s_pin=tw.get("s_pin"),
                     symbolic=tw.get("symbolic", frozenset()),
-                    inline_linear=True,
+                    inline_linear=True, structural_reads=True,
+                    flag_pins=tw.get("flag_pins"),
                 )
             except RuntimeError:
                 # PGO proposes; the fold licenses arbitrate.
@@ -616,6 +639,11 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
             union_lookup_of=e["union_lookup_of"])
         span_lo, span_hi = e["span"]
         spec_next = e["spec_next"]
+        fp = e.get("flag_pins") or {}
+        bit_of = dict(PIN_FLAGS)
+        p_guard = 0
+        for name, v in fp.items():
+            p_guard |= (bit_of[name] << 8) | (bit_of[name] if v else 0)
         seqtab.append([
             e["head"], k, mdesc, span_hi - span_lo,
             add_slots([(delta << 8) | byte for delta, byte in e["checks"]]),
@@ -624,6 +652,7 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
             0 if e["s_pin"] is None else e["s_pin"],
             span_lo, span_hi - span_lo,
             add_slots(spec_next) if any(p >= 0 for p in spec_next) else -1,
+            p_guard,
         ])
         trace_packed += 1
 
@@ -639,7 +668,7 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
     assert all(list(vals) == [1.0] for _cols, vals in reg_grows)
 
     tables["layer_tab"] = np.array(layer_tab, dtype=np.int32)
-    tables["mem_meta"] = np.array(mem_meta, dtype=np.int32).reshape(-1, 2)
+    tables["mem_meta"] = np.array(mem_meta, dtype=np.int32).reshape(-1, 3)
     tables["reg_meta"] = np.array(reg_meta, dtype=np.int32).reshape(-1, 2)
     tables["slots_tab"] = np.array(slots_tab, dtype=np.int32)
     tables["heads_col"] = np.array(heads_col, dtype=np.int32)
@@ -960,14 +989,16 @@ def bench_suite(name: str, n: int, threads: int, check: bool, experts=(),
             Cpu6502TransformerMachine,
         )
         eng = Cpu6502TransformerMachine(bcd=bcd)
-        pcs_parts, s_parts, w_parts = [], [], []
+        pcs_parts, s_parts, p_parts, w_parts = [], [], [], []
         for out in eng.iter_run_arrays(image, start_pc=START_PC,
                                        max_steps=n):
             pcs_parts.append(np.asarray(out["pc"], dtype=np.int64))
             s_parts.append(np.asarray(out["s"], dtype=np.int64))
+            p_parts.append(np.asarray(out["p"], dtype=np.int64))
             w_parts.append(np.asarray(out["w_addr"], dtype=np.int64))
         pcs = np.concatenate(pcs_parts)
         s_arr = np.concatenate(s_parts)
+        p_arr = np.concatenate(p_parts)
         written = frozenset(
             int(a) for a in np.unique(np.concatenate(w_parts))
         )
@@ -1006,14 +1037,25 @@ def bench_suite(name: str, n: int, threads: int, check: bool, experts=(),
             if prop is None:
                 continue
             steps, symbolic, uses_stack = prop
+            at = np.nonzero(pcs == head)[0]
+            at = at[at > 0]
             s_pin = None
             if uses_stack:
-                at = np.nonzero(pcs == head)[0]
-                at = at[at > 0]
                 if not at.size:
                     continue
                 vals, vc = np.unique(s_arr[at - 1], return_counts=True)
                 s_pin = int(vals[np.argmax(vc)])
+            # Housekeeping P bits with a constant profiled entering value
+            # pin at fold time; dispatch guards (P & mask) == values.  A
+            # D pin of 0 deletes the decimal ADC/SBC circuit (and the
+            # operand bit extraction feeding it) from the whole window.
+            flag_pins = {}
+            if at.size:
+                entering_p = p_arr[at - 1]
+                for pname, bit in PIN_FLAGS:
+                    bits = entering_p & bit
+                    if np.all(bits == bits[0]):
+                        flag_pins[pname] = 1.0 if bits[0] else 0.0
             # A license failure names its failing step; the prefix before
             # it is still a valid window, and the suffix head gets its own
             # proposal on a later iteration.
@@ -1027,12 +1069,18 @@ def bench_suite(name: str, n: int, threads: int, check: bool, experts=(),
                 try:
                     expert = build_trace_window_expert(
                         pg, trunc, s_pin=use_s, symbolic=symbolic,
-                        inline_linear=True,
+                        inline_linear=True, structural_reads=True,
+                        flag_pins=flag_pins,
                     )
                     break
                 except RuntimeError as exc:
                     st = getattr(exc, "step", None)
                     if st is None or st < 2:
+                        # Pinning can shift the inline width profile past
+                        # the budget; the unpinned build is still valid.
+                        if flag_pins:
+                            flag_pins = {}
+                            continue
                         print(
                             f"[metal {name}] PGO reject ({hits} hits): {exc}"
                         )
