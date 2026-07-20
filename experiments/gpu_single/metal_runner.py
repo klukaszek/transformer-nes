@@ -117,12 +117,13 @@ from transformer_nes.cpu6502.backends.weights.experts import (  # noqa: E402
 )
 from transformer_nes.cpu6502.backends.weights.windows import (  # noqa: E402
     BRANCH_OPERATIONS,
+    MEMORY_WRITE_OPERATIONS,
     STACK_OPERATIONS,
     match_shape_windows,
     propose_trace_window,
     scan_sequence_windows,
 )
-from transformer_nes.cpu6502.spec import OPCODES  # noqa: E402
+from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY  # noqa: E402
 from transformer_nes.graph.core import MEMORY_GROUP_FUSED  # noqa: E402
 from transformer_nes.model.classify import (  # noqa: E402
     integer_score_terms,
@@ -231,34 +232,47 @@ def propose_profile_shapes(image: bytes, pcs, cap: int = 64):
     nestest deliberately visits thousands of distinct test PCs, so
     address PGO sees no hot heads.  Opcode-normalized n-grams expose the
     repeated test-macro grammar instead.  Interior relative branches use
-    the shape fold's exact prefix rollback; stack/control-transfer and
-    memory-addressing forms stay with the existing explicit libraries.
+    the shape fold's exact prefix rollback; memory forms follow the
+    shape license's shape (first-step reads are shadow-checked, interior
+    reads must self-bound to zero page, stores stay zero-page, no read
+    follows a write) -- the fold arbitrates every survivor downstream.
     """
     from collections import Counter, defaultdict
 
     counts = Counter()
     boundaries = defaultdict(set)
     n_steps_of = {}
+    spec_of = {}
     pcs = [int(pc) for pc in pcs]
-    for n_steps in range(4, 9):
+    for n_steps in range(4, 13):
         for start in range(len(pcs) - n_steps + 1):
             template = bytearray()
             has_interior_branch = False
+            wrote = False
             prev_pc = prev_len = None
             for j in range(n_steps):
                 pc = pcs[start + j]
                 op = OPCODES.get(image[pc])
                 if (
                     op is None
-                    or op.mode not in ("imm", "imp", "acc", "rel")
                     or op.operation in STACK_OPERATIONS
-                    or op.operation in ("brk", "rts", "rti")
+                    or op.operation in ("brk", "rti", "jmp")
                     or (
                         prev_pc is not None
                         and pc != (prev_pc + prev_len) & 0xFFFF
                     )
                 ):
                     break
+                if op.mode not in ("imm", "imp", "acc", "rel"):
+                    zp_class = op.mode in ("zpg", "zpx", "zpy")
+                    if op.operation in READS_MEMORY and (
+                        wrote or (j > 0 and not zp_class)
+                    ):
+                        break
+                    if op.operation in MEMORY_WRITE_OPERATIONS:
+                        if not zp_class:
+                            break
+                        wrote = True
                 has_interior_branch |= (
                     j + 1 < n_steps
                     and op.operation in BRANCH_OPERATIONS
@@ -266,13 +280,13 @@ def propose_profile_shapes(image: bytes, pcs, cap: int = 64):
                 template.extend([op.byte] + [0] * (op.length - 1))
                 prev_pc, prev_len = pc, op.length
             else:
-                if has_interior_branch:
-                    key = bytes(template)
-                    counts[key] += 1
-                    boundaries[key].update(
-                        range(start + 1, start + n_steps)
-                    )
-                    n_steps_of[key] = n_steps
+                key = bytes(template)
+                counts[key] += 1
+                boundaries[key].update(
+                    range(start + 1, start + n_steps)
+                )
+                n_steps_of[key] = n_steps
+                spec_of[key] = has_interior_branch
 
     eligible = {
         template: covered
@@ -296,8 +310,11 @@ def propose_profile_shapes(image: bytes, pcs, cap: int = 64):
             break
         selected.append((gain, counts[template], template))
         claimed.update(eligible.pop(template))
+    # Dispatch tries same-head candidates in sid order; greedy gain
+    # order measured better than longest-first (long shapes strand
+    # their tails at unmatched heads).
     return tuple(
-        (f"pgo_shape_{i}_{hits}", template, 1, True)
+        (f"pgo_shape_{i}_{hits}", template, 1, spec_of[template])
         for i, (_gain, hits, template) in enumerate(selected)
     )
 
@@ -1322,12 +1339,30 @@ def bench_suite(name: str, n: int, threads: int, check: bool, experts=(),
             covered.update(pc for pc, _b in trunc)
         traces = tuple(proposed)
         if name == "nestest":
-            profile_shapes = propose_profile_shapes(
-                image, pcs, cap=pgo_windows
-            )
+            # The proposer emits license-shaped candidates; the fold still
+            # arbitrates each one (a reject costs one throwaway build).
+            kept = []
+            shape_rejects = 0
+            for shape in propose_profile_shapes(
+                image, pcs, cap=2 * pgo_windows
+            ):
+                if len(kept) >= pgo_windows:
+                    break
+                try:
+                    build_shape_experts(
+                        pg, [shape], inline_linear=True,
+                        structural_reads=True, allow_stores=True,
+                        allow_runtime_store_guard=True,
+                    )
+                except RuntimeError:
+                    shape_rejects += 1
+                    continue
+                kept.append(shape)
+            profile_shapes = tuple(kept)
             print(
                 f"[metal {name}] PGO selected {len(profile_shapes)} "
-                "canonical opcode shapes"
+                f"canonical opcode shapes ({shape_rejects} "
+                "license-rejected)"
             )
         lay = sorted(e["layers"] for e in proposed)
         print(

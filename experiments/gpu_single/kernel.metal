@@ -120,6 +120,39 @@ constant int EMSK[31] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
                          0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0,
                          1, 1, 1, 1, 1, 1, 1, 1};
 
+// Sequence-window dispatch guards, re-evaluated live on every use; byte
+// identity is proven separately -- once at scan, then by page
+// write-epochs on memoized hits.
+inline bool seq_guards_ok(device const int* SQ, int pc,
+                          threadgroup const int* stg,
+                          device const float* ram,
+                          device const float* wr) {
+    const int counter = SQ[6] == SEQ_GUARD_X ? stg[2]
+        : (SQ[6] == SEQ_GUARD_Y ? stg[3] : 0);
+    bool ok = SQ[6] == 0 || counter == 0 || counter >= SQ[7];
+    if (SQ[6] == SEQ_GUARD_S) ok = stg[4] == SQ[7];
+    if (SQ[6] == SEQ_GUARD_STORE_ABS) {
+        const int alo = pc + SQ[7];
+        const int lo = wr[alo] != 0.0f ? (int)ram[alo] : 0;
+        const int hi = wr[alo + 1] != 0.0f ? (int)ram[alo + 1] : 0;
+        const int target = lo | (hi << 8);
+        ok = target < 0x2000 && (target < pc || target >= pc + SQ[3]);
+    }
+    if (ok && SQ[11]
+            && (stg[5] & (SQ[11] >> 8)) != (SQ[11] & 0xFF))
+        ok = false;
+    return ok;
+}
+
+// Sum of the write-epochs of every 256-byte page a window's span
+// touches; equality with the fill-time snapshot proves its bytes are
+// unwritten since verification (epochs only grow -- no ABA).
+inline int span_epoch(device const int* pepoch, int lo, int len) {
+    int sum = 0;
+    for (int p = lo >> 8; p <= (lo + len - 1) >> 8; ++p) sum += pepoch[p];
+    return sum;
+}
+
 kernel void run6502(
     constant int* P              [[buffer(0)]],
     device const int* I          [[buffer(1)]],
@@ -131,6 +164,7 @@ kernel void run6502(
     device int* st               [[buffer(7)]],
     device int* io               [[buffer(8)]],
     device int* trace            [[buffer(9)]],
+    device int* dtab             [[buffer(10)]],
     uint tid [[thread_position_in_threadgroup]],
     uint T   [[threads_per_threadgroup]])
 {
@@ -171,21 +205,19 @@ kernel void run6502(
     int fwds = 0;
     int lays = 0;
     int low_fwds = 0;
-    int seq_cache = -1;
-    int seq_head = 0, seq_k = 0, seq_e = 0, seq_len = 0;
-    int seq_guard = 0, seq_guard_min = 0;
-    int seq_span_lo = 0, seq_span_len = 0;
-    int seq_spec = -1, cur_spec = -1;
-    int seq_pguard = 0;
+    device int* pepoch = dtab + 2 * 65536;
+    int cur_spec = -1;
     while (step < max_steps) {
         // ── dispatch + STATE embed.  Sequence windows first (pc == head,
-        // bytes re-verified from RAM, whole window inside the step
-        // budget): one forward retires K instructions.  Else the routed
-        // opcode expert: fetched byte == the graph's memory read at pc
-        // (unwritten reads mask to 0).  NMI runs the union.  EVERY lane
-        // runs the fetch chain eagerly (uniform loads) while lane 0
-        // checks the cached window: the common no-candidate path costs
-        // ONE barrier and no lane-0 serial chain. ──
+        // whole window inside the step budget): one forward retires K
+        // instructions.  Dispatch is MEMOIZED per head: dtab[2*pc] holds
+        // the last verified seqtab row (+1) and a span write-epoch
+        // snapshot; a hit re-evaluates only the live guards -- byte
+        // identity is the epoch proof.  Else the routed opcode expert:
+        // fetched byte == the graph's memory read at pc (unwritten reads
+        // mask to 0).  NMI runs the union.  EVERY lane runs the fetch
+        // chain eagerly (uniform loads) while lane 0 checks the table:
+        // the common paths cost ONE barrier and no serial scan. ──
         const int pc = stg[0];
         int e_op = 0, scan_cand = 0;
         if (stg[12] == 0) {
@@ -197,34 +229,18 @@ kernel void run6502(
         if (tid == 0) {
             int e = 0, k = 1, found = 0;
             if (stg[12] == 0) {
-                if (seq_cache >= 0 && seq_head != pc)
-                    seq_cache = -1;
-                const int cached_counter =
-                    seq_guard == SEQ_GUARD_X ? stg[2]
-                    : (seq_guard == SEQ_GUARD_Y ? stg[3] : 0);
-                bool cached_guard_ok = seq_guard == 0
-                    || cached_counter == 0 || cached_counter >= seq_guard_min;
-                if (seq_guard == SEQ_GUARD_S)
-                    cached_guard_ok = stg[4] == seq_guard_min;
-                if (seq_pguard && (stg[5] & (seq_pguard >> 8))
-                        != (seq_pguard & 0xFF))
-                    cached_guard_ok = false;
-                if (seq_guard == SEQ_GUARD_STORE_ABS) {
-                    const int alo = seq_head + seq_guard_min;
-                    const int lo = wr[alo] != 0.0f ? (int)ram[alo] : 0;
-                    const int hi = wr[alo + 1] != 0.0f
-                        ? (int)ram[alo + 1] : 0;
-                    const int target = lo | (hi << 8);
-                    cached_guard_ok = target < 0x2000
-                        && (target < seq_head
-                            || target >= seq_head + seq_len);
-                }
-                if (seq_cache >= 0 && seq_head == pc
-                        && step + seq_k <= max_steps && cached_guard_ok) {
-                    e = seq_e;
-                    k = seq_k;
-                    cur_spec = seq_spec;
-                    found = 1;
+                const int row = scan_cand ? dtab[2 * pc] : 0;
+                if (row) {
+                    device const int* SQ = I + P[17] + SEQ_ROW * (row - 1);
+                    if (dtab[2 * pc + 1]
+                                == span_epoch(pepoch, SQ[8], SQ[9])
+                            && step + SQ[1] <= max_steps
+                            && seq_guards_ok(SQ, pc, stg, ram, wr)) {
+                        e = SQ[2];
+                        k = SQ[1];
+                        cur_spec = SQ[10];
+                        found = 1;
+                    }
                 }
             } else {
                 found = 1;  // NMI runs the union (e = 0, k = 1)
@@ -251,27 +267,7 @@ kernel void run6502(
                 for (int s = sb; !found && s < se; ++s) {
                     device const int* SQ = I + P[17] + SEQ_ROW * s;
                     if (step + SQ[1] > max_steps) continue;
-                    const int counter =
-                        SQ[6] == SEQ_GUARD_X ? stg[2]
-                        : (SQ[6] == SEQ_GUARD_Y ? stg[3] : 0);
-                    bool guard_ok = SQ[6] == 0
-                        || counter == 0 || counter >= SQ[7];
-                    if (SQ[6] == SEQ_GUARD_S)
-                        guard_ok = stg[4] == SQ[7];
-                    if (SQ[6] == SEQ_GUARD_STORE_ABS) {
-                        const int alo = pc + SQ[7];
-                        const int lo = wr[alo] != 0.0f
-                            ? (int)ram[alo] : 0;
-                        const int hi = wr[alo + 1] != 0.0f
-                            ? (int)ram[alo + 1] : 0;
-                        const int target = lo | (hi << 8);
-                        guard_ok = target < 0x2000
-                            && (target < pc || target >= pc + SQ[3]);
-                    }
-                    if (guard_ok && SQ[11] && (stg[5] & (SQ[11] >> 8))
-                            != (SQ[11] & 0xFF))
-                        guard_ok = false;
-                    if (!guard_ok)
+                    if (!seq_guards_ok(SQ, pc, stg, ram, wr))
                         continue;
                     if (tid == 0) chk_tg = 0;
                     BARRIER();
@@ -291,17 +287,9 @@ kernel void run6502(
                     e_route = SQ[2];
                     k_route = SQ[1];
                     if (tid == 0) {
-                        seq_cache = s;
-                        seq_head = SQ[0];
-                        seq_k = SQ[1];
-                        seq_e = SQ[2];
-                        seq_len = SQ[3];
-                        seq_guard = SQ[6];
-                        seq_guard_min = SQ[7];
-                        seq_span_lo = SQ[8];
-                        seq_span_len = SQ[9];
-                        seq_spec = SQ[10];
-                        seq_pguard = SQ[11];
+                        dtab[2 * pc] = s + 1;
+                        dtab[2 * pc + 1] =
+                            span_epoch(pepoch, SQ[8], SQ[9]);
                     }
                 }
             }
@@ -497,9 +485,7 @@ kernel void run6502(
                         const int addr = (int)outk[22 * k + wf[w][1]] & 0xFFFF;
                         ram[addr] = (float)((int)outk[22 * k + wf[w][2]] & 0xFF);
                         wr[addr] = 1.0f;
-                        if (seq_cache >= 0 && addr >= seq_span_lo
-                                && addr < seq_span_lo + seq_span_len)
-                            seq_cache = -1;
+                        pepoch[addr >> 8] += 1;
                     }
                 }
                 if (SP && k + 1 < k_route && SP[k] >= 0

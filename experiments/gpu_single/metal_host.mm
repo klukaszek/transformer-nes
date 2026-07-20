@@ -18,7 +18,8 @@ struct Machine {
     id<MTLDevice> dev;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> pso;
-    id<MTLBuffer> bP, bI, bF, bRam, bWr, bReg, bRegAny, bSt, bIo, bTrace;
+    id<MTLBuffer> bP, bI, bF, bRam, bWr, bReg, bRegAny, bSt, bIo, bTrace,
+        bDtab;
     int threads;
     int n_regs;
 
@@ -68,6 +69,10 @@ struct Machine {
                                options:MTLResourceStorageModeShared];
         bIo = [dev newBufferWithLength:8 * 4
                                options:MTLResourceStorageModeShared];
+        // Memoized dispatch: 2 ints per pc (verified seqtab row + span
+        // epoch snapshot), then 256 page write-epoch counters.
+        bDtab = [dev newBufferWithLength:(2 * 65536 + 256) * 4
+                                 options:MTLResourceStorageModeShared];
         bTrace = nil;
     }
 
@@ -83,6 +88,7 @@ struct Machine {
         }
         std::memset(bReg.contents, 0, bReg.length);
         std::memset(bRegAny.contents, 0, bRegAny.length);
+        std::memset(bDtab.contents, 0, bDtab.length);
         int* st = (int*)bSt.contents;
         std::memset(st, 0, 13 * 4);
         st[0] = start_pc & 0xFFFF;
@@ -105,9 +111,9 @@ struct Machine {
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:pso];
-        id<MTLBuffer> bufs[10] = {bP, bI, bF, bRam, bWr, bReg, bRegAny,
-                                  bSt, bIo, bTrace ? bTrace : bIo};
-        for (int i = 0; i < 10; ++i) [enc setBuffer:bufs[i] offset:0 atIndex:i];
+        id<MTLBuffer> bufs[11] = {bP, bI, bF, bRam, bWr, bReg, bRegAny,
+                                  bSt, bIo, bTrace ? bTrace : bIo, bDtab};
+        for (int i = 0; i < 11; ++i) [enc setBuffer:bufs[i] offset:0 atIndex:i];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [enc endEncoding];

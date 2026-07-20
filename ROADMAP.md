@@ -6,6 +6,42 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
+## 2026-07-19 metal v16 — memoized dispatch + license-shaped PGO
+shapes: 750K Klaus (1.3 µs) / ~391K nestest (2.6 µs)
+
+With forwards scalar, dispatch was ~3.7 of 4.5 µs per nestest forward
+(probe-5 anatomy: body only 464 ns/step).  Two rungs:
+
+- **Memoized dispatch.**  The single-entry window cache generalizes to
+  a full per-head table: dtab[2·pc] holds the last verified seqtab row
+  (+1) and a span write-epoch snapshot; 256 per-page epoch counters
+  bump on every committed RAM write.  A hit skips the candidate scan
+  and ALL byte re-verification (the epoch equality is the byte proof —
+  epochs only grow, no ABA); live guards (X/Y/S counters, P pins,
+  store-target) still re-evaluate every time, so it stays exact under
+  self-modifying code (the verify invalidation case covers it).
+  Klaus 711K → **749,856 steps/s (1.3 µs)**, t=32; 1.27x real-time.
+- **License-shaped shape proposer.**  propose_profile_shapes now emits
+  memory forms the shape license admits (first-step reads shadow-
+  checked, interior reads zero-page-bounded, zero-page stores, no
+  read-after-write), with per-shape fold arbitration downstream (0 of
+  64 rejected — the license model is accurate).  nestest 1.68 → 1.70
+  instr/fwd; a 128-shape probe reached 1.77 with FLAT throughput —
+  the static template-composition supply is exhausted, confirming
+  predicated regions as nestest's next multiplier.  Longest-first
+  same-head ordering measured WORSE tiling (long shapes strand their
+  tails); greedy gain order stands.
+
+nestest lands at ~391K (2.6 µs; the 23 ms bench is ±3% noisy), forward
+cost 4.3-4.5 µs.  CORRECTNESS: full 1M Klaus and full nestest
+lockstep-exact with memoization + lowering live; verify suite exact
+(incl. sequence-cache invalidation via epochs); ruff clean.
+
+Next: predicated control-flow regions (assessment item 2) — every
+cheaper-forward lever is now in; nestest needs regions that fold BOTH
+branch outcomes to raise 1.70 instr/fwd.  Then MMIO/PPU toward the
+whole-console kernel.
+
 ## 2026-07-19 metal v15 — lowering rung 3: whole forwards scalar,
 711K Klaus (1.4 µs) / 376K nestest (2.7 µs) — REAL-TIME CPU CROSSED
 
