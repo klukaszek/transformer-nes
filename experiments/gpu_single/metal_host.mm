@@ -66,7 +66,7 @@ struct Machine {
                                    options:MTLResourceStorageModeShared];
         bSt = [dev newBufferWithLength:13 * 4
                                options:MTLResourceStorageModeShared];
-        bIo = [dev newBufferWithLength:4 * 4
+        bIo = [dev newBufferWithLength:8 * 4
                                options:MTLResourceStorageModeShared];
         bTrace = nil;
     }
@@ -100,7 +100,7 @@ struct Machine {
         int* io = (int*)bIo.contents;
         io[0] = max_steps;
         io[1] = trace;
-        io[2] = io[3] = 0;
+        io[2] = io[3] = io[4] = io[5] = io[6] = 0;
 
         id<MTLCommandBuffer> cb = [queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -121,6 +121,9 @@ struct Machine {
         py::dict out;
         out["steps"] = io[2];
         out["halted"] = io[3];
+        out["forwards"] = io[4];
+        out["layers"] = io[5];
+        out["lowered_forwards"] = io[6];
         if (trace == 1) {
             py::array_t<int32_t> tr({(py::ssize_t)io[2], (py::ssize_t)22});
             std::memcpy(tr.mutable_data(), bTrace.contents,

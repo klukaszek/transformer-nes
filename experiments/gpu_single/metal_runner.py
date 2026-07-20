@@ -64,6 +64,17 @@ off: they measured slower than branch-final windows on Klaus.  Klaus's
 check-macro block packs into ~50 windows covering ~97% of its steps;
 threads=128 is the measured optimum for these wide window models.
 
+v13 adds STRUCTURAL LOWERING (scalargen.py): --lower N emits up to N
+routed model stacks (trace windows hottest-first, then sequence
+windows, canonical shapes, opcode experts) as scalar Metal expressions
+on lane 0 -- literal weight evaluation with liveness pruning, no stream
+walks and no per-layer barriers -- dispatched by a threadgroup-uniform
+switch on the route, interpreter retained as the fallback (and the
+union) and for the 6-8 attribution probes.  (Compiled row tiles were
+tried first and removed: 2026-07-19 ROADMAP entry -- per-term codegen
+recovers only ~7% because phase cost is device-load latency plus
+barriers, which lowering deletes outright.)
+
 Usage:
   uv run python experiments/gpu_single/metal_runner.py --verify
   uv run python experiments/gpu_single/metal_runner.py --bench 100000 [--threads 32]
@@ -93,6 +104,7 @@ from gpu_runner import (  # noqa: E402
     check_row,
     ref_machine,
 )
+from scalargen import emit_lowered  # noqa: E402
 
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS  # noqa: E402
 from transformer_nes.cpu6502.backends.weights.experts import (  # noqa: E402
@@ -104,6 +116,7 @@ from transformer_nes.cpu6502.backends.weights.experts import (  # noqa: E402
     head_row,
 )
 from transformer_nes.cpu6502.backends.weights.windows import (  # noqa: E402
+    BRANCH_OPERATIONS,
     STACK_OPERATIONS,
     match_shape_windows,
     propose_trace_window,
@@ -191,7 +204,102 @@ GPU_NESTEST_EXTRA_SHAPES = (
     ("nop3", bytes.fromhex("eaeaea"), 1),
     ("sta_zp_php", bytes.fromhex("850008"), 1),
 )
-GPU_NESTEST_SHAPES = GPU_SHAPE_LIBRARY + GPU_NESTEST_EXTRA_SHAPES
+GPU_NESTEST_SPEC_SHAPES = (
+    ("flags_bcs_beq_bpl_bvs_cmp_bne_rts",
+     bytes.fromhex("b000f00010007000c900d00060"), 1, True),
+    ("flags_bvc_bcc_bpl_cmp_bne_rts",
+     bytes.fromhex("500090001000c900d00060"), 1, True),
+    ("flags_bvc_beq_bmi_bcs_cmp_bne",
+     bytes.fromhex("5000f0003000b000c900d000"), 1, True),
+    ("flags_beq_bmi_bcs_cmp_bne_rts",
+     bytes.fromhex("f0003000b000c900d00060"), 1, True),
+    ("cmp_bne_cpx_bne_cpy_beq",
+     bytes.fromhex("c900d000e000d000c000f000"), 1, True),
+    ("cmp_bne_cpy_bne_cpx_bne",
+     bytes.fromhex("c900d000c000d000e000d000"), 1, True),
+    ("bcc_bne_bmi_bvc_cmp_bne",
+     bytes.fromhex("9000d00030005000c900d000"), 1, True),
+)
+GPU_NESTEST_SHAPES = (
+    GPU_NESTEST_SPEC_SHAPES + GPU_SHAPE_LIBRARY + GPU_NESTEST_EXTRA_SHAPES
+)
+
+
+def propose_profile_shapes(image: bytes, pcs, cap: int = 64):
+    """Select reusable straight-line opcode shapes from a low-PC-hit trace.
+
+    nestest deliberately visits thousands of distinct test PCs, so
+    address PGO sees no hot heads.  Opcode-normalized n-grams expose the
+    repeated test-macro grammar instead.  Interior relative branches use
+    the shape fold's exact prefix rollback; stack/control-transfer and
+    memory-addressing forms stay with the existing explicit libraries.
+    """
+    from collections import Counter, defaultdict
+
+    counts = Counter()
+    boundaries = defaultdict(set)
+    n_steps_of = {}
+    pcs = [int(pc) for pc in pcs]
+    for n_steps in range(4, 9):
+        for start in range(len(pcs) - n_steps + 1):
+            template = bytearray()
+            has_interior_branch = False
+            prev_pc = prev_len = None
+            for j in range(n_steps):
+                pc = pcs[start + j]
+                op = OPCODES.get(image[pc])
+                if (
+                    op is None
+                    or op.mode not in ("imm", "imp", "acc", "rel")
+                    or op.operation in STACK_OPERATIONS
+                    or op.operation in ("brk", "rts", "rti")
+                    or (
+                        prev_pc is not None
+                        and pc != (prev_pc + prev_len) & 0xFFFF
+                    )
+                ):
+                    break
+                has_interior_branch |= (
+                    j + 1 < n_steps
+                    and op.operation in BRANCH_OPERATIONS
+                )
+                template.extend([op.byte] + [0] * (op.length - 1))
+                prev_pc, prev_len = pc, op.length
+            else:
+                if has_interior_branch:
+                    key = bytes(template)
+                    counts[key] += 1
+                    boundaries[key].update(
+                        range(start + 1, start + n_steps)
+                    )
+                    n_steps_of[key] = n_steps
+
+    eligible = {
+        template: covered
+        for template, covered in boundaries.items()
+        if counts[template] >= 2
+    }
+    claimed = set()
+    selected = []
+    while eligible and len(selected) < cap:
+        template = max(
+            eligible,
+            key=lambda key: (
+                len(eligible[key] - claimed),
+                counts[key],
+                n_steps_of[key],
+                key,
+            ),
+        )
+        gain = len(eligible[template] - claimed)
+        if not gain:
+            break
+        selected.append((gain, counts[template], template))
+        claimed.update(eligible.pop(template))
+    return tuple(
+        (f"pgo_shape_{i}_{hits}", template, 1, True)
+        for i, (_gain, hits, template) in enumerate(selected)
+    )
 
 
 def stack_rows(rows):
@@ -232,6 +340,7 @@ class Stream:
             lane = loads.index(min(loads))
             lanes[lane].append((dst, cols, vals))
             loads[lane] += len(cols)
+
         for lane in lanes:
             self.seg.append(len(self.dst))
             for dst, cols, vals in lane:
@@ -301,7 +410,8 @@ def countdown_guard(head: int, code: bytes) -> int:
 
 
 def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
-                windows=(), shapes=(), shape_images=(), trace_windows=()):
+                windows=(), shapes=(), shape_images=(), trace_windows=(),
+                lower: int = 0):
     """Build the union model plus per-opcode experts and flatten everything
     into kernel buffers.  Layers of all models share the streams and layer
     table (indexed by global layer); each model gets a 12-int descriptor:
@@ -334,11 +444,19 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
         heads_val.extend(float(v) for v in vals)
         return co, vo, len(cols)
 
+    merged_layers = 0
+
     def pack_model(mdl, n_layers, label, state_slots, readout, shead, hhead,
-                   union_lookup_of=None):
+                   union_lookup_of=None, cap=None):
+        nonlocal merged_layers
         dm = mdl.tok.weight.shape[1]
         is_union = union_lookup_of is None
         lay0 = len(layer_tab)
+        if cap is not None:
+            cap["dm"] = dm
+            cap["readout"] = [int(s) for s in readout]
+            cap["shead"] = [int(c) for c in shead[0]]
+            cap["hhead"] = [int(c) for c in hhead[0]]
 
         def fused_rows(direct, extra):
             rows = []
@@ -368,19 +486,59 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
             pt_cols = [2 * h + c for h in pt for c in range(2)]
             ad = op[:, pt_cols] @ ip[[2 * dm + c for c in pt_cols]]
             lu_cols = [2 * h + c for h in lookup for c in range(2)]
-            astream.add_layer(fused_rows(ad, op[:, lu_cols] if lookup else None))
+            a_rows = fused_rows(ad, op[:, lu_cols] if lookup else None)
 
             fk = mdl.ffn_kinds[li]
             pt_j = [j for j in range(ffn) if fk[j] == 2]
             fd = fo[:, pt_j] @ fi[[ffn + j for j in pt_j]]
             live = [j for j in range(ffn) if fk[j] == 1 and fo[:, j].any()]
-            fstream.add_layer(fused_rows(fd, fo[:, live] if live else None))
+            f_rows = fused_rows(fd, fo[:, live] if live else None)
+            fstream.add_layer(f_rows)
+            # Gate/value acc slots live at xa[dm + slot].  A gate term
+            # v*xa[c] expands linearly through the attention row
+            # (xa[c] = x[c] + row_c . [x; ho]) into pre-attention reads,
+            # so the gate walk merges into the attention walk: one stream
+            # chain per layer instead of two (the measured wall is the
+            # serial load chain each walk restarts, not the barrier).
+            # License: short rows and dyadic-bounded products only -- the
+            # cap is the width policy that keeps ladder sums from
+            # smearing into every consumer.
             grows = []
             for jj, j in enumerate(live):
                 for dst, row in ((2 * jj, fi[j]), (2 * jj + 1, fi[ffn + j])):
                     nz = np.nonzero(row)[0]
-                    grows.append((dst, list(nz), list(row[nz])))
-            gstream.add_layer(grows)
+                    grows.append((dm + dst, list(nz), list(row[nz])))
+            a_row_of = {d: (cols, vals) for d, cols, vals in a_rows}
+
+            def expand_gates(grows=grows, a_row_of=a_row_of):
+                rows = []
+                for dst, cols, vals in grows:
+                    out_c, out_v = [], []
+                    for c, v in zip(cols, vals, strict=True):
+                        out_c.append(int(c))
+                        out_v.append(float(v))
+                        row = a_row_of.get(int(c))
+                        if row is None:
+                            continue
+                        if len(row[0]) > 8:
+                            return None
+                        for rc, rv in zip(*row, strict=True):
+                            p = float(v) * float(rv)
+                            if abs(p) > 65536 or 2 * p != round(2 * p):
+                                return None
+                            out_c.append(int(rc))
+                            out_v.append(p)
+                    rows.append((dst, out_c, out_v))
+                return rows
+
+            merged_rows = expand_gates()
+            if merged_rows is None:
+                astream.add_layer(a_rows)
+                gstream.add_layer(grows)
+            else:
+                astream.add_layer(a_rows + merged_rows)
+                gstream.add_layer([])
+                merged_layers += 1
 
             mem0, reg0 = len(mem_meta), len(reg_meta)
             lu_ids = mdl.head_lookup_ids[li]
@@ -404,11 +562,17 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                     if g == MEMORY_GROUP_FUSED and is_union:
                         raise RuntimeError(
                             f"{label} L{li} h{h}: fused reads are expert-only")
+                    # Constant-address reads (most window reads) skip the
+                    # kernel's query walk -- two dependent device-latency
+                    # hops on every lookup layer's critical path.
+                    qconst = (int(round(terms[0][0]))
+                              if len(terms) == 1
+                              and terms[0][1] == mdl.one_slot else -1)
                     mem_rows.append(([i for _c, i in terms],
                                      [c for c, _i in terms]))
                     mem_meta.append((-1 if g == MEMORY_GROUP_FUSED
                                      else g * 4096, 2 * pos,
-                                     2 * lu_head_count[lu_ids[h]]))
+                                     2 * lu_head_count[lu_ids[h]], qconst))
                     continue
                 rq = register_query(qx, qy, one_id=mdl.one_slot,
                                     latest=bool(mdl.head_tiebreak[li][h]))
@@ -474,6 +638,17 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                 nreg, *score_cols, gate_col,
                 value_base, pair_count, rid_base, ho_base,
             ])
+            if cap is not None:
+                cap["layers"].append({
+                    "li": len(layer_tab) - 1,
+                    "a": a_rows + (merged_rows or []),
+                    "g": grows if merged_rows is None else [],
+                    "f": f_rows,
+                    "mem": [(mem_meta[i], mem_rows[i])
+                            for i in range(mem0, len(mem_meta))],
+                    "nreg": nreg,
+                    "n_live": len(live),
+                })
 
         sc_, sv_, sn_ = add_head(shead)
         hc_, hv_, hn_ = add_head(hhead)
@@ -489,18 +664,32 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
         [readout_slots[n] for n in READOUT_ORDER],
         head_row(model, tok_to_idx["STATE"]), head_row(model, tok_to_idx["HALT"]))
 
+    # Lowering captures every routed (non-union) model; the caps return
+    # windows-first so the N budget stays hottest-first (see scalargen).
+    trace_caps, seq_caps, shape_caps, expert_caps = [], [], [], []
+
+    def low_cap(tier):
+        if not lower:
+            return None
+        cap = {"dm": 0, "layers": []}
+        tier.append(cap)
+        return cap
+
     optab = [0] * 256
     for e in build_opcode_experts(
         pg, sorted(expert_opcodes), inline_linear=True,
         structural_reads=True,
     ):
         spec = e["step_spec"]
+        cap = low_cap(expert_caps)
         optab[e["byte"]] = pack_model(
             e["model"], e["layers"], f"expert {e['name']}",
             spec_state_slots(spec),
             [spec["outputs"][n] for n in READOUT_ORDER],
             spec["state_head"], spec["halt_head"],
-            union_lookup_of=e["union_lookup_of"])
+            union_lookup_of=e["union_lookup_of"], cap=cap)
+        if cap is not None:
+            cap["mdesc"] = optab[e["byte"]]
 
     # Sequence windows: one forward retires the whole window.  The kernel
     # re-verifies the bytes at dispatch, so windows from any image are
@@ -534,13 +723,16 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                 continue
             spec = e["step_spec"]
             k = e["n_steps"]
+            cap = low_cap(seq_caps)
             mdesc = pack_model(
                 e["model"], e["layers"], e["name"],
                 spec_state_slots(spec),
                 [spec["step_outputs"][s][n]
                  for s in range(k) for n in READOUT_ORDER],
                 spec["state_head"], spec["halt_head"],
-                union_lookup_of=e["union_lookup_of"])
+                union_lookup_of=e["union_lookup_of"], cap=cap)
+            if cap is not None:
+                cap["mdesc"] = mdesc
             seqtab.append([
                 head, k, mdesc, len(e["window"]),
                 add_slots([
@@ -569,14 +761,17 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                 )
             spec = e["step_spec"]
             k = e["n_steps"]
+            cap = low_cap(shape_caps)
             shape_desc.append(pack_model(
                 e["model"], e["layers"], e["name"],
                 spec_state_slots(spec),
                 [spec["step_outputs"][s][n]
                  for s in range(k) for n in READOUT_ORDER],
                 spec["state_head"], spec["halt_head"],
-                union_lookup_of=e["union_lookup_of"],
+                union_lookup_of=e["union_lookup_of"], cap=cap,
             ))
+            if cap is not None:
+                cap["mdesc"] = shape_desc[-1]
             shape_checks.append(add_slots([
                 (int(offset) << 8) | int(byte)
                 for offset, byte in meta["sig"]
@@ -604,7 +799,13 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                 SEQ_GUARD_STORE_ABS if store_guard is not None
                 else SEQ_GUARD_NONE,
                 0 if store_guard is None else store_guard,
-                head, meta["length"], -1, 0,
+                head, meta["length"],
+                add_slots([
+                    -1 if off < 0 else head + off
+                    for off in e.get("spec_offsets", ())
+                ]) if any(off >= 0 for off in e.get("spec_offsets", ()))
+                else -1,
+                0,
             ])
             shape_matches += 1
 
@@ -630,13 +831,16 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
                 continue
         spec = e["step_spec"]
         k = e["n_steps"]
+        cap = low_cap(trace_caps)
         mdesc = pack_model(
             e["model"], e["layers"], e["name"],
             spec_state_slots(spec),
             [spec["step_outputs"][s][n]
              for s in range(k) for n in READOUT_ORDER],
             spec["state_head"], spec["halt_head"],
-            union_lookup_of=e["union_lookup_of"])
+            union_lookup_of=e["union_lookup_of"], cap=cap)
+        if cap is not None:
+            cap["mdesc"] = mdesc
         span_lo, span_hi = e["span"]
         spec_next = e["spec_next"]
         fp = e.get("flag_pins") or {}
@@ -668,7 +872,7 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
     assert all(list(vals) == [1.0] for _cols, vals in reg_grows)
 
     tables["layer_tab"] = np.array(layer_tab, dtype=np.int32)
-    tables["mem_meta"] = np.array(mem_meta, dtype=np.int32).reshape(-1, 3)
+    tables["mem_meta"] = np.array(mem_meta, dtype=np.int32).reshape(-1, 4)
     tables["reg_meta"] = np.array(reg_meta, dtype=np.int32).reshape(-1, 2)
     tables["slots_tab"] = np.array(slots_tab, dtype=np.int32)
     tables["heads_col"] = np.array(heads_col, dtype=np.int32)
@@ -704,8 +908,13 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
         "max_lookup": max(t[0] for t in layer_tab),
         "max_live": max(t[1] for t in layer_tab),
         "max_k": max((row[1] for row in seqtab), default=1),
+        "max_head": max(max(d[8], d[11]) for d in desc),
+        "merged_layers": merged_layers,
+        "total_layers": len(layer_tab),
     }
-    return tables, params
+    low_caps = [(cap["mdesc"], cap) for cap in
+                trace_caps + seq_caps + shape_caps + expert_caps]
+    return tables, params, low_caps
 
 
 def pack_buffers(tables, params, threads):
@@ -761,12 +970,19 @@ def pack_buffers(tables, params, threads):
         ioff["desc"], ioff["optab"], ioff["seqtab"], ioff["seqhead"],
     ], dtype=np.int32)
     simd = threads <= 32
+    tg_d = params["d_model"]
+    tg_live = max(params["max_live"], 1)
+    tg_ho = max(2 * params["max_lookup"], 1)
+    tg_reg = max(params["n_regs"], 1)
+    tg_out = 22 * max(params["max_k"], 1)
+    tg_head = max(params["max_head"], 1)
     defines = (
-        f"#define TG_D {params['d_model']}\n"
-        f"#define TG_LIVE {max(params['max_live'], 1)}\n"
-        f"#define TG_HO {max(2 * params['max_lookup'], 1)}\n"
-        f"#define TG_REG {max(params['n_regs'], 1)}\n"
-        f"#define TG_OUT {22 * max(params['max_k'], 1)}\n"
+        f"#define TG_D {tg_d}\n"
+        f"#define TG_LIVE {tg_live}\n"
+        f"#define TG_HO {tg_ho}\n"
+        f"#define TG_REG {tg_reg}\n"
+        f"#define TG_OUT {tg_out}\n"
+        f"#define TG_HEAD {tg_head}\n"
         f"#define SEQ_ROW {SEQ_ROW}\n"
         f"#define SEQ_GUARD_X {SEQ_GUARD_X}\n"
         f"#define SEQ_GUARD_Y {SEQ_GUARD_Y}\n"
@@ -820,16 +1036,20 @@ class MetalMachine:
 
     def __init__(self, threads: int = 32, expert_opcodes=(), windows=(),
                  bcd: bool = False, shapes=(), shape_images=(),
-                 trace_windows=()):
-        tables, params = pack_tables(
+                 trace_windows=(), lower: int = 0):
+        tables, params, low_caps = pack_tables(
             bcd=bcd, T=threads, expert_opcodes=expert_opcodes, windows=windows,
             shapes=shapes, shape_images=shape_images,
-            trace_windows=trace_windows,
+            trace_windows=trace_windows, lower=lower,
         )
         ibuf, fbuf, parr, defines = pack_buffers(tables, params, threads)
+        low_src = ""
+        if low_caps:
+            low_src, lstats = emit_lowered(low_caps[:lower], threads, params)
+            params.update(lstats)
         host = load_host()
         with open(os.path.join(HERE, "kernel.metal")) as f:
-            source = defines + f.read()
+            source = defines + low_src + f.read()
         self.native = host.Machine(source, ibuf, fbuf, parr, threads)
         if self.native.threads != threads:
             raise RuntimeError(
@@ -878,7 +1098,7 @@ def parse_experts(spec: str) -> tuple:
     return tuple(int(b, 16) for b in spec.split(","))
 
 
-def verify(threads: int, experts=()):
+def verify(threads: int, experts=(), lower: int = 0):
     from transformer_nes.cpu6502.backends.weights.runner import (
         VERIFY_START,
         verify_program,
@@ -901,7 +1121,11 @@ def verify(threads: int, experts=()):
     m = MetalMachine(
         threads, experts, windows, shapes=GPU_SHAPE_LIBRARY,
         shape_images=(image, bench_image(), invalidation_image),
+        lower=lower,
     )
+    if m.params.get("lowered"):
+        print(f"[metal t={threads}] verifying with "
+              f"{m.params['lowered']} lowered models live")
     m.boot_image(image, start_pc=VERIFY_START)
     res = m.run(40, trace=True)
     rows = m.trace_rows(res)
@@ -962,7 +1186,8 @@ def bench(n: int, threads: int, null_model: bool = False, experts=(),
 def bench_suite(name: str, n: int, threads: int, check: bool, experts=(),
                 windows=True, pgo_windows: int = 0,
                 pgo_min_hits: int = 512, shapes: bool = True,
-                trace_len: int = 10, spec_min: float = 2.0):
+                trace_len: int = 10, spec_min: float = 2.0,
+                replay_probe: int = 0, lower: int = 0):
     """Benchmark a conformance workload from boot on the megakernel."""
     if name == "nestest":
         from transformer_nes.cpu6502.examples.nestest import (
@@ -979,7 +1204,7 @@ def bench_suite(name: str, n: int, threads: int, check: bool, experts=(),
     else:
         raise ValueError(f"unknown suite {name!r}")
 
-    wins, traces = (), ()
+    wins, traces, profile_shapes = (), (), ()
     if pgo_windows:
         # Profile through the C++ weights engine (the reference machine is
         # for lockstep checks, not traces), then propose flow-following
@@ -1092,25 +1317,44 @@ def bench_suite(name: str, n: int, threads: int, check: bool, experts=(),
             proposed.append(expert)
             covered.update(pc for pc, _b in trunc)
         traces = tuple(proposed)
+        if name == "nestest":
+            profile_shapes = propose_profile_shapes(
+                image, pcs, cap=pgo_windows
+            )
+            print(
+                f"[metal {name}] PGO selected {len(profile_shapes)} "
+                "canonical opcode shapes"
+            )
+        lay = sorted(e["layers"] for e in proposed)
         print(
             f"[metal {name}] PGO built {len(traces)} trace windows, "
             f"{rejected} rejected (cap={pgo_windows}, "
-            f"min_hits={pgo_min_hits})"
+            f"min_hits={pgo_min_hits}); layers "
+            f"{lay[0] if lay else 0}-{lay[-1] if lay else 0} "
+            f"(median {lay[len(lay) // 2] if lay else 0}), "
+            f"steps {sorted(e['n_steps'] for e in proposed)[len(lay) // 2] if lay else 0} median"
         )
     elif windows and not shapes:
         # Canonical shapes supersede the cold static-loop scan. Concrete
         # models enter representative runs only through explicit PGO; the
         # old scan has no nestest/Klaus coverage win.
         wins = scan_sequence_windows(image)
-    suite_shapes = (
+    suite_shapes = profile_shapes + (
         GPU_NESTEST_SHAPES if name == "nestest" else GPU_SHAPE_LIBRARY
     )
     m = MetalMachine(
         threads, experts, wins, bcd=bcd,
         shapes=suite_shapes if shapes else (),
         shape_images=(image,) if shapes else (),
-        trace_windows=traces,
+        trace_windows=traces, lower=lower,
     )
+    if m.params.get("lowered"):
+        p = m.params
+        print(
+            f"[metal {name}] {p['lowered']} window models lowered to scalar "
+            f"({p['low_skipped']} skipped): {p['low_ops']} ops, "
+            f"{p['low_temps']} temps, {p['low_stores']} stores"
+        )
     if check:
         m.boot_image(image, start_pc=START_PC)
         res = m.run(n, trace=True)
@@ -1121,19 +1365,43 @@ def bench_suite(name: str, n: int, threads: int, check: bool, experts=(),
         print(f"[metal {name} t={threads}] {len(rows)} steps lockstep-exact")
 
     gpu_heat()
+    # A probe run pairs with an adjacent normal run (thermal rule: only
+    # adjacent runs compare); the delta is the replayed layer-stack cost.
+    base_dt = None
+    if replay_probe:
+        m.boot_image(image, start_pc=START_PC)
+        t0 = time.perf_counter()
+        base_steps = int(m.run(n)["steps"])
+        base_dt = time.perf_counter() - t0
+        print(f"[metal {name} t={threads}] paired base: {base_steps} steps "
+              f"in {base_dt:.3f}s = {base_steps / base_dt:,.0f} steps/s")
     m.boot_image(image, start_pc=START_PC)
     t0 = time.perf_counter()
-    res = m.run(n)
+    res = m.native.run(n, replay_probe) if replay_probe else m.run(n)
     dt = time.perf_counter() - t0
     steps = int(res["steps"])
+    if base_dt is not None:
+        print(f"[metal {name} t={threads}] probe {replay_probe} delta: "
+              f"{(dt - base_dt) / steps * 1e9:.0f} ns/step replayed "
+              f"layer stack")
+    fwds = int(res.get("forwards", 0)) or 1
+    lays = int(res.get("layers", 0))
     print(
         f"[metal {name} t={threads}] {steps} steps in {dt:.3f}s = "
         f"{steps / dt:,.0f} steps/s ({dt / steps * 1e6:.1f} us/step); "
+        f"{fwds} forwards ({steps / fwds:.2f} instr/fwd, "
+        f"{dt / fwds * 1e6:.1f} us/fwd, {lays / fwds:.1f} layers/fwd); "
         f"{m.params['n_seq']} windows packed, "
         f"{m.params['shape_matches']} shape matches, "
         f"{m.params['trace_packed']} trace windows, "
-        f"{m.params['skipped_seq']} rejected"
+        f"{m.params['skipped_seq']} rejected; "
+        f"{m.params['merged_layers']}/{m.params['total_layers']} "
+        f"gate-merged layers"
     )
+    if m.params.get("lowered"):
+        lf = int(res.get("lowered_forwards", 0))
+        print(f"[metal {name} t={threads}] lowered coverage: {lf}/{fwds} "
+              f"forwards ({lf / fwds:.1%})")
 
 
 def main():
@@ -1148,13 +1416,22 @@ def main():
                    help="profile this suite and pin up to N hot prefixes")
     p.add_argument("--pgo-min-hits", type=int, default=512,
                    help="minimum profile executions for a pinned prefix")
-    p.add_argument("--trace-len", type=int, default=10,
+    p.add_argument("--trace-len", type=int, default=16,
                    help="max instructions per proposed trace window")
     p.add_argument("--spec-min", type=float, default=2.0,
                    help="min profiled fall-through rate to speculate past "
                         "a branch (default > 1: branch-final windows; "
                         "measured better on Klaus)")
     p.add_argument("--null-model", action="store_true")
+    p.add_argument("--replay-probe", type=int, default=0,
+                   help="5: run each forward's layer stack twice (results "
+                        "discarded) -- the adjacent delta isolates layer "
+                        "cost; 6: replay without lookups; 7: replay without "
+                        "stream walks (deltas vs 5 attribute the layer cost)")
+    p.add_argument("--lower", type=int, default=0,
+                   help="lower up to N routed models to generated scalar "
+                        "Metal: trace windows hottest-first, then sequence "
+                        "windows, canonical shapes, opcode experts")
     p.add_argument("--experts", default="all",
                    help="all | none | comma-separated opcode hex bytes")
     p.add_argument("--no-windows", action="store_true")
@@ -1162,7 +1439,7 @@ def main():
     args = p.parse_args()
     experts = parse_experts(args.experts)
     if args.verify:
-        verify(args.threads, experts)
+        verify(args.threads, experts, lower=args.lower)
     if args.bench:
         if args.suite == "micro":
             bench(args.bench, args.threads, args.null_model, experts,
@@ -1174,7 +1451,9 @@ def main():
                         pgo_min_hits=args.pgo_min_hits,
                         shapes=not args.no_shapes,
                         trace_len=args.trace_len,
-                        spec_min=args.spec_min)
+                        spec_min=args.spec_min,
+                        replay_probe=args.replay_probe,
+                        lower=args.lower)
 
 
 if __name__ == "__main__":

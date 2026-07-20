@@ -6,6 +6,129 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
+## 2026-07-19 metal v14 — lowering rung 2: every routed tier scalar,
+570.7K Klaus (1.8 µs) / 275.7K nestest (3.6 µs), 100% coverage
+
+Rung 1's capture generalizes to every pack_model call, so `--lower N`
+now lowers trace windows (hottest-first), sequence windows, canonical
+shapes, and opcode experts; only the union stays interpreter-only.
+Both suites route 100.0% of forwards through scalar bodies — nestest
+has zero trace windows, and this is the first rung that reaches its
+shape/expert mix at all.
+
+- Klaus 1M, t=128: **570,703 steps/s (1.8 µs/instruction)**, full
+  trace lockstep-exact, 298 models lowered (120,879 ops).  Ladder:
+  t=32 546K, t=64 563K, t=128 optimal.  1.81x v15, 1.20x rung 1;
+  real-time NES (~592K) is 4% away.
+- Nestest 8,991 steps, t=128: **275,666 steps/s (3.6 µs)**, lockstep-
+  exact, 336 models lowered — **1.91x v15's 144.5K** with zero new
+  composition: the same 1.68 instr/fwd, each forward just costs less.
+- Replayed layer stack (paired probe, t=128): 456 ns/step, vs 866
+  (rung 1) and 1875 (interpreter) — a 75.7% total cut.  The adjacent
+  paired base measured 574.5K.
+- Verify suite runs lockstep-exact with 257 lowered models live
+  (`--verify --lower 512`); whole build ~15 s including Metal compile
+  of ~173K-op generated source; suite 86 green; ruff clean.
+
+The cost anatomy has flipped: with stacks at 456 ns/step, the
+per-forward FIXED floor (dispatch scan, TG_D zeroing + embed wave,
+readout gather, commit) is ~5.3 µs of every 7.2 µs forward.  Rung 3 is
+whole-forward lowering: a lowered route needs no threadgroup residual
+at all — lane 0 can read stg[] directly, skip the zero/embed wave,
+compute the readout and head sums scalar, and write outk straight from
+expressions.  Liveness already knows the embed slots; non-embed leaves
+are exact zeros.  That collapses the remaining barriers per forward to
+~1 and attacks both suites equally (nestest's 6.1 µs/fwd is nearly all
+floor).  After that: predicated regions (assessment item 2) to raise
+nestest's 1.68 instr/fwd.
+
+## 2026-07-19 metal v13b — structural lowering rung 1: window stacks as
+scalar Metal, 474K Klaus (2.1 µs), gate passed at 53.8%
+
+Item 3 of the post-v15 assessment, in its trivial-recognizer form: a
+v14+ trace-window model has no register rows and only fused/constant
+reads, so its ENTIRE layer stack is already an exact scalar program —
+every residual slot a dyadic-linear expression, every FFN unit a ReGLU
+of two, every read a guarded ram[] load.  scalargen.py emits that
+program as straight-line expressions (literal weight evaluation,
+identical numbers; dyadic exactness licenses the reordering) executed
+by lane 0 behind the same uniform route switch, with liveness pruned
+backward from the readout and head slots.  No stream walks, no
+per-layer barriers, no tables — the two costs the tile experiment
+proved dominant simply do not exist on the lowered path.
+`--lower-windows N`; interpreter remains the fallback and serves the
+6-8 attribution probes.  The row-tile backend was removed the same day
+(dead surface); its paired-probe harness and the io[6] coverage counter
+stay.
+
+Measured on 1M Klaus, 49 windows, 83.1% forward coverage:
+
+- Replayed layer stack (probe-5 adjacent pairs, t=256): 1875 → 866
+  ns/step — a 53.8% cut, PASSING the pre-registered ≥40% gate.
+- End-to-end: 341K → 469K steps/s adjacent at t=256; thread ladder
+  moved DOWN as predicted for serial bodies: **t=128 474,067 steps/s
+  (2.1 µs/instruction)**, t=64 465K, t=256 ~464-469K.  1.50x v15's
+  315.7K; real-time NES (~592K) is now 1.25x away.
+- Lowered bodies: 29,026 ops / 11,790 temps / 4,018 stores across 49
+  models (~600 ops per lowered forward, ~590 avg terms — liveness
+  keeps roughly everything because a 22·k readout consumes the width).
+
+CORRECTNESS: full 1M Klaus lockstep-exact with all 49 windows lowered
+(t=256), and the deeper dev-config windows (median 5 layers, t=32)
+lockstep-exact; `--verify` green; ruff clean.
+
+Next rungs, in order: (1) lower shape models and opcode experts the
+same way — nestest routes EVERYTHING through those tiers (zero trace
+windows) and still pays 6.9 µs; (2) whole-forward lowering — with the
+stack scalar, the ~1.6 µs dispatch/embed/readout floor around it is
+the next largest term; (3) GPU-aware scheduling (item 4) matters only
+for what stays on the interpreter.
+
+## 2026-07-19 metal v13 — compiled row tiles: NEGATIVE result, the
+sparse walk is a latency/barrier floor, not interpreter overhead
+
+Experiment 1 from the post-v15 assessment: generate straight-line Metal
+for the hottest trace-window models (`--compile-tiles N`, tilegen.py) —
+homogeneous unrolled rounds over constant-memory term tables, uniform
+coefficients folded to immediates, no seg loads / packed decode / tail
+branches, dispatched by a uniform route switch with the interpreter as
+fallback.  Hard gate pre-registered: ≥40% reduction in replayed
+layer-stack time (probe-5 paired delta; `--replay-probe` now runs its
+own adjacent base for the thermal rule, and the kernel counts
+tile-routed forwards in io[6]).
+
+Measured on 1M Klaus, 49 PGO windows:
+
+- t=256, top-4 tiles: 1.9% forward coverage — the window hit
+  distribution is FLAT (hottest head ~4.7K of 244K forwards); a
+  "hottest four" prototype cannot move the total.
+- t=256, all 49 tiles: 83.1% coverage, but base REGRESSED 342K → 291K
+  steps/s.  The [round][lane] tables are 96% padding at t=256 (4.2 MB
+  vs the interpreter's 225 KB packed stream) and every cold forward
+  pays the constant-cache misses; the warm replay hides them.
+- t=128, all 49 tiles (fair pair): replayed layer stack 1874 → 1738
+  ns/step = 7.3% warm reduction; base 340K → 334K (net loss).
+
+Verdict: gate FAILED by 5x on the favorable metric.  Eliminating the
+interpreter machinery (decode, seg bounds, loops, tails) is worth ~7%
+because at t=128-256 each lane walks only 1-2 terms per phase: the
+phase cost is one unhidden device-load latency plus the barrier wave —
+a floor ANY term-table executor pays.  The 1.46 µs sparse-walk share is
+memory latency and barrier structure, not instruction overhead, so
+per-term codegen variants (packing, encodings, arity buckets) are a
+dead end at these widths.  Per the pre-registered decision rule the
+next lever is STRUCTURAL CIRCUIT LOWERING (recognize wrap/compare/mux/
+flag-assembly subgraphs, execute fused integer ops, prove slot-by-slot
+equivalence), which removes rounds and barriers instead of decorating
+them.  Fewer, wider layers (GPU-aware scheduling) attacks the same
+floor.
+
+CORRECTNESS: full 1M Klaus lockstep-exact WITH 49 tiles live at t=256;
+`--verify` green; default build identical (tiles are opt-in); ruff
+clean.  The tile backend was removed the same day once the verdict was
+in (see v13b above); the paired probe and io[6] coverage counter stay
+as measurement infrastructure.
+
 ## 2026-07-18 construction v15 — flag-circuit flattening + constant-side
 multiply fold, 315.7K Klaus (3.2 µs) / 144.5K nestest
 

@@ -23,6 +23,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
+inline float reglu_at(threadgroup const float* v, int base) {
+    const float g = v[base];
+    return g > 0.0f ? g * v[base + 1] : 0.0f;
+}
+
 inline float csr_dot(device const int* cols, device const float* vals,
                      int b, int e, threadgroup const float* v) {
     float a = 0.0f;
@@ -35,7 +40,8 @@ struct Trip4 {
     float v0, v1, v2, v3;
 };
 
-inline Trip4 load4(device const int* TR, int t) {
+template <typename PTR>
+inline Trip4 load4(PTR TR, int t) {
     Trip4 b;
     const uint p0 = as_type<uint>(TR[2 * t]);
     const uint p1 = as_type<uint>(TR[2 * t + 2]);
@@ -64,20 +70,55 @@ inline Trip4 load4(device const int* TR, int t) {
 // load until first use).  Inside the walk, batch n+1's loads issue
 // before batch n applies -- the load->use stall pays once per phase at
 // most, not once per batch.
+// The <=3-term tail is branchless load-then-apply: thin expert layers
+// put 1-3 terms on a lane, so the old per-term loop was 1-3 SERIAL
+// device stalls per walk (a stalled apply blocks the next load's issue
+// on an in-order core).  Clamped indices make the extra loads harmless
+// duplicates.  probe8 (replay only): pin every trip load to the segment
+// head -- apply work runs but the streaming loads collapse to one warm
+// line, attributing walk cost to loads vs apply.
 #define STREAM_PHASE(TR, NZ, T0, E, DST, SRC)                              \
     if (NZ) {                                                              \
         int t = (T0);                                                      \
         for (; t + 4 <= (E); t += 4) {                                     \
-            const Trip4 b = load4((TR), t);                                \
+            const Trip4 b = load4((TR), probe8 ? (T0) : t);                \
             STREAM_APPLY(b, DST, SRC)                                      \
         }                                                                  \
-        for (; t < (E); ++t) {                                             \
-            const uint p = as_type<uint>((TR)[2 * t]);                      \
-            const int d = int(p >> 16), c = int(p & 0xffffu);              \
-            DST[d] += as_type<float>((TR)[2 * t + 1]) * SRC(c);            \
+        const int rem = (E) - t;                                           \
+        if (rem > 0) {                                                     \
+            const int ta = probe8 ? (T0) : t;                              \
+            const int tb = probe8 ? (T0) : t + (rem > 1);                  \
+            const int tc = probe8 ? (T0) : t + 2 * (rem > 2);              \
+            const uint pa = as_type<uint>((TR)[2 * ta]);                   \
+            const float va = as_type<float>((TR)[2 * ta + 1]);             \
+            const uint pb = as_type<uint>((TR)[2 * tb]);                   \
+            const float vb = as_type<float>((TR)[2 * tb + 1]);             \
+            const uint pc = as_type<uint>((TR)[2 * tc]);                   \
+            const float vc = as_type<float>((TR)[2 * tc + 1]);             \
+            DST[int(pa >> 16)] += va * SRC(int(pa & 0xffffu));             \
+            if (rem > 1)                                                   \
+                DST[int(pb >> 16)] += vb * SRC(int(pb & 0xffffu));         \
+            if (rem > 2)                                                   \
+                DST[int(pc >> 16)] += vc * SRC(int(pc & 0xffffu));         \
         }                                                                  \
         BARRIER();                                                         \
     }
+
+// Branch-free parallel STATE embed: value i is (stg[src] >> sh) & msk
+// (src -1 is the constant 1.0 for is_state).  A switch on tid would
+// serialize under SIMT; this is one uniform round per lane.
+constant int ESRC[31] = {0, 0, 1, 2, 3, 4,
+                         5, 5, 5, 5, 5, 5, 5, 5,
+                         6, 7, 8, 9, 9, 10, 11, 12, -1,
+                         1, 1, 1, 1, 1, 1, 1, 1};
+constant int ESH[31] = {0, 8, 0, 0, 0, 0,
+                        0, 1, 2, 3, 4, 5, 6, 7,
+                        0, 0, 0, 0, 8, 0, 0, 0, 0,
+                        7, 6, 5, 4, 3, 2, 1, 0};
+constant int EMSK[31] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                         1, 1, 1, 1, 1, 1, 1, 1,
+                         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0,
+                         1, 1, 1, 1, 1, 1, 1, 1};
 
 kernel void run6502(
     constant int* P              [[buffer(0)]],
@@ -93,18 +134,26 @@ kernel void run6502(
     uint tid [[thread_position_in_threadgroup]],
     uint T   [[threads_per_threadgroup]])
 {
+    // xa carries the layer's gate/value accumulators at xa[D + slot]:
+    // merged layers stream them beside the attention adds, and the FFN
+    // walk applies ReGLU at the read site (no act phase).
     threadgroup float x[TG_D];
-    threadgroup float xa[TG_D];
-    threadgroup float acc[2 * TG_LIVE];
-    threadgroup float act[TG_LIVE];
+    threadgroup float xa[TG_D + 2 * TG_LIVE];
     threadgroup float ho[TG_HO];
     threadgroup float rs[TG_REG];
     threadgroup float rv[2 * TG_REG];
     threadgroup float outk[TG_OUT];
+    threadgroup float hstage[2 * TG_HEAD];
     threadgroup int rany[TG_REG];
     threadgroup int halted_tg;
     threadgroup int e_tg;
     threadgroup int k_tg;
+    threadgroup int found_tg;
+    threadgroup int chk_tg;
+    // Machine state lives in threadgroup memory for the whole dispatch:
+    // its device round trips were unhidden-latency landmarks on every
+    // forward's dispatch/embed/commit path.
+    threadgroup int stg[13];
 
     const int NREG = P[3];
     for (int r = tid; r < NREG; r += T) {
@@ -113,11 +162,15 @@ kernel void run6502(
         rv[2 * r + 1] = regstate[3 * r + 2];
         rany[r] = regany[r];
     }
+    for (int i = tid; i < 13; i += T) stg[i] = st[i];
     if (tid == 0) halted_tg = 0;
     BARRIER();
 
     const int max_steps = io[0], do_trace = io[1];
     int step = 0;
+    int fwds = 0;
+    int lays = 0;
+    int low_fwds = 0;
     int seq_cache = -1;
     int seq_head = 0, seq_k = 0, seq_e = 0, seq_len = 0;
     int seq_guard = 0, seq_guard_min = 0;
@@ -125,28 +178,36 @@ kernel void run6502(
     int seq_spec = -1, cur_spec = -1;
     int seq_pguard = 0;
     while (step < max_steps) {
-        // ── dispatch + STATE embed ──
+        // ── dispatch + STATE embed.  Sequence windows first (pc == head,
+        // bytes re-verified from RAM, whole window inside the step
+        // budget): one forward retires K instructions.  Else the routed
+        // opcode expert: fetched byte == the graph's memory read at pc
+        // (unwritten reads mask to 0).  NMI runs the union.  EVERY lane
+        // runs the fetch chain eagerly (uniform loads) while lane 0
+        // checks the cached window: the common no-candidate path costs
+        // ONE barrier and no lane-0 serial chain. ──
         for (int i = tid; i < TG_D; i += T) x[i] = 0.0f;
+        const int pc = stg[0];
+        int e_op = 0, scan_cand = 0;
+        if (stg[12] == 0) {
+            const int opc = (wr[pc] != 0.0f) ? (int)ram[pc] : 0;
+            e_op = (I + P[16])[opc];
+            scan_cand = P[2] ? (I + P[18])[pc] : 0;
+        }
+        cur_spec = -1;
         if (tid == 0) {
-            // Sequence windows first (pc == head, bytes re-verified from
-            // RAM, whole window inside the step budget): one forward
-            // retires K instructions.  Else the routed opcode expert:
-            // fetched byte == the graph's memory read at pc (unwritten
-            // reads mask to 0).  NMI runs the union.
-            const int pc = st[0];
             int e = 0, k = 1, found = 0;
-            cur_spec = -1;
-            if (st[12] == 0) {
+            if (stg[12] == 0) {
                 if (seq_cache >= 0 && seq_head != pc)
                     seq_cache = -1;
                 const int cached_counter =
-                    seq_guard == SEQ_GUARD_X ? st[2]
-                    : (seq_guard == SEQ_GUARD_Y ? st[3] : 0);
+                    seq_guard == SEQ_GUARD_X ? stg[2]
+                    : (seq_guard == SEQ_GUARD_Y ? stg[3] : 0);
                 bool cached_guard_ok = seq_guard == 0
                     || cached_counter == 0 || cached_counter >= seq_guard_min;
                 if (seq_guard == SEQ_GUARD_S)
-                    cached_guard_ok = st[4] == seq_guard_min;
-                if (seq_pguard && (st[5] & (seq_pguard >> 8))
+                    cached_guard_ok = stg[4] == seq_guard_min;
+                if (seq_pguard && (stg[5] & (seq_pguard >> 8))
                         != (seq_pguard & 0xFF))
                     cached_guard_ok = false;
                 if (seq_guard == SEQ_GUARD_STORE_ABS) {
@@ -166,100 +227,97 @@ kernel void run6502(
                     cur_spec = seq_spec;
                     found = 1;
                 }
-                if (!found && P[2]) {
-                    const int hr = (I + P[18])[pc];
-                    const int sb = (hr >> 8) - 1;
-                    const int se = sb + (hr & 0xFF);
-                    for (int s = sb; !found && s < se; ++s) {
-                        device const int* SQ = I + P[17] + SEQ_ROW * s;
-                        if (step + SQ[1] > max_steps) continue;
-                        const int counter =
-                            SQ[6] == SEQ_GUARD_X ? st[2]
-                            : (SQ[6] == SEQ_GUARD_Y ? st[3] : 0);
-                        bool guard_ok = SQ[6] == 0
-                            || counter == 0 || counter >= SQ[7];
-                        if (SQ[6] == SEQ_GUARD_S)
-                            guard_ok = st[4] == SQ[7];
-                        if (SQ[6] == SEQ_GUARD_STORE_ABS) {
-                            const int alo = pc + SQ[7];
-                            const int lo = wr[alo] != 0.0f
-                                ? (int)ram[alo] : 0;
-                            const int hi = wr[alo + 1] != 0.0f
-                                ? (int)ram[alo + 1] : 0;
-                            const int target = lo | (hi << 8);
-                            guard_ok = target < 0x2000
-                                && (target < pc || target >= pc + SQ[3]);
-                        }
-                        if (!guard_ok)
-                            continue;
-                        if (SQ[11] && (st[5] & (SQ[11] >> 8))
-                                != (SQ[11] & 0xFF))
-                            continue;
-                        device const int* wb = I + SQ[4];
-                        bool ok = true;
-                        for (int j = 0; j < SQ[5]; ++j) {
-                            const int check = wb[j];
-                            const int a = (pc + (check >> 8)) & 0xFFFF;
-                            const int b = wr[a] != 0.0f
-                                ? (int)ram[a] : 0;
-                            if (b != (check & 0xFF)) {
-                                ok = false; break;
-                            }
-                        }
-                        if (ok) {
-                            e = SQ[2];
-                            k = SQ[1];
-                            found = 1;
-                            seq_cache = s;
-                            seq_head = SQ[0];
-                            seq_k = SQ[1];
-                            seq_e = SQ[2];
-                            seq_len = SQ[3];
-                            seq_guard = SQ[6];
-                            seq_guard_min = SQ[7];
-                            seq_span_lo = SQ[8];
-                            seq_span_len = SQ[9];
-                            seq_spec = SQ[10];
-                            cur_spec = SQ[10];
-                            seq_pguard = SQ[11];
-                        }
-                    }
-                }
-                if (!found) {
-                    const int opc = (wr[pc] != 0.0f) ? (int)ram[pc] : 0;
-                    e = (I + P[16])[opc];
-                }
+            } else {
+                found = 1;  // NMI runs the union (e = 0, k = 1)
             }
             e_tg = e;
             k_tg = k;
+            found_tg = found;
         }
         BARRIER();
-        device const int* XD = I + P[15] + 12 * e_tg;
+        int e_route = e_op, k_route = 1;
+        if (found_tg) {
+            e_route = e_tg;
+            k_route = k_tg;
+        } else if (scan_cand) {
+            // Cold-path candidate scan, uniform on ALL lanes: guards
+            // recompute redundantly from uniform device/state reads, and
+            // the byte checks -- the measured dispatch wall as serial
+            // lane-0 load chains -- split across lanes (chk_tg reduces).
+            // All control flow here is uniform, so barriers are legal.
+            int found = 0;
+            {
+                const int sb = (scan_cand >> 8) - 1;
+                const int se = sb + (scan_cand & 0xFF);
+                for (int s = sb; !found && s < se; ++s) {
+                    device const int* SQ = I + P[17] + SEQ_ROW * s;
+                    if (step + SQ[1] > max_steps) continue;
+                    const int counter =
+                        SQ[6] == SEQ_GUARD_X ? stg[2]
+                        : (SQ[6] == SEQ_GUARD_Y ? stg[3] : 0);
+                    bool guard_ok = SQ[6] == 0
+                        || counter == 0 || counter >= SQ[7];
+                    if (SQ[6] == SEQ_GUARD_S)
+                        guard_ok = stg[4] == SQ[7];
+                    if (SQ[6] == SEQ_GUARD_STORE_ABS) {
+                        const int alo = pc + SQ[7];
+                        const int lo = wr[alo] != 0.0f
+                            ? (int)ram[alo] : 0;
+                        const int hi = wr[alo + 1] != 0.0f
+                            ? (int)ram[alo + 1] : 0;
+                        const int target = lo | (hi << 8);
+                        guard_ok = target < 0x2000
+                            && (target < pc || target >= pc + SQ[3]);
+                    }
+                    if (guard_ok && SQ[11] && (stg[5] & (SQ[11] >> 8))
+                            != (SQ[11] & 0xFF))
+                        guard_ok = false;
+                    if (!guard_ok)
+                        continue;
+                    if (tid == 0) chk_tg = 0;
+                    BARRIER();
+                    device const int* wb = I + SQ[4];
+                    bool myok = true;
+                    for (int j = tid; j < SQ[5]; j += T) {
+                        const int check = wb[j];
+                        const int a = (pc + (check >> 8)) & 0xFFFF;
+                        const int b = wr[a] != 0.0f ? (int)ram[a] : 0;
+                        if (b != (check & 0xFF)) myok = false;
+                    }
+                    if (!myok) chk_tg = 1;
+                    BARRIER();
+                    if (chk_tg) continue;
+                    found = 1;
+                    cur_spec = SQ[10];
+                    e_route = SQ[2];
+                    k_route = SQ[1];
+                    if (tid == 0) {
+                        seq_cache = s;
+                        seq_head = SQ[0];
+                        seq_k = SQ[1];
+                        seq_e = SQ[2];
+                        seq_len = SQ[3];
+                        seq_guard = SQ[6];
+                        seq_guard_min = SQ[7];
+                        seq_span_lo = SQ[8];
+                        seq_span_len = SQ[9];
+                        seq_spec = SQ[10];
+                        seq_pguard = SQ[11];
+                    }
+                }
+            }
+        }
+        device const int* XD = I + P[15] + 12 * e_route;
         const int lay0 = XD[0], NL = XD[1], D = XD[2];
 
-        if (tid == 0) {
-            const int pc = st[0], a = st[1], xr = st[2], y = st[3];
-            const int sp = st[4], p = st[5], ir = st[6], oplo = st[7];
-            const int ophi = st[8], ea = st[9], data = st[10];
-            const int hl = st[11], nmi = st[12];
-            device const int* SL = I + XD[4];
-            const float vals[31] = {
-                (float)(pc & 0xFF), (float)((pc >> 8) & 0xFF),
-                (float)a, (float)xr, (float)y, (float)sp,
-                (float)(p & 1), (float)((p >> 1) & 1), (float)((p >> 2) & 1),
-                (float)((p >> 3) & 1), (float)((p >> 4) & 1),
-                (float)((p >> 5) & 1), (float)((p >> 6) & 1),
-                (float)((p >> 7) & 1),
-                (float)ir, (float)oplo, (float)ophi,
-                (float)(ea & 0xFF), (float)((ea >> 8) & 0xFF),
-                (float)data, (float)hl, (float)nmi, 1.0f,
-                // Served A bits, MSB first: state carries its own bits.
-                (float)((a >> 7) & 1), (float)((a >> 6) & 1),
-                (float)((a >> 5) & 1), (float)((a >> 4) & 1),
-                (float)((a >> 3) & 1), (float)((a >> 2) & 1),
-                (float)((a >> 1) & 1), (float)(a & 1)};
-            for (int i = 0; i < 31; ++i) x[SL[i]] = vals[i];
-            x[XD[3]] = 1.0f;
+        // Embed on ALL lanes (the 31 SL loads were a serial lane-0
+        // device chain): one branch-free table round per lane.
+        if (tid < 31) {
+            const int s = ESRC[tid];
+            const float v = s < 0
+                ? 1.0f : (float)((stg[s] >> ESH[tid]) & EMSK[tid]);
+            x[(I + XD[4])[tid]] = v;
+            if (tid == 0) x[XD[3]] = 1.0f;
         }
         BARRIER();
 
@@ -268,8 +326,33 @@ kernel void run6502(
             BARRIER(); BARRIER(); BARRIER();
             BARRIER(); BARRIER(); BARRIER();
         }
-        // ── layers (the routed model's range) ──
-        for (int li = lay0; li < (do_trace >= 2 ? lay0 : lay0 + NL); ++li) {
+        // ── layers (the routed model's range).  Probes 5-7 replay the
+        // stack once more AFTER the gather (results discarded, real
+        // trajectory kept): the adjacent bench delta isolates pure
+        // layer-stack cost.  6 skips lookups on the replay, 7 skips the
+        // stream walks -- deltas vs 5 attribute the layer cost. ──
+        for (int pass = 0; ; ++pass) {
+        const int skip_lu = pass && do_trace == 6;
+        const int skip_walk = pass && do_trace == 7;
+        const int probe8 = pass && do_trace == 8;
+#ifdef LOWERED_MODELS
+        // Lowered routes (scalargen.py): the whole layer stack as scalar
+        // expressions on lane 0 -- no walks, no per-layer barriers.  The
+        // route is uniform, so the branch and the join barrier are too.
+        // Probes 2-4 skip layers; replays stay lowered only for probe 5
+        // (6-8 attribute the interpreter's stream walks and fall back).
+        if (lowered_model_of(e_route) >= 0
+                && !(do_trace >= 2 && do_trace < 5)
+                && (pass == 0 || do_trace == 5)) {
+            if (pass == 0) low_fwds += 1;
+            if (tid == 0)
+                lowered_stack(lowered_model_of(e_route), x, ram, wr);
+            BARRIER();
+        } else
+#endif
+        for (int li = lay0;
+             li < (do_trace >= 2 && do_trace < 5 ? lay0 : lay0 + NL);
+             ++li) {
             device const int* LT = I + P[13] + 12 * li;
             const int n_lookup = LT[0], n_live = LT[1];
             const int mem0 = LT[2], nmem = LT[3], nreg = LT[4];
@@ -289,16 +372,21 @@ kernel void run6502(
             device const int* TRG = I + P[8];
             device const int* TRF = I + P[6];
 
-            // phase A: xa = x; lookups fill every ho slot from x.
+            // phase A: xa = x, acc slots zeroed; lookups fill ho from x.
             for (int i = tid; i < D; i += T) xa[i] = x[i];
-            if (n_lookup) {
+            for (int i = tid; i < 2 * n_live; i += T) xa[D + i] = 0.0f;
+            if (n_lookup && !skip_lu) {
                 for (int mi = tid; mi < nmem; mi += T) {
                     const int row = mem0 + mi;
-                    device const int* mp = I + P[10];
-                    const float q = csr_dot(I + P[11], F + P[12],
-                                            mp[row], mp[row + 1], x);
-                    device const int* MM = I + P[14] + 3 * row;
-                    const int qi = (int)rint(q);
+                    device const int* MM = I + P[14] + 4 * row;
+                    // MM[3] >= 0: constant-address read, no query walk.
+                    int qi = MM[3];
+                    if (qi < 0) {
+                        device const int* mp = I + P[10];
+                        const float q = csr_dot(I + P[11], F + P[12],
+                                                mp[row], mp[row + 1], x);
+                        qi = (int)rint(q);
+                    }
                     const int base = MM[0];
                     // base -1: fused 64K-span read (expert folds) -- qi IS
                     // the address; else the union's 4K group dispatch.
@@ -339,95 +427,98 @@ kernel void run6502(
 
             // phase B: attention adds.
 #define SRC_ATTN(c) ((c) < D ? x[(c)] : ho[(c) - D])
-            STREAM_PHASE(TRA, a_nz, a_t0, a_e, xa, SRC_ATTN)
+            STREAM_PHASE(TRA, a_nz && !skip_walk, a_t0, a_e, xa, SRC_ATTN)
 
-            // phase C: x = xa; ReGLU gate/value accumulate, combine.
+            // phase C: x = xa.  An unmerged gate walk shares this wave --
+            // the copy writes x, the walk touches only xa -- so the wave
+            // ends at the walk's own barrier.
             for (int i = tid; i < D; i += T) x[i] = xa[i];
-            for (int i = tid; i < 2 * n_live; i += T) acc[i] = 0.0f;
-            BARRIER();
-            if (n_live) {
+            if (!g_nz) { BARRIER(); }
 #define SRC_GATE(c) (xa[(c)])
-                STREAM_PHASE(TRG, g_nz, g_t0, g_e, acc, SRC_GATE)
-                for (int j = tid; j < n_live; j += T) {
-                    const float g = acc[2 * j];
-                    act[j] = g > 0.0f ? g * acc[2 * j + 1] : 0.0f;
-                }
-                BARRIER();
-            }
+            STREAM_PHASE(TRG, g_nz && !skip_walk, g_t0, g_e, xa, SRC_GATE)
 
-            // phase D: FFN adds.
-#define SRC_FFN(c) ((c) < D ? xa[(c)] : act[(c) - D])
-            STREAM_PHASE(TRF, f_nz, f_t0, f_e, x, SRC_FFN)
+            // phase D: FFN adds; ReGLU applied at the read site.
+#define SRC_FFN(c) ((c) < D ? xa[(c)] : reglu_at(xa, D + 2 * ((c) - D)))
+            STREAM_PHASE(TRF, f_nz && !skip_walk, f_t0, f_e, x, SRC_FFN)
         }
 
         // ── readout, writes, next state (K rows for windows).  The
-        // slot gather runs on all lanes -- the RO loads are the last
-        // serial device chains -- then lane 0 commits in step order.
+        // slot gather and the state/halt head products run on all lanes
+        // in one wave -- RO loads and the head dots were the last serial
+        // lane-0 device chains -- then lane 0 commits in step order.
         // Speculated interior branches (cur_spec >= 0): each verified
         // step's next_pc readout must equal the trace's assumed pc; on
         // the first violation only the exact prefix commits -- st takes
         // that step's state, later rows/writes never apply. ──
-        {
+        if (pass == 0) {
             device const int* RO = I + XD[5];
-            for (int i = tid; i < 22 * k_tg; i += T)
+            for (int i = tid; i < 22 * k_route; i += T)
                 outk[i] = rint(x[RO[i]]);
+            for (int i = tid; i < XD[8]; i += T)
+                hstage[i] = (F + XD[7])[i] * x[(I + XD[6])[i]];
+            for (int i = tid; i < XD[11]; i += T)
+                hstage[TG_HEAD + i] = (F + XD[10])[i] * x[(I + XD[9])[i]];
         }
         BARRIER();
+        if (do_trace < 5 || pass == 1) break;
+        }
         if (tid == 0) {
             device const int* SP = cur_spec >= 0 ? I + cur_spec : 0;
-            int out[22];
-            int committed = k_tg;
-            for (int k = 0; k < k_tg; ++k) {
-                for (int i = 0; i < 22; ++i)
-                    out[i] = (int)outk[22 * k + i];
+            int committed = k_route;
+            for (int k = 0; k < k_route; ++k) {
                 if (do_trace == 1) {
                     device int* tr = trace + 22 * (step + k);
-                    for (int i = 0; i < 22; ++i) tr[i] = out[i];
+                    for (int i = 0; i < 22; ++i)
+                        tr[i] = (int)outk[22 * k + i];
                 }
+                // Only the write triples (and a speculated next_pc) are
+                // read per step; the final state comes from the last
+                // committed row below.
                 const int wf[3][3] = {{13, 14, 15}, {16, 17, 18},
                                       {19, 20, 21}};
                 for (int w = 0; w < 3; ++w) {
-                    if (out[wf[w][0]] & 0xFF) {
-                        const int addr = out[wf[w][1]] & 0xFFFF;
-                        ram[addr] = (float)(out[wf[w][2]] & 0xFF);
+                    if ((int)outk[22 * k + wf[w][0]] & 0xFF) {
+                        const int addr = (int)outk[22 * k + wf[w][1]] & 0xFFFF;
+                        ram[addr] = (float)((int)outk[22 * k + wf[w][2]] & 0xFF);
                         wr[addr] = 1.0f;
                         if (seq_cache >= 0 && addr >= seq_span_lo
                                 && addr < seq_span_lo + seq_span_len)
                             seq_cache = -1;
                     }
                 }
-                if (SP && k + 1 < k_tg && SP[k] >= 0
-                        && (out[1] & 0xFFFF) != SP[k]) {
+                if (SP && k + 1 < k_route && SP[k] >= 0
+                        && ((int)outk[22 * k + 1] & 0xFFFF) != SP[k]) {
                     committed = k + 1;
                     break;
                 }
             }
             float ss = 0.0f, hs = 0.0f;
-            if (committed == k_tg) {
-                for (int i = 0; i < XD[8]; ++i)
-                    ss += (F + XD[7])[i] * x[(I + XD[6])[i]];
-                for (int i = 0; i < XD[11]; ++i)
-                    hs += (F + XD[10])[i] * x[(I + XD[9])[i]];
+            if (committed == k_route) {
+                for (int i = 0; i < XD[8]; ++i) ss += hstage[i];
+                for (int i = 0; i < XD[11]; ++i) hs += hstage[TG_HEAD + i];
             }
             k_tg = committed;
-            st[0] = out[1] & 0xFFFF;
-            st[1] = out[2] & 0xFF;
-            st[2] = out[3] & 0xFF;
-            st[3] = out[4] & 0xFF;
-            st[4] = out[5] & 0xFF;
-            st[5] = out[6] & 0xFF;
-            st[6] = out[8] & 0xFF;
-            st[7] = out[9] & 0xFF;
-            st[8] = out[10] & 0xFF;
-            st[9] = out[11] & 0xFFFF;
-            st[10] = out[12] & 0xFF;
-            st[11] = out[7] & 0xFF;
+            threadgroup const float* fin = outk + 22 * (committed - 1);
+            stg[0] = (int)fin[1] & 0xFFFF;
+            stg[1] = (int)fin[2] & 0xFF;
+            stg[2] = (int)fin[3] & 0xFF;
+            stg[3] = (int)fin[4] & 0xFF;
+            stg[4] = (int)fin[5] & 0xFF;
+            stg[5] = (int)fin[6] & 0xFF;
+            stg[6] = (int)fin[8] & 0xFF;
+            stg[7] = (int)fin[9] & 0xFF;
+            stg[8] = (int)fin[10] & 0xFF;
+            stg[9] = (int)fin[11] & 0xFFFF;
+            stg[10] = (int)fin[12] & 0xFF;
+            stg[11] = (int)fin[7] & 0xFF;
             // Probe modes skip the layers, so the readout is garbage;
             // a garbage halt would end the timing loop at step one.
-            if ((st[11] || hs > ss) && do_trace < 2) halted_tg = 1;
+            if ((stg[11] || hs > ss) && do_trace < 2) halted_tg = 1;
         }
         DBARRIER();
         step += k_tg;
+        fwds += 1;
+        lays += NL;
         if (halted_tg) break;
     }
 
@@ -437,8 +528,12 @@ kernel void run6502(
         regstate[3 * r + 2] = rv[2 * r + 1];
         regany[r] = rany[r];
     }
+    for (int i = tid; i < 13; i += T) st[i] = stg[i];
     if (tid == 0) {
         io[2] = step;
         io[3] = halted_tg;
+        io[4] = fwds;
+        io[5] = lays;
+        io[6] = low_fwds;
     }
 }

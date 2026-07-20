@@ -41,3 +41,6 @@ transformer_nes/nes/examples/zelda2.nes
 # F1 debug snapshots
 _debug_dumps/
 experiments/gpu_single/_build/
+
+# Finder litter
+.DS_Store
