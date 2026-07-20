@@ -1,17 +1,33 @@
-"""Structural lowering, rung 1: whole window stacks as scalar Metal.
+"""Structural lowering: whole routed forwards as scalar Metal.
 
-A v14+ trace-window model has no register rows and only fused/constant
-reads, so its layer stack is an exact closed-form program over the embed
-slots and RAM: every residual slot is a dyadic-linear expression, every
-FFN unit a ReGLU of two such, every read a guarded ram[] load.  This
-module emits that program as straight-line scalar expressions -- literal
-weight evaluation, identical numbers -- executed by lane 0 with no
-stream walks and no per-layer barriers.  Liveness runs backward from the
-readout and head slots, so dead width never emits.  Dispatch stays a
-threadgroup-uniform switch; everything not lowered runs the interpreter.
+A v14+ routed model (no register rows, fused/constant reads only) is an
+exact closed-form program over the machine state and RAM: every residual
+slot is a dyadic-linear expression, every FFN unit a ReGLU of two such,
+every read a guarded ram[] load.  This module emits that program as
+straight-line scalar expressions -- literal weight evaluation, identical
+numbers -- executed by lane 0 for the WHOLE forward: leaves read stg[]
+through the kernel's embed map (non-embed leaves are exact zeros and
+their terms drop), the readout lands in outk directly, and the state/
+halt head sums return by reference.  No residual buffer, no stream
+walks, no embed or readout waves, no per-layer barriers.  Liveness runs
+backward from the readout and head slots, so dead width never emits.
+Dispatch stays a threadgroup-uniform switch; everything not lowered
+(and the union) runs the interpreter.  Replay passes rerun the body
+verbatim -- inputs are unchanged until commit, so the stores rewrite
+identical values.
 """
 
 from __future__ import annotations
+
+# The kernel's branch-free STATE embed map (ESRC/ESH/EMSK): value i of
+# the 31-slot state_slots table is (stg[src] >> sh) & msk, src -1 = 1.0.
+ESRC = (0, 0, 1, 2, 3, 4, 5, 5, 5, 5, 5, 5, 5, 5,
+        6, 7, 8, 9, 9, 10, 11, 12, -1, 1, 1, 1, 1, 1, 1, 1, 1)
+ESH = (0, 8, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7,
+       0, 0, 0, 0, 8, 0, 0, 0, 0, 7, 6, 5, 4, 3, 2, 1, 0)
+EMSK = (0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 1, 1, 1, 1, 1, 1, 1, 1,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0,
+        1, 1, 1, 1, 1, 1, 1, 1)
 
 
 def f32(v: float) -> str:
@@ -40,9 +56,12 @@ class Fn:
         return name
 
     def sum_expr(self, base, terms):
-        """base ('0.0f' or an expr) plus coefficient-weighted sources."""
+        """base ('0.0f' or an expr) plus coefficient-weighted sources;
+        exact-zero sources contribute nothing and drop."""
         parts = [] if base == "0.0f" else [base]
         for coeff, src in terms:
+            if src == "0.0f":
+                continue
             self.ops += 1
             if coeff == 1.0:
                 parts.append(f"+ {src}")
@@ -82,7 +101,8 @@ def liveness(cap):
     """Backward closure from readout + head slots; per layer returns the
     live f dsts, attn slots, acc ids, and (mem entry, offsets) uses."""
     dm = cap["dm"]
-    live = set(cap["readout"]) | set(cap["shead"]) | set(cap["hhead"])
+    live = (set(cap["readout"])
+            | set(cap["shead"][0]) | set(cap["hhead"][0]))
     plans = []
     for lay in reversed(cap["layers"]):
         a_res, a_acc, g_acc, f_rows, ho_of = layer_maps(lay, dm)
@@ -129,9 +149,24 @@ def emit_model(cap):
     fn = Fn(dm)
     plans = liveness(cap)
     cur: dict[int, str] = {}
+    embed_idx = {s: i for i, s in enumerate(cap["state_slots"])}
+    assert len(cap["state_slots"]) == 31
 
     def x_of(s):
-        return cur.get(s, f"x[{s}]")
+        e = cur.get(s)
+        if e is not None:
+            return e
+        if s == cap["one_slot"]:
+            return "1.0f"
+        i = embed_idx.get(s)
+        if i is None:
+            return "0.0f"
+        src, sh, msk = ESRC[i], ESH[i], EMSK[i]
+        if src < 0:
+            return "1.0f"
+        if sh:
+            return f"(float)((stg[{src}] >> {sh}) & {msk})"
+        return f"(float)(stg[{src}] & {msk})"
 
     for lay, (f_live, xa_need, acc_need, mem_use) in zip(
             cap["layers"], plans, strict=True):
@@ -172,12 +207,16 @@ def emit_model(cap):
         def a_src(c, ho=ho):
             return x_of(c) if c < dm else ho[c - dm]
 
+        def val(base, terms):
+            e = fn.sum_expr(base, terms)
+            return e if e == base or e == "0.0f" else fn.temp(e)
+
         # Attention adds -> post-attn residual view (xa).
         xa: dict[int, str] = {}
         for s in sorted(xa_need):
             if s in a_res:
-                xa[s] = fn.temp(fn.sum_expr(
-                    x_of(s), [(float(v), a_src(c)) for c, v in a_res[s]]))
+                xa[s] = val(x_of(s),
+                            [(float(v), a_src(c)) for c, v in a_res[s]])
 
         def xa_of(s, xa=xa):
             return xa.get(s, x_of(s))
@@ -186,11 +225,11 @@ def emit_model(cap):
         acc: dict[int, str] = {}
         for i in sorted(acc_need):
             if i in a_acc:
-                acc[i] = fn.temp(fn.sum_expr("0.0f", [
-                    (float(v), a_src(c)) for c, v in a_acc[i]]))
+                acc[i] = val("0.0f",
+                             [(float(v), a_src(c)) for c, v in a_acc[i]])
             elif i in g_acc:
-                acc[i] = fn.temp(fn.sum_expr("0.0f", [
-                    (float(v), xa_of(c)) for c, v in g_acc[i]]))
+                acc[i] = val("0.0f",
+                             [(float(v), xa_of(c)) for c, v in g_acc[i]])
 
         reglu_memo: dict[int, str] = {}
 
@@ -198,8 +237,11 @@ def emit_model(cap):
             if p not in memo:
                 g = acc.get(2 * p, "0.0f")
                 v = acc.get(2 * p + 1, "0.0f")
-                fn.ops += 1
-                memo[p] = fn.temp(f"({g} > 0.0f ? {g} * {v} : 0.0f)")
+                if g == "0.0f" or v == "0.0f":
+                    memo[p] = "0.0f"
+                else:
+                    fn.ops += 1
+                    memo[p] = fn.temp(f"({g} > 0.0f ? {g} * {v} : 0.0f)")
             return memo[p]
 
         # FFN adds on top of the copied residual.
@@ -207,16 +249,18 @@ def emit_model(cap):
         for d in sorted(f_live):
             terms = [(float(v), xa_of(c) if c < dm else reglu(c - dm))
                      for c, v in f_rows[d]]
-            newx[d] = fn.temp(fn.sum_expr(xa_of(d), terms))
+            newx[d] = val(xa_of(d), terms)
         cur.update(xa)
         cur.update(newx)
 
     stores = 0
-    out = set(cap["readout"]) | set(cap["shead"]) | set(cap["hhead"])
-    for s in sorted(out):
-        if s in cur:
-            fn.emit(f"x[{s}] = {cur[s]};")
-            stores += 1
+    for i, slot in enumerate(cap["readout"]):
+        fn.emit(f"outk[{i}] = rint({x_of(slot)});")
+        stores += 1
+    for name, (cols, vals) in (("ss", cap["shead"]), ("hs", cap["hhead"])):
+        fn.emit(f"{name} = " + fn.sum_expr("0.0f", [
+            (float(v), x_of(int(c)))
+            for c, v in zip(cols, vals, strict=True)]) + ";")
     return fn, stores
 
 
@@ -241,20 +285,22 @@ def emit_lowered(captures, threads, params):
         "using namespace metal;\n",
         f"#define LOWERED_MODELS {len(models)}\n",
     ]
+    args = ("threadgroup float* outk, threadgroup const int* stg,\n"
+            "        device float* ram, device float* wr,\n"
+            "        thread float& ss, thread float& hs")
     for k, (_mdesc, fn, _stores) in enumerate(models):
-        src.append(
-            f"inline void lowered_m{k}(threadgroup float* x,\n"
-            "        device float* ram, device float* wr) {\n")
+        src.append(f"inline void lowered_m{k}({args}) {{\n")
         src.append("\n".join(fn.lines) + "\n}\n")
     src.append("inline int lowered_model_of(int e) {\n    switch (e) {\n")
     for k, (mdesc, _fn, _stores) in enumerate(models):
         src.append(f"    case {mdesc}: return {k};\n")
     src.append("    }\n    return -1;\n}\n")
-    src.append(
-        "inline void lowered_stack(int m, threadgroup float* x,\n"
-        "        device float* ram, device float* wr) {\n    switch (m) {\n")
+    src.append(f"inline void lowered_stack(int m, {args}) {{\n"
+               "    switch (m) {\n")
     for k in range(len(models)):
-        src.append(f"    case {k}: lowered_m{k}(x, ram, wr); break;\n")
+        src.append(
+            f"    case {k}: lowered_m{k}(outk, stg, ram, wr, ss, hs);"
+            " break;\n")
     src.append("    }\n}\n")
 
     stats = {

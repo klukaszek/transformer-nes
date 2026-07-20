@@ -454,9 +454,13 @@ def pack_tables(bcd: bool = False, T: int = 32, expert_opcodes=(),
         lay0 = len(layer_tab)
         if cap is not None:
             cap["dm"] = dm
+            cap["one_slot"] = int(mdl.one_slot)
+            cap["state_slots"] = [int(s) for s in state_slots]
             cap["readout"] = [int(s) for s in readout]
-            cap["shead"] = [int(c) for c in shead[0]]
-            cap["hhead"] = [int(c) for c in hhead[0]]
+            cap["shead"] = ([int(c) for c in shead[0]],
+                            [float(v) for v in shead[1]])
+            cap["hhead"] = ([int(c) for c in hhead[0]],
+                            [float(v) for v in hhead[1]])
 
         def fused_rows(direct, extra):
             rows = []

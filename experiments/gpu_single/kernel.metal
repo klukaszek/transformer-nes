@@ -186,7 +186,6 @@ kernel void run6502(
         // runs the fetch chain eagerly (uniform loads) while lane 0
         // checks the cached window: the common no-candidate path costs
         // ONE barrier and no lane-0 serial chain. ──
-        for (int i = tid; i < TG_D; i += T) x[i] = 0.0f;
         const int pc = stg[0];
         int e_op = 0, scan_cand = 0;
         if (stg[12] == 0) {
@@ -309,17 +308,29 @@ kernel void run6502(
         }
         device const int* XD = I + P[15] + 12 * e_route;
         const int lay0 = XD[0], NL = XD[1], D = XD[2];
+#ifdef LOWERED_MODELS
+        const int low_m = lowered_model_of(e_route);
+        const bool low_route = low_m >= 0
+            && !(do_trace >= 2 && do_trace < 5);
+#else
+        const bool low_route = false;
+#endif
 
         // Embed on ALL lanes (the 31 SL loads were a serial lane-0
-        // device chain): one branch-free table round per lane.
-        if (tid < 31) {
-            const int s = ESRC[tid];
-            const float v = s < 0
-                ? 1.0f : (float)((stg[s] >> ESH[tid]) & EMSK[tid]);
-            x[(I + XD[4])[tid]] = v;
-            if (tid == 0) x[XD[3]] = 1.0f;
+        // device chain): one branch-free table round per lane.  Lowered
+        // routes skip the zero wave and embed entirely -- their bodies
+        // read stg[] directly and never touch x.
+        if (!low_route) {
+            for (int i = tid; i < TG_D; i += T) x[i] = 0.0f;
+            if (tid < 31) {
+                const int s = ESRC[tid];
+                const float v = s < 0
+                    ? 1.0f : (float)((stg[s] >> ESH[tid]) & EMSK[tid]);
+                x[(I + XD[4])[tid]] = v;
+                if (tid == 0) x[XD[3]] = 1.0f;
+            }
+            BARRIER();
         }
-        BARRIER();
 
         // Probe modes: 2 = null model (no layers), 3 = barriers only.
         for (int li = 0; li < (do_trace == 3 ? P[1] : 0); ++li) {
@@ -331,24 +342,26 @@ kernel void run6502(
         // trajectory kept): the adjacent bench delta isolates pure
         // layer-stack cost.  6 skips lookups on the replay, 7 skips the
         // stream walks -- deltas vs 5 attribute the layer cost. ──
+#ifdef LOWERED_MODELS
+        float ss_low = 0.0f, hs_low = 0.0f;
+#endif
         for (int pass = 0; ; ++pass) {
         const int skip_lu = pass && do_trace == 6;
         const int skip_walk = pass && do_trace == 7;
         const int probe8 = pass && do_trace == 8;
 #ifdef LOWERED_MODELS
-        // Lowered routes (scalargen.py): the whole layer stack as scalar
-        // expressions on lane 0 -- no walks, no per-layer barriers.  The
-        // route is uniform, so the branch and the join barrier are too.
-        // Probes 2-4 skip layers; replays stay lowered only for probe 5
-        // (6-8 attribute the interpreter's stream walks and fall back).
-        if (lowered_model_of(e_route) >= 0
-                && !(do_trace >= 2 && do_trace < 5)
-                && (pass == 0 || do_trace == 5)) {
+        // Lowered routes (scalargen.py): the WHOLE forward as scalar
+        // expressions on lane 0 -- no zero/embed wave, no walks, no
+        // barriers; outk and the head sums come straight from the body.
+        // The route is uniform, so the branch is too.  Probes 2-4 skip
+        // layers (interpreter path); replay passes rerun the body
+        // verbatim -- inputs are unchanged until commit, so the stores
+        // rewrite identical values.
+        if (low_route) {
             if (pass == 0) low_fwds += 1;
             if (tid == 0)
-                lowered_stack(lowered_model_of(e_route), x, ram, wr);
-            BARRIER();
-        } else
+                lowered_stack(low_m, outk, stg, ram, wr, ss_low, hs_low);
+        } else {
 #endif
         for (int li = lay0;
              li < (do_trace >= 2 && do_trace < 5 ? lay0 : lay0 + NL);
@@ -460,6 +473,9 @@ kernel void run6502(
                 hstage[TG_HEAD + i] = (F + XD[10])[i] * x[(I + XD[9])[i]];
         }
         BARRIER();
+#ifdef LOWERED_MODELS
+        }
+#endif
         if (do_trace < 5 || pass == 1) break;
         }
         if (tid == 0) {
@@ -494,8 +510,14 @@ kernel void run6502(
             }
             float ss = 0.0f, hs = 0.0f;
             if (committed == k_route) {
+#ifdef LOWERED_MODELS
+                if (low_route) { ss = ss_low; hs = hs_low; } else {
+#endif
                 for (int i = 0; i < XD[8]; ++i) ss += hstage[i];
                 for (int i = 0; i < XD[11]; ++i) hs += hstage[TG_HEAD + i];
+#ifdef LOWERED_MODELS
+                }
+#endif
             }
             k_tg = committed;
             threadgroup const float* fin = outk + 22 * (committed - 1);

@@ -6,6 +6,44 @@ handoff point for fresh working sessions; the design details live in
 the architecture-agnostic optimization catalog (for reuse on future
 targets) lives in [`PLAYBOOK.md`](PLAYBOOK.md).
 
+## 2026-07-19 metal v15 — lowering rung 3: whole forwards scalar,
+711K Klaus (1.4 µs) / 376K nestest (2.7 µs) — REAL-TIME CPU CROSSED
+
+With every routed stack scalar, the per-forward fixed floor dominated
+(~5.3 of 7.2 µs: TG_D zero wave, embed wave, readout gather, their
+barriers).  Rung 3 lowers the WHOLE forward: bodies read stg[] directly
+through the kernel's embed map (ESRC/ESH/EMSK mirrored in scalargen;
+non-embed leaves are exact zeros and their terms drop at emission),
+write outk straight from expressions, and return the state/halt head
+sums by reference.  Lowered routes skip the zero/embed wave, the
+readout gather, and every barrier between dispatch and commit.  Replay
+probes rerun the body verbatim -- inputs don't change until commit, so
+unguarded stores rewrite identical values and nothing can be DCE'd.
+
+- Klaus 1M: **711,259 steps/s (1.4 µs/instruction)** -- t=32 optimal
+  (699K t=64, 688K t=128; the ladder INVERTED once the waves left: a
+  single simdgroup makes the remaining barriers near-free).  2.25x
+  v15-construction, 1.25x rung 2.  **1.20x real-time NES (~592K): the
+  CPU side is now real-time-capable on Klaus-shaped code.**
+- Nestest: **375,715 steps/s (2.7 µs)**, t=32 -- **2.60x** the 144.5K
+  handoff, still at 1.68 instr/fwd and 100% lowered coverage; the
+  forward now costs 4.5 µs (was 12.1).
+- Zero-leaf term dropping shrank the Klaus bodies 120,879 → 113,316
+  ops while ADDING the readout/head expressions.
+- CORRECTNESS: full 1M Klaus and full nestest lockstep-exact at t=32
+  AND t=128 with 100% of forwards lowered; verify suite exact with 257
+  lowered models; suite 86 green; ruff clean.
+
+What remains per the anatomy: nestest's 4.5 µs/fwd is now dispatch
+(window scan + byte re-verification) + the serial body + commit.  The
+levers, in rough order: (1) predicated control-flow regions
+(assessment item 2) to raise 1.68 instr/fwd -- unchanged by lowering
+and now the dominant nestest multiplier; (2) dispatch cost (the seq
+scan's guarded byte checks are the last all-lane work); (3) body ILP
+(emission currently serializes rows; independent rows could interleave
+or split across 2-4 lanes); (4) MMIO/PPU integration toward the
+whole-console kernel -- the CPU rate now supports it.
+
 ## 2026-07-19 metal v14 — lowering rung 2: every routed tier scalar,
 570.7K Klaus (1.8 µs) / 275.7K nestest (3.6 µs), 100% coverage
 
