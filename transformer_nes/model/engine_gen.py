@@ -840,7 +840,7 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
     """
     is_union = union_lookup_of is None
     dm = mdl.tok.weight.shape[1]
-    nh = mdl.attn[0].num_heads
+    nh = mdl.attn[0].num_heads if mdl.attn else 0
     plans: list[dict] = []
     for li in range(len(mdl.attn)):
         check_ffn_kinds(mdl, li)
@@ -1273,8 +1273,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         step_outs = None if sequence_final else (
             spec.get("step_outputs") or [spec["outputs"]]
         )
-        hc, hv = spec["halt_head"]
-        shc, shv = spec["state_head"]
+        if not sequence_final:
+            hc, hv = spec["halt_head"]
+            shc, shv = spec["state_head"]
         dm = mdl.tok.weight.shape[1]
 
         emit(f"    void {fn_name}({'Eng& E, ' if seq_mode else ''}long long* out) {{")
@@ -1307,7 +1308,30 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             emit(f"        layer_{li}{layer_suffix}("
                  f"{'E, ' if seq_mode else ''}x);")
         if sequence_final:
-            outs = sequence_final
+            outs = sequence_final["model"]
+            constants = sequence_final["constant"]
+            preserved = set(sequence_final["preserve"])
+            preserved_expr = {
+                "new_a": f"{E}st_a", "new_x": f"{E}st_x",
+                "new_y": f"{E}st_y", "new_s": f"{E}st_s",
+                "new_p": f"({E}st_p | 0x20)",
+                "new_halted": f"({E}st_halted ? 1 : 0)",
+                "fetched_opcode": f"{E}st_ir",
+                "fetched_operand_lo": f"{E}st_oplo",
+                "fetched_operand_hi": f"{E}st_ophi",
+                "ea": f"{E}st_ea", "data_out": f"{E}st_data",
+                "next_pc": f"{E}st_pc",
+            }
+
+            def final_value(name):
+                if name in outs:
+                    return rdv(outs[name])
+                if name in constants:
+                    return str(constants[name])
+                if name in preserved:
+                    return preserved_expr[name]
+                raise RuntimeError(f"sequence receipt omitted {name}")
+
             emit(f"        out[0] = {E}st_pc;")
             for i, (name, mask) in enumerate((
                 ("new_a", 0xFF), ("new_x", 0xFF), ("new_y", 0xFF),
@@ -1317,17 +1341,13 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 ("data_out", 0xFF), ("new_halted", 0xFF),
                 ("next_pc", 0xFFFF),
             ), start=1):
-                emit(f"        out[{i}] = {rdv(outs[name])} & 0x{mask:X};")
+                emit(f"        out[{i}] = {final_value(name)} & 0x{mask:X};")
             emit("        out[14] = 0;")
             for step_writes in spec["sequence_writes"]:
                 for addr_slot, value_slot in step_writes:
                     emit(f"        {E}insert_write((int)({rdv(addr_slot)} & 0xFFFF), "
                          f"(int)({rdv(value_slot)} & 0xFF), {E}seq + 1);")
-            emit(f"        const long long halt_logit = "
-                 f"{expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
-            emit(f"        const long long state_logit = "
-                 f"{expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
-            emit("        out[13] = halt_logit > state_logit ? 1 : 0;")
+            emit("        out[13] = 0;")
             emit(f"        {E}st_pc = (int)out[12];")
             emit(f"        {E}st_a = (int)out[1]; {E}st_x = (int)out[2]; "
                  f"{E}st_y = (int)out[3];")

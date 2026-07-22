@@ -267,6 +267,13 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
         if isinstance(expr, Expression):
             output_dims |= set(expr.terms.keys())
 
+    if not ops:
+        log("ASAP schedule: 0 ops, 0 layers, max alive width 0, busiest layer 0 ops")
+        return dict(
+            phase_assign={}, std_layers=[], num_layers=0,
+            dim_birth={}, dim_death={}, alive_after={}, width=None,
+        )
+
     # ASAP with phase parity (the same rule min_layers uses).  Iterate in
     # stable ops order, not set order: the schedule (and therefore the
     # constructed weights) must be deterministic across processes.
@@ -639,5 +646,4 @@ def milp_schedule(
         alive_after=alive_after,
         width=opt_D,
     )
-
 

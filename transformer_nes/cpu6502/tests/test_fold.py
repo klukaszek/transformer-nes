@@ -25,6 +25,7 @@ import pytest
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS
 from transformer_nes.cpu6502.backends.weights.experts import (
+    SEQUENCE_PRESERVE_INPUTS,
     SEQUENCE_STATE_DIMS,
     build_shape_experts,
     project_sequence_execution,
@@ -424,7 +425,16 @@ def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
     receipt = project_sequence_execution(r, len(pin_list))
 
     assert receipt["writes"] == [[], [], []]
-    assert set(receipt["final"]) == set(SEQUENCE_STATE_DIMS)
+    final = receipt["final"]
+    classified = (
+        set(final["model"]) | set(final["constant"]) | set(final["preserve"])
+    )
+    assert classified == set(SEQUENCE_STATE_DIMS)
+    assert not (
+        set(final["model"]) & set(final["constant"])
+        or set(final["model"]) & set(final["preserve"])
+        or set(final["constant"]) & set(final["preserve"])
+    )
     assert len(r.program_graph.all_dims) < proof_dims * 0.76
     for k in range(len(pin_list) - 1):
         for name in (
@@ -454,33 +464,43 @@ def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
             continue
         values = ev.step(inputs)
         expected = steps[idx + len(pin_list) - 1]["reads"]
-        for name, dim_name in receipt["final"].items():
+        for name, dim_name in final["model"].items():
             mask = 0xFFFF if name in ("next_pc", "ea") else 0xFF
             assert int(round(ev.read(values, dim_name))) & mask == (
                 expected[name] & mask
             )
+        for name, value in final["constant"].items():
+            mask = 0xFFFF if name in ("next_pc", "ea") else 0xFF
+            assert value & mask == expected[name] & mask
+        for name in final["preserve"]:
+            value = sum(
+                (1 if input_name == "one" else inputs[input_name]) * coeff
+                for input_name, coeff in SEQUENCE_PRESERVE_INPUTS[name]
+            )
+            mask = 0xFFFF if name in ("next_pc", "ea") else 0xFF
+            assert value & mask == expected[name] & mask
         windows += 1
         skip = len(pin_list) - 1
         idx += 1
     assert windows >= 2
 
 
-def test_sequence_execution_projection_collapses_model_width(folder):
-    """Receipt width must not grow with a repeated deterministic region."""
+def test_sequence_execution_projection_eliminates_deterministic_model(folder):
+    """A licensed deterministic region needs no transformer operations."""
     pins = sequence_pins(
         SPIN_HEAD, bytes([0x4C, 0x08, 0x04]), OPCODES,
     ) * 8
-    proof = folder.fold_sequence(pins, SEQUENCE_FEEDBACK, label="full_spin")
-    _model, _tokens, _rows, proof_info = schedule_and_build(proof)
-
-    execution = folder.fold_sequence(
-        pins, SEQUENCE_FEEDBACK, label="execution_spin",
+    structural = GraphFolder(
+        folder.pg, root_names=RUNTIME_READ_DIMS, structural_reads=True,
     )
-    project_sequence_execution(execution, len(pins))
+    execution = structural.fold_sequence(
+        pins, SEQUENCE_FEEDBACK, label="execution_spin", inline_linear=True,
+    )
+    receipt = project_sequence_execution(execution, len(pins))
     _model, _tokens, _rows, execution_info = schedule_and_build(execution)
 
-    assert execution_info.n_layers == proof_info.n_layers
-    assert execution_info.d_model <= proof_info.d_model // 4
+    assert receipt["final"]["model"] == {}
+    assert execution_info.n_layers == 0
 
 
 @pytest.mark.parametrize("byte", SHADOW_OPCODES)

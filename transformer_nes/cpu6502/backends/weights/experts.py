@@ -115,11 +115,73 @@ SEQUENCE_STATE_DIMS = (
     "ea", "data_out", "next_pc",
 )
 
+SEQUENCE_PRESERVE_INPUTS = {
+    "new_a": (("in_a", 1),),
+    "new_x": (("in_x", 1),),
+    "new_y": (("in_y", 1),),
+    "new_s": (("in_s", 1),),
+    "new_p": tuple(
+        ("one" if mask == reference.FLAG_U else name, mask)
+        for name, mask in P_FLAG_NAMES
+    ),
+    "new_halted": (("in_halted", 1),),
+    "fetched_opcode": (("in_ir", 1),),
+    "fetched_operand_lo": (("in_oplo", 1),),
+    "fetched_operand_hi": (("in_ophi", 1),),
+    "ea": (("in_ea_lo", 1), ("in_ea_hi", 256)),
+    "data_out": (("in_data", 1),),
+    "next_pc": (("in_pc_lo", 1), ("in_pc_hi", 256)),
+}
+
 WRITE_RECEIPTS = (
     ("is_store", "write_addr_out", "write_value_out"),
     ("is_store2", "write_addr2_out", "write_value2_out"),
     ("is_store3", "write_addr3_out", "write_value3_out"),
 )
+
+
+def linear_input_form(expr: Expression) -> dict:
+    memo = {}
+
+    def expand_dim(dim):
+        if dim in memo:
+            return memo[dim]
+        result = (
+            expand_expr(dim.expr)
+            if isinstance(dim, PersistDimension)
+            else {dim: 1.0}
+        )
+        memo[dim] = result
+        return result
+
+    def expand_expr(value):
+        result = {}
+        for dim, coeff in value.terms.items():
+            for source, source_coeff in expand_dim(dim).items():
+                result[source] = result.get(source, 0.0) + coeff * source_coeff
+        return {dim: coeff for dim, coeff in result.items() if coeff}
+
+    return expand_expr(expr)
+
+
+def classify_sequence_state(fold_result, final_names) -> dict:
+    by_name = fold_result.dim_of_name
+    one = fold_result.program_graph.one
+    result = {"model": {}, "preserve": [], "constant": {}}
+    for name, dim_name in final_names.items():
+        dim = by_name[dim_name]
+        form = linear_input_form(Expression({dim: 1.0}))
+        expected = {
+            by_name[input_name]: float(coeff)
+            for input_name, coeff in SEQUENCE_PRESERVE_INPUTS[name]
+        }
+        if form == expected:
+            result["preserve"].append(name)
+        elif all(source is one for source in form):
+            result["constant"][name] = int(round(form.get(one, 0.0)))
+        else:
+            result["model"][name] = dim_name
+    return result
 
 
 def project_sequence_execution(fold_result, n_steps: int) -> dict:
@@ -133,8 +195,9 @@ def project_sequence_execution(fold_result, n_steps: int) -> dict:
     final_names = {
         name: f"{name}__s{n_steps - 1}" for name in SEQUENCE_STATE_DIMS
     }
+    final = classify_sequence_state(fold_result, final_names)
     writes = []
-    retained = list(final_names.values())
+    retained = list(final["model"].values())
     for k in range(n_steps):
         step_writes = []
         for flag, addr, value in WRITE_RECEIPTS:
@@ -154,31 +217,33 @@ def project_sequence_execution(fold_result, n_steps: int) -> dict:
     readout = Expression()
     for name in dict.fromkeys(retained):
         readout = readout + 1e-6 * fold_result.dim_of_name[name]
-    outputs = dict(fold_result.program_graph.output_tokens)
-    outputs["READOUT"] = readout
+    outputs = {"READOUT": readout}
     fold_result.program_graph = project_program_graph(
         fold_result.program_graph, outputs
     )
     fold_result.dim_of_name = {}
     for dim in fold_result.program_graph.all_dims:
         fold_result.dim_of_name.setdefault(dim.name, dim)
-    return {"final": final_names, "writes": writes}
+    return {"final": final, "writes": writes}
 
 
-def sequence_step_spec(fold_result, receipt, model, tok_to_idx, info) -> dict:
+def sequence_step_spec(fold_result, receipt, info) -> dict:
     def slot(name):
         return info.slot_of[fold_result.dim_of_name[name]]
 
     spec = step_spec_base(slot)
     spec["sequence_final"] = {
-        name: slot(dim_name) for name, dim_name in receipt["final"].items()
+        "model": {
+            name: slot(dim_name)
+            for name, dim_name in receipt["final"]["model"].items()
+        },
+        "preserve": receipt["final"]["preserve"],
+        "constant": receipt["final"]["constant"],
     }
     spec["sequence_writes"] = [
         [(slot(addr), slot(value)) for addr, value in step]
         for step in receipt["writes"]
     ]
-    spec["halt_head"] = head_row(model, tok_to_idx["HALT"])
-    spec["state_head"] = head_row(model, tok_to_idx["STATE"])
     return spec
 
 
@@ -611,7 +676,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
             (inlined[0], inlined[3]), label,
         ):
             r, receipt, materialized = inlined_r, inlined_receipt, inlined
-    model, _tokens, tok_to_idx, info = materialized
+    model, _tokens, _tok_to_idx, info = materialized
     cycles = sum(op.cycles for op in ops)
     # Window bytes join the name: different banks may carry different
     # windows at one head, and each needs its own step_core symbol.
@@ -620,7 +685,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
         "head": head, "has_stores": has_stores,
         "window": bytes(code), "n_steps": n_steps, "cycles": cycles,
         "cycles_prefix": cycles - ops[-1].cycles, "model": model,
-        "step_spec": sequence_step_spec(r, receipt, model, tok_to_idx, info),
+        "step_spec": sequence_step_spec(r, receipt, info),
         "union_lookup_of": r.union_lookup_of,
         "assume_taken_steps": assume_taken_steps,
         "layers": info.n_layers, "_d": info.d_model,
@@ -1048,7 +1113,7 @@ def build_shape_experts(pg, shapes, *,
                 (inlined[0], inlined[3]), label,
             ):
                 r, receipt, materialized = inlined_r, inlined_receipt, inlined
-        model, _tokens, tok_to_idx, info = materialized
+        model, _tokens, _tok_to_idx, info = materialized
         ops_full = ops * repeat
         cycles = sum(op.cycles for op in ops_full)
         experts.append({
@@ -1060,9 +1125,7 @@ def build_shape_experts(pg, shapes, *,
             "spec_offsets": spec_offsets,
             "cycles": cycles,
             "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
-            "step_spec": sequence_step_spec(
-                r, receipt, model, tok_to_idx, info,
-            ),
+            "step_spec": sequence_step_spec(r, receipt, info),
             "union_lookup_of": r.union_lookup_of,
             "layers": info.n_layers, "_d": info.d_model,
         })
