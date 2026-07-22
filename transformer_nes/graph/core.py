@@ -433,3 +433,60 @@ class ProgramGraph:
         self.all_dims = list(graph_dims)
         self.all_lookups = list(graph_lookups)
         self.one = one
+
+
+def project_program_graph(program_graph: ProgramGraph, output_tokens) -> ProgramGraph:
+    """Return the dependency closure of a new output-token set.
+
+    Folding deliberately constructs a proof graph with more named readouts
+    than an execution model needs.  Replacing an output expression alone is
+    insufficient because schedulers consume ``all_dims``/``all_lookups``.
+    This projection removes every operation outside the input/output closure,
+    so receipt elimination happens before scheduling and weight construction.
+    """
+    live_dims = {program_graph.one}
+    live_lookups = set()
+    pending = []
+
+    def seed(value):
+        if isinstance(value, Expression):
+            pending.extend(value.terms)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                seed(item)
+
+    for value in program_graph.input_tokens.values():
+        seed(value)
+    for value in output_tokens.values():
+        seed(value)
+
+    while pending:
+        dim = pending.pop()
+        if dim in live_dims:
+            continue
+        live_dims.add(dim)
+        if isinstance(dim, PersistDimension):
+            pending.extend(dim.expr.terms)
+        elif isinstance(dim, ReGLUDimension):
+            pending.extend(dim.a_expr.terms)
+            pending.extend(dim.b_expr.terms)
+        elif isinstance(dim, LookUpDimension):
+            lookup = dim.lookup
+            if lookup in live_lookups:
+                continue
+            live_lookups.add(lookup)
+            pending.extend(lookup.dims)
+            for expr in (
+                lookup.query_exprs_2d
+                + lookup.key_exprs_2d
+                + lookup.value_exprs
+            ):
+                pending.extend(expr.terms)
+
+    projected = ProgramGraph(program_graph.input_tokens, output_tokens)
+    projected.all_dims = [d for d in program_graph.all_dims if d in live_dims]
+    projected.all_lookups = [
+        lu for lu in program_graph.all_lookups if lu in live_lookups
+    ]
+    projected.one = program_graph.one
+    return projected

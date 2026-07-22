@@ -102,10 +102,12 @@ public:
                                      py::arg("trace") = false)
                          .cast<py::dict>();
       cycles += py::cast<int64_t>(out["cycles"]);
-      // The native write journal / PRG banking are not wired to this
-      // console; fail loudly rather than drop mapper side effects.
-      if (py::len(out["wj_addr"]) != 0)
-        throw std::runtime_error("engine returned journaled writes but no drain is wired");
+      // Journaled device writes (PPU registers): applied in-engine without
+      // pausing and drained here in program order, before the chunk's
+      // paused write.  The frame-at-once PPU samples state only at split/
+      // render boundaries, which all follow a drain, so the deferral is
+      // invisible.  Native PRG banking still fails loudly (not wired).
+      drain_journal(out, cycle_base + cycles);
       drain_leases(out);
       // A watched write pauses the engine, so the chunk's writes
       // executed at its end: stamp them with the cycle there.
@@ -175,6 +177,19 @@ private:
       int count = py::cast<int>(rt_.attr("take_lease_served")(addr));
       if (auto owner = lease_owners_.find(addr); count && owner != lease_owners_.end())
         owner->second->lease_consumed(addr, count);
+    }
+  }
+  void drain_journal(const py::dict& out, int64_t cycle) {
+    py::sequence aa = out["wj_addr"], vv = out["wj_value"];
+    if (py::len(aa) != py::len(vv))
+      throw std::runtime_error("CPU engine returned mismatched journal arrays");
+    // Order-only device state (PPU $2000-$3FFF): route each to its device
+    // in program order.  These never carry a mapper side effect (PRG
+    // banking still routes through the pause path), so no lease kill.
+    for (py::size_t i = 0; i < py::len(aa); ++i) {
+      int a = py::cast<int>(aa[i]);
+      if (auto* d = device_at(a))
+        d->write(a, py::cast<int>(vv[i]), cycle);
     }
   }
   void drain_leases(const py::dict& out) {

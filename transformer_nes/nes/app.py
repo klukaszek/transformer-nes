@@ -72,7 +72,11 @@ def run_app(
 def main():
     parser = argparse.ArgumentParser(description="Play an NES ROM")
     parser.add_argument("rom")
-    parser.add_argument("--backend", choices=("reference", "graph", "weights"), default="weights")
+    parser.add_argument(
+        "--backend",
+        choices=("reference", "graph", "weights"),
+        default="weights",
+    )
     parser.add_argument("--scale", type=int, default=3)
     parser.add_argument("--frames", type=int, default=0)
     parser.add_argument("--record")

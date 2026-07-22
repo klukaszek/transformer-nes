@@ -889,8 +889,7 @@ debug accessor (kept; the kernel carries no debug code).
 ## 2026-07-17 megakernel v4 — expert routing on GPU, 21x
 
 The recorded "expert-fold-on-GPU arc" landed in one rung: the fold/plan
-machinery is now in the Metal packer
-(`experiments/gpu_single/{metal_runner.py, kernel.metal}`), and the
+machinery was implemented in the now-retired Metal prototype, and the
 megakernel routes every step to a per-opcode expert model.
 
 - **Mechanics.**  `build_opcode_experts` (the C++ engine's own fold →
@@ -998,8 +997,8 @@ Receipts: full suite 74 green (incl. `test_export` lockstep: export →
 standalone TorchMachine vs reference, 40 instructions, through the
 ragged shapes); ruff clean.  Census scripts live in the session
 scratchpad (weight_census{,2}.py, check_qk_sides.py).
-**Same-day follow-up — single-machine GPU runner, measured
-(`experiments/gpu_single/gpu_runner.py`), per explicit user call: ONE
+**Same-day follow-up — retired single-machine GPU runner, measured, per
+explicit user call: ONE
 6502 on the GPU (latency), not a batch.**  The runner lifts the
 generated engine's O(1) attention forms to torch tensors, licensed by
 model/classify.py exactly as engine_gen is: passthrough heads compose
@@ -1030,9 +1029,8 @@ steps/s, an order below the CPU engine and below real-time NES
 lane is batch, where the same O(1)-forms runner design applies
 unchanged (state tensors gain a leading batch dim).
 
-**Same-day follow-up 2 — Metal megakernel prototype, the GPU-resident
-run loop (`experiments/gpu_single/{metal_runner.py, kernel.metal,
-metal_host.mm}`), per user call ("will we just have to generate
+**Same-day follow-up 2 — retired Metal megakernel prototype and GPU-resident
+run loop, per user call ("will we just have to generate
 megakernels like the cpp engine?" — yes, and here is rung one).**  One
 Metal dispatch executes up to max_steps WHOLE instructions in a single
 threadgroup: STATE embed, all 75 layers, readout with half-even rint,

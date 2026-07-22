@@ -450,15 +450,17 @@ MEM_QUERY = mem_query_cpp("long long")
 
 # Per-ROM sequence-module hook: a separately compiled window module attaches
 # its dispatch through a raw function pointer, so a new ROM's window set never
-# recompiles this TU.  The module fills seq_out with K trace rows per forward.
-# A pinned module window outranks the canonical shape table (it folded the
-# operands too, so its forward is cheaper); both fall back to per-step.
+# recompiles this TU.  Execution models return one final state and apply their
+# ordered writes directly; traced runs bypass them.  A pinned module window
+# outranks the canonical shape table (it folded the operands too, so its
+# forward is cheaper); both fall back to per-step.
 SEQ_HOOK = """\
     typedef int (*SeqFn)(void*, void*, long, long, long, long, int);
     SeqFn seq_fn = nullptr;
     void* seq_ctx = nullptr;
     static constexpr int SEQ_MAX_K = 32;
     long long seq_out[21 * SEQ_MAX_K];
+    long seq_cycles = 0;
     // Module window heads: dispatch misses cost one array load instead
     // of a cross-module call into the module's head switch.
     unsigned char seq_head[65536] = {};
@@ -495,34 +497,14 @@ ENGINE_STEP_BODY = """\
             // A routed sequence consumes a whole window in one forward;
             // its guards (in seq_dispatch) keep this step-for-step
             // equivalent to the per-instruction path below.
-            {
+            if (!trace) {
                 const int k_seq = seq_dispatch(i, max_steps, cycles_this,
                                                max_cycles, stop_on_trap);
                 if (k_seq > 0) {
-                    for (int k = 0; k < k_seq; ++k) {
-                        const long long* ok = seq_out + 21 * k;
-                        if (trace) {
-                            t_pc.push_back((int)ok[0]); t_a.push_back((int)ok[1]);
-                            t_x.push_back((int)ok[2]); t_y.push_back((int)ok[3]);
-                            t_s.push_back((int)ok[4]); t_p.push_back((int)ok[5]);
-                            t_ir.push_back((int)ok[6]); t_oplo.push_back((int)ok[7]);
-                            t_ophi.push_back((int)ok[8]); t_ea.push_back((int)ok[9]);
-                            t_data.push_back((int)ok[10]);
-                            t_halted.push_back((int)ok[11]);
-                            // Store-licensed rows carry writes (already
-                            // applied inside the forward, below $2000 by
-                            // license + the dispatch watch guard).
-                            for (int w = 0; w < (int)ok[14]; ++w) {
-                                w_row.push_back(step_index);
-                                w_addr.push_back((int)ok[15 + 2 * w]);
-                                w_value.push_back((int)ok[16 + 2 * w]);
-                            }
-                        }
-                        ++step_index;
-                        const long step_cycles = (long)CYCLES[(unsigned char)ok[6]];
-                        cycles_this += step_cycles; cycles_total += step_cycles;
-                    }
-                    if (seq_out[21 * (k_seq - 1) + 13]) {
+                    step_index += k_seq;
+                    cycles_this += seq_cycles;
+                    cycles_total += seq_cycles;
+                    if (st_halted) {
                         st_halted = true; reason = "halt"; break;
                     }
                     i += k_seq - 1;
@@ -702,7 +684,8 @@ PYBIND_STEP_METHODS = """\
         .def("window_shape", &ENGINE_T::window_shape)"""
 
 
-# Core-side seq_out capacity; keep in sync with SEQ_MAX_K in SEQ_HOOK.
+# Maximum instructions retired by one execution model; keep in sync with
+# SEQ_MAX_K in SEQ_HOOK.
 SEQ_MAX_K = 32
 
 
@@ -718,7 +701,7 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
     if max_k > SEQ_MAX_K:
         raise RuntimeError(
             f"sequence window of {max_k} steps exceeds the core's "
-            f"seq_out capacity ({SEQ_MAX_K})"
+            f"execution-model limit ({SEQ_MAX_K})"
         )
     emit("// Generated per-ROM sequence module (model/engine_gen.py): folded")
     emit("// window experts + dispatch, compiled against the core engine's")
@@ -779,6 +762,7 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
             emit(f"                && (max_cycles <= 0 || cycles_this + {prefix} < max_cycles)")
             emit(f"                && {match}) {{")
             emit(f"                step_core__{exp['name']}(E, E.seq_out);")
+            emit(f"                E.seq_cycles = {exp['cycles']};")
             emit(f"                return {k};")
             emit("            }")
         emit("            return 0;")
@@ -1276,16 +1260,16 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         return f"shr2(x[{slot}])"
 
     def emit_step_core(fn_name, layer_suffix, mdl, spec):
-        # One whole instruction, sharing the embed/readout/write/halt
-        # protocol; layer_suffix selects the union stack ("") or a routed
-        # expert's own rebuilt stack ("__<name>").  Each model embeds and
-        # reads out through its own slot layout (spec); the persistent
-        # st_* registers are the cross-model interface.
+        # One model forward, sharing the embed/readout/write/halt protocol;
+        # layer_suffix selects the union stack ("") or a routed expert's
+        # rebuilt stack ("__<name>").  Sequence models retire a licensed
+        # region through one final-state receipt; ordinary experts retire one
+        # instruction.  Persistent st_* registers are the model interface.
         ins = spec["inputs"]
-        # A sequence expert reads out K instructions from one forward
-        # (per-step slot maps under "step_outputs"); a plain expert is
-        # the K=1 case.
-        step_outs = spec.get("step_outputs") or [spec["outputs"]]
+        sequence_final = spec.get("sequence_final")
+        step_outs = None if sequence_final else (
+            spec.get("step_outputs") or [spec["outputs"]]
+        )
         hc, hv = spec["halt_head"]
         shc, shv = spec["state_head"]
         dm = mdl.tok.weight.shape[1]
@@ -1319,6 +1303,38 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         for li in range(len(mdl.attn)):
             emit(f"        layer_{li}{layer_suffix}("
                  f"{'E, ' if seq_mode else ''}x);")
+        if sequence_final:
+            outs = sequence_final
+            emit(f"        out[0] = {E}st_pc;")
+            for i, (name, mask) in enumerate((
+                ("new_a", 0xFF), ("new_x", 0xFF), ("new_y", 0xFF),
+                ("new_s", 0xFF), ("new_p", 0xFF),
+                ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
+                ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF),
+                ("data_out", 0xFF), ("new_halted", 0xFF),
+                ("next_pc", 0xFFFF),
+            ), start=1):
+                emit(f"        out[{i}] = {rdv(outs[name])} & 0x{mask:X};")
+            emit("        out[14] = 0;")
+            for step_writes in spec["sequence_writes"]:
+                for addr_slot, value_slot in step_writes:
+                    emit(f"        {E}insert_write((int)({rdv(addr_slot)} & 0xFFFF), "
+                         f"(int)({rdv(value_slot)} & 0xFF), {E}seq + 1);")
+            emit(f"        const long long halt_logit = "
+                 f"{expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
+            emit(f"        const long long state_logit = "
+                 f"{expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
+            emit("        out[13] = halt_logit > state_logit ? 1 : 0;")
+            emit(f"        {E}st_pc = (int)out[12];")
+            emit(f"        {E}st_a = (int)out[1]; {E}st_x = (int)out[2]; "
+                 f"{E}st_y = (int)out[3];")
+            emit(f"        {E}st_s = (int)out[4]; {E}st_p = (int)out[5];")
+            emit(f"        {E}st_ir = (int)out[6]; {E}st_oplo = (int)out[7]; "
+                 f"{E}st_ophi = (int)out[8];")
+            emit(f"        {E}st_ea = (int)out[9]; {E}st_data = (int)out[10];")
+            emit(f"        {E}st_halted = out[11] != 0 || out[13] != 0;")
+            emit("    }")
+            return
         for k, outs in enumerate(step_outs):
             off = 21 * k
             for i, (name, mask) in enumerate((
@@ -1573,6 +1589,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 emit(f"                && {checks}) {{")
                 emit("                ++fallback_count[st_pc];")
                 emit(f"                step_core__{exp['name']}(seq_out);")
+                emit(f"                seq_cycles = {exp['cycles']};")
                 emit(f"                return {exp['n_steps']};")
                 emit("            }")
                 emit("            return 0;")

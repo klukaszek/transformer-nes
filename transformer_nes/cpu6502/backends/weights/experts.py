@@ -23,10 +23,12 @@ from transformer_nes.cpu6502.backends.weights.windows import (
 )
 from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
 from transformer_nes.graph.core import (
+    Expression,
     InputDimension,
     LookUpDimension,
     PersistDimension,
     ReGLUDimension,
+    project_program_graph,
 )
 from transformer_nes.graph.fold import (
     SEQUENCE_FEEDBACK,
@@ -102,6 +104,79 @@ def fold_step_spec(fold_result, model, tok_to_idx, info, *,
             {name: slot(f"{name}__s{k}") for name in RUNTIME_READ_DIMS}
             for k in range(n_steps)
         ]
+    spec["halt_head"] = head_row(model, tok_to_idx["HALT"])
+    spec["state_head"] = head_row(model, tok_to_idx["STATE"])
+    return spec
+
+
+SEQUENCE_STATE_DIMS = (
+    "new_a", "new_x", "new_y", "new_s", "new_p", "new_halted",
+    "fetched_opcode", "fetched_operand_lo", "fetched_operand_hi",
+    "ea", "data_out", "next_pc",
+)
+
+WRITE_RECEIPTS = (
+    ("is_store", "write_addr_out", "write_value_out"),
+    ("is_store2", "write_addr2_out", "write_value2_out"),
+    ("is_store3", "write_addr3_out", "write_value3_out"),
+)
+
+
+def project_sequence_execution(fold_result, n_steps: int) -> dict:
+    """Replace the proof graph's per-step trace ABI with its execution ABI.
+
+    The complete fold is retained until all control, read, write and halt
+    licenses have passed.  Only then do we keep the final architectural
+    state and the address/value of each statically-live ordered write.  The
+    projected graph is what gets scheduled and converted to weights.
+    """
+    final_names = {
+        name: f"{name}__s{n_steps - 1}" for name in SEQUENCE_STATE_DIMS
+    }
+    writes = []
+    retained = list(final_names.values())
+    for k in range(n_steps):
+        step_writes = []
+        for flag, addr, value in WRITE_RECEIPTS:
+            active = const_root(fold_result, flag, k, fold_result.label)
+            if active not in (0, 1):
+                raise RuntimeError(
+                    f"{fold_result.label} s{k}: {flag} is not boolean"
+                )
+            if not active:
+                continue
+            addr_name = f"{addr}__s{k}"
+            value_name = f"{value}__s{k}"
+            step_writes.append((addr_name, value_name))
+            retained.extend((addr_name, value_name))
+        writes.append(step_writes)
+
+    readout = Expression()
+    for name in dict.fromkeys(retained):
+        readout = readout + 1e-6 * fold_result.dim_of_name[name]
+    outputs = dict(fold_result.program_graph.output_tokens)
+    outputs["READOUT"] = readout
+    fold_result.program_graph = project_program_graph(
+        fold_result.program_graph, outputs
+    )
+    fold_result.dim_of_name = {}
+    for dim in fold_result.program_graph.all_dims:
+        fold_result.dim_of_name.setdefault(dim.name, dim)
+    return {"final": final_names, "writes": writes}
+
+
+def sequence_step_spec(fold_result, receipt, model, tok_to_idx, info) -> dict:
+    def slot(name):
+        return info.slot_of[fold_result.dim_of_name[name]]
+
+    spec = step_spec_base(slot)
+    spec["sequence_final"] = {
+        name: slot(dim_name) for name, dim_name in receipt["final"].items()
+    }
+    spec["sequence_writes"] = [
+        [(slot(addr), slot(value)) for addr, value in step]
+        for step in receipt["writes"]
+    ]
     spec["halt_head"] = head_row(model, tok_to_idx["HALT"])
     spec["state_head"] = head_row(model, tok_to_idx["STATE"])
     return spec
@@ -465,6 +540,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                 "(next_pc != the next step's pc)"
             )
 
+    receipt = project_sequence_execution(r, n_steps)
     model, _tokens, tok_to_idx, info = schedule_and_build(r)
     cycles = sum(op.cycles for op in ops)
     # Window bytes join the name: different banks may carry different
@@ -474,8 +550,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
         "head": head, "has_stores": has_stores,
         "window": bytes(code), "n_steps": n_steps, "cycles": cycles,
         "cycles_prefix": cycles - ops[-1].cycles, "model": model,
-        "step_spec": fold_step_spec(r, model, tok_to_idx, info,
-                                    n_steps=n_steps),
+        "step_spec": sequence_step_spec(r, receipt, model, tok_to_idx, info),
         "union_lookup_of": r.union_lookup_of,
         "assume_taken_steps": assume_taken_steps,
         "layers": info.n_layers, "_d": info.d_model,
@@ -564,45 +639,10 @@ def build_trace_window_expert(pg, steps, *, s_pin: int | None = None,
     """
     head = steps[0][0]
     label = f"trace @{head:04X}"
-    pinned: dict[int, int] = {}
-    for pc, body in steps:
-        for j, byte in enumerate(body):
-            addr = (pc + j) & 0xFFFF
-            if addr in symbolic:
-                continue
-            if pinned.setdefault(addr, byte) != byte:
-                raise RuntimeError(
-                    f"{label}: byte {addr:04X} pinned twice with different "
-                    "values"
-                )
-    ops = []
-    pin_list = []
-    read_bounds: dict[tuple[int, str], tuple[int, int]] = {}
-    for k, (pc, body) in enumerate(steps):
-        op = OPCODES.get(body[0])
-        if op is None or len(body) != op.length:
-            raise RuntimeError(f"{label} s{k}: bad instruction at {pc:04X}")
-        if pc not in pinned:
-            raise RuntimeError(f"{label} s{k}: opcode byte is symbolic")
-        ops.append(op)
-        pins = opcode_pins(op.byte, OPCODES)
-        pins["current_pc_lo"] = float(pc & 0xFF)
-        pins["current_pc_hi"] = float((pc >> 8) & 0xFF)
-        pins["current_halted"] = 0.0
-        lo, hi = (pc + 1) & 0xFFFF, (pc + 2) & 0xFFFF
-        if lo in pinned:
-            pins["fetched_operand_lo_all"] = float(pinned[lo])
-        if hi in pinned:
-            pins["fetched_operand_hi_all"] = float(pinned[hi])
-        if k == 0 and s_pin is not None:
-            pins["current_s"] = float(s_pin)
-        if k == 0 and flag_pins:
-            pins.update({n: float(v) for n, v in flag_pins.items()})
-        pin_list.append(pins)
-        operand_pinned = all(
-            (pc + j) in pinned for j in range(1, op.length)
-        )
-        read_bounds.update(trace_read_bounds(k, op, body, operand_pinned))
+    pinned = pin_region_bytes(steps, symbolic, label)
+    ops, pin_list, read_bounds = region_pin_list(
+        steps, pinned, label, s_pin, flag_pins,
+    )
 
     folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS,
                          structural_reads=structural_reads)
@@ -653,7 +693,13 @@ def build_trace_window_expert(pg, steps, *, s_pin: int | None = None,
     }
 
 
-def license_trace_fold(r, steps, pinned, label, read_bounds) -> list[int]:
+def license_trace_fold(
+    r,
+    steps,
+    pinned,
+    label,
+    read_bounds,
+) -> list[int]:
     """The trace-window licenses over one fold result (see
     build_trace_window_expert).  Returns spec_next: for every step whose
     next_pc could not be proven constant (a speculated branch), the pc the
@@ -684,6 +730,23 @@ def license_trace_fold(r, steps, pinned, label, read_bounds) -> list[int]:
                 f"{label} s{k}: control flow deviates from the trace",
                 step=k,
             )
+    license_step_effects(r, n_steps, pinned, label, read_bounds)
+    return spec_next
+
+
+def license_step_effects(
+    r,
+    n_steps: int,
+    pinned,
+    label,
+    read_bounds,
+) -> None:
+    """The per-step memory/halt licenses shared by trace windows and
+    predicated regions: no step halts, every store has a constant address
+    below $2000 that overlaps no pinned byte, and every surviving read is
+    forwarded, at a constant RAM/ROM address, or interval-bounded inside
+    RAM/ROM.  Every check is per NODE, so a region's arms are licensed
+    exactly as if each were its own straight-line window."""
     for k in range(n_steps):
         if const_root(r, "new_halted", k, label) != 0:
             raise SequenceRejection(f"{label} s{k}: may halt", step=k)
@@ -725,7 +788,55 @@ def license_trace_fold(r, steps, pinned, label, read_bounds) -> list[int]:
                 f"{label} s{k}: read {name} bound [{lo:.0f}, {hi:.0f}] "
                 "may reach a device", step=k,
             )
-    return spec_next
+
+
+def region_pin_list(nodes, pinned, label, s_pin, flag_pins):
+    """Per-node pins plus certified read bounds for a region/trace tree:
+    every node's pc, opcode and resident operand bytes pin; the ROOT
+    additionally pins the guarded entering S and P bits."""
+    ops, pin_list = [], []
+    read_bounds: dict[tuple[int, str], tuple[int, int]] = {}
+    for k, (pc, body) in enumerate(nodes):
+        op = OPCODES.get(body[0])
+        if op is None or len(body) != op.length:
+            raise RuntimeError(f"{label} s{k}: bad instruction at {pc:04X}")
+        if pc not in pinned:
+            raise RuntimeError(f"{label} s{k}: opcode byte is symbolic")
+        ops.append(op)
+        pins = opcode_pins(op.byte, OPCODES)
+        pins["current_pc_lo"] = float(pc & 0xFF)
+        pins["current_pc_hi"] = float((pc >> 8) & 0xFF)
+        pins["current_halted"] = 0.0
+        lo, hi = (pc + 1) & 0xFFFF, (pc + 2) & 0xFFFF
+        if lo in pinned:
+            pins["fetched_operand_lo_all"] = float(pinned[lo])
+        if hi in pinned:
+            pins["fetched_operand_hi_all"] = float(pinned[hi])
+        if k == 0 and s_pin is not None:
+            pins["current_s"] = float(s_pin)
+        if k == 0 and flag_pins:
+            pins.update({n: float(v) for n, v in flag_pins.items()})
+        pin_list.append(pins)
+        operand_pinned = all((pc + j) in pinned for j in range(1, op.length))
+        read_bounds.update(trace_read_bounds(k, op, body, operand_pinned))
+    return ops, pin_list, read_bounds
+
+
+def pin_region_bytes(nodes, symbolic, label) -> dict[int, int]:
+    """Address -> byte for every resident byte a region's nodes execute.
+    Two nodes may share an address (arms rejoin) as long as they agree."""
+    pinned: dict[int, int] = {}
+    for pc, body in nodes:
+        for j, byte in enumerate(body):
+            addr = (pc + j) & 0xFFFF
+            if addr in symbolic:
+                continue
+            if pinned.setdefault(addr, byte) != byte:
+                raise RuntimeError(
+                    f"{label}: byte {addr:04X} pinned twice with different "
+                    "values"
+                )
+    return pinned
 
 
 def build_shape_experts(pg, shapes, *,
@@ -845,6 +956,7 @@ def build_shape_experts(pg, shapes, *,
                         "head + offset for every head"
                     )
 
+        receipt = project_sequence_execution(r, n_steps)
         model, _tokens, tok_to_idx, info = schedule_and_build(r)
         ops_full = ops * repeat
         cycles = sum(op.cycles for op in ops_full)
@@ -855,9 +967,11 @@ def build_shape_experts(pg, shapes, *,
             "has_stores": has_stores, "store_bounds": store_bounds,
             "store_guard_offset": store_guard_offset,
             "spec_offsets": spec_offsets,
+            "cycles": cycles,
             "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
-            "step_spec": fold_step_spec(r, model, tok_to_idx, info,
-                                        n_steps=n_steps),
+            "step_spec": sequence_step_spec(
+                r, receipt, model, tok_to_idx, info,
+            ),
             "union_lookup_of": r.union_lookup_of,
             "layers": info.n_layers, "_d": info.d_model,
         })

@@ -154,11 +154,9 @@ def test_run_loop_matches_per_step():
 
 @pytest.mark.slow
 def test_sequence_experts_match_per_step():
-    """All three dispatch tiers must produce byte-identical run-loop traces:
-    the per-ROM pinned module, the canonical shape table (zero per-ROM
-    compile -- every idiom below matches a library shape), and the pure
-    per-instruction path, across polls, mid-run flag flips, the branch
-    fall-through, the spin, and chunk boundaries landing mid-window."""
+    """Traced fallback stays byte-identical across configurations; untraced
+    pinned/shape execution models finish with the same state, RAM and cycles
+    as the per-instruction path across polls, branches and odd boundaries."""
     import numpy as np
 
     from transformer_nes.cpu6502.backends.weights.windows import (
@@ -222,6 +220,37 @@ def test_sequence_experts_match_per_step():
     for pc in (0x0408, 0x040B, 0x0410):
         assert pc in traces[0]["pc"], f"never reached {pc:04X}"
 
+    # Gameplay does not request instruction traces.  In that mode the
+    # sequence models use the compact execution receipt; compare persistent
+    # state/RAM/cycles after the same boundary and input schedule.
+    final = []
+    for cfg in configs:
+        m = Cpu6502TransformerMachine(bcd=False, **cfg)
+        m.load_image(bytes(image), start_pc=0x0400)
+
+        def run_untraced(n, m=m):
+            done = cycles = 0
+            while done < n:
+                out = m.run(min(701, n - done), trace=False)
+                assert int(out["steps"]) > 0, out["reason"]
+                done += int(out["steps"])
+                cycles += int(out["cycles"])
+            assert done == n
+            return cycles
+
+        cycles = run_untraced(3000)
+        m.inject_write(0x0700, 0x40)
+        cycles += run_untraced(1000)
+        m.inject_write(0x0010, 0x80)
+        cycles += run_untraced(1000)
+        state = m.get_state()
+        state.pop("pos", None)  # transformer positions differ by construction
+        final.append((state, m.dump_ram(), cycles))
+        if "sequence_windows" in cfg:
+            hot = set(int(pc) for pc in m.engine.jit_hot(100))
+            assert not hot & {0x0400, 0x0408, 0x040B, 0x0410}, hot
+    assert final[0] == final[1] == final[2]
+
 
 def store_loop_image() -> bytearray:
     """Three store-carrying micro-loops plus a spin: an indexed copy, an
@@ -248,9 +277,8 @@ def store_loop_image() -> bytearray:
 
 @pytest.mark.slow
 def test_store_windows_match_per_step():
-    """Store-licensed windows: the pinned module must execute the copy /
-    RMW / stack-push loops as single forwards with traces (writes
-    included) and final RAM byte-identical to the per-instruction path."""
+    """Store-licensed execution models must finish copy/RMW/push loops with
+    state, cycles and RAM byte-identical to the per-instruction path."""
     import numpy as np
 
     from transformer_nes.cpu6502.backends.weights.windows import (
@@ -285,14 +313,29 @@ def test_store_windows_match_per_step():
         rams.append(m.dump_ram())
         if "sequence_windows" in cfg:
             assert m.seq_module is not None
-            # The loop heads ran hundreds of times; through the module
-            # they must never reach the per-instruction counter.
-            hot = set(int(pc) for pc in m.engine.jit_hot(100))
-            assert not hot & {0x0400, 0x0409, 0x040E}, hot
     for k in fields:
         assert np.array_equal(traces[0][k], traces[1][k]), f"{k} diverged"
     assert rams[0] == rams[1]
     assert rams[0][0x0300:0x0400] == bytes(image[0x0600:0x0700])
+
+    final = []
+    for cfg in configs2:
+        m = Cpu6502TransformerMachine(bcd=False, **cfg)
+        m.load_image(bytes(image), start_pc=0x0400)
+        done = cycles = 0
+        while done < 2800:
+            out = m.run(min(701, 2800 - done), trace=False)
+            assert int(out["steps"]) > 0, out["reason"]
+            done += int(out["steps"])
+            cycles += int(out["cycles"])
+        assert done == 2800
+        state = m.get_state()
+        state.pop("pos", None)  # transformer positions differ by construction
+        final.append((state, m.dump_ram(), cycles))
+        if "sequence_windows" in cfg:
+            hot = set(int(pc) for pc in m.engine.jit_hot(100))
+            assert not hot & {0x0400, 0x0409, 0x040E}, hot
+    assert final[0] == final[1]
 
 
 @pytest.mark.slow

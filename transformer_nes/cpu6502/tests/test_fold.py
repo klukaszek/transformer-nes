@@ -24,7 +24,12 @@ import pytest
 
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS
-from transformer_nes.cpu6502.backends.weights.experts import build_shape_experts
+from transformer_nes.cpu6502.backends.weights.experts import (
+    SEQUENCE_STATE_DIMS,
+    build_shape_experts,
+    project_sequence_execution,
+    schedule_and_build,
+)
 from transformer_nes.cpu6502.backends.weights.runner import VERIFY_START, verify_program
 from transformer_nes.cpu6502.interpreter import build
 from transformer_nes.cpu6502.spec import OPCODES
@@ -405,6 +410,79 @@ def test_sequence_fold_shadows_union(
     assert windows >= 2, "the stream never dispatched the sequence"
 
 
+def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
+    """The execution model is built from the licensed fold after removing
+    the per-instruction trace receipt.  A write-free three-instruction poll
+    keeps exactly one final architectural receipt and still agrees with the
+    union on that state at every dispatch."""
+    code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
+    pin_list = sequence_pins(POLL_HEAD, code, OPCODES)
+    r = folder.fold_sequence(
+        pin_list, SEQUENCE_FEEDBACK, label="projected_poll",
+    )
+    proof_dims = len(r.program_graph.all_dims)
+    receipt = project_sequence_execution(r, len(pin_list))
+
+    assert receipt["writes"] == [[], [], []]
+    assert set(receipt["final"]) == set(SEQUENCE_STATE_DIMS)
+    assert len(r.program_graph.all_dims) < proof_dims * 0.76
+    for k in range(len(pin_list) - 1):
+        for name in (
+            "current_pc", "fetched_opcode", "fetched_operand_lo",
+            "fetched_operand_hi", "ea", "data_out", "next_pc",
+            "is_store", "is_store2", "is_store3",
+        ):
+            assert f"{name}__s{k}" not in r.dim_of_name
+
+    ev = ProgramEvaluator(r.program_graph)
+    steps = poll_run["steps"]
+    idx = 0
+    skip = 0
+    windows = 0
+    for kind, inputs in poll_run["tokens"]:
+        if kind != "state":
+            ev.step(inputs)
+            continue
+        if skip:
+            skip -= 1
+            idx += 1
+            continue
+        pc = inputs["in_pc_lo"] | (inputs["in_pc_hi"] << 8)
+        if pc != POLL_HEAD or idx + len(pin_list) > len(steps):
+            ev.step(inputs)
+            idx += 1
+            continue
+        values = ev.step(inputs)
+        expected = steps[idx + len(pin_list) - 1]["reads"]
+        for name, dim_name in receipt["final"].items():
+            mask = 0xFFFF if name in ("next_pc", "ea") else 0xFF
+            assert int(round(ev.read(values, dim_name))) & mask == (
+                expected[name] & mask
+            )
+        windows += 1
+        skip = len(pin_list) - 1
+        idx += 1
+    assert windows >= 2
+
+
+def test_sequence_execution_projection_collapses_model_width(folder):
+    """Receipt width must not grow with a repeated deterministic region."""
+    pins = sequence_pins(
+        SPIN_HEAD, bytes([0x4C, 0x08, 0x04]), OPCODES,
+    ) * 8
+    proof = folder.fold_sequence(pins, SEQUENCE_FEEDBACK, label="full_spin")
+    _model, _tokens, _rows, proof_info = schedule_and_build(proof)
+
+    execution = folder.fold_sequence(
+        pins, SEQUENCE_FEEDBACK, label="execution_spin",
+    )
+    project_sequence_execution(execution, len(pins))
+    _model, _tokens, _rows, execution_info = schedule_and_build(execution)
+
+    assert execution_info.n_layers == proof_info.n_layers
+    assert execution_info.d_model <= proof_info.d_model // 4
+
+
 @pytest.mark.parametrize("byte", SHADOW_OPCODES)
 @pytest.mark.parametrize(
     "inline_linear", [False, True], ids=["materialized", "linear-inlined"],
@@ -600,7 +678,7 @@ def test_shape_fold_shadows_union(
 
 def test_shape_absolute_store_requires_runtime_guard(union_pg):
     """A symbolic absolute store is admitted only with the narrow router
-    license and reports the live operand offset that Metal must guard."""
+    license and reports the live operand offset the runtime must guard."""
     shape = ("lda_sta_abs", bytes.fromhex("a9008d0000"), 1)
     with pytest.raises(RuntimeError, match="not provably below"):
         build_shape_experts(
