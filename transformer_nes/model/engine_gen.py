@@ -626,7 +626,7 @@ RUN_LOOP = "\n\n".join((
     void set_run_state(int pc, int a, int x, int y, int s, int p,
                        int ir, int oplo, int ophi, int ea, int data, int halted) {
         st_pc = pc & 0xFFFF; st_a = a & 0xFF; st_x = x & 0xFF; st_y = y & 0xFF;
-        st_s = s & 0xFF; st_p = p & 0xFF;
+        st_s = s & 0xFF; st_p = (p | 0x20) & 0xFF;
         st_ir = ir & 0xFF; st_oplo = oplo & 0xFF; st_ophi = ophi & 0xFF;
         st_ea = ea & 0xFFFF; st_data = data & 0xFF;
         st_halted = halted != 0;
@@ -702,13 +702,6 @@ def emit_recurrence_dispatch(emit, exp, E: str, step_call: str, indent: str) -> 
              f" ? (room - {prefix} - 1) / {cycles} + 1 : 0;")
         emit(f"{indent}    if (recurrence_n > cap) recurrence_n = cap;")
         emit(f"{indent}}}")
-        emit(f"{indent}const int recurrence_head = {E}st_pc;")
-        emit(f"{indent}{E}st_ir = {E}ram[recurrence_head];")
-        emit(f"{indent}{E}st_oplo = {E}ram[(recurrence_head + 1) & 0xFFFF];")
-        emit(f"{indent}{E}st_ophi = {E}ram[(recurrence_head + 2) & 0xFFFF];")
-        emit(f"{indent}{E}st_ea = {E}st_oplo | ({E}st_ophi << 8);")
-        emit(f"{indent}{E}st_data = 0; {E}st_p |= 0x20;")
-        emit(f"{indent}{E}st_pc = {E}st_ea;")
         emit(f"{indent}{E}seq_cycles = recurrence_n * {cycles};")
         emit(f"{indent}return (int)recurrence_n;")
         return
@@ -1460,12 +1453,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 "new_x": ("st_x", 0xFF),
                 "new_y": ("st_y", 0xFF),
                 "new_s": ("st_s", 0xFF),
-                "new_p": ("st_p", 0xFF),
-                "fetched_opcode": ("st_ir", 0xFF),
-                "fetched_operand_lo": ("st_oplo", 0xFF),
-                "fetched_operand_hi": ("st_ophi", 0xFF),
-                "ea": ("st_ea", 0xFFFF),
-                "data_out": ("st_data", 0xFF),
             }
             for name, (field, mask) in fields.items():
                 if name in outs:
@@ -1476,7 +1463,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                          f"{int(constants[name]) & mask};")
             flag_masks = {
                 "p_c": 0x01, "p_z": 0x02, "p_i": 0x04, "p_d": 0x08,
-                "p_b": 0x10, "p_u": 0x20, "p_v": 0x40, "p_n": 0x80,
+                "p_b": 0x10, "p_v": 0x40, "p_n": 0x80,
             }
             for name, mask in flag_masks.items():
                 if name in outs:
@@ -1486,12 +1473,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 else:
                     continue
                 emit(f"        {E}st_p = ({E}st_p & ~0x{mask:X}) | ({value});")
-            if "new_halted" in outs:
-                emit(f"        {E}st_halted = "
-                     f"({rdv(outs['new_halted'])} & 0xFF) != 0;")
-            elif "new_halted" in constants:
-                emit(f"        {E}st_halted = "
-                     f"{str(bool(constants['new_halted'])).lower()};")
             control = spec["sequence_control"]
             if control["relative_to_head"]:
                 fallthrough = f"({E}st_pc + {control['fallthrough']})"
@@ -1506,9 +1487,17 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     f"(int)(std::int8_t){E}ram[({E}st_pc + {operand_offset}) & 0xFFFF])"
                 )
             predicate = control["predicate"]
+            if control["flag_mask"]:
+                mask = control["flag_mask"]
+                expected = f"0x{mask:X}" if control["flag_value"] else "0"
+                condition = f"({E}st_p & 0x{mask:X}) == {expected}"
+            elif predicate is not None:
+                condition = f"({rdv(predicate)} & 1)"
+            else:
+                condition = None
             successor = (
-                fallthrough if predicate is None
-                else f"(({rdv(predicate)} & 1) ? {target} : {fallthrough})"
+                fallthrough if condition is None
+                else f"({condition} ? {target} : {fallthrough})"
             )
             emit(f"        {E}st_pc = (int)({successor} & 0xFFFF);")
             for step_writes in spec["sequence_writes"]:
@@ -1800,7 +1789,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("                      int irq, LArr out_arr) {")
         emit('        if ((int)out_arr.size() != 21) throw std::runtime_error("step out buffer must have 21 slots");')
         emit("        st_pc = pc & 0xFFFF; st_a = a & 0xFF; st_x = xr & 0xFF;")
-        emit("        st_y = yr & 0xFF; st_s = sr & 0xFF; st_p = p & 0xFF;")
+        emit("        st_y = yr & 0xFF; st_s = sr & 0xFF; st_p = (p | 0x20) & 0xFF;")
         emit("        st_ir = ir & 0xFF; st_oplo = oplo & 0xFF; st_ophi = ophi & 0xFF;")
         emit("        st_ea = ea & 0xFFFF; st_data = data & 0xFF;")
         emit("        st_halted = halted != 0; nmi_pending = nmi != 0;")

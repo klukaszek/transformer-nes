@@ -42,6 +42,8 @@ class ControlFlow:
     target: int
     relative_to_head: bool = False
     relative_operand_offset: int | None = None
+    flag_mask: int = 0
+    flag_value: bool = True
 
 
 @dataclass(frozen=True)

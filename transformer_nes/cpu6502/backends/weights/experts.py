@@ -12,6 +12,7 @@ import contextlib
 import hashlib
 import logging
 import time
+from dataclasses import replace
 
 import numpy as np
 
@@ -122,10 +123,8 @@ def fold_step_spec(fold_result, model, tok_to_idx, info, *,
 
 
 SEQUENCE_STATE_DIMS = (
-    "new_a", "new_x", "new_y", "new_s", "new_halted",
-    "fetched_opcode", "fetched_operand_lo", "fetched_operand_hi",
-    "ea", "data_out", "p_c", "p_z", "p_i", "p_d", "p_b", "p_u",
-    "p_v", "p_n",
+    "new_a", "new_x", "new_y", "new_s",
+    "p_c", "p_z", "p_i", "p_d", "p_b", "p_v", "p_n",
 )
 
 SEQUENCE_FLAG_DIMS = (
@@ -145,13 +144,6 @@ SEQUENCE_PRESERVE_INPUTS = {
     "new_s": (("in_s", 1),),
     **{name: ((input_name, 1),)
        for name, _dim_name, _mask, input_name in SEQUENCE_FLAG_DIMS},
-    "p_u": (("one", 1),),
-    "new_halted": (("in_halted", 1),),
-    "fetched_opcode": (("in_ir", 1),),
-    "fetched_operand_lo": (("in_oplo", 1),),
-    "fetched_operand_hi": (("in_ophi", 1),),
-    "ea": (("in_ea_lo", 1), ("in_ea_hi", 256)),
-    "data_out": (("in_data", 1),),
 }
 
 WRITE_RECEIPTS = (
@@ -160,9 +152,10 @@ WRITE_RECEIPTS = (
     ("is_store3", "write_addr3_out", "write_value3_out"),
 )
 SEQUENCE_ROOT_DIMS = (
-    *(name for name in RUNTIME_READ_DIMS if name != "new_p"),
+    "new_a", "new_x", "new_y", "new_s",
     *(dim_name for _name, dim_name, _mask, _input_name in SEQUENCE_FLAG_DIMS),
-    "branch_taken",
+    "ea", "next_pc", "new_halted", "branch_taken",
+    *(name for receipt in WRITE_RECEIPTS for name in receipt),
 )
 
 
@@ -231,7 +224,6 @@ def project_sequence_execution(
         for name, dim_name, _mask, _input_name in SEQUENCE_FLAG_DIMS
     })
     final = classify_sequence_state(fold_result, final_names)
-    final["constant"]["p_u"] = 1
     outputs = []
     output_tokens = {}
     for name in SEQUENCE_STATE_DIMS:
@@ -262,8 +254,11 @@ def project_sequence_execution(
             output_tokens[f"write:{k}:{order}:address"] = Expression({address: 1})
             output_tokens[f"write:{k}:{order}:value"] = Expression({write_value: 1})
 
-    if control.predicate is not None:
+    if control.predicate is not None and not control.flag_mask:
         output_tokens["control:branch"] = Expression({control.predicate: 1})
+    execution_control = (
+        replace(control, predicate=None) if control.flag_mask else control
+    )
 
     program_graph = project_program_graph(
         fold_result.program_graph, output_tokens, retain_input_tokens=False,
@@ -283,7 +278,7 @@ def project_sequence_execution(
         memory_reads=tuple(program_graph.all_memory_reads),
         memory_writes=tuple(writes),
         outputs=tuple(outputs),
-        control=control,
+        control=execution_control,
         recurrence=recurrence,
         dim_of_name=dim_of_name,
     )
@@ -324,6 +319,8 @@ def sequence_step_spec(execution: ExecutionGraph, info) -> dict:
         "target": control.target,
         "relative_to_head": control.relative_to_head,
         "relative_operand_offset": control.relative_operand_offset,
+        "flag_mask": control.flag_mask,
+        "flag_value": control.flag_value,
     }
     return spec
 
@@ -404,6 +401,18 @@ def decode_ops(code: bytes) -> list:
     return ops
 
 
+BRANCH_FLAG = {
+    "bcc": (reference.FLAG_C, False),
+    "bcs": (reference.FLAG_C, True),
+    "beq": (reference.FLAG_Z, True),
+    "bmi": (reference.FLAG_N, True),
+    "bne": (reference.FLAG_Z, False),
+    "bpl": (reference.FLAG_N, False),
+    "bvc": (reference.FLAG_V, False),
+    "bvs": (reference.FLAG_V, True),
+}
+
+
 def pinned_sequence_control(fold_result, pin_list, ops) -> ControlFlow:
     k = len(pin_list) - 1
     op = ops[k]
@@ -428,6 +437,8 @@ def pinned_sequence_control(fold_result, pin_list, ops) -> ControlFlow:
             predicate=predicate,
             fallthrough=fallthrough,
             target=(fallthrough + signed) & 0xFFFF,
+            flag_mask=BRANCH_FLAG[op.operation][0],
+            flag_value=BRANCH_FLAG[op.operation][1],
         )
     if op.operation == "jmp" and op.mode == "abs":
         target = int(pins["fetched_operand_lo_all"]) | (
@@ -458,6 +469,8 @@ def shape_sequence_control(
             target=0,
             relative_to_head=True,
             relative_operand_offset=offsets[-1] + 1,
+            flag_mask=BRANCH_FLAG[op.operation][0],
+            flag_value=BRANCH_FLAG[op.operation][1],
         )
     if op.operation in SEQUENCE_WRITERS or op.operation == "jmp":
         raise RuntimeError(

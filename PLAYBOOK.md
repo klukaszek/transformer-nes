@@ -31,7 +31,7 @@ in/out and FFN in/out), not zeroes or the unused dense shape.
 | Model set | Previous construction | Current construction | Delta |
 | --- | --- | --- | --- |
 | 227 documented-opcode experts | 3,719 layers; max `d_model` 294; 265,934 sparse terms | 825 layers; max `d_model` 106; 126,706 sparse terms | −77.8% layers; −63.9% max width; −52.4% sparse work |
-| 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 59 layers; max `d_model` 38; 3,747 sparse terms | −77.0% layers; −36.7% max width; −78.5% sparse work |
+| 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 64 layers; max `d_model` 34; 2,488 sparse terms | −75.1% layers; −43.3% max width; −85.8% sparse work |
 
 The deterministic 24-instruction self-JMP is the clearest construction
 trace.  Its full proof receipt built as 38 layers / `d_model` 596 / 6,889
@@ -190,13 +190,18 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    more terms and no more layers.  This policy applies uniformly to all
    227 opcode experts, generic shapes and concrete sequences; it is not a
    ROM knob.  Together with structural serving it cut the opcode census
-   from 3,719 to 1,574 layers and 265,934 to 140,764 sparse terms.
+   from 3,719 to 1,574 layers and 265,934 to 140,764 sparse terms.  Recheck
+   ambiguous choices in the generated engine: for LDA/AND/BEQ, the selected
+   11-layer / 442-term model was slightly faster over interleaved five-million-
+   instruction runs than the 5-layer / 476-term alternative.
 
 17. **Make architectural deltas and dependency closure the model ABI.**
    Classify every final field—including each P bit independently—as preserved,
    compile-time constant, or model-computed; only computed fields remain output
    roots.  Do not carry five unchanged flags merely to repack a changed Z/N
-   pair into a byte.  Non-halting
+   pair into a byte.  Trace context is not architectural state: gameplay
+   models omit opcode, operands, effective address and data entirely, while
+   traced execution uses the exact one-step path.  Non-halting
    is already a construction license, so sequence models carry no halt
    classifier.  The lowering produces a typed execution IR of live
    `StateField` leaves, `MemoryRead` leaves, ordered `MemoryWrite` effects and
@@ -204,9 +209,9 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    only fields reachable from computed outputs or writes.  This is what lets
    a deterministic sequence become a genuine zero-layer model with only the
    constant-one residual slot (`d_model=2`).  Splitting P after the initial
-   state-delta pass kept the shape library at 59 layers while reducing max
-   `d_model` 44 → 38 and sparse terms 4,013 → 3,747; DEX/BNE's model
-   live-ins are now only PC and X.
+   state-delta pass reduced max `d_model` 44 → 38 and sparse terms 4,013 →
+   3,747.  Removing trace-only outputs then reached width 34 and 2,528 terms;
+   DEX/BNE became 2 layers / width 10 / 90 terms with X as its only live-in.
 
 18. **Return control decisions, not reconstructed program counters.**  A
    licensed region already knows its fallthrough and deterministic targets;
@@ -215,7 +220,10 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    the successor as typed metadata (absolute, head-relative, or signed
    operand-relative).  This removed PC arithmetic, wrapping and mux chains
    from the shape library: 104 → 91 layers, max `d_model` 52 → 48 and
-   6,178 → 5,657 sparse terms, with no ROM-specific assumptions.
+   6,178 → 5,657 sparse terms, with no ROM-specific assumptions.  A closing
+   branch's final status bit is already an architectural output, so the engine
+   now resolves control from P instead of retaining a duplicate `branch_taken`
+   slot; the current shape census drops another 40 terms to 2,488.
 
 19. **Expose bits by dependency, not by representation.**  The exact engine
    may serve byte bits directly, but carrying eight bit coordinates through

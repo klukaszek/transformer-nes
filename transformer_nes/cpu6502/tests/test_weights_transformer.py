@@ -244,7 +244,11 @@ def test_sequence_experts_match_per_step():
         m.inject_write(0x0010, 0x80)
         cycles += run_untraced(1000)
         state = m.get_state()
-        state.pop("pos", None)  # transformer positions differ by construction
+        state = {
+            name: state[name]
+            for name in ("pc", "a", "x", "y", "s", "p", "halted",
+                         "steps", "cycles")
+        }
         final.append((state, m.dump_ram(), cycles))
         if "sequence_windows" in cfg:
             hot = set(int(pc) for pc in m.engine.jit_hot(100))
@@ -330,7 +334,11 @@ def test_store_windows_match_per_step():
             cycles += int(out["cycles"])
         assert done == 2800
         state = m.get_state()
-        state.pop("pos", None)  # transformer positions differ by construction
+        state = {
+            name: state[name]
+            for name in ("pc", "a", "x", "y", "s", "p", "halted",
+                         "steps", "cycles")
+        }
         final.append((state, m.dump_ram(), cycles))
         if "sequence_windows" in cfg:
             hot = set(int(pc) for pc in m.engine.jit_hot(100))

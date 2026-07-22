@@ -495,10 +495,13 @@ def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
             )
             assert int(round(value)) & mask == expected_value & mask
         control = execution.control
-        taken = (
-            False if control.predicate is None
-            else bool(round(values[control.predicate]))
-        )
+        if control.flag_mask:
+            taken = bool(expected["new_p"] & control.flag_mask) == control.flag_value
+        else:
+            taken = (
+                False if control.predicate is None
+                else bool(round(values[control.predicate]))
+            )
         successor = control.target if taken else control.fallthrough
         assert successor == expected["next_pc"]
         windows += 1
@@ -866,17 +869,18 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
     experts, _meta = build_shape_experts(union_pg, [shape])
     spec = experts[0]["step_spec"]
 
-    assert set(spec["inputs"]) == {"pc_lo", "pc_hi", "x"}
+    assert set(spec["inputs"]) == {"x"}
     assert spec["p_flags"] == []
     assert {"p_z", "p_n"} <= set(spec["sequence_final"]["model"])
     assert spec["sequence_control"] == {
-        "predicate": spec["sequence_control"]["predicate"],
+        "predicate": None,
         "fallthrough": 3,
         "target": 0,
         "relative_to_head": True,
         "relative_operand_offset": 2,
+        "flag_mask": reference.FLAG_Z,
+        "flag_value": False,
     }
-    assert spec["sequence_control"]["predicate"] is not None
     recurrence = experts[0]["recurrence"]
     assert (
         recurrence.kind, recurrence.register, recurrence.delta,
