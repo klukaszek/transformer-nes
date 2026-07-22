@@ -413,10 +413,42 @@ def schedule_and_build(fold_result):
     return build_model(program_graph=fp, schedule=sched)
 
 
+def sparse_forward_work(model, n_layers: int) -> int:
+    return sum(
+        int(
+            np.count_nonzero(model.attn[li].in_proj_weight)
+            + np.count_nonzero(model.attn[li].out_proj.weight)
+            + np.count_nonzero(model.ff_in[li].weight)
+            + np.count_nonzero(model.ff_out[li].weight)
+        )
+        for li in range(n_layers)
+    )
+
+
+def prefer_inlined(materialized, inlined, label: str) -> bool:
+    materialized_model, materialized_info = materialized
+    inlined_model, inlined_info = inlined
+    materialized_work = sparse_forward_work(
+        materialized_model, materialized_info.n_layers,
+    )
+    inlined_work = sparse_forward_work(inlined_model, inlined_info.n_layers)
+    accepted = (
+        inlined_work <= materialized_work
+        and inlined_info.n_layers <= materialized_info.n_layers
+    )
+    logger.debug(
+        "%s: linear inlining %s (%d/%d layers, %d/%d sparse terms)",
+        label, "accepted" if accepted else "rejected",
+        inlined_info.n_layers, materialized_info.n_layers,
+        inlined_work, materialized_work,
+    )
+    return accepted
+
+
 def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
                          milp_seconds: int = 900,
-                         inline_linear: bool = False,
-                         structural_reads: bool = False) -> list[dict]:
+                         inline_linear: bool | None = None,
+                         structural_reads: bool = True) -> list[dict]:
     """Rebuilt per-opcode expert models for the opcode-routed engine.
 
     For each expert opcode, the union graph is partially evaluated with the
@@ -439,16 +471,35 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
                          structural_reads=structural_reads)
     experts = []
     for byte in opcodes:
-        r = folder.fold(
-            opcode_pins(byte, OPCODES), label=f"{byte:02X}",
-            inline_linear=inline_linear,
-        )
-        if r.insert_side_hazards:
-            raise RuntimeError(
-                f"expert {byte:02X}: decode pins reach insert-side "
-                f"expressions of {r.insert_side_hazards}; shared attention "
-                "state would diverge"
+        label = f"expert {byte:02X}"
+
+        def fold_candidate(inline, byte=byte, label=label):
+            candidate = folder.fold(
+                opcode_pins(byte, OPCODES), label=f"{byte:02X}",
+                inline_linear=inline,
             )
+            if candidate.insert_side_hazards:
+                raise RuntimeError(
+                    f"{label}: decode pins reach insert-side expressions of "
+                    f"{candidate.insert_side_hazards}; shared attention state "
+                    "would diverge"
+                )
+            built = schedule_and_build(candidate)
+            return candidate, built
+
+        if inline_linear is None:
+            materialized_r, materialized = fold_candidate(False)
+            inlined_r, inlined = fold_candidate(True)
+            r, built = (
+                (inlined_r, inlined)
+                if prefer_inlined(
+                    (materialized[0], materialized[3]),
+                    (inlined[0], inlined[3]), label,
+                )
+                else (materialized_r, materialized)
+            )
+        else:
+            r, built = fold_candidate(inline_linear)
         fp = r.program_graph
         if schedule == "milp":
             # Exact hygiene-objective schedule: tractable at expert scale; at
@@ -468,7 +519,7 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
                 program_graph=fp, schedule=sched,
             )
         else:
-            model, _tokens, tok_to_idx, info = schedule_and_build(r)
+            model, _tokens, tok_to_idx, info = built
         experts.append({
             "name": f"{byte:02X}", "byte": byte, "model": model,
             "step_spec": fold_step_spec(r, model, tok_to_idx, info),
@@ -485,8 +536,8 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
 
 
 def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
-                          inline_linear: bool = False,
-                          structural_reads: bool = False,
+                          inline_linear: bool | None = None,
+                          structural_reads: bool = True,
                           assume_taken_steps=()) -> dict:
     """One sequence expert: a K-instruction window folded as ONE forward.
 
@@ -517,10 +568,14 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
         pin_list[k]["branch_taken"] = 1.0
     folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS,
                          structural_reads=structural_reads)
-    r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
-                             label=f"seq_{head:04X}",
-                             inline_linear=inline_linear,
-                             bit_feedback_until=last_a_bit_step(ops))
+
+    def fold_candidate(inline):
+        return folder.fold_sequence(
+            pin_list, SEQUENCE_FEEDBACK, label=f"seq_{head:04X}",
+            inline_linear=inline, bit_feedback_until=last_a_bit_step(ops),
+        )
+
+    r = fold_candidate(False if inline_linear is None else inline_linear)
     if r.insert_side_hazards:
         raise RuntimeError(
             f"{label}: pins reach insert-side expressions "
@@ -541,7 +596,22 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
             )
 
     receipt = project_sequence_execution(r, n_steps)
-    model, _tokens, tok_to_idx, info = schedule_and_build(r)
+    materialized = schedule_and_build(r)
+    if inline_linear is None:
+        inlined_r = fold_candidate(True)
+        if inlined_r.insert_side_hazards:
+            raise RuntimeError(
+                f"{label}: pins reach insert-side expressions "
+                f"of {inlined_r.insert_side_hazards}"
+            )
+        inlined_receipt = project_sequence_execution(inlined_r, n_steps)
+        inlined = schedule_and_build(inlined_r)
+        if prefer_inlined(
+            (materialized[0], materialized[3]),
+            (inlined[0], inlined[3]), label,
+        ):
+            r, receipt, materialized = inlined_r, inlined_receipt, inlined
+    model, _tokens, tok_to_idx, info = materialized
     cycles = sum(op.cycles for op in ops)
     # Window bytes join the name: different banks may carry different
     # windows at one head, and each needs its own step_core symbol.
@@ -840,8 +910,8 @@ def pin_region_bytes(nodes, symbolic, label) -> dict[int, int]:
 
 
 def build_shape_experts(pg, shapes, *,
-                        inline_linear: bool = False,
-                        structural_reads: bool = False,
+                        inline_linear: bool | None = None,
+                        structural_reads: bool = True,
                         allow_stores: bool = False,
                         allow_runtime_store_guard: bool = False,
                         ) -> tuple[list[dict], list[dict]]:
@@ -883,11 +953,17 @@ def build_shape_experts(pg, shapes, *,
         pin_list = pins * repeat
         pc_offsets = offsets * repeat
         n_steps = len(pin_list)
-        r = folder.fold_sequence(pin_list, SEQUENCE_FEEDBACK,
-                                 label=f"shape_{name}", pc_offsets=pc_offsets,
-                                 inline_linear=inline_linear,
-                                 bit_feedback_until=last_a_bit_step(
-                                     ops * repeat))
+        def fold_candidate(
+            inline, pin_list=pin_list, name=name, pc_offsets=pc_offsets,
+            ops=ops, repeat=repeat,
+        ):
+            return folder.fold_sequence(
+                pin_list, SEQUENCE_FEEDBACK, label=f"shape_{name}",
+                pc_offsets=pc_offsets, inline_linear=inline,
+                bit_feedback_until=last_a_bit_step(ops * repeat),
+            )
+
+        r = fold_candidate(False if inline_linear is None else inline_linear)
         if r.insert_side_hazards:
             raise RuntimeError(
                 f"{label}: pins reach insert-side expressions "
@@ -957,7 +1033,22 @@ def build_shape_experts(pg, shapes, *,
                     )
 
         receipt = project_sequence_execution(r, n_steps)
-        model, _tokens, tok_to_idx, info = schedule_and_build(r)
+        materialized = schedule_and_build(r)
+        if inline_linear is None:
+            inlined_r = fold_candidate(True)
+            if inlined_r.insert_side_hazards:
+                raise RuntimeError(
+                    f"{label}: pins reach insert-side expressions "
+                    f"of {inlined_r.insert_side_hazards}"
+                )
+            inlined_receipt = project_sequence_execution(inlined_r, n_steps)
+            inlined = schedule_and_build(inlined_r)
+            if prefer_inlined(
+                (materialized[0], materialized[3]),
+                (inlined[0], inlined[3]), label,
+            ):
+                r, receipt, materialized = inlined_r, inlined_receipt, inlined
+        model, _tokens, tok_to_idx, info = materialized
         ops_full = ops * repeat
         cycles = sum(op.cycles for op in ops_full)
         experts.append({

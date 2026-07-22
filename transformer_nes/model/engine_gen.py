@@ -983,32 +983,35 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
                 b.append(f"        {ctx.elem} ho{2 * h}, ho{2 * h + 1};")
                 b.append("        {")
                 b.append(f"            if (hull_seen[{hid}] != {ctx.E}seq) {{")
-                if guard is not None:
-                    # A live (unrescinded) K row means the model would
-                    # insert into a memory hull, which this engine cannot
-                    # do; the clear gate is an exact zero test.
-                    live_cond = " && ".join(
-                        f"x[{g_id}] == 0" for g_id in guard[1]
-                    ) or "true"
-                    b.append(f"                if ({live_cond})")
-                else:
-                    k1 = expr_dbl(*row(ip, dm + 2 * h + 1), ctx.dref)
-                    b.append(f"                const double kyg = {k1};")
-                    b.append("                if (kyg > -1.0e29)")
-                b.append('                    throw std::runtime_error('
-                         '"live forward insert into a memory-group hull");')
+                if not fused:
+                    if guard is not None:
+                        # A live (unrescinded) K row means the model would
+                        # insert into a memory hull, which this engine cannot
+                        # do; the clear gate is an exact zero test.
+                        live_cond = " && ".join(
+                            f"x[{g_id}] == 0" for g_id in guard[1]
+                        ) or "true"
+                        b.append(f"                if ({live_cond})")
+                    else:
+                        k1 = expr_dbl(*row(ip, dm + 2 * h + 1), ctx.dref)
+                        b.append(f"                const double kyg = {k1};")
+                        b.append("                if (kyg > -1.0e29)")
+                    b.append('                    throw std::runtime_error('
+                             '"live forward insert into a memory-group hull");')
                 b.append(f"                hull_seen[{hid}] = {ctx.E}seq;")
                 b.append("            }")
                 b.append(f"            const long long qi = shr2({qi_expr});")
                 b.append("            long long mo[2] = {0, 0};")
                 if fused:
                     # Fused 64K-span read (expert folds): the group is
-                    # the address's own high nibble; the exact mask
-                    # downstream zeroes any non-exact winner, and (0,0)
-                    # is exactly the empty-structure result.
+                    # the address's own high nibble. Structural folds remove
+                    # the graph's exact-address mask, so enforce it here.
                     b.append("            if ((unsigned long long)qi >> 16 == 0)")
+                    b.append("            {")
                     b.append(f"                {ctx.E}mem_query((int)(qi >> 12), "
                              "qi & 4095, mo);")
+                    b.append("                if (mo[1] != qi) mo[0] = mo[1] = 0;")
+                    b.append("            }")
                 else:
                     # Group dispatch: qi is the address minus this group's
                     # base, so qi in [0, 4096) iff the address falls in this
