@@ -187,7 +187,8 @@ def test_sequence_experts_match_per_step():
     configs: tuple[dict[str, Any], ...] = (
         {"sequence_windows": windows},           # pinned module + shape table
         {},                                      # shape table only
-        {"shape_library": ()},                   # pure per-instruction
+        {"shape_library": ()},                   # compact per-instruction
+        {"expert_opcodes": (), "shape_library": ()},  # union fallback only
     )
     traces = []
     for cfg in configs:

@@ -28,6 +28,7 @@ from transformer_nes.cpu6502.backends.weights.experts import (
     SEQUENCE_PRESERVE_INPUTS,
     SEQUENCE_ROOT_DIMS,
     SEQUENCE_STATE_DIMS,
+    build_opcode_execution_experts,
     build_shape_experts,
     decode_ops,
     last_a_bit_step,
@@ -886,6 +887,17 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
         recurrence.kind, recurrence.register, recurrence.delta,
         recurrence.closure_operand_offset, recurrence.closure_operand_value,
     ) == ("affine_until", "x", -1, 2, 0xFD)
+
+
+def test_compact_opcode_experts_exclude_side_effecting_instructions(union_pg):
+    experts = build_opcode_execution_experts(
+        union_pg, [0xCA, 0xA5, 0x0A, 0x85, 0x48, 0x4C],
+    )
+    assert [expert["byte"] for expert in experts] == [0xCA, 0xA5, 0x0A]
+    assert all(expert["kind"] == "exec_opcode" for expert in experts)
+    dex = experts[0]
+    assert set(dex["step_spec"]["inputs"]) == {"x"}
+    assert dex["step_spec"]["sequence_writes"] == [[]]
 
 
 @pytest.mark.parametrize(

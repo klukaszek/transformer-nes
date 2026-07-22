@@ -16,6 +16,7 @@ import numpy as np
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.cpu6502.backends.weights.experts import (
+    build_opcode_execution_experts,
     build_opcode_experts,
     build_sequence_expert,
     build_shape_experts,
@@ -149,6 +150,9 @@ class Cpu6502TransformerMachine:
                 schedule=self.expert_schedule,
                 milp_seconds=self.expert_milp_seconds,
             )
+            experts.extend(build_opcode_execution_experts(
+                self.pg, expert_opcodes,
+            ))
             if shapes:
                 shape_experts, shapes_meta = build_shape_experts(self.pg, shapes)
                 experts.extend(shape_experts)

@@ -813,6 +813,47 @@ def build_opcode_experts(pg, opcodes, *, schedule: str = "asap",
     return experts
 
 
+def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
+    eligible = []
+    for byte in opcodes or ():
+        byte = int(byte)
+        op = OPCODES.get(byte)
+        if op is None:
+            continue
+        writes_memory = (
+            op.operation in MEMORY_WRITE_OPERATIONS and op.mode != "acc"
+        )
+        if (
+            writes_memory
+            or op.operation in SEQUENCE_WRITERS
+            or op.operation in {"jmp", "pha", "php"}
+        ):
+            continue
+        eligible.append((byte, op))
+    if not eligible:
+        return []
+
+    shapes = [
+        (f"exec_{byte:02X}", bytes([byte] + [0] * (op.length - 1)), 1)
+        for byte, op in eligible
+    ]
+    experts, _meta = build_shape_experts(pg, shapes)
+    for expert, (byte, _op) in zip(experts, eligible, strict=True):
+        if expert["has_stores"] or expert["recurrence"] is not None:
+            raise RuntimeError(
+                f"compact opcode {byte:02X} escaped its execution license"
+            )
+        expert.update(kind="exec_opcode", byte=byte)
+    logger.info(
+        "compact execution experts: %d opcodes, %d layers, %d sparse terms",
+        len(experts),
+        sum(expert["layers"] for expert in experts),
+        sum(sparse_forward_work(expert["model"], expert["layers"])
+            for expert in experts),
+    )
+    return experts
+
+
 def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                           inline_linear: bool | None = None,
                           structural_reads: bool = True,

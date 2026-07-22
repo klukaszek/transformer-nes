@@ -31,6 +31,7 @@ in/out and FFN in/out), not zeroes or the unused dense shape.
 | Model set | Previous construction | Current construction | Delta |
 | --- | --- | --- | --- |
 | 227 documented-opcode experts | 3,719 layers; max `d_model` 294; 265,934 sparse terms | 825 layers; max `d_model` 106; 126,706 sparse terms | −77.8% layers; −63.9% max width; −52.4% sparse work |
+| 134 untraced opcode experts | 438 full-receipt layers; max `d_model` 70; 66,379 sparse terms | 510 delta-only layers; max `d_model` 34; 21,473 sparse terms | +16.4% layers; −51.4% max width; −67.6% sparse work |
 | 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 64 layers; max `d_model` 34; 2,488 sparse terms | −75.1% layers; −43.3% max width; −85.8% sparse work |
 
 The deterministic 24-instruction self-JMP is the clearest construction
@@ -270,6 +271,18 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    computed fields read their residual slot, and control metadata assigns PC.
    Sequence and shape forwards no longer allocate or populate the legacy
    672-slot receipt buffer.
+
+23. **Give untraced single instructions the same delta ABI as regions.**
+   A shape miss used to force gameplay through a full 21-field tracing expert.
+   Build a second one-instruction family only for opcodes whose current read has
+   already passed watch arbitration and whose instruction has no write, pull,
+   interrupt or unresolved jump effect.  The engine uses it only with
+   `trace=false`; every excluded effect and every interrupt falls through to the
+   original exact expert.  This admits 134 documented opcodes, including 39
+   zero-layer experts, at 21,473 sparse terms instead of 66,379 for the same full
+   receipts.  On a shape-disabled LDX/DEX/BNE loop, two million instructions fell
+   from 49.1 ms to 9.7–10.4 ms (~4.9×).  Zero-layer emission advances the model
+   position and applies metadata/deltas without clearing an unused residual.
 
 ## Dead ends (kept so they stay dead)
 

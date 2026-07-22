@@ -514,6 +514,14 @@ ENGINE_STEP_BODY = """\
             const bool was_int = nmi_pending || irq_ready();
             const int prev_pc = st_pc;
             ++fallback_count[prev_pc];  // JIT profile: per-instruction steps only
+            if (!trace && !was_int && execution_step()) {
+                ++step_index;
+                const long step_cycles = (long)CYCLES[ram[prev_pc]];
+                cycles_this += step_cycles; cycles_total += step_cycles;
+                if (stop_on_trap && st_pc == prev_pc) { reason = "trap"; break; }
+                if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }
+                continue;
+            }
             step_core(o);  // updates st_*, applies writes to ram + memory
             if (trace) {
                 t_pc.push_back((int)o[0]); t_a.push_back((int)o[1]);
@@ -1403,14 +1411,24 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             hc, hv = spec["halt_head"]
             shc, shv = spec["state_head"]
         dm = mdl.tok.weight.shape[1]
+        needs_x = (
+            not sequence_final
+            or bool(mdl.attn)
+            or bool(sequence_final["model"])
+            or any(spec["sequence_writes"])
+            or spec["sequence_control"]["predicate"] is not None
+        )
+        if not needs_x and (ins or spec["p_flags"]):
+            raise RuntimeError("zero-work execution model retained live inputs")
 
         args = "Eng& E" if seq_mode else ""
         if not sequence_final:
             args += (", " if args else "") + "long long* out"
         emit(f"    void {fn_name}({args}) {{")
-        emit(f"        {elem}* x = xbuf;")
-        emit(f"        for (int i = 0; i < {dm}; ++i) x[i] = 0;")
-        emit(f"        x[{mdl.one_slot}] = {one_e};")
+        if needs_x:
+            emit(f"        {elem}* x = xbuf;")
+            emit(f"        for (int i = 0; i < {dm}; ++i) x[i] = 0;")
+            emit(f"        x[{mdl.one_slot}] = {one_e};")
 
         def embed(key, value):
             if key in ins:
@@ -1469,7 +1487,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 if name in outs:
                     value = f"({rdv(outs[name])} & 1) ? 0x{mask:X} : 0"
                 elif name in constants:
-                    value = f"0x{mask:X}" if constants[name] else "0"
+                    op = "|=" if constants[name] else "&="
+                    value = f"0x{mask:X}" if constants[name] else f"~0x{mask:X}"
+                    emit(f"        {E}st_p {op} {value};")
+                    continue
                 else:
                     continue
                 emit(f"        {E}st_p = ({E}st_p & ~0x{mask:X}) | ({value});")
@@ -1694,6 +1715,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         # pinning is_op_<byte> runs exactly when that byte is fetched.  A
         # pending NMI overrides the instruction, so it takes the union step.
         op_experts = [e for e in experts if e.get("kind") is None]
+        exec_op_experts = [
+            e for e in experts if e.get("kind") == "exec_opcode"
+        ]
         shape_experts = [e for e in experts if e.get("kind") == "shape"]
         emit("")
         emit("    void step_core(long long* out) {")
@@ -1706,6 +1730,16 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             emit("            }")
             emit("        }")
         emit("        step_core_union(out);")
+        emit("    }")
+        emit("")
+        emit("    bool execution_step() {")
+        if exec_op_experts:
+            emit("        switch (ram[st_pc]) {")
+            for exp in exec_op_experts:
+                emit(f"            case 0x{exp['byte']:02X}: "
+                     f"step_core__{exp['name']}(); return true;")
+            emit("        }")
+        emit("        return false;")
         emit("    }")
 
         # Canonical shape windows (native run loop only): compiled once into
