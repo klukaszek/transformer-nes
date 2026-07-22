@@ -59,6 +59,7 @@ from transformer_nes.graph.fold import (
     sequence_pins,
     sequence_shape_pins,
 )
+from transformer_nes.model.engine_gen import generate_source
 from transformer_nes.scheduler.milp import build_graph, min_layers
 
 # Opcodes exercised by weights_runner.verify_program, chosen to cover the
@@ -904,6 +905,13 @@ def test_compact_opcode_experts_cover_stack_and_control(union_pg):
     brk = experts[9]
     assert len(brk["step_spec"]["sequence_writes"][0]) == 3
     assert brk["step_spec"]["sequence_halt"] is not None
+
+    legacy = dict(experts[0])
+    legacy.pop("kind")
+    with pytest.raises(RuntimeError, match="compact opcodes or shapes"):
+        generate_source(
+            experts[0]["model"], experts[0]["step_spec"], experts=[legacy],
+        )
 
 
 @pytest.mark.parametrize(

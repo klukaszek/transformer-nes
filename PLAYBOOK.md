@@ -330,7 +330,11 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    retaining trace context. Their construction falls from 22 layers / max
    `d_model` 60 / 3,996 sparse terms to 19 / 26 / 1,028; absolute JMP is zero
    layers. The complete opcode+shape core falls 57,396 → 54,428 sparse terms,
-   with no full-receipt experts left in production.
+   with no full-receipt experts left in production. The obsolete receipt-expert
+   builder, multi-row receipt emitter and compatibility dispatch were then
+   deleted; the generator rejects any attempt to put that tier back into a core.
+   The sole 21-field receipt is now exactly what tracing and interrupt fallback
+   require, emitted directly as the union `step_core`.
 
 ## Dead ends (kept so they stay dead)
 

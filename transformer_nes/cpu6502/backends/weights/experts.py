@@ -16,7 +16,6 @@ from typing import Literal
 import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS
 from transformer_nes.cpu6502.backends.weights.windows import (
     BRANCH_OPERATIONS,
     MEMORY_WRITE_OPERATIONS,
@@ -43,7 +42,6 @@ from transformer_nes.graph.execution import (
 from transformer_nes.graph.fold import (
     SEQUENCE_FEEDBACK,
     GraphFolder,
-    opcode_pins,
     sequence_pins,
     sequence_shape_pins,
 )
@@ -97,28 +95,6 @@ def step_spec_base(slot) -> dict:
     for key, name in OPTIONAL_INPUT_SLOT_NAMES.items():
         with contextlib.suppress(KeyError):
             spec["inputs"][key] = slot(name)
-    return spec
-
-
-def fold_step_spec(fold_result, model, tok_to_idx, info, *,
-                   n_steps: int | None = None) -> dict:
-    """Slot map for one folded model's generated step, resolved through the
-    fold's name map and the model's own schedule/slot assignment.  ``n_steps``
-    switches to per-step output maps (sequence/shape folds)."""
-
-    def slot(name):
-        return info.slot_of[fold_result.dim_of_name[name]]
-
-    spec = step_spec_base(slot)
-    if n_steps is None:
-        spec["outputs"] = {name: slot(name) for name in RUNTIME_READ_DIMS}
-    else:
-        spec["step_outputs"] = [
-            {name: slot(f"{name}__s{k}") for name in RUNTIME_READ_DIMS}
-            for k in range(n_steps)
-        ]
-    spec["halt_head"] = head_row(model, tok_to_idx["HALT"])
-    spec["state_head"] = head_row(model, tok_to_idx["STATE"])
     return spec
 
 
@@ -772,71 +748,6 @@ def prefer_inlined(materialized, inlined, label: str) -> bool:
         inlined_work, materialized_work,
     )
     return accepted
-
-
-def build_opcode_experts(pg, opcodes) -> list[dict]:
-    """Rebuilt per-opcode expert models for the opcode-routed engine.
-
-    For each expert opcode, the union graph is partially evaluated with the
-    decode one-hot gates pinned (is_op_<byte>=1, every other is_op_*=0,
-    is_nmi=0 -- exactly what the hard router supplies), and the *folded*
-    graph is scheduled and weight-compiled into its own transformer.
-
-    Safety is checked, not assumed: the fold refuses lookups whose
-    insert-side expressions can reach a pin (shared attention state must be
-    pin-independent), and engine_gen refuses any expert head whose
-    classification disagrees with the union's.  Correctness rests on
-    ram[pc] == the graph's fetched opcode; the lockstep chain (every opcode
-    swept through its expert by nestest and Klaus) is the receipt.
-    """
-    opcodes = [int(b) for b in (opcodes or []) if int(b) in OPCODES]
-    if not opcodes:
-        return []
-
-    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS,
-                         structural_reads=True)
-    experts = []
-    for byte in opcodes:
-        label = f"expert {byte:02X}"
-
-        def fold_candidate(inline, byte=byte, label=label):
-            candidate = folder.fold(
-                opcode_pins(byte, OPCODES), label=f"{byte:02X}",
-                inline_linear=inline,
-            )
-            if candidate.insert_side_hazards:
-                raise RuntimeError(
-                    f"{label}: decode pins reach insert-side expressions of "
-                    f"{candidate.insert_side_hazards}; shared attention state "
-                    "would diverge"
-                )
-            built = schedule_and_build(candidate)
-            return candidate, built
-
-        materialized_r, materialized = fold_candidate(False)
-        inlined_r, inlined = fold_candidate(True)
-        r, built = (
-            (inlined_r, inlined)
-            if prefer_inlined(
-                (materialized[0], materialized[3]),
-                (inlined[0], inlined[3]), label,
-            )
-            else (materialized_r, materialized)
-        )
-        model, _tokens, tok_to_idx, info = built
-        experts.append({
-            "name": f"{byte:02X}", "byte": byte, "model": model,
-            "step_spec": fold_step_spec(r, model, tok_to_idx, info),
-            "union_lookup_of": r.union_lookup_of,
-            "layers": info.n_layers, "_d": info.d_model,
-        })
-    logger.info(
-        "routed experts: %d rebuilt models, %d-%d layers, d_model %d-%d",
-        len(experts),
-        min(e["layers"] for e in experts), max(e["layers"] for e in experts),
-        min(e["_d"] for e in experts), max(e["_d"] for e in experts),
-    )
-    return experts
 
 
 def build_opcode_execution_experts(pg, opcodes) -> list[dict]:

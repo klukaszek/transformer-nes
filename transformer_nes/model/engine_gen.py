@@ -1291,24 +1291,23 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     seq_module_core: str | None = None) -> tuple[str, int, bool]:
     """Return ``(source, memory_head_count, has_machine_step)``.
 
-    ``step_spec`` enables the native machine protocol. ``experts`` contains
-    independently folded opcode or sequence models whose attention state is
-    resolved through union lookup provenance. ``seq_module_core`` switches
-    emission from the core engine to a per-ROM module attached to that core.
+    ``step_spec`` enables the native machine protocol. Core ``experts`` are
+    compact opcode or canonical shape execution models; sequence-module
+    experts are licensed per-ROM regions. ``seq_module_core`` switches
+    emission from the core engine to a module attached to that core.
     """
     experts = experts or []
     seq_mode = seq_module_core is not None
-    if not seq_mode and any(e.get("kind") == "seq" for e in experts):
-        raise RuntimeError(
-            "sequence experts are compiled per-ROM (SequenceModule) and "
-            "attached at runtime, not emitted into the core engine"
-        )
+    if not seq_mode and any(
+        e.get("kind") not in {"exec_opcode", "shape"} for e in experts
+    ):
+        raise RuntimeError("core experts must be compact opcodes or shapes")
     if seq_mode and (
         not experts or any(e.get("kind") != "seq" for e in experts)
     ):
         raise RuntimeError("a sequence module takes kind='seq' experts only")
     if experts and step_spec is None:
-        raise RuntimeError("opcode-routed expert models require a step_spec")
+        raise RuntimeError("execution models require a step_spec")
 
     # Shared-state prefix: "" emitting the engine itself (its own members),
     # "E." emitting a sequence module (a typed reference to the core engine).
@@ -1392,16 +1391,11 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         return f"shr2(x[{slot}])"
 
     def emit_step_core(fn_name, layer_suffix, mdl, spec, *, stage_writes=False):
-        # One model forward, sharing the embed/readout/write/halt protocol;
-        # layer_suffix selects the union stack ("") or a routed expert's
-        # rebuilt stack ("__<name>").  Sequence models retire a licensed
-        # region through one final-state receipt; ordinary experts retire one
-        # instruction.  Persistent st_* registers are the model interface.
+        # One model forward over persistent st_* state. The union emits one
+        # diagnostic receipt; execution models emit only final state, control
+        # and ordered effects.
         ins = spec["inputs"]
         sequence_final = spec.get("sequence_final")
-        step_outs = None if sequence_final else (
-            spec.get("step_outputs") or [spec["outputs"]]
-        )
         if stage_writes and sum(map(len, spec["sequence_writes"])) > 3:
             raise RuntimeError("compact execution exceeds three staged writes")
         if not sequence_final:
@@ -1546,52 +1540,46 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                              f"(int)({rdv(value_slot)} & 0xFF), {E}seq + 1);")
             emit("    }")
             return
-        for k, outs in enumerate(step_outs):
-            off = 21 * k
-            for i, (name, mask) in enumerate((
-                ("current_pc", 0xFFFF), ("new_a", 0xFF), ("new_x", 0xFF),
-                ("new_y", 0xFF), ("new_s", 0xFF), ("new_p", 0xFF),
-                ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
-                ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF), ("data_out", 0xFF),
-                ("new_halted", 0xFF), ("next_pc", 0xFFFF),
-            )):
-                emit(f"        out[{off + i}] = {rdv(outs[name])} & 0x{mask:X};")
-            emit("        { long long n_writes = 0;")
-            for store, addr, value in (
-                ("is_store", "write_addr_out", "write_value_out"),
-                ("is_store2", "write_addr2_out", "write_value2_out"),
-                ("is_store3", "write_addr3_out", "write_value3_out"),
-            ):
-                emit(f"        if (({rdv(outs[store])} & 0xFF) != 0) {{")
-                emit(f"            out[{off + 15} + 2 * n_writes] = {rdv(outs[addr])} & 0xFFFF;")
-                emit(f"            out[{off + 16} + 2 * n_writes] = {rdv(outs[value])} & 0xFF;")
-                emit("            ++n_writes;")
-                emit("        }")
-            emit(f"        out[{off + 14}] = n_writes;")
-            emit("        for (long long i = 0; i < n_writes; ++i)")
-            emit(f"            {E}insert_write((int)out[{off + 15} + 2 * i], "
-                 f"(int)out[{off + 16} + 2 * i], {E}seq + 1);")
+        outs = spec["outputs"]
+        for i, (name, mask) in enumerate((
+            ("current_pc", 0xFFFF), ("new_a", 0xFF), ("new_x", 0xFF),
+            ("new_y", 0xFF), ("new_s", 0xFF), ("new_p", 0xFF),
+            ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
+            ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF), ("data_out", 0xFF),
+            ("new_halted", 0xFF), ("next_pc", 0xFFFF),
+        )):
+            emit(f"        out[{i}] = {rdv(outs[name])} & 0x{mask:X};")
+        emit("        { long long n_writes = 0;")
+        for store, addr, value in (
+            ("is_store", "write_addr_out", "write_value_out"),
+            ("is_store2", "write_addr2_out", "write_value2_out"),
+            ("is_store3", "write_addr3_out", "write_value3_out"),
+        ):
+            emit(f"        if (({rdv(outs[store])} & 0xFF) != 0) {{")
+            emit(f"            out[15 + 2 * n_writes] = {rdv(outs[addr])} & 0xFFFF;")
+            emit(f"            out[16 + 2 * n_writes] = {rdv(outs[value])} & 0xFF;")
+            emit("            ++n_writes;")
             emit("        }")
-            if k + 1 < len(step_outs):
-                # Non-final rows of a sequence are generation-verified
-                # non-halting; only the final row competes STATE vs HALT.
-                emit(f"        out[{off + 13}] = 0;")
-        last = 21 * (len(step_outs) - 1)
+        emit("        out[14] = n_writes;")
+        emit("        for (long long i = 0; i < n_writes; ++i)")
+        emit(f"            {E}insert_write((int)out[15 + 2 * i], "
+             f"(int)out[16 + 2 * i], {E}seq + 1);")
+        emit("        }")
         emit(f"        const long long halt_logit = "
              f"{expr_int(hc, hv, lambda i: f'x[{i}]', 'halt head')};")
         emit(f"        const long long state_logit = "
              f"{expr_int(shc, shv, lambda i: f'x[{i}]', 'state head')};")
-        emit(f"        out[{last + 13}] = halt_logit > state_logit ? 1 : 0;")
+        emit("        out[13] = halt_logit > state_logit ? 1 : 0;")
         emit("        // Advance the architectural state (inputs are fully")
         emit("        // consumed by the embed above before this update).")
-        emit(f"        {E}st_pc = (int)out[{last + 12}];")
-        emit(f"        {E}st_a = (int)out[{last + 1}]; {E}st_x = (int)out[{last + 2}]; "
-             f"{E}st_y = (int)out[{last + 3}];")
-        emit(f"        {E}st_s = (int)out[{last + 4}]; {E}st_p = (int)out[{last + 5}];")
-        emit(f"        {E}st_ir = (int)out[{last + 6}]; {E}st_oplo = (int)out[{last + 7}]; "
-             f"{E}st_ophi = (int)out[{last + 8}];")
-        emit(f"        {E}st_ea = (int)out[{last + 9}]; {E}st_data = (int)out[{last + 10}];")
-        emit(f"        {E}st_halted = out[{last + 11}] != 0;")
+        emit(f"        {E}st_pc = (int)out[12];")
+        emit(f"        {E}st_a = (int)out[1]; {E}st_x = (int)out[2]; "
+             f"{E}st_y = (int)out[3];")
+        emit(f"        {E}st_s = (int)out[4]; {E}st_p = (int)out[5];")
+        emit(f"        {E}st_ir = (int)out[6]; {E}st_oplo = (int)out[7]; "
+             f"{E}st_ophi = (int)out[8];")
+        emit(f"        {E}st_ea = (int)out[9]; {E}st_data = (int)out[10];")
+        emit(f"        {E}st_halted = out[11] != 0;")
         emit("    }")
 
     if seq_mode:
@@ -1722,34 +1710,19 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("    // halt logits.  Fills the 21-slot out buffer (trace row + next")
         emit("    // state + writes) and advances st_* to the next instruction.")
         emit("")
-        emit_step_core("step_core_union", "", model, step_spec)
+        emit_step_core("step_core", "", model, step_spec)
         for exp in experts:
             emit("")
             emit_step_core(f"step_core__{exp['name']}", f"__{exp['name']}",
                            exp["model"], exp["step_spec"],
                            stage_writes=exp.get("kind") == "exec_opcode")
 
-        # Opcode-routed dispatch (the MoE router): the fetched opcode is
-        # ram[st_pc] (== the graph's memory read at pc), so an expert built by
-        # pinning is_op_<byte> runs exactly when that byte is fetched.  A
-        # pending NMI overrides the instruction, so it takes the union step.
-        op_experts = [e for e in experts if e.get("kind") is None]
+        # Compact opcode execution is selected by the byte at st_pc. Pending
+        # interrupts and tracing bypass it through step_core's union receipt.
         exec_op_experts = [
             e for e in experts if e.get("kind") == "exec_opcode"
         ]
         shape_experts = [e for e in experts if e.get("kind") == "shape"]
-        emit("")
-        emit("    void step_core(long long* out) {")
-        if op_experts:
-            emit("        if (!nmi_pending && !irq_ready()) {")
-            emit("            switch (ram[st_pc]) {")
-            for exp in op_experts:
-                emit(f"                case 0x{exp['byte']:02X}: "
-                     f"step_core__{exp['name']}(out); return;")
-            emit("            }")
-            emit("        }")
-        emit("        step_core_union(out);")
-        emit("    }")
         emit("")
         emit("    int exec_n_writes = 0;")
         emit("    int exec_write_addr[3], exec_write_value[3];")
