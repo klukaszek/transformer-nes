@@ -459,7 +459,6 @@ SEQ_HOOK = """\
     SeqFn seq_fn = nullptr;
     void* seq_ctx = nullptr;
     static constexpr int SEQ_MAX_K = 32;
-    long long seq_out[21 * SEQ_MAX_K];
     long seq_cycles = 0;
     // Module window heads: dispatch misses cost one array load instead
     // of a cross-module call into the module's head switch.
@@ -856,10 +855,10 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
             emit(f"                && {match}) {{")
             emit_recurrence_dispatch(
                 emit, exp, "E.",
-                f"step_core__{exp['name']}(E, E.seq_out);",
+                f"step_core__{exp['name']}(E);",
                 "                ",
             )
-            emit(f"                step_core__{exp['name']}(E, E.seq_out);")
+            emit(f"                step_core__{exp['name']}(E);")
             emit(f"                E.seq_cycles = {exp['cycles']};")
             emit(f"                return {k};")
             emit("            }")
@@ -974,6 +973,8 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
         hull_of_group: dict[int, int] = {}
         hull_of_head: dict[int, int] = {}
         for h in lookup:
+            if mem_groups[h] == MEMORY_GROUP_FUSED:
+                continue
             g = groups[h]
             if g < 0:
                 raise RuntimeError(f"{label} L{li} head {h}: negative cache group")
@@ -1007,11 +1008,13 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
         # Per-head emission blocks (each self-contained: it defines
         # ho{2h} and ho{2h+1}), keyed by head.
         head_blocks: dict[int, list[str]] = {}
+        memory_read_blocks: list[str] = []
+        memory_read_names: dict[int, tuple[str, str, str]] = {}
 
         # ── Attention: hull heads, then residual updates ─────────
         for h in lookup:
             b = head_blocks.setdefault(h, [])
-            hid = hull_of_head[h]
+            hid = hull_of_head.get(h)
             tb = "TieBreak::LATEST" if tiebreak[h] else "TieBreak::AVERAGE"
             # Eligibility decisions live in model/classify.py, shared
             # in model/classify.py, the single license source.
@@ -1068,23 +1071,40 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
             reg_ok = reg_q is not None
 
             if mem_ok:
-                # Memory-group lookup served by the exact nearest-address
-                # structure. Nearest address wins and equal-distance ties
-                # use the latest write. The hull remains empty by design.
                 g = mem_groups[h]
                 assert mem_terms is not None  # mem_ok on this branch
                 qi_expr = expr_int([i for _c, i in mem_terms],
                                     [c for c, _i in mem_terms],
                                     ctx.xref, f"{label} L{li} mem query")
-                k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
-                guard = integer_score_terms(
-                    1.0, 1.0, [],
-                    list(zip(k1_dat, k1_idx, strict=True)),
-                )
                 b.append(f"        {ctx.elem} ho{2 * h}, ho{2 * h + 1};")
                 b.append("        {")
-                b.append(f"            if (hull_seen[{hid}] != {ctx.E}seq) {{")
-                if not fused:
+                if fused:
+                    read_id = lookup_ids[h]
+                    names = memory_read_names.get(read_id)
+                    if names is None:
+                        stem = f"mr{len(memory_read_names)}"
+                        names = (f"{stem}_q", f"{stem}_v", f"{stem}_a")
+                        memory_read_names[read_id] = names
+                        qname, vname, aname = names
+                        memory_read_blocks.extend((
+                            f"        const long long {qname} = shr2({qi_expr});",
+                            f"        const bool {stem}_valid = "
+                            f"(unsigned long long){qname} <= 0xFFFFULL;",
+                            f"        const long long {vname} = {stem}_valid ? "
+                            f"{ctx.E}ram[(int){qname}] : 0;",
+                            f"        const long long {aname} = "
+                            f"{stem}_valid ? {qname} : 0;",
+                        ))
+                    _qname, vname, aname = names
+                else:
+                    assert hid is not None
+                    b.append(f"            const long long qi = shr2({qi_expr});")
+                    k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
+                    guard = integer_score_terms(
+                        1.0, 1.0, [],
+                        list(zip(k1_dat, k1_idx, strict=True)),
+                    )
+                    b.append(f"            if (hull_seen[{hid}] != {ctx.E}seq) {{")
                     if guard is not None:
                         # A live (unrescinded) K row means the model would
                         # insert into a memory hull, which this engine cannot
@@ -1099,21 +1119,9 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
                         b.append("                if (kyg > -1.0e29)")
                     b.append('                    throw std::runtime_error('
                              '"live forward insert into a memory-group hull");')
-                b.append(f"                hull_seen[{hid}] = {ctx.E}seq;")
-                b.append("            }")
-                b.append(f"            const long long qi = shr2({qi_expr});")
-                b.append("            long long mo[2] = {0, 0};")
-                if fused:
-                    # Fused 64K-span read (expert folds): the group is
-                    # the address's own high nibble. Structural folds remove
-                    # the graph's exact-address mask, so enforce it here.
-                    b.append("            if ((unsigned long long)qi >> 16 == 0)")
-                    b.append("            {")
-                    b.append(f"                {ctx.E}mem_query((int)(qi >> 12), "
-                             "qi & 4095, mo);")
-                    b.append("                if (mo[1] != qi) mo[0] = mo[1] = 0;")
+                    b.append(f"                hull_seen[{hid}] = {ctx.E}seq;")
                     b.append("            }")
-                else:
+                    b.append("            long long mo[2] = {0, 0};")
                     # Group dispatch: qi is the address minus this group's
                     # base, so qi in [0, 4096) iff the address falls in this
                     # group.  Other groups' contributions are gate-zeroed
@@ -1122,13 +1130,17 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
                     b.append(f"                {ctx.E}mem_query({g}, qi, mo);")
                 outputs = memory_outputs[h] or ("value", "address")
 
-                def served_output(kind):
+                def served_output(
+                    kind,
+                    value_name=vname if fused else "mo[0]",
+                    address_name=aname if fused else "mo[1]",
+                ):
                     if kind == "value":
-                        return "mo[0]"
+                        return value_name
                     if kind == "address":
-                        return "mo[1]"
+                        return address_name
                     if kind.startswith("bit"):
-                        return f"((mo[0] >> {int(kind[3:])}) & 1)"
+                        return f"(({value_name} >> {int(kind[3:])}) & 1)"
                     raise RuntimeError(f"unknown memory output {kind!r}")
 
                 for component in range(2):
@@ -1270,6 +1282,7 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
 
         plans.append({
             "li": li, "lookup": lookup, "head_blocks": head_blocks,
+            "memory_reads": memory_read_blocks,
             "ad_def": ad_def, "opkept": opkept, "ad_apply": ad_apply,
             "fd_def": fd_def, "live": live, "neuron_blocks": neuron_blocks,
             "fokept": fokept, "fd_apply": fd_apply,
@@ -1345,6 +1358,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     def emit_layer_fn(plan, suffix):
         li = plan["li"]
         out = [f"    void layer_{li}{suffix}({layer_sig}) {{"]
+        out.extend(plan["memory_reads"])
         for h in plan["lookup"]:
             out.extend(plan["head_blocks"][h])
         out.extend(plan["ad_def"])
@@ -1397,7 +1411,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             shc, shv = spec["state_head"]
         dm = mdl.tok.weight.shape[1]
 
-        emit(f"    void {fn_name}({'Eng& E, ' if seq_mode else ''}long long* out) {{")
+        args = "Eng& E" if seq_mode else ""
+        if not sequence_final:
+            args += (", " if args else "") + "long long* out"
+        emit(f"    void {fn_name}({args}) {{")
         emit(f"        {elem}* x = xbuf;")
         emit(f"        for (int i = 0; i < {dm}; ++i) x[i] = 0;")
         emit(f"        x[{mdl.one_slot}] = {one_e};")
@@ -1438,36 +1455,31 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         if sequence_final:
             outs = sequence_final["model"]
             constants = sequence_final["constant"]
-            preserved = set(sequence_final["preserve"])
-            preserved_expr = {
-                "new_a": f"{E}st_a", "new_x": f"{E}st_x",
-                "new_y": f"{E}st_y", "new_s": f"{E}st_s",
-                "new_p": f"({E}st_p | 0x20)",
-                "new_halted": f"({E}st_halted ? 1 : 0)",
-                "fetched_opcode": f"{E}st_ir",
-                "fetched_operand_lo": f"{E}st_oplo",
-                "fetched_operand_hi": f"{E}st_ophi",
-                "ea": f"{E}st_ea", "data_out": f"{E}st_data",
+            fields = {
+                "new_a": ("st_a", 0xFF),
+                "new_x": ("st_x", 0xFF),
+                "new_y": ("st_y", 0xFF),
+                "new_s": ("st_s", 0xFF),
+                "new_p": ("st_p", 0xFF),
+                "fetched_opcode": ("st_ir", 0xFF),
+                "fetched_operand_lo": ("st_oplo", 0xFF),
+                "fetched_operand_hi": ("st_ophi", 0xFF),
+                "ea": ("st_ea", 0xFFFF),
+                "data_out": ("st_data", 0xFF),
             }
-
-            def final_value(name):
+            for name, (field, mask) in fields.items():
                 if name in outs:
-                    return rdv(outs[name])
-                if name in constants:
-                    return str(constants[name])
-                if name in preserved:
-                    return preserved_expr[name]
-                raise RuntimeError(f"sequence receipt omitted {name}")
-
-            emit(f"        out[0] = {E}st_pc;")
-            for i, (name, mask) in enumerate((
-                ("new_a", 0xFF), ("new_x", 0xFF), ("new_y", 0xFF),
-                ("new_s", 0xFF), ("new_p", 0xFF),
-                ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
-                ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF),
-                ("data_out", 0xFF), ("new_halted", 0xFF),
-            ), start=1):
-                emit(f"        out[{i}] = {final_value(name)} & 0x{mask:X};")
+                    emit(f"        {E}{field} = (int)({rdv(outs[name])} "
+                         f"& 0x{mask:X});")
+                elif name in constants:
+                    emit(f"        {E}{field} = "
+                         f"{int(constants[name]) & mask};")
+            if "new_halted" in outs:
+                emit(f"        {E}st_halted = "
+                     f"({rdv(outs['new_halted'])} & 0xFF) != 0;")
+            elif "new_halted" in constants:
+                emit(f"        {E}st_halted = "
+                     f"{str(bool(constants['new_halted'])).lower()};")
             control = spec["sequence_control"]
             if control["relative_to_head"]:
                 fallthrough = f"({E}st_pc + {control['fallthrough']})"
@@ -1486,21 +1498,11 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 fallthrough if predicate is None
                 else f"(({rdv(predicate)} & 1) ? {target} : {fallthrough})"
             )
-            emit(f"        out[12] = {successor} & 0xFFFF;")
-            emit("        out[14] = 0;")
+            emit(f"        {E}st_pc = (int)({successor} & 0xFFFF);")
             for step_writes in spec["sequence_writes"]:
                 for addr_slot, value_slot in step_writes:
                     emit(f"        {E}insert_write((int)({rdv(addr_slot)} & 0xFFFF), "
                          f"(int)({rdv(value_slot)} & 0xFF), {E}seq + 1);")
-            emit("        out[13] = 0;")
-            emit(f"        {E}st_pc = (int)out[12];")
-            emit(f"        {E}st_a = (int)out[1]; {E}st_x = (int)out[2]; "
-                 f"{E}st_y = (int)out[3];")
-            emit(f"        {E}st_s = (int)out[4]; {E}st_p = (int)out[5];")
-            emit(f"        {E}st_ir = (int)out[6]; {E}st_oplo = (int)out[7]; "
-                 f"{E}st_ophi = (int)out[8];")
-            emit(f"        {E}st_ea = (int)out[9]; {E}st_data = (int)out[10];")
-            emit(f"        {E}st_halted = out[11] != 0 || out[13] != 0;")
             emit("    }")
             return
         for k, outs in enumerate(step_outs):
@@ -1761,10 +1763,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 emit("                ++fallback_count[st_pc];")
                 emit_recurrence_dispatch(
                     emit, exp, "",
-                    f"step_core__{exp['name']}(seq_out);",
+                    f"step_core__{exp['name']}();",
                     "                ",
                 )
-                emit(f"                step_core__{exp['name']}(seq_out);")
+                emit(f"                step_core__{exp['name']}();")
                 emit(f"                seq_cycles = {exp['cycles']};")
                 emit(f"                return {exp['n_steps']};")
                 emit("            }")
