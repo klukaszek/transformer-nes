@@ -362,11 +362,34 @@ def test_store_windows_decline_under_low_watch():
     while done < 2800:
         out = m.run(2800 - done)
         done += int(out["steps"])
+        if len(out["hit_addr"]):
+            assert int(out["pause_ir"]) == 0xE6
         for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
             assert int(addr) == 0x0020
             hits += 1
             assert int(value) == hits & 0xFF
     assert hits == 256  # the INC $20 loop paused on every single write
+
+
+@pytest.mark.slow
+def test_compact_store_routes_write_journal():
+    image = bytearray(0x10000)
+    image[0x0400:0x0408] = bytes([
+        0xA9, 0x55,        # LDA #$55
+        0x8D, 0x00, 0x20,  # STA $2000
+        0x4C, 0x05, 0x04,  # spin
+    ])
+    m = Cpu6502TransformerMachine(bcd=False)
+    m.load_image(bytes(image), start_pc=0x0400)
+    groups = bytearray(0x10000)
+    groups[0x2000] = 1
+    m.set_write_journal(groups)
+
+    out = m.run(2, trace=False)
+
+    assert out["wj_addr"].tolist() == [0x2000]
+    assert out["wj_value"].tolist() == [0x55]
+    assert m.read_ram(0x2000) == 0x55
 
 
 @pytest.mark.slow

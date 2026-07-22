@@ -32,6 +32,7 @@ from transformer_nes.cpu6502.backends.weights.experts import (
     build_shape_experts,
     decode_ops,
     last_a_bit_step,
+    opcode_execution_bytes,
     pinned_sequence_control,
     project_sequence_execution,
     schedule_and_build,
@@ -879,15 +880,22 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
     ) == ("affine_until", "x", -1, 2, 0xFD)
 
 
-def test_compact_opcode_experts_exclude_side_effecting_instructions(union_pg):
+def test_compact_opcode_experts_stage_writes_and_exclude_stack_control(union_pg):
+    assert len(opcode_execution_bytes(OPCODES)) == 217
     experts = build_opcode_execution_experts(
-        union_pg, [0xCA, 0xA5, 0x0A, 0x85, 0x48, 0x4C],
+        union_pg, [0xCA, 0xA5, 0x0A, 0x85, 0x87, 0x48, 0x4C],
     )
-    assert [expert["byte"] for expert in experts] == [0xCA, 0xA5, 0x0A]
+    assert [expert["byte"] for expert in experts] == [
+        0xCA, 0xA5, 0x0A, 0x85, 0x87,
+    ]
     assert all(expert["kind"] == "exec_opcode" for expert in experts)
     dex = experts[0]
     assert set(dex["step_spec"]["inputs"]) == {"x"}
     assert dex["step_spec"]["sequence_writes"] == [[]]
+    sta = experts[-2]
+    assert len(sta["step_spec"]["sequence_writes"][0]) == 1
+    sax = experts[-1]
+    assert len(sax["step_spec"]["sequence_writes"][0]) == 1
 
 
 @pytest.mark.parametrize(

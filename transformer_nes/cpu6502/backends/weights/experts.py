@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from dataclasses import replace
+from typing import Literal
 
 import numpy as np
 
@@ -49,6 +50,7 @@ from transformer_nes.model.weights import build_model
 from transformer_nes.scheduler.milp import asap_schedule
 
 logger = logging.getLogger(__name__)
+STACK_CONTROL_OPERATIONS = SEQUENCE_WRITERS - {"sax"}
 
 # Residual input slots shared by every generated step spec: spec key -> the
 # graph dimension name it resolves through (union slot map or fold name map).
@@ -442,7 +444,7 @@ def pinned_sequence_control(fold_result, pin_list, ops) -> ControlFlow:
             int(pins["fetched_operand_hi_all"]) << 8
         )
         return ControlFlow(predicate=None, fallthrough=target, target=target)
-    if op.operation in SEQUENCE_WRITERS or op.operation == "jmp":
+    if op.operation in STACK_CONTROL_OPERATIONS or op.operation == "jmp":
         raise RuntimeError(
             f"sequence final control {op.mnemonic} is not host-resolvable"
         )
@@ -469,7 +471,7 @@ def shape_sequence_control(
             flag_mask=BRANCH_FLAG[op.operation][0],
             flag_value=BRANCH_FLAG[op.operation][1],
         )
-    if op.operation in SEQUENCE_WRITERS or op.operation == "jmp":
+    if op.operation in STACK_CONTROL_OPERATIONS or op.operation == "jmp":
         raise RuntimeError(
             f"shape final control {op.mnemonic} is not host-resolvable"
         )
@@ -792,12 +794,8 @@ def opcode_execution_bytes(opcodes) -> tuple[int, ...]:
         op = OPCODES.get(byte)
         if op is None:
             continue
-        writes_memory = (
-            op.operation in MEMORY_WRITE_OPERATIONS and op.mode != "acc"
-        )
         if (
-            writes_memory
-            or op.operation in SEQUENCE_WRITERS
+            op.operation in STACK_CONTROL_OPERATIONS
             or op.operation in {"jmp", "pha", "php"}
         ):
             continue
@@ -816,13 +814,15 @@ def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
         (f"exec_{byte:02X}", bytes([byte] + [0] * (op.length - 1)), 1)
         for byte, op in eligible
     ]
-    experts, _meta = build_shape_experts(pg, shapes)
+    experts, _meta = _build_symbolic_execution_experts(
+        pg, shapes, expert_kind="exec_opcode",
+    )
     for expert, (byte, _op) in zip(experts, eligible, strict=True):
         if expert["recurrence"] is not None:
             raise RuntimeError(
                 f"compact opcode {byte:02X} escaped its execution license"
             )
-        expert.update(kind="exec_opcode", byte=byte)
+        expert["byte"] = byte
     logger.info(
         "compact execution experts: %d opcodes, %d layers, %d sparse terms",
         len(experts),
@@ -934,10 +934,12 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     }
 
 
-def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
-    """Canonical shape experts for the runtime window table.
+def _build_symbolic_execution_experts(
+    pg, shapes, *, expert_kind: Literal["shape", "exec_opcode"],
+) -> tuple[list[dict], list[dict]]:
+    """Symbolic-PC execution experts for shapes and individual opcodes.
 
-    Each shape folds ONCE with pc and every operand byte symbolic
+    Each template folds once with pc and every operand byte symbolic
     (fold_sequence pc_offsets); the license: only the first instruction may
     read memory, every step non-halting with stores bounded below $2000
     (a symbolic zero-page operand bounds itself), and each interior
@@ -945,9 +947,9 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
     head the window fits at, which is possible exactly because the folded
     expression may depend on nothing but the pc bytes.  The JMP self-spin's
     closure is a dispatch property instead (the router compares the operand
-    bytes to the head). Stores and speculative interior control are rejected;
-    a library shape that fails its license is a hard error because the library
-    is code.
+    bytes to the head). Canonical shapes reject stores and speculative interior
+    control. Single-opcode execution may instead expose ordered writes because
+    its generated caller stages them through runtime effect arbitration.
     """
     folder = GraphFolder(pg, root_names=SEQUENCE_ROOT_DIMS,
                          structural_reads=True)
@@ -987,7 +989,12 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
                 f"of {r.insert_side_hazards}"
             )
         check_reads_licensed(r, ops * repeat, label)
-        if check_writes_licensed(r, n_steps, label):
+        if expert_kind == "exec_opcode":
+            if n_steps != 1:
+                raise RuntimeError("staged effects require one instruction")
+            if const_root(r, "new_halted", 0, label) != 0:
+                raise RuntimeError(f"{label}: may halt")
+        elif check_writes_licensed(r, n_steps, label):
             # A shape's head is symbolic, so store disjointness from the
             # window's own bytes cannot be proven. Store idioms belong to
             # concrete sequence modules, where that proof is static.
@@ -1040,7 +1047,7 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
         ops_full = ops * repeat
         cycles = sum(op.cycles for op in ops_full)
         experts.append({
-            "kind": "shape", "name": f"shape_{name}", "shape_id": sid,
+            "kind": expert_kind, "name": f"shape_{name}", "shape_id": sid,
             "opcode_checks": checks, "length": len(template),
             "self_target": self_target, "n_steps": n_steps,
             "cycles": cycles,
@@ -1067,3 +1074,9 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
             min(e["_d"] for e in experts), max(e["_d"] for e in experts),
         )
     return experts, meta
+
+
+def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
+    return _build_symbolic_execution_experts(
+        pg, shapes, expert_kind="shape",
+    )

@@ -31,8 +31,9 @@ in/out and FFN in/out), not zeroes or the unused dense shape.
 | Model set | Previous construction | Current construction | Delta |
 | --- | --- | --- | --- |
 | 227 documented-opcode experts | 3,719 layers; max `d_model` 294; 265,934 sparse terms | 825 layers; max `d_model` 106; 126,706 sparse terms | −77.8% layers; −63.9% max width; −52.4% sparse work |
-| Production full-receipt experts | 227 experts; 825 layers; max `d_model` 106; 126,706 sparse terms | 93 experts; 387 layers; max `d_model` 106; 60,327 sparse terms | −59.0% experts; −53.1% layers; −52.4% sparse work |
+| Production full-receipt experts | 227 experts; 825 layers; max `d_model` 106; 126,706 sparse terms | 10 experts; 22 layers; max `d_model` 60; 3,996 sparse terms | −95.6% experts; −97.3% layers; −43.4% max width; −96.8% sparse work |
 | 134 untraced opcode experts | 438 full-receipt layers; max `d_model` 70; 66,379 sparse terms | 510 delta-only layers; max `d_model` 34; 21,473 sparse terms | +16.4% layers; −51.4% max width; −67.6% sparse work |
+| 83 store/RMW opcode experts | 365 full-receipt layers; max `d_model` 106; 56,331 sparse terms | 560 delta/effect layers; max `d_model` 78; 29,439 sparse terms | +53.4% layers; −26.4% max width; −47.7% sparse work |
 | 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 64 layers; max `d_model` 34; 2,488 sparse terms | −75.1% layers; −43.3% max width; −85.8% sparse work |
 
 The deterministic 24-instruction self-JMP is the clearest construction
@@ -306,6 +307,18 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    opcodes not yet compacted. The production core fell from 376 to 242 experts;
    its full-receipt family fell from 825 to 387 layers and 126,706 to 60,327
    sparse terms. Gameplay routing is unchanged, while tracing remains exact.
+
+26. **Stage effects; do not preserve a receipt merely because an instruction
+   writes.** A one-step execution model now returns architectural deltas plus
+   at most three ordered `(address, value)` effects. The run loop commits those
+   effects through the existing mapper, journal and write-watch arbitration,
+   preserving self-modification order, `pause_ir`, RMW routing and token
+   positions without carrying 21 trace fields. This admits all 83 store/RMW
+   opcodes: their sparse work falls 56,331 → 29,439 and max width 106 → 78.
+   Across the production opcode/shape core, sparse terms fall 84,288 → 57,396
+   while max width falls 106 → 78. One million shape-disabled STA-heavy
+   instructions fell 27.3 → 12.5 ms (~2.18×); INC-heavy instructions fell
+   30.6 → 17.2 ms (~1.78×). Only ten stack/control opcodes retain full receipts.
 
 ## Dead ends (kept so they stay dead)
 

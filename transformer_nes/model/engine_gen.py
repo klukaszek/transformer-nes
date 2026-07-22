@@ -512,11 +512,28 @@ ENGINE_STEP_BODY = """\
             }
             const bool was_int = nmi_pending || irq_ready();
             const int prev_pc = st_pc;
-            if (!trace && !was_int && execution_step()) {
+            const unsigned char exec_opcode = ram[prev_pc];
+            if (!trace && !was_int && execution_step(exec_opcode)) {
+                int exec_hits = 0;
+                for (int w = 0; w < exec_n_writes; ++w) {
+                    const int wa = exec_write_addr[w], wv = exec_write_value[w];
+                    insert_write(wa, wv, seq + 1);
+                    if (wa >= 0x8000 && mapper_kind) {
+                        mapper_write(wa, wv);
+                    } else if (wjournal[wa]) {
+                        journal_write(wa, wv);
+                    } else if (!wwatch.empty() && in_ranges(wwatch, wa)) {
+                        hit_addr.push_back(wa); hit_value.push_back(wv);
+                        ++exec_hits;
+                    }
+                }
                 ++step_index;
-                const long step_cycles = (long)CYCLES[ram[prev_pc]];
+                const long step_cycles = (long)CYCLES[exec_opcode];
                 cycles_this += step_cycles; cycles_total += step_cycles;
                 if (stop_on_trap && st_pc == prev_pc) { reason = "trap"; break; }
+                if (exec_hits > 0) {
+                    st_ir = exec_opcode; reason = "watch_write"; break;
+                }
                 if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }
                 continue;
             }
@@ -1373,7 +1390,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     def rdv(slot):
         return f"shr2(x[{slot}])"
 
-    def emit_step_core(fn_name, layer_suffix, mdl, spec):
+    def emit_step_core(fn_name, layer_suffix, mdl, spec, *, stage_writes=False):
         # One model forward, sharing the embed/readout/write/halt protocol;
         # layer_suffix selects the union stack ("") or a routed expert's
         # rebuilt stack ("__<name>").  Sequence models retire a licensed
@@ -1384,6 +1401,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         step_outs = None if sequence_final else (
             spec.get("step_outputs") or [spec["outputs"]]
         )
+        if stage_writes and sum(map(len, spec["sequence_writes"])) > 3:
+            raise RuntimeError("compact execution exceeds three staged writes")
         if not sequence_final:
             hc, hv = spec["halt_head"]
             shc, shv = spec["state_head"]
@@ -1500,8 +1519,15 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             emit(f"        {E}st_pc = (int)({successor} & 0xFFFF);")
             for step_writes in spec["sequence_writes"]:
                 for addr_slot, value_slot in step_writes:
-                    emit(f"        {E}insert_write((int)({rdv(addr_slot)} & 0xFFFF), "
-                         f"(int)({rdv(value_slot)} & 0xFF), {E}seq + 1);")
+                    if stage_writes:
+                        emit(f"        exec_write_addr[exec_n_writes] = "
+                             f"(int)({rdv(addr_slot)} & 0xFFFF);")
+                        emit(f"        exec_write_value[exec_n_writes] = "
+                             f"(int)({rdv(value_slot)} & 0xFF);")
+                        emit("        ++exec_n_writes;")
+                    else:
+                        emit(f"        {E}insert_write((int)({rdv(addr_slot)} & 0xFFFF), "
+                             f"(int)({rdv(value_slot)} & 0xFF), {E}seq + 1);")
             emit("    }")
             return
         for k, outs in enumerate(step_outs):
@@ -1684,7 +1710,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         for exp in experts:
             emit("")
             emit_step_core(f"step_core__{exp['name']}", f"__{exp['name']}",
-                           exp["model"], exp["step_spec"])
+                           exp["model"], exp["step_spec"],
+                           stage_writes=exp.get("kind") == "exec_opcode")
 
         # Opcode-routed dispatch (the MoE router): the fetched opcode is
         # ram[st_pc] (== the graph's memory read at pc), so an expert built by
@@ -1708,9 +1735,12 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("        step_core_union(out);")
         emit("    }")
         emit("")
-        emit("    bool execution_step() {")
+        emit("    int exec_n_writes = 0;")
+        emit("    int exec_write_addr[3], exec_write_value[3];")
+        emit("    bool execution_step(unsigned char opcode) {")
+        emit("        exec_n_writes = 0;")
         if exec_op_experts:
-            emit("        switch (ram[st_pc]) {")
+            emit("        switch (opcode) {")
             for exp in exec_op_experts:
                 emit(f"            case 0x{exp['byte']:02X}: "
                      f"step_core__{exp['name']}(); return true;")
