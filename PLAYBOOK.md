@@ -30,8 +30,8 @@ in/out and FFN in/out), not zeroes or the unused dense shape.
 
 | Model set | Previous construction | Current construction | Delta |
 | --- | --- | --- | --- |
-| 227 documented-opcode experts | 3,719 layers; max `d_model` 294; 265,934 sparse terms | 1,574 layers; max `d_model` 76; 140,764 sparse terms | −57.7% layers; −74.1% max width; −47.1% sparse work |
-| 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 91 layers; max `d_model` 48; 5,657 sparse terms | −64.6% layers; −20.0% max width; −67.6% sparse work |
+| 227 documented-opcode experts | 3,719 layers; max `d_model` 294; 265,934 sparse terms | 825 layers; max `d_model` 106; 126,706 sparse terms | −77.8% layers; −63.9% max width; −52.4% sparse work |
+| 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 59 layers; max `d_model` 44; 4,013 sparse terms | −77.0% layers; −26.7% max width; −77.0% sparse work |
 
 The deterministic 24-instruction self-JMP is the clearest construction
 trace.  Its full proof receipt built as 38 layers / `d_model` 596 / 6,889
@@ -211,6 +211,16 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    operand-relative).  This removed PC arithmetic, wrapping and mux chains
    from the shape library: 104 → 91 layers, max `d_model` 52 → 48 and
    6,178 → 5,657 sparse terms, with no ROM-specific assumptions.
+
+19. **Expose bits by dependency, not by representation.**  The exact engine
+   may serve byte bits directly, but carrying eight bit coordinates through
+   every model simply moves the extraction cost into width.  Build the
+   served-bit proof graph, then let execution projection retain only consumed
+   state bits and let each `MemoryRead` enumerate only its requested bit
+   positions (an ADC operand read, for example, exposes `bit7`, not eight
+   bits).  Scalar loops keep their scalar ABI.  This cut the opcode census
+   from 1,574 → 825 layers and 140,764 → 126,706 sparse terms; shapes fell
+   from 91 → 59 layers and 5,657 → 4,013 terms.
 
 ## Dead ends (kept so they stay dead)
 

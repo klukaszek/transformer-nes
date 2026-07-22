@@ -30,6 +30,7 @@ from transformer_nes.cpu6502.backends.weights.experts import (
     SEQUENCE_STATE_DIMS,
     build_shape_experts,
     decode_ops,
+    last_a_bit_step,
     pinned_sequence_control,
     project_sequence_execution,
     schedule_and_build,
@@ -575,6 +576,29 @@ def test_execution_ir_retains_ordered_writes(folder):
     assert (write.step, write.order) == (0, 0)
     assert write.address in execution.program_graph.all_dims
     assert write.value in execution.program_graph.all_dims
+
+
+def test_external_memory_read_exposes_only_consumed_bits():
+    reset_graph()
+    input_tokens, output_tokens = build(bcd=False, wide_bits=True)
+    pg = ProgramGraph(input_tokens, output_tokens)
+    code = bytes([0x6D, 0x00, 0x07])  # ADC $0700 consumes only operand bit 7.
+    pins = sequence_pins(SPIN_HEAD, code, OPCODES)
+    ops = decode_ops(code)
+    folder = GraphFolder(
+        pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
+    )
+    proof = folder.fold_sequence(
+        pins, SEQUENCE_FEEDBACK, label="selective_bits", inline_linear=True,
+        bit_feedback_until=last_a_bit_step(ops),
+    )
+    execution = project_sequence_execution(
+        proof, len(pins), pinned_sequence_control(proof, pins, ops),
+    )
+
+    assert [read.output_kinds for read in execution.memory_reads] == [
+        ("value", "address", "bit7"),
+    ]
 
 
 @pytest.mark.parametrize("byte", SHADOW_OPCODES)

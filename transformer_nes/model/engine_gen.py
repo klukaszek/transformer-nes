@@ -1324,6 +1324,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         embed("ea_hi", sc(f"({E}st_ea >> 8) & 0xFF"))
         embed("data", sc(f"{E}st_data"))
         embed("halted", sc(f"{E}st_halted ? 1 : 0"))
+        for bit in range(8):
+            embed(f"a_bit{bit}", sc(f"({E}st_a >> {bit}) & 1"))
         if "nmi" in ins:
             embed("nmi", sc(f"{E}nmi_pending ? 1 : 0"))
             emit(f"        {E}nmi_pending = false;")

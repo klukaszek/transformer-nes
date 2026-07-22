@@ -67,7 +67,7 @@ class Cpu6502TransformerMachine:
                  expert_milp_seconds: int = 900):
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
-        self.rt = Cpu6502Runtime(bcd=bcd)
+        self.rt = Cpu6502Runtime(bcd=bcd, wide_bits=True)
         dim_by_id = {d.id: d for d in self.rt.all_dims}
         self.dim_by_name = {
             name: dim_by_id[dim_id] for name, dim_id in self.rt.dim_id_by_name.items()

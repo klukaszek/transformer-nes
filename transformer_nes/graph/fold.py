@@ -189,19 +189,22 @@ class GraphMaterializer:
                         len(graph.graph_dims), len(graph.graph_lookups),
                         len(graph.graph_memory_reads),
                     )
-                    want_bits = self.structural_reads and any(
-                        b in live for b in getattr(d, "read_bit_dims", ())
+                    wanted_bits = tuple(
+                        j for j, bit in enumerate(getattr(d, "read_bit_dims", ()))
+                        if self.structural_reads and bit in live
                     )
                     expr = masked_exact_read(
                         tr(site["address"]), tr(site["byte_value"]),
                         tr(site["write_addr"]), tr(site["is_write"]),
                         structural=self.structural_reads,
-                        bit_values=[tr(Expression({wb: 1}))
-                                    for wb in site["bit_values"]]
-                        if want_bits else (),
+                        bit_indices=wanted_bits,
                     )
-                    if want_bits:
-                        fused_reads[d] = next(iter(expr.terms)).memory_read
+                    if wanted_bits:
+                        read = next(iter(expr.terms)).memory_read
+                        fused_reads[d] = (
+                            read,
+                            {j: read.dims[2 + i] for i, j in enumerate(wanted_bits)},
+                        )
                     nd = PersistDimension(expr, name=name_of(d.name))
                     sub[d] = Expression({nd: 1})
                     dr, dp, dl, dt = graph_delta(*marks)
@@ -214,8 +217,8 @@ class GraphMaterializer:
                 if rb is not None and rb[0] in fused_reads:
                     # This bit's read serves it directly: substitute the
                     # fused lookup's bit value; the ladder never builds.
-                    lu = fused_reads[rb[0]]
-                    sub[d] = Expression({lu.dims[2 + rb[1]]: 1})
+                    _read, bit_dims = fused_reads[rb[0]]
+                    sub[d] = Expression({bit_dims[rb[1]]: 1})
                     continue
                 (e,) = folded[d]
                 nd = PersistDimension(tr(e), name=name_of(d.name))
@@ -259,7 +262,7 @@ class GraphMaterializer:
 
 
 def masked_exact_read(addr, byte_value, write_addr, is_write, *,
-                      structural: bool = False, bit_values=()) -> Expression:
+                      structural: bool = False, bit_indices=()) -> Expression:
     """A memory_at site rebuilt flat: one 64K-span lookup plus the
     exact-address mask.  Identical output to the union's 16-group sum
     (the mask keeps exact hits only, and an exact hit answers from its
@@ -276,7 +279,7 @@ def masked_exact_read(addr, byte_value, write_addr, is_write, *,
     ``structural`` targets backends that serve the fused read exactly
     (value at addr when written and in range, else 0)."""
     if structural:
-        bits = tuple(f"bit{7 - i}" for i in range(len(bit_values)))
+        bits = tuple(f"bit{7 - i}" for i in bit_indices)
         read = MemoryRead(addr, bits=bits)
         return Expression({read.dims[0]: 1})
     value, found = graph.fetch([byte_value, write_addr], query=addr,
