@@ -36,6 +36,15 @@ class ArchitecturalOutput:
 
 
 @dataclass(frozen=True)
+class ControlFlow:
+    predicate: Dimension | None
+    fallthrough: int
+    target: int
+    relative_to_head: bool = False
+    relative_operand_offset: int | None = None
+
+
+@dataclass(frozen=True)
 class ExecutionGraph:
     program_graph: ProgramGraph
     n_steps: int
@@ -43,6 +52,7 @@ class ExecutionGraph:
     memory_reads: tuple[MemoryRead, ...]
     memory_writes: tuple[MemoryWrite, ...]
     outputs: tuple[ArchitecturalOutput, ...]
+    control: ControlFlow
     dim_of_name: dict[str, Dimension]
 
     def output(self, name: str) -> ArchitecturalOutput:

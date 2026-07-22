@@ -20,6 +20,7 @@ from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS
 from transformer_nes.cpu6502.backends.weights.windows import (
     BRANCH_OPERATIONS,
     MEMORY_WRITE_OPERATIONS,
+    SEQUENCE_WRITERS,
 )
 from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
 from transformer_nes.graph.core import (
@@ -32,6 +33,7 @@ from transformer_nes.graph.core import (
 )
 from transformer_nes.graph.execution import (
     ArchitecturalOutput,
+    ControlFlow,
     ExecutionGraph,
     MemoryWrite,
     StateField,
@@ -121,7 +123,7 @@ def fold_step_spec(fold_result, model, tok_to_idx, info, *,
 SEQUENCE_STATE_DIMS = (
     "new_a", "new_x", "new_y", "new_s", "new_p", "new_halted",
     "fetched_opcode", "fetched_operand_lo", "fetched_operand_hi",
-    "ea", "data_out", "next_pc",
+    "ea", "data_out",
 )
 
 SEQUENCE_PRESERVE_INPUTS = {
@@ -139,7 +141,6 @@ SEQUENCE_PRESERVE_INPUTS = {
     "fetched_operand_hi": (("in_ophi", 1),),
     "ea": (("in_ea_lo", 1), ("in_ea_hi", 256)),
     "data_out": (("in_data", 1),),
-    "next_pc": (("in_pc_lo", 1), ("in_pc_hi", 256)),
 }
 
 WRITE_RECEIPTS = (
@@ -147,6 +148,7 @@ WRITE_RECEIPTS = (
     ("is_store2", "write_addr2_out", "write_value2_out"),
     ("is_store3", "write_addr3_out", "write_value3_out"),
 )
+SEQUENCE_ROOT_DIMS = (*RUNTIME_READ_DIMS, "branch_taken")
 
 
 def linear_input_form(expr: Expression) -> dict:
@@ -193,7 +195,9 @@ def classify_sequence_state(fold_result, final_names) -> dict:
     return result
 
 
-def project_sequence_execution(fold_result, n_steps: int) -> ExecutionGraph:
+def project_sequence_execution(
+    fold_result, n_steps: int, control: ControlFlow,
+) -> ExecutionGraph:
     """Replace the proof graph's per-step trace ABI with its execution ABI.
 
     The complete fold is retained until all control, read, write and halt
@@ -235,6 +239,9 @@ def project_sequence_execution(fold_result, n_steps: int) -> ExecutionGraph:
             output_tokens[f"write:{k}:{order}:address"] = Expression({address: 1})
             output_tokens[f"write:{k}:{order}:value"] = Expression({write_value: 1})
 
+    if control.predicate is not None:
+        output_tokens["control:branch"] = Expression({control.predicate: 1})
+
     program_graph = project_program_graph(
         fold_result.program_graph, output_tokens, retain_input_tokens=False,
     )
@@ -253,6 +260,7 @@ def project_sequence_execution(fold_result, n_steps: int) -> ExecutionGraph:
         memory_reads=tuple(program_graph.all_memory_reads),
         memory_writes=tuple(writes),
         outputs=tuple(outputs),
+        control=control,
         dim_of_name=dim_of_name,
     )
 
@@ -282,6 +290,17 @@ def sequence_step_spec(execution: ExecutionGraph, info) -> dict:
             info.slot_of[write.address], info.slot_of[write.value],
         ))
     spec["sequence_writes"] = writes
+    control = execution.control
+    spec["sequence_control"] = {
+        "predicate": (
+            None if control.predicate is None
+            else info.slot_of[control.predicate]
+        ),
+        "fallthrough": control.fallthrough,
+        "target": control.target,
+        "relative_to_head": control.relative_to_head,
+        "relative_operand_offset": control.relative_operand_offset,
+    }
     return spec
 
 
@@ -359,6 +378,71 @@ def decode_ops(code: bytes) -> list:
         ops.append(op)
         off += op.length
     return ops
+
+
+def pinned_sequence_control(fold_result, pin_list, ops) -> ControlFlow:
+    k = len(pin_list) - 1
+    op = ops[k]
+    pins = pin_list[k]
+    pc = int(pins["current_pc_lo"]) | (int(pins["current_pc_hi"]) << 8)
+    fallthrough = (pc + op.length) & 0xFFFF
+    if op.operation in BRANCH_OPERATIONS:
+        offset = int(pins["fetched_operand_lo_all"])
+        signed = offset - 256 if offset & 0x80 else offset
+        predicate = fold_result.dim_of_name[f"branch_taken__s{k}"]
+        form = linear_input_form(Expression({predicate: 1}))
+        one = fold_result.program_graph.one
+        if all(dim is one for dim in form):
+            successor = (
+                (fallthrough + signed) & 0xFFFF
+                if int(round(form.get(one, 0.0))) else fallthrough
+            )
+            return ControlFlow(
+                predicate=None, fallthrough=successor, target=successor,
+            )
+        return ControlFlow(
+            predicate=predicate,
+            fallthrough=fallthrough,
+            target=(fallthrough + signed) & 0xFFFF,
+        )
+    if op.operation == "jmp" and op.mode == "abs":
+        target = int(pins["fetched_operand_lo_all"]) | (
+            int(pins["fetched_operand_hi_all"]) << 8
+        )
+        return ControlFlow(predicate=None, fallthrough=target, target=target)
+    if op.operation in SEQUENCE_WRITERS or op.operation == "jmp":
+        raise RuntimeError(
+            f"sequence final control {op.mnemonic} is not host-resolvable"
+        )
+    return ControlFlow(
+        predicate=None, fallthrough=fallthrough, target=fallthrough,
+    )
+
+
+def shape_sequence_control(
+    fold_result, n_steps: int, ops, offsets, length: int, self_target: bool,
+) -> ControlFlow:
+    if self_target:
+        return ControlFlow(
+            predicate=None, fallthrough=0, target=0, relative_to_head=True,
+        )
+    op = ops[-1]
+    if op.operation in BRANCH_OPERATIONS:
+        return ControlFlow(
+            predicate=fold_result.dim_of_name[f"branch_taken__s{n_steps - 1}"],
+            fallthrough=length,
+            target=0,
+            relative_to_head=True,
+            relative_operand_offset=offsets[-1] + 1,
+        )
+    if op.operation in SEQUENCE_WRITERS or op.operation == "jmp":
+        raise RuntimeError(
+            f"shape final control {op.mnemonic} is not host-resolvable"
+        )
+    return ControlFlow(
+        predicate=None, fallthrough=length, target=length,
+        relative_to_head=True,
+    )
 
 
 def check_reads_licensed(fold_result, ops, label: str) -> None:
@@ -669,7 +753,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
             )
         pin_list[k] = dict(pin_list[k])
         pin_list[k]["branch_taken"] = 1.0
-    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS,
+    folder = GraphFolder(pg, root_names=SEQUENCE_ROOT_DIMS,
                          structural_reads=structural_reads)
 
     def fold_candidate(inline):
@@ -698,7 +782,9 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                 "(next_pc != the next step's pc)"
             )
 
-    execution = project_sequence_execution(r, n_steps)
+    execution = project_sequence_execution(
+        r, n_steps, pinned_sequence_control(r, pin_list, ops),
+    )
     materialized = schedule_and_build(execution)
     if inline_linear is None:
         inlined_r = fold_candidate(True)
@@ -707,7 +793,10 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                 f"{label}: pins reach insert-side expressions "
                 f"of {inlined_r.insert_side_hazards}"
             )
-        inlined_execution = project_sequence_execution(inlined_r, n_steps)
+        inlined_execution = project_sequence_execution(
+            inlined_r, n_steps,
+            pinned_sequence_control(inlined_r, pin_list, ops),
+        )
         inlined = schedule_and_build(inlined_execution)
         if prefer_inlined(
             (materialized[0], materialized[3]),
@@ -1034,7 +1123,7 @@ def build_shape_experts(pg, shapes, *,
     guard. A library shape that fails its selected license is a hard error:
     the library is code.
     """
-    folder = GraphFolder(pg, root_names=RUNTIME_READ_DIMS,
+    folder = GraphFolder(pg, root_names=SEQUENCE_ROOT_DIMS,
                          structural_reads=structural_reads)
     experts: list[dict] = []
     meta: list[dict] = []
@@ -1135,7 +1224,12 @@ def build_shape_experts(pg, shapes, *,
                         "head + offset for every head"
                     )
 
-        execution = project_sequence_execution(r, n_steps)
+        execution = project_sequence_execution(
+            r, n_steps,
+            shape_sequence_control(
+                r, n_steps, ops, offs, len(template), self_target,
+            ),
+        )
         materialized = schedule_and_build(execution)
         if inline_linear is None:
             inlined_r = fold_candidate(True)
@@ -1144,7 +1238,12 @@ def build_shape_experts(pg, shapes, *,
                     f"{label}: pins reach insert-side expressions "
                     f"of {inlined_r.insert_side_hazards}"
                 )
-            inlined_execution = project_sequence_execution(inlined_r, n_steps)
+            inlined_execution = project_sequence_execution(
+                inlined_r, n_steps,
+                shape_sequence_control(
+                    inlined_r, n_steps, ops, offs, len(template), self_target,
+                ),
+            )
             inlined = schedule_and_build(inlined_execution)
             if prefer_inlined(
                 (materialized[0], materialized[3]),

@@ -31,7 +31,7 @@ in/out and FFN in/out), not zeroes or the unused dense shape.
 | Model set | Previous construction | Current construction | Delta |
 | --- | --- | --- | --- |
 | 227 documented-opcode experts | 3,719 layers; max `d_model` 294; 265,934 sparse terms | 1,574 layers; max `d_model` 76; 140,764 sparse terms | −57.7% layers; −74.1% max width; −47.1% sparse work |
-| 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 104 layers; max `d_model` 52; 6,178 sparse terms | −59.5% layers; −13.3% max width; −64.6% sparse work |
+| 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 91 layers; max `d_model` 48; 5,657 sparse terms | −64.6% layers; −20.0% max width; −67.6% sparse work |
 
 The deterministic 24-instruction self-JMP is the clearest construction
 trace.  Its full proof receipt built as 38 layers / `d_model` 596 / 6,889
@@ -202,6 +202,15 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    only fields reachable from computed outputs or writes.  This is what lets
    a deterministic sequence become a genuine zero-layer model with only the
    constant-one residual slot (`d_model=2`).
+
+18. **Return control decisions, not reconstructed program counters.**  A
+   licensed region already knows its fallthrough and deterministic targets;
+   a generic relative branch also exposes its signed operand byte to the
+   engine.  Keep only the branch predicate as a model output and represent
+   the successor as typed metadata (absolute, head-relative, or signed
+   operand-relative).  This removed PC arithmetic, wrapping and mux chains
+   from the shape library: 104 → 91 layers, max `d_model` 52 → 48 and
+   6,178 → 5,657 sparse terms, with no ROM-specific assumptions.
 
 ## Dead ends (kept so they stay dead)
 

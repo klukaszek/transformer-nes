@@ -1348,7 +1348,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 "fetched_operand_lo": f"{E}st_oplo",
                 "fetched_operand_hi": f"{E}st_ophi",
                 "ea": f"{E}st_ea", "data_out": f"{E}st_data",
-                "next_pc": f"{E}st_pc",
             }
 
             def final_value(name):
@@ -1367,9 +1366,27 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 ("fetched_opcode", 0xFF), ("fetched_operand_lo", 0xFF),
                 ("fetched_operand_hi", 0xFF), ("ea", 0xFFFF),
                 ("data_out", 0xFF), ("new_halted", 0xFF),
-                ("next_pc", 0xFFFF),
             ), start=1):
                 emit(f"        out[{i}] = {final_value(name)} & 0x{mask:X};")
+            control = spec["sequence_control"]
+            if control["relative_to_head"]:
+                fallthrough = f"({E}st_pc + {control['fallthrough']})"
+                target = f"({E}st_pc + {control['target']})"
+            else:
+                fallthrough = str(control["fallthrough"])
+                target = str(control["target"])
+            operand_offset = control["relative_operand_offset"]
+            if operand_offset is not None:
+                target = (
+                    f"({E}st_pc + {control['fallthrough']} + "
+                    f"(int)(std::int8_t){E}ram[({E}st_pc + {operand_offset}) & 0xFFFF])"
+                )
+            predicate = control["predicate"]
+            successor = (
+                fallthrough if predicate is None
+                else f"(({rdv(predicate)} & 1) ? {target} : {fallthrough})"
+            )
+            emit(f"        out[12] = {successor} & 0xFFFF;")
             emit("        out[14] = 0;")
             for step_writes in spec["sequence_writes"]:
                 for addr_slot, value_slot in step_writes:

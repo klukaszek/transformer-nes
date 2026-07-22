@@ -26,8 +26,11 @@ from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS
 from transformer_nes.cpu6502.backends.weights.experts import (
     SEQUENCE_PRESERVE_INPUTS,
+    SEQUENCE_ROOT_DIMS,
     SEQUENCE_STATE_DIMS,
     build_shape_experts,
+    decode_ops,
+    pinned_sequence_control,
     project_sequence_execution,
     schedule_and_build,
 )
@@ -428,7 +431,9 @@ def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
         pin_list, SEQUENCE_FEEDBACK, label="projected_poll",
     )
     proof_dims = len(r.program_graph.all_dims)
-    execution = project_sequence_execution(r, len(pin_list))
+    execution = project_sequence_execution(
+        r, len(pin_list), pinned_sequence_control(r, pin_list, decode_ops(code)),
+    )
 
     assert execution.memory_writes == ()
     classified = {output.name for output in execution.outputs}
@@ -476,6 +481,13 @@ def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
                     for input_name, coeff in SEQUENCE_PRESERVE_INPUTS[name]
                 )
             assert int(round(value)) & mask == expected[name] & mask
+        control = execution.control
+        taken = (
+            False if control.predicate is None
+            else bool(round(values[control.predicate]))
+        )
+        successor = control.target if taken else control.fallthrough
+        assert successor == expected["next_pc"]
         windows += 1
         skip = len(pin_list) - 1
         idx += 1
@@ -488,12 +500,15 @@ def test_sequence_execution_projection_eliminates_deterministic_model(folder):
         SPIN_HEAD, bytes([0x4C, 0x08, 0x04]), OPCODES,
     ) * 8
     structural = GraphFolder(
-        folder.pg, root_names=RUNTIME_READ_DIMS, structural_reads=True,
+        folder.pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
     )
     execution = structural.fold_sequence(
         pins, SEQUENCE_FEEDBACK, label="execution_spin", inline_linear=True,
     )
-    execution_graph = project_sequence_execution(execution, len(pins))
+    execution_graph = project_sequence_execution(
+        execution, len(pins),
+        pinned_sequence_control(execution, pins, decode_ops(bytes([0x4C, 0x08, 0x04])) * 8),
+    )
     _model, _tokens, _rows, execution_info = schedule_and_build(execution_graph)
 
     assert not any(
@@ -511,12 +526,14 @@ def test_structural_execution_uses_external_memory_reads(folder):
     code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
     pins = sequence_pins(POLL_HEAD, code, OPCODES)
     structural = GraphFolder(
-        folder.pg, root_names=RUNTIME_READ_DIMS, structural_reads=True,
+        folder.pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
     )
     proof = structural.fold_sequence(
         pins, SEQUENCE_FEEDBACK, label="external_poll", inline_linear=True,
     )
-    execution = project_sequence_execution(proof, len(pins))
+    execution = project_sequence_execution(
+        proof, len(pins), pinned_sequence_control(proof, pins, decode_ops(code)),
+    )
     model, _tokens, _rows, _info = schedule_and_build(execution)
 
     assert execution.memory_reads
@@ -548,7 +565,10 @@ def test_execution_ir_retains_ordered_writes(folder):
     proof = structural.fold_sequence(
         pins, SEQUENCE_FEEDBACK, label="ordered_store", inline_linear=True,
     )
-    execution = project_sequence_execution(proof, len(pins))
+    execution = project_sequence_execution(
+        proof, len(pins),
+        pinned_sequence_control(proof, pins, decode_ops(bytes([0x85, 0x10]))),
+    )
 
     assert len(execution.memory_writes) == 1
     write = execution.memory_writes[0]
@@ -780,6 +800,14 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
         reference.FLAG_B,
         reference.FLAG_V,
     }
+    assert spec["sequence_control"] == {
+        "predicate": spec["sequence_control"]["predicate"],
+        "fallthrough": 3,
+        "target": 0,
+        "relative_to_head": True,
+        "relative_operand_offset": 2,
+    }
+    assert spec["sequence_control"]["predicate"] is not None
 
 
 def test_shape_interior_branch_requires_explicit_speculation(union_pg):
