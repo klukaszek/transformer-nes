@@ -92,10 +92,10 @@ Standard softmax attention is O(n) per step.  Since this model uses hardmax atte
 ### The transformer itself
 
 `6502-transformer` runs the machine as **actual transformer weights**:
-`scheduler/milp.py`'s load-balanced critical-path scheduler assigns the gates to 75 layers, `model/weights.py` constructs the transformer's weight matrices analytically (`WeightModel`: d_model=634, 317 heads, no training), and inference is genuine — Q/K/V projections, hardmax attention, ReGLU FFN, residual stream, and no position encoding (token order enters only through the LATEST tie-break) — run by generated straight-line C++ with a native run loop, exact integer arithmetic end-to-end, O(1) attention state, and four routed execution tiers (optional pinned sequence modules, canonical shapes serving any ROM, compact untraced opcode execution, and the exact union proof model for tracing, interrupts, and unknown bytes).
+`scheduler/milp.py`'s load-balanced critical-path scheduler assigns the decimal-enabled graph to 69 layers, `model/weights.py` constructs the transformer's weight matrices analytically (`WeightModel`: d_model=630, 315 heads, no training), and inference is genuine — Q/K/V projections, hardmax attention, ReGLU FFN, residual stream, and no position encoding (token order enters only through the LATEST tie-break) — run by generated straight-line C++ with a native run loop, exact integer arithmetic end-to-end, O(1) attention state, and four routed execution tiers (optional pinned sequence modules, canonical shapes serving any ROM, compact opcode execution with engine-derived trace receipts, and the exact union proof model for interrupts and unknown bytes).
 **The full 8,991-instruction nestest suite passes through the weights in
 under 0.1 seconds**, the full 30.6M-instruction Klaus suite
-lockstep-matches with decimal mode in ~73 s, and gameplay replays on the
+lockstep-matches with decimal mode in ~68 s, and gameplay replays on the
 recorded input tapes at ~1,050 fps (SMB), 756-905 fps (SMB3), and
 386-485 fps (CV3), byte-identical to the reference-driven console.  See
 [`transformer_nes/cpu6502/README.md`](transformer_nes/cpu6502/README.md).

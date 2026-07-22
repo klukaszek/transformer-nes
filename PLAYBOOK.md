@@ -1,7 +1,7 @@
 # Optimization playbook
 
 Levers that took the 6502 weights transformer from 0.13 instr/s to
-~750K instr/s (full Klaus incl. lockstep; SMB gameplay tape ~1,700 fps),
+~440K instr/s (full Klaus incl. lockstep; SMB gameplay tape ~1,700 fps),
 stated architecture-agnostically so they
 transfer to future targets (other CPUs, WASM, batched fleets).  Each
 entry: the lever, the receipt here, and what it needs to transfer.
@@ -333,8 +333,21 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    with no full-receipt experts left in production. The obsolete receipt-expert
    builder, multi-row receipt emitter and compatibility dispatch were then
    deleted; the generator rejects any attempt to put that tier back into a core.
-   The sole 21-field receipt is now exactly what tracing and interrupt fallback
-   require, emitted directly as the union `step_core`.
+   The sole proof receipt remains as the union `step_core` for interrupts and
+   unknown bytes.
+
+28. **A trace receipt does not require a trace transformer.** Compact execution
+   already determines post-state, control and ordered effects. The generated
+   engine now derives the remaining diagnostic fields around that forward:
+   opcode and operands from instruction metadata, EA from the addressing mode,
+   data from an operation-source table, and writes from staged effects. Thus the
+   existing full `trace=True` API remains field-for-field exact without routing
+   documented opcodes through the 69-layer union. On the sustained 30M-step
+   Klaus lockstep this repaired a regression from 198.2 s / 151K steps/s to
+   68.1 s / 441K steps/s; complete nestest reaches 5.46M steps/s. The compact
+   untraced path remains ~63M steps/s on the same Klaus prefix. Transfer requires
+   that trace fields be observational metadata, derivable from licensed inputs,
+   outputs and effects rather than additional machine state.
 
 ## Dead ends (kept so they stay dead)
 

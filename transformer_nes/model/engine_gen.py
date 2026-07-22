@@ -24,6 +24,7 @@ from transformer_nes.cpu6502.backends.weights.run_protocol import (
     IN_RANGES_CPP,
     MACHINE_API_CPP,
     SHADOW_READ_TARGET_CPP,
+    TRACE_RECEIPT_CPP,
     mem_query_cpp,
     run_loop_cpp,
     run_state_members_cpp,
@@ -513,10 +514,28 @@ ENGINE_STEP_BODY = """\
             const bool was_int = nmi_pending || irq_ready();
             const int prev_pc = st_pc;
             const unsigned char exec_opcode = ram[prev_pc];
-            if (!trace && !was_int && execution_step(exec_opcode)) {
+            int pre_a = 0, pre_x = 0, pre_y = 0, pre_p = 0;
+            int tr_lo = 0, tr_hi = 0, tr_ea = 0, tr_operand = 0;
+            if (trace) {
+                pre_a = st_a; pre_x = st_x; pre_y = st_y; pre_p = st_p;
+                const int tr_len = TRACE_LENGTH[exec_opcode];
+                if (tr_len > 1) tr_lo = ram[(prev_pc + 1) & 0xFFFF];
+                if (tr_len > 2) tr_hi = ram[(prev_pc + 2) & 0xFFFF];
+                tr_ea = trace_ea(exec_opcode, prev_pc, pre_x, pre_y);
+                const int data_kind = TRACE_DATA[exec_opcode];
+                if (data_kind >= 11)
+                    tr_operand = TRACE_MODE[exec_opcode] == 11 ? tr_lo : ram[tr_ea];
+            }
+            if (!was_int && execution_step(exec_opcode)) {
+                const int tr_data = trace
+                    ? trace_data(exec_opcode, pre_a, pre_x, pre_y, pre_p, tr_operand)
+                    : 0;
                 int exec_hits = 0;
                 for (int w = 0; w < exec_n_writes; ++w) {
                     const int wa = exec_write_addr[w], wv = exec_write_value[w];
+                    if (trace) {
+                        w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);
+                    }
                     insert_write(wa, wv, seq + 1);
                     if (wa >= 0x8000 && mapper_kind) {
                         mapper_write(wa, wv);
@@ -526,6 +545,17 @@ ENGINE_STEP_BODY = """\
                         hit_addr.push_back(wa); hit_value.push_back(wv);
                         ++exec_hits;
                     }
+                }
+                if (trace) {
+                    t_pc.push_back(prev_pc); t_a.push_back(st_a);
+                    t_x.push_back(st_x); t_y.push_back(st_y);
+                    t_s.push_back(st_s); t_p.push_back(st_p);
+                    t_ir.push_back(exec_opcode); t_oplo.push_back(tr_lo);
+                    t_ophi.push_back(tr_hi); t_ea.push_back(tr_ea);
+                    t_data.push_back(tr_data);
+                    t_halted.push_back(st_halted ? 1 : 0);
+                    st_ir = exec_opcode; st_oplo = tr_lo; st_ophi = tr_hi;
+                    st_ea = tr_ea; st_data = tr_data;
                 }
                 ++step_index;
                 const long step_cycles = (long)CYCLES[exec_opcode];
@@ -578,6 +608,7 @@ ENGINE_STEP_BODY = """\
 # the run-loop protocol blocks).
 RUN_LOOP = "\n\n".join((
     SHADOW_READ_TARGET_CPP,
+    TRACE_RECEIPT_CPP,
     IN_RANGES_CPP,
     run_loop_cpp(extra_locals="        long long o[21];",
                  step_body=ENGINE_STEP_BODY),

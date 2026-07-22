@@ -13,8 +13,12 @@ from transformer_nes.cpu6502.spec import (
     MODE_ABSOLUTE,
     MODE_ABSOLUTE_X,
     MODE_ABSOLUTE_Y,
+    MODE_ACCUMULATOR,
+    MODE_IMMEDIATE,
+    MODE_INDIRECT,
     MODE_INDIRECT_X,
     MODE_INDIRECT_Y,
+    MODE_RELATIVE,
     MODE_ZERO_PAGE,
     MODE_ZERO_PAGE_X,
     MODE_ZERO_PAGE_Y,
@@ -53,6 +57,89 @@ def cycle_table() -> tuple[int, ...]:
     table = [2] * 256
     for byte, op in OPCODES.items():
         table[byte] = op.cycles
+    return tuple(table)
+
+
+TRACE_MODE_CODE = {
+    MODE_IMMEDIATE: 11,
+    MODE_ZERO_PAGE: 1,
+    MODE_ZERO_PAGE_X: 2,
+    MODE_ZERO_PAGE_Y: 3,
+    MODE_ABSOLUTE: 4,
+    MODE_ABSOLUTE_X: 5,
+    MODE_ABSOLUTE_Y: 6,
+    MODE_INDIRECT_X: 7,
+    MODE_INDIRECT_Y: 8,
+    MODE_INDIRECT: 9,
+    MODE_RELATIVE: 10,
+}
+
+
+def trace_mode_table() -> tuple[int, ...]:
+    table = [0] * 256
+    for byte, op in OPCODES.items():
+        table[byte] = TRACE_MODE_CODE.get(op.mode, 0)
+    return tuple(table)
+
+
+def trace_length_table() -> tuple[int, ...]:
+    table = [1] * 256
+    for byte, op in OPCODES.items():
+        table[byte] = op.length
+    return tuple(table)
+
+
+def trace_data_table() -> tuple[int, ...]:
+    """Opcode-to-source code for reference-compatible trace ``data``."""
+    pre_a = {"store_a", "pha"}
+    pre_x = {"store_x"}
+    pre_y = {"store_y"}
+    pre_p = {"php"}
+    write = {
+        "inc", "isb", "dec", "dcp", "sax", "slo", "rla", "sre", "rra",
+    }
+    post_a = {
+        "load_a", "lax", "adc", "sbc", "and", "ora", "eor", "pla",
+        "txa", "tya",
+    }
+    post_x = {"load_x", "inx", "dex", "tax", "tsx"}
+    post_y = {"load_y", "iny", "dey", "tay"}
+    table = [0] * 256
+    for byte, op in OPCODES.items():
+        operation = op.operation
+        if operation in pre_a:
+            kind = 1
+        elif operation in pre_x:
+            kind = 2
+        elif operation in pre_y:
+            kind = 3
+        elif operation in pre_p:
+            kind = 4
+        elif operation in write:
+            kind = 5
+        elif operation in {"asl", "lsr", "rol", "ror"}:
+            kind = 6 if op.mode == MODE_ACCUMULATOR else 5
+        elif operation in post_a:
+            kind = 6
+        elif operation in post_x:
+            kind = 7
+        elif operation in post_y:
+            kind = 8
+        elif operation == "txs":
+            kind = 9
+        elif operation == "plp":
+            kind = 10
+        elif operation == "cmp":
+            kind = 11
+        elif operation == "cpx":
+            kind = 12
+        elif operation == "cpy":
+            kind = 13
+        elif operation == "bit":
+            kind = 14
+        else:
+            kind = 0
+        table[byte] = kind
     return tuple(table)
 
 
@@ -145,6 +232,52 @@ SHADOW_READ_TARGET_CPP = """\
         return -1;
     }"""
 
+
+TRACE_RECEIPT_CPP = """\
+    int trace_ea(int opcode, int pc, int xr, int yr) const {
+        const int mode = TRACE_MODE[opcode];
+        const int lo = ram[(pc + 1) & 0xFFFF];
+        const int hi = ram[(pc + 2) & 0xFFFF];
+        switch (mode) {
+            case 1: case 11: return lo;
+            case 2: return (lo + xr) & 0xFF;
+            case 3: return (lo + yr) & 0xFF;
+            case 4: return lo | (hi << 8);
+            case 5: return ((lo | (hi << 8)) + xr) & 0xFFFF;
+            case 6: return ((lo | (hi << 8)) + yr) & 0xFFFF;
+            case 7: { const int zp = (lo + xr) & 0xFF;
+                      return ram[zp] | (ram[(zp + 1) & 0xFF] << 8); }
+            case 8: { const int base = ram[lo] | (ram[(lo + 1) & 0xFF] << 8);
+                      return (base + yr) & 0xFFFF; }
+            case 9: { const int ptr = lo | (hi << 8);
+                      const int next = (ptr & 0xFF00) | ((ptr + 1) & 0xFF);
+                      return ram[ptr] | (ram[next] << 8); }
+            case 10: return (pc + 2 + (int)(std::int8_t)lo) & 0xFFFF;
+        }
+        return 0;
+    }
+
+    int trace_data(int opcode, int pre_a, int pre_x, int pre_y, int pre_p,
+                   int operand) const {
+        switch (TRACE_DATA[opcode]) {
+            case 1: return pre_a;
+            case 2: return pre_x;
+            case 3: return pre_y;
+            case 4: return pre_p;
+            case 5: return exec_write_value[0];
+            case 6: return st_a;
+            case 7: return st_x;
+            case 8: return st_y;
+            case 9: return st_s;
+            case 10: return st_p;
+            case 11: return (pre_a - operand) & 0xFF;
+            case 12: return (pre_x - operand) & 0xFF;
+            case 13: return (pre_y - operand) & 0xFF;
+            case 14: return operand;
+        }
+        return 0;
+    }"""
+
 IN_RANGES_CPP = """\
     static bool in_ranges(const std::vector<std::pair<int,int>>& v, int addr) {
         for (const auto& r : v) if (addr >= r.first && addr <= r.second) return true;
@@ -158,6 +291,9 @@ def run_state_members_cpp() -> str:
     the shadow-decode / base-cycle tables."""
     read_mode = ", ".join(str(v) for v in read_mode_table())
     cycles_tab = ", ".join(str(v) for v in cycle_table())
+    trace_mode = ", ".join(str(v) for v in trace_mode_table())
+    trace_length = ", ".join(str(v) for v in trace_length_table())
+    trace_data = ", ".join(str(v) for v in trace_data_table())
     return f"""\
     unsigned char ram[65536];  // mirror of the write log, for shadow decode
     int st_pc = 0, st_a = 0, st_x = 0, st_y = 0, st_s = 0xFD, st_p = 0x24;
@@ -211,6 +347,9 @@ def run_state_members_cpp() -> str:
     std::vector<int> wj_addr, wj_value;  // write journal since last drain
     std::vector<int> ls_addr; std::vector<long> ls_served;  // native lease kills
     static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};
+    static constexpr unsigned char TRACE_MODE[256] = {{ {trace_mode} }};
+    static constexpr unsigned char TRACE_LENGTH[256] = {{ {trace_length} }};
+    static constexpr unsigned char TRACE_DATA[256] = {{ {trace_data} }};
     // Base cycles per opcode (no penalty cycles); NMI costs 7.
     static constexpr unsigned char CYCLES[256] = {{ {cycles_tab} }};"""
 

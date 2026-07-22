@@ -74,7 +74,7 @@ ROADMAP.md.
 `backends/weights/` (`6502-transformer`) closes the loop on the project's
 premise: the graph is scheduled onto layers and compiled by
 `model/weights.py` into actual transformer weight matrices
-(`WeightModel` — d_model=634, 75 layers, 317 attention heads),
+(`WeightModel` — decimal-enabled d_model=630, 69 layers, 315 attention heads),
 constructed analytically, no training.  Execution is genuine transformer
 inference: embeddings, Q/K/V projections, hardmax attention, ReGLU FFN,
 residual stream, output head.  There is **no position encoding** — token
@@ -119,8 +119,9 @@ compact delta/control/effect experts, alongside a canonical
 homebrew included, zero per-ROM compilation). An explicit caller may attach a
 per-ROM **sequence module** that outranks those tiers by pinning licensed
 instruction windows as one forward (~160 KB TU, ~1 s cached). Interrupts,
-unknown bytes, and traced execution retain the exact union path instead of
-carrying a second diagnostic receipt in the production core. Compact writes are
+unknown bytes retain the exact union path. Documented opcodes derive their full
+trace receipt in the engine around compact execution instead of carrying a
+second diagnostic transformer. Compact writes are
 staged and routed through the same mapper, journal and watch machinery as full
 receipts before the instruction retires. Static control is engine metadata;
 dynamic control returns one target slot, and only BRK returns a halt slot.
@@ -128,7 +129,7 @@ dynamic control returns one target slot, and only BRK returns a halt slot.
 With the generated engine, **the full 8,991-instruction nestest suite runs
 through the actual transformer weights in under 0.1 s** (`6502-nestest
 --runner weights`) and the full 30.6M-instruction Klaus suite
-lockstep-matches with decimal mode in ~75 s, checkpointing disabled
+lockstep-matches with decimal mode in ~68 s, checkpointing disabled
 entirely (engine state is O(1); the snapshot-and-rebuild machinery remains
 for the NES console).  Gameplay through the weights on the recorded input
 tapes runs at ~1,050 fps (SMB), 756-885 fps (SMB3), and 386-485 fps (CV3),

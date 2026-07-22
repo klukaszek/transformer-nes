@@ -447,6 +447,35 @@ def test_compact_stack_and_control_match_reference():
 
 
 @pytest.mark.slow
+def test_full_trace_interrupt_uses_union_receipt():
+    image = bytearray(0x10000)
+    image[0x0400:0x0403] = bytes([0xA9, 0x55, 0xEA])
+    image[0x0500] = 0xEA
+    image[0xFFFA:0xFFFC] = bytes([0x00, 0x05])
+
+    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+    ref.pc = 0x0400
+    ref.nmi_pending = True
+    expected = ref.step()
+
+    machine = Cpu6502TransformerMachine(bcd=False)
+    machine.load_image(bytes(image), start_pc=0x0400)
+    machine.set_nmi()
+    out = machine.run(1, trace=True)
+
+    state = expected.state
+    assert tuple(int(out[name][0]) for name in (
+        "pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi", "ea", "data",
+    )) == (
+        state.pc, state.a, state.x, state.y, state.s, state.p, state.ir,
+        state.operand_lo, state.operand_hi, state.ea, state.data,
+    )
+    assert list(zip(out["w_addr"], out["w_value"], strict=True)) == [
+        (write.addr, write.value) for write in expected.writes
+    ]
+
+
+@pytest.mark.slow
 def test_store_window_license_rejections():
     """Unlicensable windows must be skipped, never mis-dispatched: a store
     to a register range ($2007) and a store into the window's own bytes."""
