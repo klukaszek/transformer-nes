@@ -31,6 +31,7 @@ in/out and FFN in/out), not zeroes or the unused dense shape.
 | Model set | Previous construction | Current construction | Delta |
 | --- | --- | --- | --- |
 | 227 documented-opcode experts | 3,719 layers; max `d_model` 294; 265,934 sparse terms | 825 layers; max `d_model` 106; 126,706 sparse terms | −77.8% layers; −63.9% max width; −52.4% sparse work |
+| Production full-receipt experts | 227 experts; 825 layers; max `d_model` 106; 126,706 sparse terms | 93 experts; 387 layers; max `d_model` 106; 60,327 sparse terms | −59.0% experts; −53.1% layers; −52.4% sparse work |
 | 134 untraced opcode experts | 438 full-receipt layers; max `d_model` 70; 66,379 sparse terms | 510 delta-only layers; max `d_model` 34; 21,473 sparse terms | +16.4% layers; −51.4% max width; −67.6% sparse work |
 | 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 64 layers; max `d_model` 34; 2,488 sparse terms | −75.1% layers; −43.3% max width; −85.8% sparse work |
 
@@ -297,6 +298,14 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    proposal/profiling path removed over 700 net lines without changing the model
    census. Concrete store windows remain an explicit, statically licensed
    sequence-module operation rather than a tuning mode.
+
+25. **Do not build a diagnostic receipt beside an equivalent execution
+   model.** The 134 compact opcodes already own untraced execution, so their
+   full 21-field experts served tracing alone. Traced steps now use the exact
+   union fallback for those bytes, leaving full receipts only for the 93
+   opcodes not yet compacted. The production core fell from 376 to 242 experts;
+   its full-receipt family fell from 825 to 387 layers and 126,706 to 60,327
+   sparse terms. Gameplay routing is unchanged, while tracing remains exact.
 
 ## Dead ends (kept so they stay dead)
 

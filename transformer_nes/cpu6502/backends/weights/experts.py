@@ -785,7 +785,7 @@ def build_opcode_experts(pg, opcodes) -> list[dict]:
     return experts
 
 
-def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
+def opcode_execution_bytes(opcodes) -> tuple[int, ...]:
     eligible = []
     for byte in opcodes or ():
         byte = int(byte)
@@ -801,7 +801,14 @@ def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
             or op.operation in {"jmp", "pha", "php"}
         ):
             continue
-        eligible.append((byte, op))
+        eligible.append(byte)
+    return tuple(eligible)
+
+
+def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
+    eligible = [
+        (byte, OPCODES[byte]) for byte in opcode_execution_bytes(opcodes)
+    ]
     if not eligible:
         return []
 
