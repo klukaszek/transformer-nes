@@ -42,6 +42,12 @@ live-in ABI finally made it 0 / 2 / 0.  The proof graph still exists long
 enough to license the optimization; none of it survives merely to explain
 an already-proven execution.
 
+For the generic LDA-absolute / AND / BEQ polling shape, typed lowering takes
+the 141-dimension proof fold to a 20-dimension execution graph with five live
+state fields, one `MemoryRead`, zero token `LookUp`s and none of
+`byte_value`/`addr_lo`/`addr_hi`/`is_memory_write`.  Its emitted receipt is
+3 layers / `d_model` 12 / 92 sparse terms.
+
 ## The levers
 
 1. **Straight-line codegen specialization** (~5x).  Emit one C++ TU per
@@ -115,11 +121,12 @@ an already-proven execution.
    unselected branches, and the substitute equals a state the arithmetic
    already handles for real.
 
-10. **Separate the proof graph from the execution receipt before building
+10. **Separate the proof graph from the execution graph before building
    weights.**  Fold the complete K-step composition under router pins and
    retain every intermediate readout until control, memory, write, halt,
-   watch and self-modification licenses pass.  Then project it to one final
-   architectural update plus its statically-live ordered writes; traced
+   watch and self-modification licenses pass.  Then lower it to typed state
+   leaves, external memory reads, one final architectural update and its
+   statically-live ordered writes; traced
    execution uses the per-instruction path.  Generic shapes keep symbolic
    pc/operands, while concrete hot windows spend stronger byte pins.  The
    router re-verifies those facts live, and budget/speculation guards keep
@@ -139,10 +146,11 @@ an already-proven execution.
    The union model splits memory into 16 lookup groups so exported f32
    attention scores stay distinguishable.  The exact engine does not
    compute those scores: a structural fold embeds current state directly
-   and rebuilds each live RAM read as one externally-served full-address
-   lookup.  Its exact-address test lives in the memory primitive, so the
-   graph carries no group gates, exact mask, key rows or WRITE-token value
-   rows.  General form: preserve the formulation required by the portable
+   and rebuilds each live RAM read as one first-class `MemoryRead(address)`.
+   The read exposes value, exact address and only the bits requested by its
+   consumers; its exact-address test lives in the primitive, so the graph
+   carries no group gates, exact mask, key rows or WRITE-token value rows.
+   General form: preserve the formulation required by the portable
    artifact, but erase it from a consumer with a stronger exact primitive.
 
 13. **Share one monotone threshold ladder across parallel decodes of the
@@ -188,11 +196,12 @@ an already-proven execution.
    Classify every final field as preserved, compile-time constant, or
    model-computed; only computed fields remain output roots.  Non-halting
    is already a construction license, so sequence models carry no halt
-   classifier.  Then project input tokens too: embed only state dimensions
-   reachable from computed outputs or ordered writes.  Structural memory
-   values are supplied externally and therefore create no false WRITE-token
-   live-ins.  This is what lets a deterministic sequence become a genuine
-   zero-layer model with only the constant-one residual slot (`d_model=2`).
+   classifier.  The lowering produces a typed execution IR of live
+   `StateField` leaves, `MemoryRead` leaves, ordered `MemoryWrite` effects and
+   classified architectural outputs; the proof fold remains intact.  Embed
+   only fields reachable from computed outputs or writes.  This is what lets
+   a deterministic sequence become a genuine zero-layer model with only the
+   constant-one residual slot (`d_model=2`).
 
 ## Dead ends (kept so they stay dead)
 

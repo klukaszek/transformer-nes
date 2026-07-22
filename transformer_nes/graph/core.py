@@ -1,8 +1,7 @@
 """Computation graph primitives for transformer compilation.
 
-Any program expressible as an Append-Only Lookup Machine (ALM) can be
-built using these primitives and compiled into a transformer via
-scheduler/milp.py + model/weights.py.
+Proof graphs use Append-Only Lookup Machine (ALM) primitives.  Licensed
+execution graphs may additionally contain engine-served memory reads.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ BIG = 1e30  # large constant used to effectively zero-out attention keys (clear_
 
 graph_dims = []
 graph_lookups = []
+graph_memory_reads = []
 multiply_cache = {}
 reglu_cache = {}
 stepglu_cache = {}
@@ -224,6 +224,32 @@ class LookUpDimension(Dimension):
         self.value_index = value_index
 
 
+class MemoryRead:
+    counter = 0
+
+    def __init__(self, address, *, bits=()):
+        self.id = MemoryRead.counter
+        MemoryRead.counter += 1
+        self.name = f"memory_read_{self.id}"
+        self.address = to_expr(address)
+        self.output_kinds = ("value", "address", *tuple(bits))
+        self.dims = [
+            MemoryReadDimension(self, i, kind)
+            for i, kind in enumerate(self.output_kinds)
+        ]
+        graph_memory_reads.append(self)
+
+
+class MemoryReadDimension(Dimension):
+    def __init__(self, memory_read, value_index, output_kind):
+        super().__init__(
+            f"memory_read_{memory_read.id}_{output_kind}", kind="memory_read"
+        )
+        self.memory_read = memory_read
+        self.value_index = value_index
+        self.output_kind = output_kind
+
+
 def make_multiply(a, b):
     ka, kb = expr_key(a), expr_key(b)
     key = (ka, kb)
@@ -411,12 +437,14 @@ def reset_graph():
     global one
     graph_dims.clear()
     graph_lookups.clear()
+    graph_memory_reads.clear()
     multiply_cache.clear()
     reglu_cache.clear()
     stepglu_cache.clear()
     clear_key_cache.clear()
     Dimension.counter = 0
     LookUp.counter = 0
+    MemoryRead.counter = 0
     one = InputDimension("one")
 
 
@@ -432,6 +460,7 @@ class ProgramGraph:
         self.output_tokens = output_tokens
         self.all_dims = list(graph_dims)
         self.all_lookups = list(graph_lookups)
+        self.all_memory_reads = list(graph_memory_reads)
         self.one = one
 
 
@@ -448,6 +477,7 @@ def project_program_graph(
     """
     live_dims = {program_graph.one}
     live_lookups = set()
+    live_memory_reads = set()
     pending = []
 
     def seed(value):
@@ -485,12 +515,24 @@ def project_program_graph(
                 + lookup.value_exprs
             ):
                 pending.extend(expr.terms)
+        elif isinstance(dim, MemoryReadDimension):
+            memory_read = dim.memory_read
+            if memory_read in live_memory_reads:
+                continue
+            live_memory_reads.add(memory_read)
+            pending.extend(memory_read.dims)
+            pending.extend(memory_read.address.terms)
 
     input_tokens = program_graph.input_tokens if retain_input_tokens else {}
     projected = ProgramGraph(input_tokens, output_tokens)
     projected.all_dims = [d for d in program_graph.all_dims if d in live_dims]
     projected.all_lookups = [
         lu for lu in program_graph.all_lookups if lu in live_lookups
+    ]
+    projected.all_memory_reads = [
+        read
+        for read in program_graph.all_memory_reads
+        if read in live_memory_reads
     ]
     projected.one = program_graph.one
     return projected

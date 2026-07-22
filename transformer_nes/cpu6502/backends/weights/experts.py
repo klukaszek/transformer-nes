@@ -30,6 +30,12 @@ from transformer_nes.graph.core import (
     ReGLUDimension,
     project_program_graph,
 )
+from transformer_nes.graph.execution import (
+    ArchitecturalOutput,
+    ExecutionGraph,
+    MemoryWrite,
+    StateField,
+)
 from transformer_nes.graph.fold import (
     SEQUENCE_FEEDBACK,
     GraphFolder,
@@ -187,7 +193,7 @@ def classify_sequence_state(fold_result, final_names) -> dict:
     return result
 
 
-def project_sequence_execution(fold_result, n_steps: int) -> dict:
+def project_sequence_execution(fold_result, n_steps: int) -> ExecutionGraph:
     """Replace the proof graph's per-step trace ABI with its execution ABI.
 
     The complete fold is retained until all control, read, write and halt
@@ -199,11 +205,23 @@ def project_sequence_execution(fold_result, n_steps: int) -> dict:
         name: f"{name}__s{n_steps - 1}" for name in SEQUENCE_STATE_DIMS
     }
     final = classify_sequence_state(fold_result, final_names)
+    outputs = []
+    output_tokens = {}
+    for name in SEQUENCE_STATE_DIMS:
+        if name in final["model"]:
+            dim = fold_result.dim_of_name[final["model"][name]]
+            outputs.append(ArchitecturalOutput(name, "model", dimension=dim))
+            output_tokens[f"state:{name}"] = Expression({dim: 1})
+        elif name in final["constant"]:
+            outputs.append(ArchitecturalOutput(
+                name, "constant", constant=final["constant"][name],
+            ))
+        else:
+            outputs.append(ArchitecturalOutput(name, "preserve"))
+
     writes = []
-    retained = list(final["model"].values())
     for k in range(n_steps):
-        step_writes = []
-        for flag, addr, value in WRITE_RECEIPTS:
+        for order, (flag, addr, value) in enumerate(WRITE_RECEIPTS):
             active = const_root(fold_result, flag, k, fold_result.label)
             if active not in (0, 1):
                 raise RuntimeError(
@@ -211,42 +229,59 @@ def project_sequence_execution(fold_result, n_steps: int) -> dict:
                 )
             if not active:
                 continue
-            addr_name = f"{addr}__s{k}"
-            value_name = f"{value}__s{k}"
-            step_writes.append((addr_name, value_name))
-            retained.extend((addr_name, value_name))
-        writes.append(step_writes)
+            address = fold_result.dim_of_name[f"{addr}__s{k}"]
+            write_value = fold_result.dim_of_name[f"{value}__s{k}"]
+            writes.append(MemoryWrite(k, order, address, write_value))
+            output_tokens[f"write:{k}:{order}:address"] = Expression({address: 1})
+            output_tokens[f"write:{k}:{order}:value"] = Expression({write_value: 1})
 
-    readout = Expression()
-    for name in dict.fromkeys(retained):
-        readout = readout + 1e-6 * fold_result.dim_of_name[name]
-    outputs = {"READOUT": readout}
-    fold_result.program_graph = project_program_graph(
-        fold_result.program_graph, outputs, retain_input_tokens=False,
+    program_graph = project_program_graph(
+        fold_result.program_graph, output_tokens, retain_input_tokens=False,
     )
-    fold_result.dim_of_name = {}
-    for dim in fold_result.program_graph.all_dims:
-        fold_result.dim_of_name.setdefault(dim.name, dim)
-    return {"final": final, "writes": writes}
+    dim_of_name = {}
+    for dim in program_graph.all_dims:
+        dim_of_name.setdefault(dim.name, dim)
+    state_fields = tuple(
+        StateField(dim.name, dim)
+        for dim in program_graph.all_dims
+        if isinstance(dim, InputDimension) and dim is not program_graph.one
+    )
+    return ExecutionGraph(
+        program_graph=program_graph,
+        n_steps=n_steps,
+        state_fields=state_fields,
+        memory_reads=tuple(program_graph.all_memory_reads),
+        memory_writes=tuple(writes),
+        outputs=tuple(outputs),
+        dim_of_name=dim_of_name,
+    )
 
 
-def sequence_step_spec(fold_result, receipt, info) -> dict:
+def sequence_step_spec(execution: ExecutionGraph, info) -> dict:
     def slot(name):
-        return info.slot_of[fold_result.dim_of_name[name]]
+        return info.slot_of[execution.dim_of_name[name]]
 
     spec = step_spec_base(slot)
     spec["sequence_final"] = {
         "model": {
-            name: slot(dim_name)
-            for name, dim_name in receipt["final"]["model"].items()
+            output.name: info.slot_of[output.dimension]
+            for output in execution.outputs if output.source == "model"
         },
-        "preserve": receipt["final"]["preserve"],
-        "constant": receipt["final"]["constant"],
+        "preserve": [
+            output.name for output in execution.outputs
+            if output.source == "preserve"
+        ],
+        "constant": {
+            output.name: output.constant for output in execution.outputs
+            if output.source == "constant"
+        },
     }
-    spec["sequence_writes"] = [
-        [(slot(addr), slot(value)) for addr, value in step]
-        for step in receipt["writes"]
-    ]
+    writes = [[] for _ in range(execution.n_steps)]
+    for write in execution.memory_writes:
+        writes[write.step].append((
+            info.slot_of[write.address], info.slot_of[write.value],
+        ))
+    spec["sequence_writes"] = writes
     return spec
 
 
@@ -474,8 +509,8 @@ def check_writes_licensed(fold_result, n_steps: int, label: str, *,
     return has_stores
 
 
-def schedule_and_build(fold_result):
-    fp = fold_result.program_graph
+def schedule_and_build(graph):
+    fp = graph.program_graph
     sched = asap_schedule(fp.input_tokens, fp.output_tokens,
                           program_graph=fp, log=logger.debug)
     return build_model(program_graph=fp, schedule=sched)
@@ -663,8 +698,8 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                 "(next_pc != the next step's pc)"
             )
 
-    receipt = project_sequence_execution(r, n_steps)
-    materialized = schedule_and_build(r)
+    execution = project_sequence_execution(r, n_steps)
+    materialized = schedule_and_build(execution)
     if inline_linear is None:
         inlined_r = fold_candidate(True)
         if inlined_r.insert_side_hazards:
@@ -672,13 +707,13 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                 f"{label}: pins reach insert-side expressions "
                 f"of {inlined_r.insert_side_hazards}"
             )
-        inlined_receipt = project_sequence_execution(inlined_r, n_steps)
-        inlined = schedule_and_build(inlined_r)
+        inlined_execution = project_sequence_execution(inlined_r, n_steps)
+        inlined = schedule_and_build(inlined_execution)
         if prefer_inlined(
             (materialized[0], materialized[3]),
             (inlined[0], inlined[3]), label,
         ):
-            r, receipt, materialized = inlined_r, inlined_receipt, inlined
+            r, execution, materialized = inlined_r, inlined_execution, inlined
     model, _tokens, _tok_to_idx, info = materialized
     cycles = sum(op.cycles for op in ops)
     # Window bytes join the name: different banks may carry different
@@ -688,7 +723,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
         "head": head, "has_stores": has_stores,
         "window": bytes(code), "n_steps": n_steps, "cycles": cycles,
         "cycles_prefix": cycles - ops[-1].cycles, "model": model,
-        "step_spec": sequence_step_spec(r, receipt, info),
+        "step_spec": sequence_step_spec(execution, info),
         "union_lookup_of": r.union_lookup_of,
         "assume_taken_steps": assume_taken_steps,
         "layers": info.n_layers, "_d": info.d_model,
@@ -1100,8 +1135,8 @@ def build_shape_experts(pg, shapes, *,
                         "head + offset for every head"
                     )
 
-        receipt = project_sequence_execution(r, n_steps)
-        materialized = schedule_and_build(r)
+        execution = project_sequence_execution(r, n_steps)
+        materialized = schedule_and_build(execution)
         if inline_linear is None:
             inlined_r = fold_candidate(True)
             if inlined_r.insert_side_hazards:
@@ -1109,13 +1144,13 @@ def build_shape_experts(pg, shapes, *,
                     f"{label}: pins reach insert-side expressions "
                     f"of {inlined_r.insert_side_hazards}"
                 )
-            inlined_receipt = project_sequence_execution(inlined_r, n_steps)
-            inlined = schedule_and_build(inlined_r)
+            inlined_execution = project_sequence_execution(inlined_r, n_steps)
+            inlined = schedule_and_build(inlined_execution)
             if prefer_inlined(
                 (materialized[0], materialized[3]),
                 (inlined[0], inlined[3]), label,
             ):
-                r, receipt, materialized = inlined_r, inlined_receipt, inlined
+                r, execution, materialized = inlined_r, inlined_execution, inlined
         model, _tokens, _tok_to_idx, info = materialized
         ops_full = ops * repeat
         cycles = sum(op.cycles for op in ops_full)
@@ -1128,7 +1163,7 @@ def build_shape_experts(pg, shapes, *,
             "spec_offsets": spec_offsets,
             "cycles": cycles,
             "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
-            "step_spec": sequence_step_spec(r, receipt, info),
+            "step_spec": sequence_step_spec(execution, info),
             "union_lookup_of": r.union_lookup_of,
             "layers": info.n_layers, "_d": info.d_model,
         })

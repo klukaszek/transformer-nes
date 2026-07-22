@@ -856,6 +856,9 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
         mem_groups = mdl.head_memory_groups[li]
         lookup_ids = mdl.head_lookup_ids[li]
         pairs = mdl.head_pairs[li]
+        memory_outputs = getattr(
+            mdl, "head_memory_outputs", [[None] * nh for _ in mdl.attn]
+        )[li]
 
         lookup = [h for h in range(nh) if kinds[h] == 1]
         passthrough = [h for h in range(nh) if kinds[h] == 2]
@@ -1019,8 +1022,26 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
                     # downstream, and (0,0) is exactly the empty-group result.
                     b.append("            if ((unsigned long long)qi >> 12 == 0)")
                     b.append(f"                {ctx.E}mem_query({g}, qi, mo);")
-                b.append(f"            ho{2 * h} = ({ctx.elem})(mo[0] << F);")
-                b.append(f"            ho{2 * h + 1} = ({ctx.elem})(mo[1] << F);")
+                outputs = memory_outputs[h] or ("value", "address")
+
+                def served_output(kind):
+                    if kind == "value":
+                        return "mo[0]"
+                    if kind == "address":
+                        return "mo[1]"
+                    if kind.startswith("bit"):
+                        return f"((mo[0] >> {int(kind[3:])}) & 1)"
+                    raise RuntimeError(f"unknown memory output {kind!r}")
+
+                for component in range(2):
+                    value = (
+                        served_output(outputs[component])
+                        if component < len(outputs) else "0"
+                    )
+                    b.append(
+                        f"            ho{2 * h + component} = "
+                        f"({ctx.elem})({value} << F);"
+                    )
                 b.append("        }")
             elif reg_ok:
                 # Register index: allocated by the union in scan order,

@@ -21,9 +21,12 @@ from typing import NamedTuple
 import numpy as np
 
 from transformer_nes.graph.core import (
+    MEMORY_GROUP_FUSED,
     Expression,
     InputDimension,
     LookUpDimension,
+    MemoryRead,
+    MemoryReadDimension,
     PersistDimension,
     ReGLUDimension,
 )
@@ -78,6 +81,7 @@ class WeightModel:
     head_memory_groups: list[list[int]]
     head_lookup_ids: list[list[int]]
     head_pairs: list[list[int]]
+    head_memory_outputs: list[list[tuple[str, ...] | None]]
     attn_erase: list
     ffn_erase: list
     one_slot: int
@@ -201,7 +205,9 @@ def build_model(program_graph=None, schedule=None):
         d for d in ALL_DIMS if isinstance(d, ReGLUDimension) and d not in non_internal
     }
     internal_lookups = {
-        d for d in ALL_DIMS if isinstance(d, LookUpDimension) and d not in non_internal
+        d for d in ALL_DIMS
+        if isinstance(d, (LookUpDimension, MemoryReadDimension))
+        and d not in non_internal
     }
     internal_persists = {
         d for d in ALL_DIMS if isinstance(d, PersistDimension) and d not in non_internal
@@ -239,14 +245,17 @@ def build_model(program_graph=None, schedule=None):
         lookup_dims_set = set()
         for lu in attn:
             lookup_dims_set |= set(lu.dims)
-        n_lu_heads = sum((len(lu.value_exprs) + 1) // 2 for lu in attn)
+        n_lu_heads = sum((len(lu.dims) + 1) // 2 for lu in attn)
 
         pt_srcs = set(erased1)
         for pd in persist1:
             for d in pd.expr.terms:
                 if d not in slot_of or d in internal_dims:
                     continue
-                if not (isinstance(d, LookUpDimension) and d in lookup_dims_set):
+                if not (
+                    isinstance(d, (LookUpDimension, MemoryReadDimension))
+                    and d in lookup_dims_set
+                ):
                     pt_srcs.add(slot_of[d])
 
         max_heads = max(max_heads, n_lu_heads + (len(pt_srcs) + 1) // 2)
@@ -335,19 +344,31 @@ def build_model(program_graph=None, schedule=None):
             return tuple(sorted((d.id, c) for d, c in expr.terms.items()))
 
         for lu in attn:
-            nv = len(lu.value_exprs)
+            if isinstance(lu, MemoryRead):
+                value_exprs = [Expression() for _ in lu.dims]
+                query_exprs = [lu.address, one_expr]
+                key_exprs = [Expression(), Expression()]
+                tie_break = "latest"
+                memory_group = MEMORY_GROUP_FUSED
+            else:
+                value_exprs = lu.value_exprs
+                query_exprs = lu.query_exprs_2d
+                key_exprs = lu.key_exprs_2d
+                tie_break = lu.tie_break
+                memory_group = lu.memory_group
+            nv = len(value_exprs)
             for p in range((nv + 1) // 2):
                 h = head_idx
                 head_idx += 1
                 n_hulls += 1
-                layer_tiebreak.append(1 if lu.tie_break == "latest" else 0)
-                ip[h * 2] = expr_to_tensor(lu.query_exprs_2d[0]) * HARD_K * sqrt_dh
-                ip[h * 2 + 1] = expr_to_tensor(lu.query_exprs_2d[1]) * HARD_K * sqrt_dh
-                ip[D + h * 2] = expr_to_tensor(lu.key_exprs_2d[0])
-                ip[D + h * 2 + 1] = expr_to_tensor(lu.key_exprs_2d[1])
-                ip[2 * D + h * 2] = expr_to_tensor(lu.value_exprs[p * 2])
+                layer_tiebreak.append(1 if tie_break == "latest" else 0)
+                ip[h * 2] = expr_to_tensor(query_exprs[0]) * HARD_K * sqrt_dh
+                ip[h * 2 + 1] = expr_to_tensor(query_exprs[1]) * HARD_K * sqrt_dh
+                ip[D + h * 2] = expr_to_tensor(key_exprs[0])
+                ip[D + h * 2 + 1] = expr_to_tensor(key_exprs[1])
+                ip[2 * D + h * 2] = expr_to_tensor(value_exprs[p * 2])
                 if p * 2 + 1 < nv:
-                    ip[2 * D + h * 2 + 1] = expr_to_tensor(lu.value_exprs[p * 2 + 1])
+                    ip[2 * D + h * 2 + 1] = expr_to_tensor(value_exprs[p * 2 + 1])
 
                 d0 = lu.dims[p * 2]
                 lookup_dim_to_head[d0] = (h, 0)
@@ -362,28 +383,36 @@ def build_model(program_graph=None, schedule=None):
                 vals = [d0.name]
                 if p * 2 + 1 < nv:
                     vals.append(lu.dims[p * 2 + 1].name)
-                v1_sig = expr_sig(lu.value_exprs[p * 2 + 1]) if p * 2 + 1 < nv else ()
-                q_terms = {d.name: c for d, c in lu.query_exprs_2d[0].terms.items()}
+                v1_sig = expr_sig(value_exprs[p * 2 + 1]) if p * 2 + 1 < nv else ()
+                q_terms = {d.name: c for d, c in query_exprs[0].terms.items()}
                 q_terms.update(
-                    {"qy_" + d.name: c for d, c in lu.query_exprs_2d[1].terms.items()}
+                    {"qy_" + d.name: c for d, c in query_exprs[1].terms.items()}
                 )
-                k_terms = {d.name: c for d, c in lu.key_exprs_2d[0].terms.items()}
+                k_terms = {d.name: c for d, c in key_exprs[0].terms.items()}
                 k_terms.update(
-                    {"ky_" + d.name: c for d, c in lu.key_exprs_2d[1].terms.items()}
+                    {"ky_" + d.name: c for d, c in key_exprs[1].terms.items()}
                 )
                 layer_heads[h] = {
                     "type": "lookup",
-                    "lookup": lu.name or f"lookup_{lu.id}",
+                    "lookup": lu.name,
                     "lookup_id": lu.id,
                     "pair": p,
                     "values": vals,
-                    "tie_break": lu.tie_break,
-                    "memory_group": -1 if lu.memory_group is None else lu.memory_group,
+                    "tie_break": tie_break,
+                    "memory_group": (
+                        -1 if memory_group is None else memory_group
+                    ),
+                    "memory_outputs": (
+                        tuple(lu.output_kinds[p * 2:p * 2 + 2])
+                        if isinstance(lu, MemoryRead) else None
+                    ),
                     "cache_key": (
-                        expr_sig(lu.key_exprs_2d[0]),
-                        expr_sig(lu.key_exprs_2d[1]),
-                        expr_sig(lu.value_exprs[p * 2]),
-                        v1_sig,
+                        ("memory_read", lu.id, p)
+                        if isinstance(lu, MemoryRead)
+                        else (
+                            expr_sig(key_exprs[0]), expr_sig(key_exprs[1]),
+                            expr_sig(value_exprs[p * 2]), v1_sig,
+                        )
                     ),
                 }
         head_map[layer_idx] = layer_heads
@@ -510,12 +539,14 @@ def build_model(program_graph=None, schedule=None):
     # onto the union's shared attention state (memory structure, registers).
     model.head_lookup_ids = []
     model.head_pairs = []
+    model.head_memory_outputs = []
     for layer_idx in range(n_layers):
         kinds = [0] * n_heads
         cache_groups = [-1] * n_heads
         memory_groups = [-1] * n_heads
         lookup_ids = [-1] * n_heads
         pairs = [-1] * n_heads
+        memory_outputs = [None] * n_heads
         cache_group_of_key = {}
         for h, info in head_map.get(layer_idx, {}).items():
             if info["type"] == "lookup":
@@ -527,6 +558,7 @@ def build_model(program_graph=None, schedule=None):
                 memory_groups[h] = info["memory_group"]
                 lookup_ids[h] = info["lookup_id"]
                 pairs[h] = info["pair"]
+                memory_outputs[h] = info["memory_outputs"]
             else:
                 kinds[h] = 2
         model.head_kinds.append(kinds)
@@ -534,6 +566,7 @@ def build_model(program_graph=None, schedule=None):
         model.head_memory_groups.append(memory_groups)
         model.head_lookup_ids.append(lookup_ids)
         model.head_pairs.append(pairs)
+        model.head_memory_outputs.append(memory_outputs)
 
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
     logger.info(
@@ -555,4 +588,3 @@ def build_model(program_graph=None, schedule=None):
     info = BuildInfo(n_layers=n_layers, std_layers=std_layers,
                      slot_of=slot_of, d_model=D)
     return model, all_tokens, tok_to_idx_map, info
-

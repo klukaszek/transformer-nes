@@ -36,12 +36,13 @@ from transformer_nes.graph.core import (
     InputDimension,
     LookUp,
     LookUpDimension,
+    MemoryRead,
+    MemoryReadDimension,
     PersistDimension,
     ProgramGraph,
     ReGLUDimension,
     reset_graph,
     stepglu,
-    to_2d_query,
 )
 
 
@@ -71,7 +72,7 @@ def subst(expr: Expression, val: dict) -> Expression:
     return out
 
 
-def graph_delta(start_d: int, start_l: int) -> tuple[int, int, int, int]:
+def graph_delta(start_d: int, start_l: int, start_m: int) -> tuple[int, int, int, int]:
     """(reglus, persists, lookups, terms) created since the registry marks;
     the fused-read builder goes through the DSL, so its dims are counted
     from the registry rather than by hand."""
@@ -87,6 +88,9 @@ def graph_delta(start_d: int, start_l: int) -> tuple[int, int, int, int]:
         nl += 1
         for e in lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs:
             nt += len(e.terms)
+    for read in graph.graph_memory_reads[start_m:]:
+        nl += 1
+        nt += len(read.address.terms)
     return nr, np_, nl, nt
 
 
@@ -125,6 +129,11 @@ def walk_live(seeds, val, folded, lookup_exprs, is_leaf, bit_leaf=None) -> set:
             for sib in d.lookup.dims:
                 if sib not in live and sib not in val:
                     live.add(sib)
+        elif isinstance(d, MemoryReadDimension):
+            deps = set(d.memory_read.address.terms)
+            for sibling in d.memory_read.dims:
+                if sibling not in live and sibling not in val:
+                    live.add(sibling)
         for dep in deps:
             if dep not in val and not is_leaf(dep) and dep not in live:
                 stack.append(dep)
@@ -151,7 +160,7 @@ class GraphMaterializer:
                     *, name_of=lambda n: n, is_leaf=None,
                     hazards=frozenset(), resolve_read=None) -> None:
         made = set()
-        fused_reads: dict = {}  # union site persist -> its fused LookUp
+        fused_reads: dict = {}
         for d in all_dims:
             if d in val or d not in live:
                 continue
@@ -176,7 +185,10 @@ class GraphMaterializer:
                         self.n_persists += 1
                         self.n_terms += len(nd.expr.terms)
                         continue
-                    marks = len(graph.graph_dims), len(graph.graph_lookups)
+                    marks = (
+                        len(graph.graph_dims), len(graph.graph_lookups),
+                        len(graph.graph_memory_reads),
+                    )
                     want_bits = self.structural_reads and any(
                         b in live for b in getattr(d, "read_bit_dims", ())
                     )
@@ -189,7 +201,7 @@ class GraphMaterializer:
                         if want_bits else (),
                     )
                     if want_bits:
-                        fused_reads[d] = next(iter(expr.terms)).lookup
+                        fused_reads[d] = next(iter(expr.terms)).memory_read
                     nd = PersistDimension(expr, name=name_of(d.name))
                     sub[d] = Expression({nd: 1})
                     dr, dp, dl, dt = graph_delta(*marks)
@@ -262,17 +274,11 @@ def masked_exact_read(addr, byte_value, write_addr, is_write, *,
     critical path.
 
     ``structural`` targets backends that serve the fused read exactly
-    (value at addr when written and in range, else 0).
-    The mask is redundant there, and the key side exists only for token
-    attention, so the lookup carries empty key and value rows. The external
-    memory primitive supplies its outputs directly."""
+    (value at addr when written and in range, else 0)."""
     if structural:
-        # wide_bits outputs are likewise supplied from the served byte.
-        served = [Expression() for _ in range(2 + len(bit_values))]
-        lu = LookUp(served, to_2d_query(addr),
-                    [Expression(), Expression()], tie_break="latest")
-        lu.memory_group = graph.MEMORY_GROUP_FUSED
-        return Expression({lu.dims[0]: 1})
+        bits = tuple(f"bit{7 - i}" for i in range(len(bit_values)))
+        read = MemoryRead(addr, bits=bits)
+        return Expression({read.dims[0]: 1})
     value, found = graph.fetch([byte_value, write_addr], query=addr,
                                key=write_addr, clear_key=1 - is_write,
                                tie_break="latest")

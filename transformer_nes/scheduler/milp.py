@@ -1,7 +1,7 @@
 """Schedulers: ops onto 4-phase transformer layers.
 
-Assigns each gate (LookUp, ReGLU, Persist) to a 4-phase layer:
-  phase 0: Attention (LookUp)
+Assigns each gate (LookUp/MemoryRead, ReGLU, Persist) to a 4-phase layer:
+  phase 0: Attention or external read
   phase 1: Persist1
   phase 2: FFN (ReGLU)
   phase 3: Persist2
@@ -30,30 +30,47 @@ from transformer_nes.graph.core import (
     InputDimension,
     LookUp,
     LookUpDimension,
+    MemoryRead,
+    MemoryReadDimension,
     PersistDimension,
     ReGLUDimension,
     graph_dims,
     graph_lookups,
+    graph_memory_reads,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def build_graph(all_dims=None, all_lookups=None):
+ATTENTION_OPS = (LookUp, MemoryRead)
+ATTENTION_DIMS = (LookUpDimension, MemoryReadDimension)
+
+
+def build_graph(all_dims=None, all_lookups=None, all_memory_reads=None):
     """Build dependency graph from dim/lookup lists.
 
     Args:
         all_dims: list of Dimension objects (defaults to module-global graph_dims)
         all_lookups: list of LookUp objects (defaults to module-global graph_lookups)
     """
+    explicit_graph = all_dims is not None or all_lookups is not None
     if all_dims is None:
         all_dims = graph_dims
     if all_lookups is None:
         all_lookups = graph_lookups
+    if all_memory_reads is None:
+        all_memory_reads = (
+            list(dict.fromkeys(
+                dim.memory_read
+                for dim in all_dims
+                if isinstance(dim, MemoryReadDimension)
+            ))
+            if explicit_graph else graph_memory_reads
+        )
     inputs = [d for d in all_dims if isinstance(d, InputDimension)]
     reglus = [d for d in all_dims if isinstance(d, ReGLUDimension)]
     persists = [d for d in all_dims if isinstance(d, PersistDimension)]
-    lookups = list(all_lookups)
+    lookups = list(all_lookups) + list(all_memory_reads)
     ops = reglus + persists + lookups
 
     produced = {}
@@ -74,8 +91,11 @@ def build_graph(all_dims=None, all_lookups=None):
         deps_cache[p] = edeps(p.expr)
     for lu in lookups:
         d = set()
-        for expr in lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs:
-            d |= edeps(expr)
+        if isinstance(lu, MemoryRead):
+            d |= edeps(lu.address)
+        else:
+            for expr in lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs:
+                d |= edeps(expr)
         deps_cache[lu] = d
 
     dim_to_op = {}
@@ -94,11 +114,14 @@ def build_graph(all_dims=None, all_lookups=None):
                 op_deps[op].add(pred)
                 children[pred].add(op)
 
-    avg_lookups = {lu for lu in lookups if lu.tie_break == "average"}
+    avg_lookups = {
+        lu for lu in lookups
+        if isinstance(lu, LookUp) and lu.tie_break == "average"
+    }
     tight_to = defaultdict(set)
     for op in reglus + persists:
         for dim in deps_cache[op]:
-            if isinstance(dim, LookUpDimension) and dim in dim_to_op:
+            if isinstance(dim, ATTENTION_DIMS) and dim in dim_to_op:
                 lu = dim_to_op[dim]
                 if lu in avg_lookups:
                     tight_to[op].add(lu)
@@ -128,7 +151,7 @@ def min_layers(ops, op_deps):
             if not all(p in phase for p in op_deps[op]):
                 continue
             lo = max((phase[p] for p in op_deps[op]), default=-1) + 1
-            if isinstance(op, LookUp):
+            if isinstance(op, ATTENTION_OPS):
                 lo += (-lo) % 4
             elif isinstance(op, ReGLUDimension):
                 lo += (2 - lo % 4 + 4) % 4
@@ -170,7 +193,7 @@ def layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims):
     for L in range(num_layers):
         std_layers.append(
             (
-                [op for op in by_phase.get(4 * L, []) if isinstance(op, LookUp)],
+                [op for op in by_phase.get(4 * L, []) if isinstance(op, ATTENTION_OPS)],
                 [op for op in by_phase.get(4 * L + 1, []) if isinstance(op, PersistDimension)],
                 [op for op in by_phase.get(4 * L + 2, []) if isinstance(op, ReGLUDimension)],
                 [op for op in by_phase.get(4 * L + 3, []) if isinstance(op, PersistDimension)],
@@ -219,7 +242,7 @@ def layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims):
 
 def legal_phases(lo, hi, op):
     """Phases of op's parity within [lo, hi]."""
-    if isinstance(op, LookUp):
+    if isinstance(op, ATTENTION_OPS):
         start, step = lo + (-lo) % 4, 4
     elif isinstance(op, ReGLUDimension):
         start, step = lo + (2 - lo % 4 + 4) % 4, 4
@@ -248,7 +271,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
 
     if program_graph is not None:
         pg = program_graph
-        graph = build_graph(pg.all_dims, pg.all_lookups)
+        graph = build_graph(pg.all_dims, pg.all_lookups, pg.all_memory_reads)
     else:
         graph = build_graph()
 
@@ -357,7 +380,7 @@ def milp_schedule(
 
     if program_graph is not None:
         pg = program_graph
-        graph = build_graph(pg.all_dims, pg.all_lookups)
+        graph = build_graph(pg.all_dims, pg.all_lookups, pg.all_memory_reads)
     else:
         graph = build_graph()
     ops = graph["ops"]
@@ -389,7 +412,7 @@ def milp_schedule(
     }
 
     def phase_of(op):
-        if isinstance(op, LookUp):
+        if isinstance(op, ATTENTION_OPS):
             return 4 * k[op]
         if isinstance(op, ReGLUDimension):
             return 4 * k[op] + 2
@@ -451,12 +474,12 @@ def milp_schedule(
     P1_deps = defaultdict(set)
     for p in persists:
         for d in deps_cache[p]:
-            if isinstance(d, (InputDimension, LookUpDimension, ReGLUDimension, PersistDimension)):
+            if isinstance(d, (InputDimension, *ATTENTION_DIMS, ReGLUDimension, PersistDimension)):
                 P1_deps[d].add(p)
 
     pd_var = {}
     for d, p_set in P1_deps.items():
-        lu_of_d = dim_to_op.get(d) if isinstance(d, LookUpDimension) else None
+        lu_of_d = dim_to_op.get(d) if isinstance(d, ATTENTION_DIMS) else None
         for L in range(N):
             v = LpVariable(f"pd_{id(d)}_{L}", 0, 1, LpBinary)
             prob += v <= lpSum(p1_at[p, L] for p in p_set)
@@ -487,7 +510,7 @@ def milp_schedule(
         prod = dim_to_op.get(d)
         if prod is None or prod not in k:
             continue
-        if isinstance(d, (LookUpDimension, ReGLUDimension)):
+        if isinstance(d, (*ATTENTION_DIMS, ReGLUDimension)):
             ns_v = LpVariable(f"ns_{di[d]}", 0, 1, LpBinary)
             prob += death[d] >= phase_of(prod) + 2 - P * (1 - ns_v)
             prob += death[d] <= phase_of(prod) + 1 + P * ns_v
@@ -623,7 +646,7 @@ def milp_schedule(
     pa = {}
     for op in ops:
         layer = int(round(value(k[op])))
-        if isinstance(op, LookUp):
+        if isinstance(op, ATTENTION_OPS):
             pa[op] = 4 * layer
         elif isinstance(op, ReGLUDimension):
             pa[op] = 4 * layer + 2
@@ -646,4 +669,3 @@ def milp_schedule(
         alive_after=alive_after,
         width=opt_D,
     )
-

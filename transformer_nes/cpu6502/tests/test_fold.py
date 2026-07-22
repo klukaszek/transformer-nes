@@ -35,8 +35,10 @@ from transformer_nes.cpu6502.backends.weights.runner import VERIFY_START, verify
 from transformer_nes.cpu6502.interpreter import build
 from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.graph.core import (
+    MEMORY_GROUP_FUSED,
     InputDimension,
     LookUpDimension,
+    MemoryReadDimension,
     PersistDimension,
     ProgramGraph,
     ReGLUDimension,
@@ -98,6 +100,9 @@ def graph_counts(pg):
                     + dim.lookup.value_exprs
                 )
             )
+        elif isinstance(dim, MemoryReadDimension) and dim.memory_read not in lookups:
+            lookups.add(dim.memory_read)
+            terms += len(dim.memory_read.address.terms)
     return reglus, persists, len(lookups), terms
 
 
@@ -423,29 +428,22 @@ def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
         pin_list, SEQUENCE_FEEDBACK, label="projected_poll",
     )
     proof_dims = len(r.program_graph.all_dims)
-    receipt = project_sequence_execution(r, len(pin_list))
+    execution = project_sequence_execution(r, len(pin_list))
 
-    assert receipt["writes"] == [[], [], []]
-    final = receipt["final"]
-    classified = (
-        set(final["model"]) | set(final["constant"]) | set(final["preserve"])
-    )
+    assert execution.memory_writes == ()
+    classified = {output.name for output in execution.outputs}
     assert classified == set(SEQUENCE_STATE_DIMS)
-    assert not (
-        set(final["model"]) & set(final["constant"])
-        or set(final["model"]) & set(final["preserve"])
-        or set(final["constant"]) & set(final["preserve"])
-    )
-    assert len(r.program_graph.all_dims) < proof_dims * 0.76
+    assert len(execution.program_graph.all_dims) < proof_dims * 0.76
+    assert len(r.program_graph.all_dims) == proof_dims
     for k in range(len(pin_list) - 1):
         for name in (
             "current_pc", "fetched_opcode", "fetched_operand_lo",
             "fetched_operand_hi", "ea", "data_out", "next_pc",
             "is_store", "is_store2", "is_store3",
         ):
-            assert f"{name}__s{k}" not in r.dim_of_name
+            assert f"{name}__s{k}" not in execution.dim_of_name
 
-    ev = ProgramEvaluator(r.program_graph)
+    ev = ProgramEvaluator(execution.program_graph)
     steps = poll_run["steps"]
     idx = 0
     skip = 0
@@ -465,21 +463,19 @@ def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
             continue
         values = ev.step(inputs)
         expected = steps[idx + len(pin_list) - 1]["reads"]
-        for name, dim_name in final["model"].items():
+        for output in execution.outputs:
+            name = output.name
             mask = 0xFFFF if name in ("next_pc", "ea") else 0xFF
-            assert int(round(ev.read(values, dim_name))) & mask == (
-                expected[name] & mask
-            )
-        for name, value in final["constant"].items():
-            mask = 0xFFFF if name in ("next_pc", "ea") else 0xFF
-            assert value & mask == expected[name] & mask
-        for name in final["preserve"]:
-            value = sum(
-                (1 if input_name == "one" else inputs[input_name]) * coeff
-                for input_name, coeff in SEQUENCE_PRESERVE_INPUTS[name]
-            )
-            mask = 0xFFFF if name in ("next_pc", "ea") else 0xFF
-            assert value & mask == expected[name] & mask
+            if output.source == "model":
+                value = ev.read(values, output.dimension.name)
+            elif output.source == "constant":
+                value = output.constant
+            else:
+                value = sum(
+                    (1 if input_name == "one" else inputs[input_name]) * coeff
+                    for input_name, coeff in SEQUENCE_PRESERVE_INPUTS[name]
+                )
+            assert int(round(value)) & mask == expected[name] & mask
         windows += 1
         skip = len(pin_list) - 1
         idx += 1
@@ -497,16 +493,68 @@ def test_sequence_execution_projection_eliminates_deterministic_model(folder):
     execution = structural.fold_sequence(
         pins, SEQUENCE_FEEDBACK, label="execution_spin", inline_linear=True,
     )
-    receipt = project_sequence_execution(execution, len(pins))
-    _model, _tokens, _rows, execution_info = schedule_and_build(execution)
+    execution_graph = project_sequence_execution(execution, len(pins))
+    _model, _tokens, _rows, execution_info = schedule_and_build(execution_graph)
 
-    assert receipt["final"]["model"] == {}
+    assert not any(
+        output.source == "model" for output in execution_graph.outputs
+    )
     assert execution_info.n_layers == 0
     assert {
         dim.name
-        for dim in execution.program_graph.all_dims
+        for dim in execution_graph.program_graph.all_dims
         if isinstance(dim, InputDimension)
     } == {"one"}
+
+
+def test_structural_execution_uses_external_memory_reads(folder):
+    code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
+    pins = sequence_pins(POLL_HEAD, code, OPCODES)
+    structural = GraphFolder(
+        folder.pg, root_names=RUNTIME_READ_DIMS, structural_reads=True,
+    )
+    proof = structural.fold_sequence(
+        pins, SEQUENCE_FEEDBACK, label="external_poll", inline_linear=True,
+    )
+    execution = project_sequence_execution(proof, len(pins))
+    model, _tokens, _rows, _info = schedule_and_build(execution)
+
+    assert execution.memory_reads
+    assert all(
+        dim.memory_read in execution.memory_reads
+        for dim in execution.program_graph.all_dims
+        if isinstance(dim, MemoryReadDimension)
+    )
+    assert not {
+        "byte_value", "addr_lo", "addr_hi", "is_memory_write"
+    } & {field.name for field in execution.state_fields}
+    fused = [
+        outputs
+        for groups, outputs_by_head in zip(
+            model.head_memory_groups, model.head_memory_outputs, strict=True,
+        )
+        for group, outputs in zip(groups, outputs_by_head, strict=True)
+        if group == MEMORY_GROUP_FUSED
+    ]
+    assert fused
+    assert fused[0] == ("value", "address")
+
+
+def test_execution_ir_retains_ordered_writes(folder):
+    pins = sequence_pins(SPIN_HEAD, bytes([0x85, 0x10]), OPCODES)
+    structural = GraphFolder(
+        folder.pg, root_names=RUNTIME_READ_DIMS, structural_reads=True,
+    )
+    proof = structural.fold_sequence(
+        pins, SEQUENCE_FEEDBACK, label="ordered_store", inline_linear=True,
+    )
+    execution = project_sequence_execution(proof, len(pins))
+
+    assert len(execution.memory_writes) == 1
+    write = execution.memory_writes[0]
+    assert (write.step, write.order) == (0, 0)
+    assert write.address in execution.program_graph.all_dims
+    assert write.value in execution.program_graph.all_dims
 
 
 @pytest.mark.parametrize("byte", SHADOW_OPCODES)
