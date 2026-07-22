@@ -45,8 +45,8 @@ from transformer_nes.graph.fold import (
     sequence_pins,
     sequence_shape_pins,
 )
+from transformer_nes.model.schedule import asap_schedule
 from transformer_nes.model.weights import build_model
-from transformer_nes.scheduler.milp import asap_schedule
 
 logger = logging.getLogger(__name__)
 STACK_CONTROL_OPERATIONS = SEQUENCE_WRITERS - {"sax"}

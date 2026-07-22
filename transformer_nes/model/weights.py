@@ -1,6 +1,6 @@
 """Analytical weight construction for the transformer.
 
-Takes a schedule (asap_schedule / milp_schedule output) and constructs the
+Takes an asap_schedule output and constructs the
 weight matrices of the transformer from the computation graph.
 
 Each half-layer is a transform: input dims -> latent (gates + passthrough) -> output dims.
@@ -100,7 +100,7 @@ def build_model(program_graph=None, schedule=None):
 
     Args:
         program_graph: a ProgramGraph wrapping the input/output tokens.
-        schedule: a precomputed schedule dict (asap_schedule / milp_schedule).
+        schedule: a precomputed schedule dict (asap_schedule output).
 
     Slots are reused across dead dims (interval coloring) and freed slots are
     erased before reuse, so the represented computation is unchanged.
@@ -122,7 +122,7 @@ def build_model(program_graph=None, schedule=None):
     if schedule is None:
         raise ValueError(
             "build_model requires a precomputed schedule "
-            "(asap_schedule or milp_schedule output)"
+            "(asap_schedule output)"
         )
     std_layers = schedule["std_layers"]
     n_layers = schedule["num_layers"]

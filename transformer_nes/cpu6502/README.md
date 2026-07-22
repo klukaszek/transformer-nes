@@ -87,17 +87,18 @@ running-argmax registers (`model/classify.py` holds the licenses; anything
 unlicensed keeps a real hull, so classification is a speed decision, never
 a correctness one).
 
-Scheduling: the optimal-width MILP does not scale at union size — the
-blowup is the formulation (per-dim/per-boundary alive indicators; HiGHS
-presolve alone exceeds an hour), not the solver.
-`scheduler/milp.py:asap_schedule` instead takes the critical path and
+Scheduling: `model/schedule.py:asap_schedule` takes the critical path and
 load-balances ops across its slack with a reverse-topological leveling
 pass (deterministic; ties go to the latest phase, which also shortens
-lifetimes).  A persist-moving hygiene sweep and the MILP's width/
-attention-hygiene objectives were excised 2026-07-13 after measurement:
-each priced only part of the emitted cost and lost (or washed) on the
-whole. Production construction always uses the deterministic balanced-ASAP
-schedule; the MILP remains a scheduler research tool, not an engine setting.
+lifetimes).  It is the only scheduler.  A persist-moving hygiene sweep
+and an optimal-lifetime MILP were both excised after measurement — each
+priced only part of the emitted cost.  The MILP went last (2026-07-22):
+once experts got small enough to solve, it cut total dim lifetime 31.6%
+yet produced an identical `d_model` and only 12.7% fewer passthroughs
+(it trades `pt_h` down and `pt_g` up), for ~13 s of solve per expert —
+about 1.7 h across a full build.  It can never beat ASAP on depth
+either: it is handed `min_layers` as its layer budget, the same
+critical-path floor ASAP already achieves.
 
 Performance: the analytic weights are ~99.9% zeros, so inference runs the
 same linear maps sparsely. `model/engine_gen.py` emits model-specific C++

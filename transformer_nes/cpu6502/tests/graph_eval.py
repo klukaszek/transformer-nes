@@ -1,19 +1,8 @@
-"""Direct float64 evaluator for a ProgramGraph.
+"""Test-only oracle for fold.py: runs a ProgramGraph directly, in float64.
 
-The generated engines execute a *scheduled, weight-compiled* form of the
-graph; this evaluator executes the graph itself, one token per call, with
-plain dict arithmetic and exact 2D hardmax attention (score argmax with the
-LATEST sequence tie-break).  It is deliberately simple: an engine-free
-semantic oracle for graph transforms (fold.py), with no scheduling, slot,
-or numerics machinery in the loop.  O(tokens) per query, so only for tests
-and diagnostics.
-
-Every token is a full forward: all lookups insert the current token before
-querying, exactly the generic ALM semantics.  Cleared inserts (clear_key:
-ky -= BIG) are inserted like any other token; a cleared winner returns
-whatever its value expressions evaluated to, which the ALM construction
-makes zero on the token types that clear them -- the same equivalence the
-engines' cleared-insert skip relies on.
+Executes the graph itself -- one token per call, dict arithmetic, hardmax
+attention -- so a folded graph can be checked against something that shares
+none of the engine's schedule/weights/codegen machinery.  O(tokens) per query.
 """
 
 from __future__ import annotations

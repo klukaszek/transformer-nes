@@ -21,6 +21,7 @@ its depth and term counts are measured directly from the graph under test.
 """
 
 import pytest
+from graph_eval import ProgramEvaluator
 
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS
@@ -51,7 +52,6 @@ from transformer_nes.graph.core import (
     ReGLUDimension,
     reset_graph,
 )
-from transformer_nes.graph.eval import ProgramEvaluator
 from transformer_nes.graph.fold import (
     SEQUENCE_FEEDBACK,
     GraphFolder,
@@ -60,7 +60,7 @@ from transformer_nes.graph.fold import (
     sequence_shape_pins,
 )
 from transformer_nes.model.engine_gen import generate_source
-from transformer_nes.scheduler.milp import build_graph, min_layers
+from transformer_nes.model.schedule import build_graph, min_layers
 
 # Opcodes exercised by weights_runner.verify_program, chosen to cover the
 # distinct machinery: zero-page store (write channel), zero-page load

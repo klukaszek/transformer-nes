@@ -24,8 +24,8 @@ import scipy.sparse as sp
 
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.graph.core import InputDimension, ProgramGraph
+from transformer_nes.model.schedule import asap_schedule
 from transformer_nes.model.weights import build_model
-from transformer_nes.scheduler.milp import asap_schedule
 
 
 def csr_tensors(name: str, mat: np.ndarray, out: dict) -> None:

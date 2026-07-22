@@ -67,7 +67,7 @@ def compile_shards() -> int:
 
 # Everything whose content can change the emitted engine, hashed into the
 # config key so any edit is a cache miss (over-inclusion is safe).
-CODE_DIRS = ("graph", "scheduler", "model", "attention")
+CODE_DIRS = ("graph", "model", "attention")
 CODE_FILES = (
     "cpu6502/spec.py",
     "cpu6502/interpreter.py",

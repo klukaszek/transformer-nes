@@ -57,8 +57,7 @@ Current status and prioritized next steps live in [`ROADMAP.md`](ROADMAP.md).
 | `transformer_nes/attention/` | O(log n) convex-hull KV cache (`hull2d_cht.h` + pybind11 ext) and the exact-evaluator attention runtime |
 | `transformer_nes/cpu6502/` | The pure 6502: opcode spec, graph interpreter, trace format, `backends/` — the three verified machines (reference oracle, exact evaluator, `weights/` — the transformer itself with its expert builders and window policy) — and `examples/klaus/` (harness + binary) |
 | `transformer_nes/nes/` | Native C++ NES hardware: bus, cartridge, mapper/MMC headers, PPU, APU, console, and tape replay; `app.py` only builds it, adapts a CPU backend, and launches it |
-| `transformer_nes/model/` | Transformer machinery: analytical weight construction (`weights.py`), attention-serving classification (`classify.py`), the generated C++ engine (`engine_gen.py`), safetensors export (`export.py`) |
-| `transformer_nes/scheduler/` | Layer scheduler: load-balanced critical-path default plus the opt-in exact MILP |
+| `transformer_nes/model/` | Transformer machinery: layer scheduling (`schedule.py` — load-balanced critical-path leveling), analytical weight construction (`weights.py`), attention-serving classification (`classify.py`), the generated C++ engine (`engine_gen.py`), safetensors export (`export.py`) |
 
 The dependency direction is one-way: `nes/` uses `cpu6502/`, which uses `graph/` + `attention/`; `cpu6502/` knows nothing about the NES.
 
@@ -92,7 +91,7 @@ Standard softmax attention is O(n) per step.  Since this model uses hardmax atte
 ### The transformer itself
 
 `6502-transformer` runs the machine as **actual transformer weights**:
-`scheduler/milp.py`'s load-balanced critical-path scheduler assigns the decimal-enabled graph to 69 layers, `model/weights.py` constructs the transformer's weight matrices analytically (`WeightModel`: d_model=630, 315 heads, no training), and inference is genuine — Q/K/V projections, hardmax attention, ReGLU FFN, residual stream, and no position encoding (token order enters only through the LATEST tie-break) — run by generated straight-line C++ with a native run loop, exact integer arithmetic end-to-end, O(1) attention state, and four routed execution tiers (optional pinned sequence modules, canonical shapes serving any ROM, compact opcode execution with engine-derived trace receipts, and the exact union proof model for interrupts and unknown bytes).
+`model/schedule.py`'s load-balanced critical-path scheduler assigns the decimal-enabled graph to 69 layers, `model/weights.py` constructs the transformer's weight matrices analytically (`WeightModel`: d_model=630, 315 heads, no training), and inference is genuine — Q/K/V projections, hardmax attention, ReGLU FFN, residual stream, and no position encoding (token order enters only through the LATEST tie-break) — run by generated straight-line C++ with a native run loop, exact integer arithmetic end-to-end, O(1) attention state, and four routed execution tiers (optional pinned sequence modules, canonical shapes serving any ROM, compact opcode execution with engine-derived trace receipts, and the exact union proof model for interrupts and unknown bytes).
 **The full 8,991-instruction nestest suite passes through the weights in
 under 0.1 seconds**, the full 30.6M-instruction Klaus suite
 lockstep-matches with decimal mode in ~68 s, and gameplay replays on the

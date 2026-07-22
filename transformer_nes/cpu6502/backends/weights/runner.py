@@ -35,8 +35,8 @@ from transformer_nes.model.engine_gen import (
     engine_config_key,
     seqmod_config_key,
 )
+from transformer_nes.model.schedule import asap_schedule
 from transformer_nes.model.weights import build_model
-from transformer_nes.scheduler.milp import asap_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +67,6 @@ class Cpu6502TransformerMachine:
         pg = ProgramGraph(self.rt.input_tokens, output_tokens)
         self.pg = pg  # kept for the expert folds (graph/fold.py)
         build_start = time.perf_counter()
-        # ASAP schedule: the optimal-width MILP does not solve at this graph
-        # size (~5M integer variables); critical-path scheduling costs some
-        # d_model but no solver time.
         sched = asap_schedule(pg.input_tokens, pg.output_tokens, program_graph=pg)
         self.model, _tokens, tok_to_idx, info = build_model(
             program_graph=pg, schedule=sched,
