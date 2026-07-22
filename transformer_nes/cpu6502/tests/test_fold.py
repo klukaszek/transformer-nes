@@ -32,7 +32,6 @@ from transformer_nes.cpu6502.backends.weights.experts import (
     build_shape_experts,
     decode_ops,
     last_a_bit_step,
-    opcode_execution_bytes,
     pinned_sequence_control,
     project_sequence_execution,
     schedule_and_build,
@@ -868,8 +867,10 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
         "predicate": None,
         "fallthrough": 3,
         "target": 0,
+        "target_dimension": None,
         "relative_to_head": True,
         "relative_operand_offset": 2,
+        "absolute_operand_offset": None,
         "flag_mask": reference.FLAG_Z,
         "flag_value": False,
     }
@@ -880,22 +881,29 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
     ) == ("affine_until", "x", -1, 2, 0xFD)
 
 
-def test_compact_opcode_experts_stage_writes_and_exclude_stack_control(union_pg):
-    assert len(opcode_execution_bytes(OPCODES)) == 217
+def test_compact_opcode_experts_cover_stack_and_control(union_pg):
     experts = build_opcode_execution_experts(
-        union_pg, [0xCA, 0xA5, 0x0A, 0x85, 0x87, 0x48, 0x4C],
+        union_pg,
+        [0xCA, 0xA5, 0x0A, 0x85, 0x87, 0x48, 0x4C, 0x20, 0x60, 0x00],
     )
     assert [expert["byte"] for expert in experts] == [
-        0xCA, 0xA5, 0x0A, 0x85, 0x87,
+        0xCA, 0xA5, 0x0A, 0x85, 0x87, 0x48, 0x4C, 0x20, 0x60, 0x00,
     ]
     assert all(expert["kind"] == "exec_opcode" for expert in experts)
     dex = experts[0]
     assert set(dex["step_spec"]["inputs"]) == {"x"}
     assert dex["step_spec"]["sequence_writes"] == [[]]
-    sta = experts[-2]
+    sta = experts[3]
     assert len(sta["step_spec"]["sequence_writes"][0]) == 1
-    sax = experts[-1]
+    sax = experts[4]
     assert len(sax["step_spec"]["sequence_writes"][0]) == 1
+    assert experts[5]["step_spec"]["sequence_writes"][0]
+    assert experts[6]["step_spec"]["sequence_control"]["absolute_operand_offset"] == 1
+    assert len(experts[7]["step_spec"]["sequence_writes"][0]) == 2
+    assert experts[8]["step_spec"]["sequence_control"]["target_dimension"] is not None
+    brk = experts[9]
+    assert len(brk["step_spec"]["sequence_writes"][0]) == 3
+    assert brk["step_spec"]["sequence_halt"] is not None
 
 
 @pytest.mark.parametrize(

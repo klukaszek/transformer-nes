@@ -17,11 +17,9 @@ from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.cpu6502.backends.weights.experts import (
     build_opcode_execution_experts,
-    build_opcode_experts,
     build_sequence_expert,
     build_shape_experts,
     head_row,
-    opcode_execution_bytes,
     step_spec_base,
 )
 from transformer_nes.cpu6502.backends.weights.windows import (
@@ -105,15 +103,7 @@ class Cpu6502TransformerMachine:
             logger.info("engine cache hit (%d experts)", engine.n_experts)
         if engine is None:
             opcode_bytes = tuple(sorted(OPCODES))
-            execution_bytes = opcode_execution_bytes(opcode_bytes)
-            execution_set = frozenset(execution_bytes)
-            receipt_bytes = tuple(
-                byte for byte in opcode_bytes if byte not in execution_set
-            )
-            experts = build_opcode_experts(self.pg, receipt_bytes)
-            experts.extend(build_opcode_execution_experts(
-                self.pg, execution_bytes,
-            ))
+            experts = build_opcode_execution_experts(self.pg, opcode_bytes)
             shape_experts, shapes_meta = build_shape_experts(
                 self.pg, SHAPE_LIBRARY,
             )

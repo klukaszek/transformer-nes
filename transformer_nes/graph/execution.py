@@ -40,8 +40,10 @@ class ControlFlow:
     predicate: Dimension | None
     fallthrough: int
     target: int
+    target_dimension: Dimension | None = None
     relative_to_head: bool = False
     relative_operand_offset: int | None = None
+    absolute_operand_offset: int | None = None
     flag_mask: int = 0
     flag_value: bool = True
 
@@ -68,6 +70,7 @@ class ExecutionGraph:
     memory_writes: tuple[MemoryWrite, ...]
     outputs: tuple[ArchitecturalOutput, ...]
     control: ControlFlow
+    halt_dimension: Dimension | None
     recurrence: RecurrenceSummary | None
     dim_of_name: dict[str, Dimension]
 

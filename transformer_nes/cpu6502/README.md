@@ -113,16 +113,17 @@ artifacts are cached by a digest covering every source file that shapes
 emission; a manifest hit skips folding and emission and dlopens the compiled
 core directly.
 
-The production core is workload-independent: it contains 10 exact full-receipt
-stack/control experts, 217 compact delta/effect opcode experts, and a canonical
+The production core is workload-independent: all 227 documented opcodes use
+compact delta/control/effect experts, alongside a canonical
 **shape-expert library** folded once with pc and operands symbolic (any ROM,
 homebrew included, zero per-ROM compilation). An explicit caller may attach a
 per-ROM **sequence module** that outranks those tiers by pinning licensed
 instruction windows as one forward (~160 KB TU, ~1 s cached). Interrupts,
-unknown bytes retain an exact one-step path; traced compact opcodes use the union
-model instead of carrying a second diagnostic receipt in the production core.
-Compact writes are staged and routed through the same mapper, journal and watch
-machinery as full receipts before the instruction retires.
+unknown bytes, and traced execution retain the exact union path instead of
+carrying a second diagnostic receipt in the production core. Compact writes are
+staged and routed through the same mapper, journal and watch machinery as full
+receipts before the instruction retires. Static control is engine metadata;
+dynamic control returns one target slot, and only BRK returns a halt slot.
 
 With the generated engine, **the full 8,991-instruction nestest suite runs
 through the actual transformer weights in under 0.1 s** (`6502-nestest

@@ -534,6 +534,7 @@ ENGINE_STEP_BODY = """\
                 if (exec_hits > 0) {
                     st_ir = exec_opcode; reason = "watch_write"; break;
                 }
+                if (st_halted) { reason = "halt"; break; }
                 if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }
                 continue;
             }
@@ -1413,6 +1414,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             or bool(sequence_final["model"])
             or any(spec["sequence_writes"])
             or spec["sequence_control"]["predicate"] is not None
+            or spec["sequence_control"]["target_dimension"] is not None
+            or spec["sequence_halt"] is not None
         )
         if not needs_x and (ins or spec["p_flags"]):
             raise RuntimeError("zero-work execution model retained live inputs")
@@ -1491,7 +1494,17 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     continue
                 emit(f"        {E}st_p = ({E}st_p & ~0x{mask:X}) | ({value});")
             control = spec["sequence_control"]
-            if control["relative_to_head"]:
+            if control["target_dimension"] is not None:
+                target = rdv(control["target_dimension"])
+                fallthrough = target
+            elif control["absolute_operand_offset"] is not None:
+                offset = control["absolute_operand_offset"]
+                target = (
+                    f"({E}ram[({E}st_pc + {offset}) & 0xFFFF] | "
+                    f"({E}ram[({E}st_pc + {offset + 1}) & 0xFFFF] << 8))"
+                )
+                fallthrough = target
+            elif control["relative_to_head"]:
                 fallthrough = f"({E}st_pc + {control['fallthrough']})"
                 target = f"({E}st_pc + {control['target']})"
             else:
@@ -1517,6 +1530,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 else f"({condition} ? {target} : {fallthrough})"
             )
             emit(f"        {E}st_pc = (int)({successor} & 0xFFFF);")
+            if spec["sequence_halt"] is not None:
+                emit(f"        {E}st_halted = "
+                     f"({rdv(spec['sequence_halt'])} & 1) != 0;")
             for step_writes in spec["sequence_writes"]:
                 for addr_slot, value_slot in step_writes:
                     if stage_writes:

@@ -964,7 +964,7 @@ class GraphFolder:
                     mat.n_terms += len(nd.expr.terms)
                 keep_alive = keep_alive + 1e-6 * sub[d]
 
-            if pc_offsets is not None and k == 0:
+            if pc_offsets is not None and k == 0 and n_steps > 1:
                 pc_exprs = tuple(
                     tr(Expression({self.by_name[n]: 1})) for n in pc_names
                 )

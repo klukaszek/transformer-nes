@@ -24,6 +24,7 @@ from transformer_nes.cpu6502.backends.weights.windows import (
 )
 from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
 from transformer_nes.graph.core import (
+    Dimension,
     Expression,
     InputDimension,
     LookUpDimension,
@@ -205,6 +206,7 @@ def classify_sequence_state(fold_result, final_names) -> dict:
 def project_sequence_execution(
     fold_result, n_steps: int, control: ControlFlow,
     recurrence: RecurrenceSummary | None = None,
+    halt_dimension: Dimension | None = None,
 ) -> ExecutionGraph:
     """Replace the proof graph's per-step trace ABI with its execution ABI.
 
@@ -255,6 +257,12 @@ def project_sequence_execution(
 
     if control.predicate is not None and not control.flag_mask:
         output_tokens["control:branch"] = Expression({control.predicate: 1})
+    if control.target_dimension is not None:
+        output_tokens["control:target"] = Expression({
+            control.target_dimension: 1,
+        })
+    if halt_dimension is not None:
+        output_tokens["halt"] = Expression({halt_dimension: 1})
     execution_control = (
         replace(control, predicate=None) if control.flag_mask else control
     )
@@ -278,6 +286,7 @@ def project_sequence_execution(
         memory_writes=tuple(writes),
         outputs=tuple(outputs),
         control=execution_control,
+        halt_dimension=halt_dimension,
         recurrence=recurrence,
         dim_of_name=dim_of_name,
     )
@@ -316,11 +325,20 @@ def sequence_step_spec(execution: ExecutionGraph, info) -> dict:
         ),
         "fallthrough": control.fallthrough,
         "target": control.target,
+        "target_dimension": (
+            None if control.target_dimension is None
+            else info.slot_of[control.target_dimension]
+        ),
         "relative_to_head": control.relative_to_head,
         "relative_operand_offset": control.relative_operand_offset,
+        "absolute_operand_offset": control.absolute_operand_offset,
         "flag_mask": control.flag_mask,
         "flag_value": control.flag_value,
     }
+    spec["sequence_halt"] = (
+        None if execution.halt_dimension is None
+        else info.slot_of[execution.halt_dimension]
+    )
     return spec
 
 
@@ -477,6 +495,40 @@ def shape_sequence_control(
         )
     return ControlFlow(
         predicate=None, fallthrough=length, target=length,
+        relative_to_head=True,
+    )
+
+
+def opcode_execution_control(fold_result, op) -> ControlFlow:
+    """Control ABI for one opcode whose operands remain runtime bytes."""
+    if op.operation in BRANCH_OPERATIONS:
+        return ControlFlow(
+            predicate=fold_result.dim_of_name["branch_taken__s0"],
+            fallthrough=op.length,
+            target=0,
+            relative_to_head=True,
+            relative_operand_offset=1,
+            flag_mask=BRANCH_FLAG[op.operation][0],
+            flag_value=BRANCH_FLAG[op.operation][1],
+        )
+    if op.operation in {"jmp", "jsr"} and op.mode == "abs":
+        return ControlFlow(
+            predicate=None,
+            fallthrough=0,
+            target=0,
+            absolute_operand_offset=1,
+        )
+    if op.operation in {"jmp", "rts", "rti", "brk"}:
+        return ControlFlow(
+            predicate=None,
+            fallthrough=0,
+            target=0,
+            target_dimension=fold_result.dim_of_name["next_pc__s0"],
+        )
+    return ControlFlow(
+        predicate=None,
+        fallthrough=op.length,
+        target=op.length,
         relative_to_head=True,
     )
 
@@ -787,25 +839,10 @@ def build_opcode_experts(pg, opcodes) -> list[dict]:
     return experts
 
 
-def opcode_execution_bytes(opcodes) -> tuple[int, ...]:
-    eligible = []
-    for byte in opcodes or ():
-        byte = int(byte)
-        op = OPCODES.get(byte)
-        if op is None:
-            continue
-        if (
-            op.operation in STACK_CONTROL_OPERATIONS
-            or op.operation in {"jmp", "pha", "php"}
-        ):
-            continue
-        eligible.append(byte)
-    return tuple(eligible)
-
-
 def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
     eligible = [
-        (byte, OPCODES[byte]) for byte in opcode_execution_bytes(opcodes)
+        (int(byte), OPCODES[int(byte)])
+        for byte in opcodes or () if int(byte) in OPCODES
     ]
     if not eligible:
         return []
@@ -964,7 +1001,10 @@ def _build_symbolic_execution_experts(
             offs.append(offs[-1] + op.length)
         checks = list(zip(offs, (op.byte for op in ops), strict=True))
         self_target = (
-            len(ops) == 1 and ops[0].operation == "jmp" and ops[0].mode == "abs"
+            expert_kind == "shape"
+            and len(ops) == 1
+            and ops[0].operation == "jmp"
+            and ops[0].mode == "abs"
         )
         if repeat > 1 and not self_target:
             raise RuntimeError(f"{label}: only a JMP self-spin may repeat")
@@ -992,7 +1032,10 @@ def _build_symbolic_execution_experts(
         if expert_kind == "exec_opcode":
             if n_steps != 1:
                 raise RuntimeError("staged effects require one instruction")
-            if const_root(r, "new_halted", 0, label) != 0:
+            if (
+                ops[0].operation != "brk"
+                and const_root(r, "new_halted", 0, label) != 0
+            ):
                 raise RuntimeError(f"{label}: may halt")
         elif check_writes_licensed(r, n_steps, label):
             # A shape's head is symbolic, so store disjointness from the
@@ -1016,12 +1059,28 @@ def _build_symbolic_execution_experts(
                     )
 
         recurrence = semantic_recurrence(ops, offs, self_target=self_target)
-        execution = project_sequence_execution(
-            r, n_steps,
-            shape_sequence_control(
-                r, n_steps, ops, offs, len(template), self_target,
-            ),
-            recurrence,
+
+        def execution_of(
+            candidate, ops, offs, template, n_steps, self_target, recurrence,
+        ):
+            control = (
+                opcode_execution_control(candidate, ops[0])
+                if expert_kind == "exec_opcode"
+                else shape_sequence_control(
+                    candidate, n_steps, ops, offs, len(template), self_target,
+                )
+            )
+            halt = (
+                candidate.dim_of_name["new_halted__s0"]
+                if expert_kind == "exec_opcode" and ops[0].operation == "brk"
+                else None
+            )
+            return project_sequence_execution(
+                candidate, n_steps, control, recurrence, halt,
+            )
+
+        execution = execution_of(
+            r, ops, offs, template, n_steps, self_target, recurrence,
         )
         materialized = schedule_and_build(execution)
         inlined_r = fold_candidate(True)
@@ -1030,12 +1089,8 @@ def _build_symbolic_execution_experts(
                 f"{label}: pins reach insert-side expressions "
                 f"of {inlined_r.insert_side_hazards}"
             )
-        inlined_execution = project_sequence_execution(
-            inlined_r, n_steps,
-            shape_sequence_control(
-                inlined_r, n_steps, ops, offs, len(template), self_target,
-            ),
-            recurrence,
+        inlined_execution = execution_of(
+            inlined_r, ops, offs, template, n_steps, self_target, recurrence,
         )
         inlined = schedule_and_build(inlined_execution)
         if prefer_inlined(

@@ -393,6 +393,60 @@ def test_compact_store_routes_write_journal():
 
 
 @pytest.mark.slow
+def test_compact_stack_and_control_match_reference():
+    image = bytearray(0x10000)
+    image[0x0400:0x0405] = bytes([
+        0xA2, 0xFC,        # LDX #$FC
+        0x9A,              # TXS
+        0x40,              # RTI -> $0410 from the prepared stack
+        0xEA,
+    ])
+    image[0x0410:0x0425] = bytes([
+        0xA9, 0x42,        # LDA #$42
+        0x48,              # PHA
+        0xA9, 0x00,        # LDA #$00
+        0x68,              # PLA
+        0x08,              # PHP
+        0x18,              # CLC
+        0x28,              # PLP
+        0x20, 0x50, 0x04,  # JSR $0450
+        0x4C, 0x22, 0x04,  # JMP $0422
+        0xEA, 0xEA, 0xEA,
+        0x6C, 0x50, 0x00,  # JMP ($0050) -> $0430
+    ])
+    image[0x0430:0x0433] = bytes([0x00, 0xEA, 0x00])
+    image[0x0450:0x0452] = bytes([0xE8, 0x60])  # INX; RTS
+    image[0x0460:0x0469] = bytes([
+        0xA9, 0x00,
+        0x8D, 0xFE, 0xFF,
+        0x8D, 0xFF, 0xFF,
+        0x40,
+    ])
+    image[0x0050:0x0052] = bytes([0x30, 0x04])
+    image[0x01FD:0x0200] = bytes([0xA5, 0x10, 0x04])
+    image[0xFFFE:0x10000] = bytes([0x60, 0x04])
+
+    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+    ref.pc = 0x0400
+    ref_rows = []
+    while not ref.halted:
+        ref_rows.append(ref.step())
+    assert len(ref_rows) == 21
+
+    machine = Cpu6502TransformerMachine(bcd=False)
+    machine.load_image(bytes(image), start_pc=0x0400)
+    out = machine.run(100, trace=False)
+
+    assert out["reason"] == "halt"
+    assert int(out["steps"]) == len(ref_rows)
+    state = machine.get_state()
+    assert tuple(state[name] for name in ("pc", "a", "x", "y", "s", "p", "halted")) == (
+        ref.pc, ref.a, ref.x, ref.y, ref.s, ref.p, ref.halted,
+    )
+    assert machine.dump_ram() == bytes(ref.memory)
+
+
+@pytest.mark.slow
 def test_store_window_license_rejections():
     """Unlicensable windows must be skipped, never mis-dispatched: a store
     to a register range ($2007) and a store into the window's own bytes."""
