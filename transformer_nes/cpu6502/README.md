@@ -21,7 +21,7 @@ package one-way.
 | `backends/reference.py` | Plain-Python oracle core.  Trusted by construction; every other backend is verified against it |
 | `backends/graph.py` | Exact evaluator: compiles the graph's static schedule to one generated Python function |
 | `backends/weights/run_protocol.py` | The weights engine's native run-loop protocol (tables + C++ blocks) |
-| `backends/weights/runner.py` | The transformer machine: construction, engine-cache orchestration, machine protocol, JIT window discovery |
+| `backends/weights/runner.py` | The transformer machine: fixed production construction, engine-cache orchestration, and machine protocol |
 | `backends/weights/experts.py` | Fold-and-build expert models (per-opcode, sequence, shape) with their dispatch licenses |
 | `backends/weights/windows.py` | ROM-independent shape library, window scanning, and shape matching |
 | `examples/klaus/harness.py` | Klaus Dormann functional-test harness (`6502-klaus`), next to its binary |
@@ -96,10 +96,8 @@ pass (deterministic; ties go to the latest phase, which also shortens
 lifetimes).  A persist-moving hygiene sweep and the MILP's width/
 attention-hygiene objectives were excised 2026-07-13 after measurement:
 each priced only part of the emitted cost and lost (or washed) on the
-whole.  The MILP survives as an opt-in per-expert certificate
-(`expert_schedule="milp"`) with a total-lifetime objective — every
-phase a value outlives its producer is one emitted passthrough/erase
-statement — width-capped at the balanced-ASAP d_model.
+whole. Production construction always uses the deterministic balanced-ASAP
+schedule; the MILP remains a scheduler research tool, not an engine setting.
 
 Performance: the analytic weights are ~99.9% zeros, so inference runs the
 same linear maps sparsely. `model/engine_gen.py` emits model-specific C++
@@ -115,15 +113,14 @@ artifacts are cached by a digest covering every source file that shapes
 emission; a manifest hit skips folding and emission and dlopens the compiled
 core directly.
 
-Routing is a three-tier MoE, workload-independent by default: one rebuilt
-expert model per opcode (227, no game-derived tuning set), a canonical
+The production core is workload-independent: it contains all 227 exact opcode
+experts, 134 compact delta-only untraced opcode experts, and a canonical
 **shape-expert library** folded once with pc and operands symbolic (any ROM,
-homebrew included, zero per-ROM compilation), and a per-ROM **sequence
-module** that pins whole instruction windows as one forward (~160 KB TU,
-~1 s cached; the console builds it automatically from a boot-time scan of
-the cartridge image).  A profile-guided JIT counter discovers hot windows
-at runtime — including code the program copies into RAM — and adds them to
-the dispatch table mid-run.
+homebrew included, zero per-ROM compilation). An explicit caller may attach a
+per-ROM **sequence module** that outranks those tiers by pinning licensed
+instruction windows as one forward (~160 KB TU, ~1 s cached). Interrupts,
+traced execution, side effects outside a compact license, and unknown bytes
+retain the exact one-step fallback.
 
 With the generated engine, **the full 8,991-instruction nestest suite runs
 through the actual transformer weights in under 0.1 s** (`6502-nestest

@@ -25,9 +25,7 @@ from transformer_nes.cpu6502.backends.weights.experts import (
 )
 from transformer_nes.cpu6502.backends.weights.windows import (
     SHAPE_LIBRARY,
-    match_shape_at,
     match_shape_windows,
-    propose_window,
 )
 from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
@@ -43,29 +41,12 @@ from transformer_nes.scheduler.milp import asap_schedule
 
 logger = logging.getLogger(__name__)
 
-# Opcode-routed experts, on by default: one expert per documented opcode, so
-# routing is workload-independent (no game-derived tuning set).  NMI steps and
-# any opcode outside a narrowed set fall back to the exact union step.
-DEFAULT_EXPERT_OPCODES = tuple(sorted(OPCODES))
-
-# A pc must report hot this many times (re-earning jit_min_count between
-# reports) before it earns a pinned-window proposal; the budget bounds the
-# next boot's fold cost.
-JIT_PROPOSAL_HEAT = 3
-JIT_PROPOSAL_CAP = 96
-
 
 class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
-    def __init__(self, *, bcd: bool = False,
-                 expert_opcodes=DEFAULT_EXPERT_OPCODES,
-                 sequence_windows=(),
-                 shape_library=SHAPE_LIBRARY,
-                 jit_interval: int = 256,
-                 jit_min_count: int = 512,
-                 expert_schedule: str = "asap",
-                 expert_milp_seconds: int = 900):
+    def __init__(self, *, bcd: bool = False):
+        self.bcd = bool(bcd)
         # Build the graph (and keep the evaluator's dim handles; its Python
         # step function is not used here).
         self.rt = Cpu6502Runtime(bcd=bcd, wide_bits=True)
@@ -112,50 +93,25 @@ class Cpu6502TransformerMachine:
         # exact fixed-point int32 residual.  The grouped memory lookup keeps
         # K-side address scores below 2^24, so float32 Q/K rounding still
         # distinguishes adjacent high addresses.
-        if expert_schedule not in ("asap", "milp"):
-            raise ValueError(f"unknown expert_schedule {expert_schedule!r}")
-        self.expert_schedule = expert_schedule
-        self.expert_milp_seconds = expert_milp_seconds
-        # The core engine is determined by source, bcd, and expert set—not
-        # the ROM's sequence windows—so it
-        # compiles once per code digest and every ROM shares it; a manifest
-        # hit skips the expert folds and the emission and loads the compiled
-        # artifact directly.  MILP schedules are excluded: their incumbents
-        # depend on solve time.
-        windows = [
-            (int(head) & 0xFFFF, bytes(code), int(repeat))
-            for head, code, repeat in (sequence_windows or ())
-        ]
-        shapes = tuple(shape_library or ())
-        cache_key = None
-        engine = None
-        if expert_schedule == "asap":
-            expert_bytes = [
-                int(b) for b in (expert_opcodes or ()) if int(b) in OPCODES
-            ]
-            shape_tag = ",".join(
-                f"{name}:{bytes(t).hex()}x{r}" for name, t, r in shapes
-            )
-            cache_key = engine_config_key(
-                bcd=bcd, expert_bytes=expert_bytes,
-                extra=f"shapes={shape_tag}",
-            )
-            engine = GeneratedWeightsEngine.from_cache(cache_key)
-            if engine is not None:
-                logger.info("engine cache hit (%d experts)", engine.n_experts)
+        #
+        # There is one production core per decimal-mode setting: the whole ISA,
+        # compact untraced execution, and the workload-independent shape table.
+        # Source content is part of the cache key, so these are construction
+        # rules rather than a second configuration vocabulary.
+        cache_key = engine_config_key(bcd=bcd)
+        engine = GeneratedWeightsEngine.from_cache(cache_key)
+        if engine is not None:
+            logger.info("engine cache hit (%d experts)", engine.n_experts)
         if engine is None:
-            shapes_meta: list[dict] = []
-            experts = build_opcode_experts(
-                self.pg, expert_opcodes,
-                schedule=self.expert_schedule,
-                milp_seconds=self.expert_milp_seconds,
-            )
+            opcode_bytes = tuple(sorted(OPCODES))
+            experts = build_opcode_experts(self.pg, opcode_bytes)
             experts.extend(build_opcode_execution_experts(
-                self.pg, expert_opcodes,
+                self.pg, opcode_bytes,
             ))
-            if shapes:
-                shape_experts, shapes_meta = build_shape_experts(self.pg, shapes)
-                experts.extend(shape_experts)
+            shape_experts, shapes_meta = build_shape_experts(
+                self.pg, SHAPE_LIBRARY,
+            )
+            experts.extend(shape_experts)
             engine = GeneratedWeightsEngine(
                 self.model, step_spec=self.step_spec(),
                 experts=experts, cache_key=cache_key,
@@ -169,27 +125,7 @@ class Cpu6502TransformerMachine:
             raise RuntimeError("generated 6502 engine is missing machine_step")
         if not self.engine.supports_direct_writes:
             raise RuntimeError("generated 6502 engine is missing direct memory writes")
-        if windows:
-            self.attach_sequence_module(windows, bcd=bcd)
         self.step_out = np.empty(21, dtype=np.int64)
-
-        # Profile-guided JIT: every jit_interval native run() returns, pcs
-        # with >= jit_min_count fallback steps since the last poll are
-        # matched against the shape library at their live RAM bytes --
-        # discovering windows the boot scan could not see (code copied to
-        # RAM at runtime, hot straight-line idioms).
-        self.jit_interval = int(jit_interval)
-        self.jit_min_count = int(jit_min_count)
-        self.jit_calls = 0
-        # Per-pc re-report count: a pc re-enters jit_hot only after
-        # re-accumulating min_count steps, so heat measures SUSTAINED
-        # execution, not one burst (a level-load memcpy reports once).
-        self.jit_heat: dict[int, int] = {}
-        # Sustained-hot pcs become pinned-window PROPOSALS for the next boot.
-        # This includes canonical shape hits: shapes are the zero-compile
-        # baseline, while a hot concrete instance deserves a smaller model
-        # with its operands folded.  Mid-run compilation would stall frames.
-        self.jit_proposals: dict[int, tuple[int, bytes, int]] = {}
         # Shape matches per injected (base, bank content): a bank switch
         # re-adds its windows from this memo instead of rescanning.
         self.region_windows: dict[tuple[int, bytes], tuple] = {}
@@ -223,12 +159,20 @@ class Cpu6502TransformerMachine:
         self.engine.forward(x)  # in place, whole stack
         return x
 
-    def attach_sequence_module(self, windows, *, bcd: bool) -> None:
+    def attach_sequence_module(self, windows) -> None:
         """Compile-or-load the per-ROM sequence module and attach its window
         dispatch to the core engine.  A new ROM's window set costs one small
         TU (cached by digest); the 43 MB core is never re-emitted for it."""
+        windows = tuple(
+            (int(head) & 0xFFFF, bytes(code), int(repeat))
+            for head, code, repeat in windows
+        )
+        self.engine.detach_seq()
+        self.seq_module = None
+        if not windows:
+            return
         key = seqmod_config_key(
-            core_digest=self.engine.digest, bcd=bcd, windows=windows
+            core_digest=self.engine.digest, bcd=self.bcd, windows=windows
         )
         mod = SequenceModule.from_cache(key, core_digest=self.engine.digest)
         if mod is None:
@@ -259,52 +203,12 @@ class Cpu6502TransformerMachine:
         """Fill the engine's runtime window table from the current RAM image
         (called at every boot/reseed; dispatch re-verifies bytes live, so a
         stale entry is only a missed fast path)."""
-        self.jit_calls = 0
-        self.jit_heat.clear()
         meta = getattr(self.engine, "shapes_meta", None) or []
         if not (meta and self.engine.has_run_loop):
             return
         self.engine.clear_windows()
         for sid, head in match_shape_windows(self.ram, meta):
             self.engine.add_window(sid, head)
-
-    def jit_tick(self) -> None:
-        """Periodic JIT poll after a native run: table-add any hot fallback
-        pc whose bytes match a library shape, read from the ENGINE's live RAM
-        (the native run loop's writes never reach the Python mirror -- a
-        runtime-copied loop exists only engine-side)."""
-        meta = getattr(self.engine, "shapes_meta", None) or []
-        if not meta:
-            return
-        self.jit_calls += 1
-        if self.jit_calls % self.jit_interval:
-            return
-        for pc in self.engine.jit_hot(self.jit_min_count):
-            pc = int(pc)
-            heat = self.jit_heat.get(pc, 0) + 1
-            self.jit_heat[pc] = heat
-            if heat > 1:
-                continue  # shapes were checked at first heat; proposals below
-            sid = match_shape_at(self.engine.read_ram, pc, meta)
-            if sid is not None:
-                self.engine.add_window(sid, pc)
-                logger.info("jit window: %s at %04X", meta[sid]["name"], pc)
-        # Proposals demand sustained heat, a bounded budget, and no overlap
-        # with an already-proposed window (suffix pcs of one hot run would
-        # each propose their own tail otherwise).
-        for pc, heat in self.jit_heat.items():
-            if heat != JIT_PROPOSAL_HEAT or len(self.jit_proposals) >= JIT_PROPOSAL_CAP:
-                continue
-            if pc in self.jit_proposals or any(
-                head <= pc < head + len(code)
-                for head, code, _r in self.jit_proposals.values()
-            ):
-                continue
-            proposal = propose_window(self.engine.read_ram, pc, max_len=6)
-            if proposal is not None:
-                self.jit_proposals[pc] = proposal
-                logger.info("jit proposal: %d bytes at %04X (next boot)",
-                            len(proposal[1]), pc)
 
     def step_spec(self) -> dict:
         """Slot map for the generated C++ machine_step (engine_gen.py)."""
@@ -553,7 +457,6 @@ class Cpu6502TransformerMachine:
         # A watch_write pause ends on the step that wrote, so this is the
         # writing opcode: the bus routes RMW writes through write_rmw.
         out["pause_ir"] = self.mstate["ir"]
-        self.jit_tick()
         return out
 
     def watch_read(self, lo: int, hi: int) -> None:
@@ -658,15 +561,9 @@ def main() -> None:
         description="Verify the 6502 running as real transformer weights."
     )
     parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument(
-        "--no-experts", action="store_true",
-        help="disable opcode-routed generated experts and run the union model",
-    )
     args = parser.parse_args()
 
-    machine = Cpu6502TransformerMachine(
-        bcd=False, expert_opcodes=() if args.no_experts else DEFAULT_EXPERT_OPCODES,
-    )
+    machine = Cpu6502TransformerMachine(bcd=False)
     logger.info(
         "transformer: d_model=%d n_layers=%d exact-int32 (%.1fs build)",
         machine.d_model,

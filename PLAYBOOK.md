@@ -284,6 +284,20 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    from 49.1 ms to 9.7–10.4 ms (~4.9×).  Zero-layer emission advances the model
    position and applies metadata/deltas without clearing an unused residual.
 
+24. **Turn measured construction policy into code, not constructor knobs.**
+   The production machine now has one semantic option, decimal mode. It always
+   builds the entire ISA, compact untraced experts and the canonical shape
+   library; every fold uses structural reads, compares materialized and inlined
+   forms by emitted layers/terms, and uses deterministic balanced-ASAP
+   scheduling. Removed alternatives included expert subsets, shape-library
+   overrides, per-expert MILP timing, forced inlining/materialization, token-read
+   folds, runtime heat thresholds, speculative shape rollback and guarded shape
+   stores. The last two were especially misleading: their metadata had no
+   generated consumer. Removing the unused trace-window construction and native
+   proposal/profiling path removed over 700 net lines without changing the model
+   census. Concrete store windows remain an explicit, statically licensed
+   sequence-module operation rather than a tuning mode.
+
 ## Dead ends (kept so they stay dead)
 
 - GPU per-matrix sparse matvec for a single stream: one dispatch costs a
@@ -306,10 +320,6 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
   the graph construction file was missing from the engine cache key, so
   a construction edit silently benchmarked (and nearly shipped) stale
   engines.  Caught only because d_model changed enough to crash.
-- Tape/bench totals can hide one-time boot work: a changed proposal
-  sidecar refolds the per-ROM module at boot (~20 s), which read as
-  "265 fps total" against 750-900 fps in every segment.  Report
-  steady-state segments and totals separately.
 - Paced slices are not throughput: a frame loop that runs 1.3 ms of
   emulation then idles 15 ms to the next display callback measures
   4.3 ms/frame for the SAME work (DVFS drops the clocks and cools the

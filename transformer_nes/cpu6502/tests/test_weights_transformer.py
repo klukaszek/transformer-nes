@@ -9,8 +9,6 @@ codegen C++ engine, lockstep against the reference oracle.
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from transformer_nes.cpu6502.backends import reference
@@ -184,19 +182,17 @@ def test_sequence_experts_match_per_step():
 
     fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
               "ea", "data", "halted")
-    configs: tuple[dict[str, Any], ...] = (
-        {"sequence_windows": windows},           # pinned module + shape table
-        {},                                      # shape table only
-        {"shape_library": ()},                   # compact per-instruction
-        {"expert_opcodes": (), "shape_library": ()},  # union fallback only
-    )
+    modes = ("pinned", "shape", "compact")
     traces = []
-    for cfg in configs:
-        m = Cpu6502TransformerMachine(bcd=False, **cfg)
+    for mode in modes:
+        m = Cpu6502TransformerMachine(bcd=False)
+        if mode == "pinned":
+            m.attach_sequence_module(windows)
         m.load_image(bytes(image), start_pc=0x0400)
-        if "shape_library" not in cfg:
-            # Every idiom in the program must be covered by a library shape.
-            assert len(match_shape_windows(image, m.engine.shapes_meta)) == 4
+        if mode == "compact":
+            m.engine.clear_windows()
+        # Every idiom in the program must be covered by a library shape.
+        assert len(match_shape_windows(image, m.engine.shapes_meta)) == 4
         chunks = []
 
         def drain(n, chunks=chunks, m=m):
@@ -225,9 +221,13 @@ def test_sequence_experts_match_per_step():
     # sequence models use the compact execution receipt; compare persistent
     # state/RAM/cycles after the same boundary and input schedule.
     final = []
-    for cfg in configs:
-        m = Cpu6502TransformerMachine(bcd=False, **cfg)
+    for mode in modes:
+        m = Cpu6502TransformerMachine(bcd=False)
+        if mode == "pinned":
+            m.attach_sequence_module(windows)
         m.load_image(bytes(image), start_pc=0x0400)
+        if mode == "compact":
+            m.engine.clear_windows()
 
         def run_untraced(n, m=m):
             done = cycles = 0
@@ -251,9 +251,6 @@ def test_sequence_experts_match_per_step():
                          "steps", "cycles")
         }
         final.append((state, m.dump_ram(), cycles))
-        if "sequence_windows" in cfg:
-            hot = set(int(pc) for pc in m.engine.jit_hot(100))
-            assert not hot & {0x0400, 0x0408, 0x040B, 0x0410}, hot
     assert final[0] == final[1] == final[2]
 
 
@@ -299,11 +296,11 @@ def test_store_windows_match_per_step():
     fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
               "ea", "data", "halted", "w_addr", "w_value")
     traces, rams = [], []
-    configs2: tuple[dict[str, Any], ...] = (
-        {"sequence_windows": windows}, {"shape_library": ()},
-    )
-    for cfg in configs2:
-        m = Cpu6502TransformerMachine(bcd=False, **cfg)
+    modes = ("pinned", "per_instruction")
+    for mode in modes:
+        m = Cpu6502TransformerMachine(bcd=False)
+        if mode == "pinned":
+            m.attach_sequence_module(windows)
         m.load_image(bytes(image), start_pc=0x0400)
         chunks = []
         done = 0
@@ -316,7 +313,7 @@ def test_store_windows_match_per_step():
             k: np.concatenate([c[k] for c in chunks]) for k in fields
         })
         rams.append(m.dump_ram())
-        if "sequence_windows" in cfg:
+        if mode == "pinned":
             assert m.seq_module is not None
     for k in fields:
         assert np.array_equal(traces[0][k], traces[1][k]), f"{k} diverged"
@@ -324,8 +321,10 @@ def test_store_windows_match_per_step():
     assert rams[0][0x0300:0x0400] == bytes(image[0x0600:0x0700])
 
     final = []
-    for cfg in configs2:
-        m = Cpu6502TransformerMachine(bcd=False, **cfg)
+    for mode in modes:
+        m = Cpu6502TransformerMachine(bcd=False)
+        if mode == "pinned":
+            m.attach_sequence_module(windows)
         m.load_image(bytes(image), start_pc=0x0400)
         done = cycles = 0
         while done < 2800:
@@ -341,9 +340,6 @@ def test_store_windows_match_per_step():
                          "steps", "cycles")
         }
         final.append((state, m.dump_ram(), cycles))
-        if "sequence_windows" in cfg:
-            hot = set(int(pc) for pc in m.engine.jit_hot(100))
-            assert not hot & {0x0400, 0x0409, 0x040E}, hot
     assert final[0] == final[1]
 
 
@@ -357,9 +353,8 @@ def test_store_windows_decline_under_low_watch():
     )
 
     image = store_loop_image()
-    m = Cpu6502TransformerMachine(
-        bcd=False, sequence_windows=scan_sequence_windows(image),
-    )
+    m = Cpu6502TransformerMachine(bcd=False)
+    m.attach_sequence_module(scan_sequence_windows(image))
     m.load_image(bytes(image), start_pc=0x0400)
     m.watch_write(0x0020, 0x0020)
     hits = 0
@@ -372,9 +367,6 @@ def test_store_windows_decline_under_low_watch():
             hits += 1
             assert int(value) == hits & 0xFF
     assert hits == 256  # the INC $20 loop paused on every single write
-    # The store windows really did fall back while watched.
-    hot = set(int(pc) for pc in m.engine.jit_hot(100))
-    assert {0x0400, 0x0409, 0x040E} <= hot, hot
 
 
 @pytest.mark.slow
@@ -392,53 +384,6 @@ def test_store_window_license_rejections():
         0x8D, 0x05, 0x03,  # STA $0305 (inside the window's own bytes)
         0xD0, 0xF9,        # BNE $0300
     ]), 1)
-    m = Cpu6502TransformerMachine(
-        bcd=False, sequence_windows=(mmio_store, self_modify),
-    )
+    m = Cpu6502TransformerMachine(bcd=False)
+    m.attach_sequence_module((mmio_store, self_modify))
     assert m.seq_module is None  # both rejected by the license
-
-
-@pytest.mark.slow
-def test_jit_discovers_runtime_window():
-    """The JIT counter must discover a loop the program WRITES INTO RAM at
-    runtime (invisible to the boot scan), add it to the window table
-    mid-run, and leave the trace byte-identical to the per-instruction
-    machine across the hot-swap."""
-    import numpy as np
-
-    image = bytearray(0x10000)
-    # Copy "DEX / BNE -3 / JMP $0303 (self)" to $0300, set X, jump there.
-    code = bytes([0xCA, 0xD0, 0xFD, 0x4C, 0x03, 0x03])
-    prog = bytearray()
-    for i, b in enumerate(code):
-        prog += bytes([0xA9, b, 0x8D, i, 0x03])   # LDA #b / STA $030i
-    prog += bytes([0xA2, 0xFF,                    # LDX #$FF
-                   0x4C, 0x00, 0x03])             # JMP $0300
-    image[0x0400:0x0400 + len(prog)] = prog
-
-    fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
-              "ea", "data", "halted")
-    traces = []
-    configs3: tuple[dict[str, Any], ...] = (
-        {"jit_interval": 1, "jit_min_count": 64},
-        {"shape_library": ()},
-    )
-    for cfg in configs3:
-        m = Cpu6502TransformerMachine(bcd=False, **cfg)
-        m.load_image(bytes(image), start_pc=0x0400)
-        if "shape_library" not in cfg:
-            # The loop does not exist at boot; only the JIT can find it.
-            assert m.engine.window_shape(0x0300) == 0
-        chunks = []
-        done = 0
-        while done < 800:
-            out = m.run(97)  # odd budgets: boundaries land mid-window
-            assert len(out["pc"]), out["reason"]
-            chunks.append(out)
-            done += len(out["pc"])
-        traces.append({k: np.concatenate([c[k] for c in chunks]) for k in fields})
-        if "shape_library" not in cfg:
-            assert m.engine.window_shape(0x0300) != 0, "JIT never added the window"
-    n = min(len(traces[0]["pc"]), len(traces[1]["pc"]))
-    for k in fields:
-        assert np.array_equal(traces[0][k][:n], traces[1][k][:n]), f"{k} diverged"

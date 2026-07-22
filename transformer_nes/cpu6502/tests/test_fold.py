@@ -848,21 +848,11 @@ def test_shape_fold_shadows_union(
         assert n >= 2, f"head {head:04X} never dispatched twice"
 
 
-def test_shape_absolute_store_requires_runtime_guard(union_pg):
-    """A symbolic absolute store is admitted only with the narrow router
-    license and reports the live operand offset the runtime must guard."""
+def test_shape_absolute_store_is_rejected(union_pg):
+    """Symbolic store shapes cannot prove disjointness from their own code."""
     shape = ("lda_sta_abs", bytes.fromhex("a9008d0000"), 1)
     with pytest.raises(RuntimeError, match="not provably below"):
-        build_shape_experts(
-            union_pg, [shape], inline_linear=True, allow_stores=True,
-        )
-    experts, _meta = build_shape_experts(
-        union_pg, [shape], inline_linear=True, allow_stores=True,
-        allow_runtime_store_guard=True,
-    )
-    assert experts[0]["has_stores"]
-    assert experts[0]["store_bounds"] is None
-    assert experts[0]["store_guard_offset"] == 3
+        build_shape_experts(union_pg, [shape])
 
 
 def test_shape_execution_abi_contains_only_live_state(union_pg):
@@ -929,15 +919,8 @@ def test_poll_recurrence_is_isa_semantic():
     assert recurrence.closure_operand_value == 0xF9
 
 
-def test_shape_interior_branch_requires_explicit_speculation(union_pg):
-    """A symbolic interior branch records the fall-through PC offset only
-    when the router opts into exact prefix rollback."""
+def test_shape_interior_branch_is_rejected(union_pg):
+    """Shape dispatch has no speculative rollback ABI."""
     plain = ("bne_lda", bytes.fromhex("d000a900"), 1)
     with pytest.raises(RuntimeError, match="interior next_pc"):
-        build_shape_experts(union_pg, [plain], inline_linear=True)
-
-    speculative = (*plain, True)
-    experts, _meta = build_shape_experts(
-        union_pg, [speculative], inline_linear=True,
-    )
-    assert experts[0]["spec_offsets"] == [2, -1]
+        build_shape_experts(union_pg, [plain])

@@ -103,11 +103,10 @@ def code_digest() -> str:
     return code_digest_cache
 
 
-def engine_config_key(*, bcd: bool, expert_bytes, extra: str = "") -> str:
+def engine_config_key(*, bcd: bool) -> str:
     """Cache key for a built engine, computable without folding or emitting:
-    the config plus a digest of every source file that shapes the emission."""
-    tag = ",".join(f"{int(b):02X}" for b in expert_bytes)
-    raw = f"{code_digest()}|bcd={int(bcd)}|experts={tag}|{extra}"
+    decimal mode plus every source file that shapes the fixed production core."""
+    raw = f"{code_digest()}|bcd={int(bcd)}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -513,7 +512,6 @@ ENGINE_STEP_BODY = """\
             }
             const bool was_int = nmi_pending || irq_ready();
             const int prev_pc = st_pc;
-            ++fallback_count[prev_pc];  // JIT profile: per-instruction steps only
             if (!trace && !was_int && execution_step()) {
                 ++step_index;
                 const long step_cycles = (long)CYCLES[ram[prev_pc]];
@@ -566,25 +564,6 @@ RUN_LOOP = "\n\n".join((
     run_loop_cpp(extra_locals="        long long o[21];",
                  step_body=ENGINE_STEP_BODY),
     """\
-    // ── JIT profile counter ──────────────────────────────────
-    // The run loop counts every per-instruction (fallback) step by pc;
-    // jit_hot reports pcs past the cumulative threshold.  Canonical shape
-    // dispatches count too: hot symbolic shapes are candidates for cheaper
-    // operand-pinned per-ROM promotion on the next boot.
-    unsigned int fallback_count[65536];
-
-    py::array_t<int> jit_hot(long min_count) {
-        std::vector<int> hot;
-        for (int pc = 0; pc < 65536; ++pc)
-            if ((long)fallback_count[pc] >= min_count) {
-                hot.push_back(pc);
-                fallback_count[pc] = 0;
-            }
-        return py::array_t<int>((py::ssize_t)hot.size(), hot.data());
-    }
-
-    int window_shape(int pc) { return shape_of_pc[pc & 0xFFFF]; }
-
     // ── Machine API (run_protocol.py) ────────────────────────""",
     MACHINE_API_CPP,
     """\
@@ -686,9 +665,7 @@ PYBIND_STEP_METHODS = """\
         .def("attach_seq", &ENGINE_T::attach_seq)
         .def("detach_seq", &ENGINE_T::detach_seq)
         .def("add_window", &ENGINE_T::add_window)
-        .def("clear_windows", &ENGINE_T::clear_windows)
-        .def("jit_hot", &ENGINE_T::jit_hot)
-        .def("window_shape", &ENGINE_T::window_shape)"""
+        .def("clear_windows", &ENGINE_T::clear_windows)"""
 
 
 # Maximum instructions retired by one execution model; keep in sync with
@@ -1633,7 +1610,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     if has_run:
         emit("        for (int i = 0; i < 65536; ++i) ram[i] = 0;")
         emit("        std::memset(shape_of_pc, 0, sizeof(shape_of_pc));")
-        emit("        std::memset(fallback_count, 0, sizeof(fallback_count));")
         emit("        st_pc = 0; st_a = st_x = st_y = 0; st_s = 0xFD; st_p = 0x24;")
         emit("        st_ir = st_oplo = st_ophi = st_ea = st_data = 0;")
         emit("        st_halted = false; nmi_pending = false; irq_pending = false;")
@@ -1783,10 +1759,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 if exp.get("self_target"):
                     checks += (" && ram[st_pc + 1] == (st_pc & 0xFF)"
                                " && ram[st_pc + 2] == ((st_pc >> 8) & 0xFF)")
-                if exp.get("has_stores"):
-                    # Licensed store targets stay below $2000; refuse
-                    # dispatch while any write watch reaches below it.
-                    checks = f"watch_write_lo >= 0x2000 && {checks}"
                 emit(f"        case {j + 1}:  // {exp['name']}")
                 guard_steps, guard_prefix = exp["n_steps"], exp["cycles_prefix"]
                 if exp.get("recurrence") is not None and exp["recurrence"].kind == "identity":
@@ -1795,7 +1767,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 emit(f"                && (max_cycles <= 0 || cycles_this + "
                      f"{guard_prefix} < max_cycles)")
                 emit(f"                && {checks}) {{")
-                emit("                ++fallback_count[st_pc];")
                 emit_recurrence_dispatch(
                     emit, exp, "",
                     f"step_core__{exp['name']}();",
@@ -1884,8 +1855,6 @@ class GeneratedWeightsEngine:
     detach_seq: Callable
     add_window: Callable
     clear_windows: Callable
-    jit_hot: Callable
-    window_shape: Callable
     digest: str
 
     def __init__(self, model, *, step_spec: dict | None = None,
@@ -1991,8 +1960,6 @@ class GeneratedWeightsEngine:
             self.detach_seq = self.engine.detach_seq
             self.add_window = self.engine.add_window
             self.clear_windows = self.engine.clear_windows
-            self.jit_hot = self.engine.jit_hot
-            self.window_shape = self.engine.window_shape
 
     def reset(self):
         self.engine.reset()
