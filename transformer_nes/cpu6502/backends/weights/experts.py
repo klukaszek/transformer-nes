@@ -51,6 +51,13 @@ from transformer_nes.model.weights import build_model
 logger = logging.getLogger(__name__)
 STACK_CONTROL_OPERATIONS = SEQUENCE_WRITERS - {"sax"}
 
+# Undocumented composite ops get no compact expert and dispatch to the union
+# path (which executes them exactly): they cost ~half the opcode-expert terms
+# yet run zero times across every gameplay tape.
+UNION_FALLBACK_OPERATIONS = frozenset({
+    "sax", "slo", "isb", "sre", "rla", "rra", "dcp", "lax",
+})
+
 # Residual input slots shared by every generated step spec: spec key -> the
 # graph dimension name it resolves through (union slot map or fold name map).
 INPUT_SLOT_NAMES = {

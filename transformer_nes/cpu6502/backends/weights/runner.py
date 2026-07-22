@@ -16,6 +16,7 @@ import numpy as np
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.cpu6502.backends.weights.experts import (
+    UNION_FALLBACK_OPERATIONS,
     build_opcode_execution_experts,
     build_sequence_expert,
     build_shape_experts,
@@ -99,7 +100,10 @@ class Cpu6502TransformerMachine:
         if engine is not None:
             logger.info("engine cache hit (%d experts)", engine.n_experts)
         if engine is None:
-            opcode_bytes = tuple(sorted(OPCODES))
+            opcode_bytes = tuple(
+                byte for byte in sorted(OPCODES)
+                if OPCODES[byte].operation not in UNION_FALLBACK_OPERATIONS
+            )
             experts = build_opcode_execution_experts(self.pg, opcode_bytes)
             shape_experts, shapes_meta = build_shape_experts(
                 self.pg, SHAPE_LIBRARY,

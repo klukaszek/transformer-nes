@@ -568,7 +568,7 @@ ENGINE_STEP_BODY = """\
                 if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }
                 continue;
             }
-            step_core(o);  // updates st_*, applies writes to ram + memory
+            step_core(o);  // union model: opcode has no compact expert (NMI, unknown, union-only families)
             if (trace) {
                 t_pc.push_back((int)o[0]); t_a.push_back((int)o[1]);
                 t_x.push_back((int)o[2]); t_y.push_back((int)o[3]);
@@ -1757,6 +1757,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("")
         emit("    int exec_n_writes = 0;")
         emit("    int exec_write_addr[3], exec_write_value[3];")
+        # Compact per-opcode dispatch; an opcode with no case returns false
+        # and the run loop takes the union step_core.
         emit("    bool execution_step(unsigned char opcode) {")
         emit("        exec_n_writes = 0;")
         if exec_op_experts:
