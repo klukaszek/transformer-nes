@@ -31,7 +31,7 @@ in/out and FFN in/out), not zeroes or the unused dense shape.
 | Model set | Previous construction | Current construction | Delta |
 | --- | --- | --- | --- |
 | 227 documented-opcode experts | 3,719 layers; max `d_model` 294; 265,934 sparse terms | 825 layers; max `d_model` 106; 126,706 sparse terms | −77.8% layers; −63.9% max width; −52.4% sparse work |
-| 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 59 layers; max `d_model` 44; 4,013 sparse terms | −77.0% layers; −26.7% max width; −77.0% sparse work |
+| 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 59 layers; max `d_model` 38; 3,747 sparse terms | −77.0% layers; −36.7% max width; −78.5% sparse work |
 
 The deterministic 24-instruction self-JMP is the clearest construction
 trace.  Its full proof receipt built as 38 layers / `d_model` 596 / 6,889
@@ -193,15 +193,20 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    from 3,719 to 1,574 layers and 265,934 to 140,764 sparse terms.
 
 17. **Make architectural deltas and dependency closure the model ABI.**
-   Classify every final field as preserved, compile-time constant, or
-   model-computed; only computed fields remain output roots.  Non-halting
+   Classify every final field—including each P bit independently—as preserved,
+   compile-time constant, or model-computed; only computed fields remain output
+   roots.  Do not carry five unchanged flags merely to repack a changed Z/N
+   pair into a byte.  Non-halting
    is already a construction license, so sequence models carry no halt
    classifier.  The lowering produces a typed execution IR of live
    `StateField` leaves, `MemoryRead` leaves, ordered `MemoryWrite` effects and
    classified architectural outputs; the proof fold remains intact.  Embed
    only fields reachable from computed outputs or writes.  This is what lets
    a deterministic sequence become a genuine zero-layer model with only the
-   constant-one residual slot (`d_model=2`).
+   constant-one residual slot (`d_model=2`).  Splitting P after the initial
+   state-delta pass kept the shape library at 59 layers while reducing max
+   `d_model` 44 → 38 and sparse terms 4,013 → 3,747; DEX/BNE's model
+   live-ins are now only PC and X.
 
 18. **Return control decisions, not reconstructed program counters.**  A
    licensed region already knows its fallthrough and deterministic targets;
@@ -246,6 +251,17 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    construction time 0.547 → 0.264 s.  The 15-shape library built in
    1.674 → 0.820 s while emitting the identical 59 layers / 4,013 sparse
    terms.
+
+22. **Lower typed execution primitives directly in the generated engine.**
+   A first-class `MemoryRead(address)` is an exact RAM load, not a reason to
+   reconstruct the old nearest-write attention query over the engine's bitset
+   index.  Evaluate its address and load RAM once, then derive every requested
+   value/bit lane from that local; an eight-bit consumer went from five indexed
+   queries/loads to one load.  Likewise, apply architectural deltas straight to
+   persistent state: preserved fields emit no code, constants are immediates,
+   computed fields read their residual slot, and control metadata assigns PC.
+   Sequence and shape forwards no longer allocate or populate the legacy
+   672-slot receipt buffer.
 
 ## Dead ends (kept so they stay dead)
 

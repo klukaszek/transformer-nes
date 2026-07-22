@@ -122,9 +122,20 @@ def fold_step_spec(fold_result, model, tok_to_idx, info, *,
 
 
 SEQUENCE_STATE_DIMS = (
-    "new_a", "new_x", "new_y", "new_s", "new_p", "new_halted",
+    "new_a", "new_x", "new_y", "new_s", "new_halted",
     "fetched_opcode", "fetched_operand_lo", "fetched_operand_hi",
-    "ea", "data_out",
+    "ea", "data_out", "p_c", "p_z", "p_i", "p_d", "p_b", "p_u",
+    "p_v", "p_n",
+)
+
+SEQUENCE_FLAG_DIMS = (
+    ("p_c", "new_p_c_final", reference.FLAG_C, "in_p_c"),
+    ("p_z", "new_p_z_final", reference.FLAG_Z, "in_p_z"),
+    ("p_i", "new_p_i_final", reference.FLAG_I, "in_p_i"),
+    ("p_d", "new_p_d_final", reference.FLAG_D, "in_p_d"),
+    ("p_b", "new_p_b_final", reference.FLAG_B, "in_p_b"),
+    ("p_v", "new_p_v_final", reference.FLAG_V, "in_p_v"),
+    ("p_n", "new_p_n_final", reference.FLAG_N, "in_p_n"),
 )
 
 SEQUENCE_PRESERVE_INPUTS = {
@@ -132,10 +143,9 @@ SEQUENCE_PRESERVE_INPUTS = {
     "new_x": (("in_x", 1),),
     "new_y": (("in_y", 1),),
     "new_s": (("in_s", 1),),
-    "new_p": tuple(
-        ("one" if mask == reference.FLAG_U else name, mask)
-        for name, mask in P_FLAG_NAMES
-    ),
+    **{name: ((input_name, 1),)
+       for name, _dim_name, _mask, input_name in SEQUENCE_FLAG_DIMS},
+    "p_u": (("one", 1),),
     "new_halted": (("in_halted", 1),),
     "fetched_opcode": (("in_ir", 1),),
     "fetched_operand_lo": (("in_oplo", 1),),
@@ -149,7 +159,11 @@ WRITE_RECEIPTS = (
     ("is_store2", "write_addr2_out", "write_value2_out"),
     ("is_store3", "write_addr3_out", "write_value3_out"),
 )
-SEQUENCE_ROOT_DIMS = (*RUNTIME_READ_DIMS, "branch_taken")
+SEQUENCE_ROOT_DIMS = (
+    *(name for name in RUNTIME_READ_DIMS if name != "new_p"),
+    *(dim_name for _name, dim_name, _mask, _input_name in SEQUENCE_FLAG_DIMS),
+    "branch_taken",
+)
 
 
 def linear_input_form(expr: Expression) -> dict:
@@ -208,9 +222,16 @@ def project_sequence_execution(
     projected graph is what gets scheduled and converted to weights.
     """
     final_names = {
-        name: f"{name}__s{n_steps - 1}" for name in SEQUENCE_STATE_DIMS
+        name: f"{name}__s{n_steps - 1}"
+        for name in SEQUENCE_STATE_DIMS
+        if not name.startswith("p_")
     }
+    final_names.update({
+        name: f"{dim_name}__s{n_steps - 1}"
+        for name, dim_name, _mask, _input_name in SEQUENCE_FLAG_DIMS
+    })
     final = classify_sequence_state(fold_result, final_names)
+    final["constant"]["p_u"] = 1
     outputs = []
     output_tokens = {}
     for name in SEQUENCE_STATE_DIMS:

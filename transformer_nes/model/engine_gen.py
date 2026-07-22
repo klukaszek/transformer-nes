@@ -1474,6 +1474,18 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                 elif name in constants:
                     emit(f"        {E}{field} = "
                          f"{int(constants[name]) & mask};")
+            flag_masks = {
+                "p_c": 0x01, "p_z": 0x02, "p_i": 0x04, "p_d": 0x08,
+                "p_b": 0x10, "p_u": 0x20, "p_v": 0x40, "p_n": 0x80,
+            }
+            for name, mask in flag_masks.items():
+                if name in outs:
+                    value = f"({rdv(outs[name])} & 1) ? 0x{mask:X} : 0"
+                elif name in constants:
+                    value = f"0x{mask:X}" if constants[name] else "0"
+                else:
+                    continue
+                emit(f"        {E}st_p = ({E}st_p & ~0x{mask:X}) | ({value});")
             if "new_halted" in outs:
                 emit(f"        {E}st_halted = "
                      f"({rdv(outs['new_halted'])} & 0xFF) != 0;")

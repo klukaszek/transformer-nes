@@ -471,6 +471,12 @@ def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
             continue
         values = ev.step(inputs)
         expected = steps[idx + len(pin_list) - 1]["reads"]
+        flag_masks = {
+            "p_c": reference.FLAG_C, "p_z": reference.FLAG_Z,
+            "p_i": reference.FLAG_I, "p_d": reference.FLAG_D,
+            "p_b": reference.FLAG_B, "p_u": reference.FLAG_U,
+            "p_v": reference.FLAG_V, "p_n": reference.FLAG_N,
+        }
         for output in execution.outputs:
             name = output.name
             mask = 0xFFFF if name in ("next_pc", "ea") else 0xFF
@@ -483,7 +489,11 @@ def test_sequence_execution_projection_keeps_only_final_state(folder, poll_run):
                     (1 if input_name == "one" else inputs[input_name]) * coeff
                     for input_name, coeff in SEQUENCE_PRESERVE_INPUTS[name]
                 )
-            assert int(round(value)) & mask == expected[name] & mask
+            expected_value = (
+                int(bool(expected["new_p"] & flag_masks[name]))
+                if name in flag_masks else expected[name]
+            )
+            assert int(round(value)) & mask == expected_value & mask
         control = execution.control
         taken = (
             False if control.predicate is None
@@ -563,7 +573,7 @@ def test_structural_execution_uses_external_memory_reads(folder):
 def test_execution_ir_retains_ordered_writes(folder):
     pins = sequence_pins(SPIN_HEAD, bytes([0x85, 0x10]), OPCODES)
     structural = GraphFolder(
-        folder.pg, root_names=RUNTIME_READ_DIMS, structural_reads=True,
+        folder.pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
     )
     proof = structural.fold_sequence(
         pins, SEQUENCE_FEEDBACK, label="ordered_store", inline_linear=True,
@@ -857,13 +867,8 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
     spec = experts[0]["step_spec"]
 
     assert set(spec["inputs"]) == {"pc_lo", "pc_hi", "x"}
-    assert {mask for _slot, mask in spec["p_flags"]} == {
-        reference.FLAG_C,
-        reference.FLAG_I,
-        reference.FLAG_D,
-        reference.FLAG_B,
-        reference.FLAG_V,
-    }
+    assert spec["p_flags"] == []
+    assert {"p_z", "p_n"} <= set(spec["sequence_final"]["model"])
     assert spec["sequence_control"] == {
         "predicate": spec["sequence_control"]["predicate"],
         "fallthrough": 3,
