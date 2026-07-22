@@ -35,6 +35,7 @@ from transformer_nes.cpu6502.backends.weights.runner import VERIFY_START, verify
 from transformer_nes.cpu6502.interpreter import build
 from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.graph.core import (
+    InputDimension,
     LookUpDimension,
     PersistDimension,
     ProgramGraph,
@@ -501,6 +502,11 @@ def test_sequence_execution_projection_eliminates_deterministic_model(folder):
 
     assert receipt["final"]["model"] == {}
     assert execution_info.n_layers == 0
+    assert {
+        dim.name
+        for dim in execution.program_graph.all_dims
+        if isinstance(dim, InputDimension)
+    } == {"one"}
 
 
 @pytest.mark.parametrize("byte", SHADOW_OPCODES)
@@ -711,6 +717,21 @@ def test_shape_absolute_store_requires_runtime_guard(union_pg):
     assert experts[0]["has_stores"]
     assert experts[0]["store_bounds"] is None
     assert experts[0]["store_guard_offset"] == 3
+
+
+def test_shape_execution_abi_contains_only_live_state(union_pg):
+    shape = ("dex_bne", bytes.fromhex("cad0fd"), 1)
+    experts, _meta = build_shape_experts(union_pg, [shape])
+    spec = experts[0]["step_spec"]
+
+    assert set(spec["inputs"]) == {"pc_lo", "pc_hi", "x"}
+    assert {mask for _slot, mask in spec["p_flags"]} == {
+        reference.FLAG_C,
+        reference.FLAG_I,
+        reference.FLAG_D,
+        reference.FLAG_B,
+        reference.FLAG_V,
+    }
 
 
 def test_shape_interior_branch_requires_explicit_speculation(union_pg):

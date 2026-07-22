@@ -1282,27 +1282,34 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit(f"        {elem}* x = xbuf;")
         emit(f"        for (int i = 0; i < {dm}; ++i) x[i] = 0;")
         emit(f"        x[{mdl.one_slot}] = {one_e};")
-        emit(f"        x[{ins['is_state']}] = {one_e};")
-        emit(f"        x[{ins['pc_lo']}] = {sc(f'{E}st_pc & 0xFF')};")
-        emit(f"        x[{ins['pc_hi']}] = {sc(f'({E}st_pc >> 8) & 0xFF')};")
-        emit(f"        x[{ins['a']}] = {sc(f'{E}st_a')};")
-        emit(f"        x[{ins['x']}] = {sc(f'{E}st_x')};")
-        emit(f"        x[{ins['y']}] = {sc(f'{E}st_y')};")
-        emit(f"        x[{ins['s']}] = {sc(f'{E}st_s')};")
+
+        def embed(key, value):
+            if key in ins:
+                emit(f"        x[{ins[key]}] = {value};")
+
+        embed("is_state", one_e)
+        embed("pc_lo", sc(f"{E}st_pc & 0xFF"))
+        embed("pc_hi", sc(f"({E}st_pc >> 8) & 0xFF"))
+        embed("a", sc(f"{E}st_a"))
+        embed("x", sc(f"{E}st_x"))
+        embed("y", sc(f"{E}st_y"))
+        embed("s", sc(f"{E}st_s"))
         for slot, mask in spec["p_flags"]:
             emit(f"        x[{slot}] = ({E}st_p & {mask}) ? {one_e} : {zero_l};")
-        emit(f"        x[{ins['ir']}] = {sc(f'{E}st_ir')};")
-        emit(f"        x[{ins['oplo']}] = {sc(f'{E}st_oplo')};")
-        emit(f"        x[{ins['ophi']}] = {sc(f'{E}st_ophi')};")
-        emit(f"        x[{ins['ea_lo']}] = {sc(f'{E}st_ea & 0xFF')};")
-        emit(f"        x[{ins['ea_hi']}] = {sc(f'({E}st_ea >> 8) & 0xFF')};")
-        emit(f"        x[{ins['data']}] = {sc(f'{E}st_data')};")
-        emit(f"        x[{ins['halted']}] = {sc(f'{E}st_halted ? 1 : 0')};")
-        emit(f"        const bool take_irq = {E}irq_ready();")
-        emit(f"        x[{ins['nmi']}] = {sc(f'{E}nmi_pending ? 1 : 0')};")
-        emit(f"        {E}nmi_pending = false;")
-        emit(f"        x[{ins['irq']}] = {sc('take_irq ? 1 : 0')};")
-        emit(f"        if (take_irq) {E}irq_pending = false;")
+        embed("ir", sc(f"{E}st_ir"))
+        embed("oplo", sc(f"{E}st_oplo"))
+        embed("ophi", sc(f"{E}st_ophi"))
+        embed("ea_lo", sc(f"{E}st_ea & 0xFF"))
+        embed("ea_hi", sc(f"({E}st_ea >> 8) & 0xFF"))
+        embed("data", sc(f"{E}st_data"))
+        embed("halted", sc(f"{E}st_halted ? 1 : 0"))
+        if "nmi" in ins:
+            embed("nmi", sc(f"{E}nmi_pending ? 1 : 0"))
+            emit(f"        {E}nmi_pending = false;")
+        if "irq" in ins:
+            emit(f"        const bool take_irq = {E}irq_ready();")
+            embed("irq", sc("take_irq ? 1 : 0"))
+            emit(f"        if (take_irq) {E}irq_pending = false;")
         emit(f"        ++{E}seq;")
         for li in range(len(mdl.attn)):
             emit(f"        layer_{li}{layer_suffix}("

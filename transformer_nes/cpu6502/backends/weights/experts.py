@@ -77,10 +77,13 @@ def head_row(model, row: int) -> tuple[list[int], list[float]]:
 def step_spec_base(slot) -> dict:
     """The input/p_flag half of a generated step spec; ``slot`` maps a graph
     dimension name to its residual slot."""
-    spec = {
-        "inputs": {key: slot(name) for key, name in INPUT_SLOT_NAMES.items()},
-        "p_flags": [(slot(name), mask) for name, mask in P_FLAG_NAMES],
-    }
+    spec = {"inputs": {}, "p_flags": []}
+    for key, name in INPUT_SLOT_NAMES.items():
+        with contextlib.suppress(KeyError):
+            spec["inputs"][key] = slot(name)
+    for name, mask in P_FLAG_NAMES:
+        with contextlib.suppress(KeyError):
+            spec["p_flags"].append((slot(name), mask))
     for key, name in OPTIONAL_INPUT_SLOT_NAMES.items():
         with contextlib.suppress(KeyError):
             spec["inputs"][key] = slot(name)
@@ -219,7 +222,7 @@ def project_sequence_execution(fold_result, n_steps: int) -> dict:
         readout = readout + 1e-6 * fold_result.dim_of_name[name]
     outputs = {"READOUT": readout}
     fold_result.program_graph = project_program_graph(
-        fold_result.program_graph, outputs
+        fold_result.program_graph, outputs, retain_input_tokens=False,
     )
     fold_result.dim_of_name = {}
     for dim in fold_result.program_graph.all_dims:

@@ -262,14 +262,14 @@ def masked_exact_read(addr, byte_value, write_addr, is_write, *,
     critical path.
 
     ``structural`` targets backends that serve the fused read exactly
-    (the Metal kernel: value at addr when written and in range, else 0).
+    (value at addr when written and in range, else 0).
     The mask is redundant there, and the key side exists only for token
-    attention, so the lookup carries empty key rows -- nothing schedules
-    after the key-square coordinate and the value lands with the lookup."""
+    attention, so the lookup carries empty key and value rows. The external
+    memory primitive supplies its outputs directly."""
     if structural:
-        # bit_values (wide_bits WRITE-token bit dims, MSB first) ride as
-        # extra value outputs: the kernel serves them from the read byte.
-        lu = LookUp([byte_value, write_addr, *bit_values], to_2d_query(addr),
+        # wide_bits outputs are likewise supplied from the served byte.
+        served = [Expression() for _ in range(2 + len(bit_values))]
+        lu = LookUp(served, to_2d_query(addr),
                     [Expression(), Expression()], tie_break="latest")
         lu.memory_group = graph.MEMORY_GROUP_FUSED
         return Expression({lu.dims[0]: 1})

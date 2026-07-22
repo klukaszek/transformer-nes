@@ -435,7 +435,9 @@ class ProgramGraph:
         self.one = one
 
 
-def project_program_graph(program_graph: ProgramGraph, output_tokens) -> ProgramGraph:
+def project_program_graph(
+    program_graph: ProgramGraph, output_tokens, *, retain_input_tokens: bool = True,
+) -> ProgramGraph:
     """Return the dependency closure of a new output-token set.
 
     Folding deliberately constructs a proof graph with more named readouts
@@ -455,8 +457,9 @@ def project_program_graph(program_graph: ProgramGraph, output_tokens) -> Program
             for item in value:
                 seed(item)
 
-    for value in program_graph.input_tokens.values():
-        seed(value)
+    if retain_input_tokens:
+        for value in program_graph.input_tokens.values():
+            seed(value)
     for value in output_tokens.values():
         seed(value)
 
@@ -483,7 +486,8 @@ def project_program_graph(program_graph: ProgramGraph, output_tokens) -> Program
             ):
                 pending.extend(expr.terms)
 
-    projected = ProgramGraph(program_graph.input_tokens, output_tokens)
+    input_tokens = program_graph.input_tokens if retain_input_tokens else {}
+    projected = ProgramGraph(input_tokens, output_tokens)
     projected.all_dims = [d for d in program_graph.all_dims if d in live_dims]
     projected.all_lookups = [
         lu for lu in program_graph.all_lookups if lu in live_lookups
