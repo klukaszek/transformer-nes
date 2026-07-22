@@ -796,7 +796,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                          structural_reads=structural_reads)
 
     def fold_candidate(inline):
-        return folder.fold_sequence(
+        return folder.fold_execution_sequence(
             pin_list, SEQUENCE_FEEDBACK, label=f"seq_{head:04X}",
             inline_linear=inline, bit_feedback_until=last_a_bit_step(ops),
         )
@@ -1207,7 +1207,7 @@ def build_shape_experts(pg, shapes, *,
             inline, pin_list=pin_list, name=name, pc_offsets=pc_offsets,
             ops=ops, repeat=repeat,
         ):
-            return folder.fold_sequence(
+            return folder.fold_execution_sequence(
                 pin_list, SEQUENCE_FEEDBACK, label=f"shape_{name}",
                 pc_offsets=pc_offsets, inline_linear=inline,
                 bit_feedback_until=last_a_bit_step(ops * repeat),

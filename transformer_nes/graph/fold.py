@@ -94,7 +94,10 @@ def graph_delta(start_d: int, start_l: int, start_m: int) -> tuple[int, int, int
     return nr, np_, nl, nt
 
 
-def walk_live(seeds, val, folded, lookup_exprs, is_leaf, bit_leaf=None) -> set:
+def walk_live(
+    seeds, val, folded, lookup_exprs, is_leaf, bit_leaf=None,
+    structural_reads: bool = False,
+) -> set:
     """Backward liveness over folded union dims.  A memory-read persist
     walks only its raw ingredients (its group fabric dies); a live lookup
     produces all of its value dims.  ``bit_leaf(d)`` returns the read-site
@@ -115,7 +118,12 @@ def walk_live(seeds, val, folded, lookup_exprs, is_leaf, bit_leaf=None) -> set:
             site = getattr(d, "memory_read", None)
             served_site = bit_leaf(d) if bit_leaf is not None else None
             if site is not None:
-                for key in ("address", "byte_value", "write_addr", "is_write"):
+                keys = (
+                    ("address",)
+                    if structural_reads
+                    else ("address", "byte_value", "write_addr", "is_write")
+                )
+                for key in keys:
                     deps |= set(subst(site[key], val).terms)
             elif served_site is not None:
                 deps = {served_site}
@@ -193,12 +201,17 @@ class GraphMaterializer:
                         j for j, bit in enumerate(getattr(d, "read_bit_dims", ()))
                         if self.structural_reads and bit in live
                     )
-                    expr = masked_exact_read(
-                        tr(site["address"]), tr(site["byte_value"]),
-                        tr(site["write_addr"]), tr(site["is_write"]),
-                        structural=self.structural_reads,
-                        bit_indices=wanted_bits,
-                    )
+                    if self.structural_reads:
+                        expr = masked_exact_read(
+                            tr(site["address"]), Expression(), Expression(),
+                            Expression(), structural=True,
+                            bit_indices=wanted_bits,
+                        )
+                    else:
+                        expr = masked_exact_read(
+                            tr(site["address"]), tr(site["byte_value"]),
+                            tr(site["write_addr"]), tr(site["is_write"]),
+                        )
                     if wanted_bits:
                         read = next(iter(expr.terms)).memory_read
                         fused_reads[d] = (
@@ -259,6 +272,14 @@ class GraphMaterializer:
                 self.n_lookups += 1
                 for e in nlu.query_exprs_2d + nlu.key_exprs_2d + nlu.value_exprs:
                     self.n_terms += len(e.terms)
+
+
+EXECUTION_INTERIOR_ROOTS = frozenset({
+    "ea", "next_pc", "new_halted",
+    "is_store", "write_addr_out", "write_value_out",
+    "is_store2", "write_addr2_out", "write_value2_out",
+    "is_store3", "write_addr3_out", "write_value3_out",
+})
 
 
 def masked_exact_read(addr, byte_value, write_addr, is_write, *,
@@ -357,18 +378,60 @@ class GraphFolder:
             if name not in self.by_name:
                 raise KeyError(f"root dim {name!r} not in the graph")
         self.hazard_cache: dict[frozenset[str], set] = {}
+        self.dependency_cache: dict[frozenset[Dimension], frozenset[Dimension]] = {}
+
+    def dependency_closure(self, seeds) -> frozenset[Dimension]:
+        key = frozenset(seeds)
+        if key in self.dependency_cache:
+            return self.dependency_cache[key]
+        live = set(key)
+        pending = list(key)
+        while pending:
+            dim = pending.pop()
+            deps = set()
+            if isinstance(dim, PersistDimension):
+                site = getattr(dim, "memory_read", None)
+                read_bit = getattr(dim, "read_bit", None)
+                if site is not None and self.structural_reads:
+                    deps.update(site["address"].terms)
+                elif read_bit is not None and self.structural_reads:
+                    deps.add(read_bit[0])
+                else:
+                    deps.update(dim.expr.terms)
+            elif isinstance(dim, ReGLUDimension):
+                deps.update(dim.a_expr.terms)
+                deps.update(dim.b_expr.terms)
+            elif isinstance(dim, LookUpDimension):
+                lookup = dim.lookup
+                deps.update(lookup.dims)
+                for expr in (
+                    lookup.query_exprs_2d
+                    + lookup.key_exprs_2d
+                    + lookup.value_exprs
+                ):
+                    deps.update(expr.terms)
+            for dep in deps:
+                if dep not in live:
+                    live.add(dep)
+                    pending.append(dep)
+        result = frozenset(live)
+        self.dependency_cache[key] = result
+        return result
 
     # ── Partial evaluation ───────────────────────────────────────────
 
     def partial_eval(self, pins: dict[str, float], frozen: frozenset = frozenset(),
                      *, inline_linear: bool = False,
                      preserve: frozenset = frozenset(),
-                     resolve_site=None, inline_budget: int | None = None):
+                     resolve_site=None, inline_budget: int | None = None,
+                     required: frozenset[Dimension] | None = None):
         pg = self.pg
         one = pg.one
         val: dict = {one: Expression({one: 1.0})}
         folded: dict = {}
         for d in pg.all_dims:
+            if required is not None and d not in required:
+                continue
             if isinstance(d, PersistDimension) and d.name in frozen:
                 # Opaque leaf: bound to another step's output at
                 # materialization (fold_sequence), never folded through.
@@ -442,6 +505,8 @@ class GraphFolder:
                     folded[d] = (e,)
         lookup_exprs: dict = {}
         for lu in pg.all_lookups:
+            if required is not None and not any(d in required for d in lu.dims):
+                continue
             lookup_exprs[lu] = {
                 "query": [subst(e, val) for e in lu.query_exprs_2d],
                 "key": [subst(e, val) for e in lu.key_exprs_2d],
@@ -531,6 +596,7 @@ class GraphFolder:
             seeds, val, folded, lookup_exprs,
             lambda d: isinstance(d, InputDimension),
             bit_leaf=bit_leaf,
+            structural_reads=self.structural_reads,
         )
 
         # ── Materialize the new graph ─────────────────────────────────
@@ -609,7 +675,8 @@ class GraphFolder:
                       forward_stores: bool = False,
                       read_bounds=None,
                       inline_budget: int | None = None,
-                      bit_feedback_until: int | None = None) -> FoldResult:
+                      bit_feedback_until: int | None = None,
+                      _execution: bool = False) -> FoldResult:
         """Fold a K-step composition of the union graph into ONE graph.
 
         pin_list[k] pins step k (the router supplies them: pc, instruction
@@ -698,6 +765,21 @@ class GraphFolder:
         pc_exprs = None  # step-0 (head) pc byte expressions, new-graph space
 
         for k in range(n_steps):
+            step_root_dims = (
+                root_dims
+                if not _execution or k + 1 == n_steps
+                else [
+                    self.by_name[name] for name in self.root_names
+                    if name in EXECUTION_INTERIOR_ROOTS
+                ]
+            )
+            seed_bits = bit_feedback_until is None or k < bit_feedback_until
+            fb_dims = [
+                self.by_name[o[0] if isinstance(o, tuple) else o]
+                for o in feedback.values()
+                if not isinstance(o, (int, float))
+                and (seed_bits or o not in bit_outs)
+            ] if k + 1 < n_steps else []
             pins = dict(pin_list[k])
             frozen: set[str] = set()
             unbound: set[str] = set()
@@ -758,6 +840,10 @@ class GraphFolder:
                 ) if pc_offsets is not None and k == 0 else frozenset(),
                 resolve_site=resolve_site if forward_stores else None,
                 inline_budget=inline_budget,
+                required=(
+                    self.dependency_closure(step_root_dims + fb_dims)
+                    if _execution else None
+                ),
             )
             insert_side_hazards |= {
                 lu.name or f"lookup_{lu.id}"
@@ -766,15 +852,8 @@ class GraphFolder:
 
             # Liveness seeds: this step's roots, the outputs the next step
             # feeds on, and (final step) the graph's output tokens.
-            seed_bits = bit_feedback_until is None or k < bit_feedback_until
-            fb_dims = [
-                self.by_name[o[0] if isinstance(o, tuple) else o]
-                for o in feedback.values()
-                if not isinstance(o, (int, float))
-                and (seed_bits or o not in bit_outs)
-            ] if k + 1 < n_steps else []
             fout = {}
-            if k + 1 == n_steps:
+            if k + 1 == n_steps and not _execution:
                 val_out = {d: v for d, v in val.items() if d not in set(root_dims)}
                 fout = {
                     name: subst(expr, val_out)
@@ -784,7 +863,7 @@ class GraphFolder:
             seeds: set = set()
             for e in fout.values():
                 seeds |= set(e.terms)
-            for d in root_dims + fb_dims:
+            for d in step_root_dims + fb_dims:
                 seeds |= set(val[d].terms) if d in val else {d}
 
             def is_leaf(d, *, frozen=frozen):
@@ -800,7 +879,8 @@ class GraphFolder:
                 return None if rb[0] in fwd_expr_of else rb[0]
 
             live = walk_live(seeds, val, folded, lookup_exprs, is_leaf,
-                             bit_leaf=bit_leaf)
+                             bit_leaf=bit_leaf,
+                             structural_reads=self.structural_reads)
 
             # Materialize this step (fresh sub: the same union dim holds a
             # different value per step); frozen persists resolve to the
@@ -875,7 +955,7 @@ class GraphFolder:
 
             # Roots: every step's readout set, suffixed; folded-away roots
             # come back as named persists (same contract as fold()).
-            for d in root_dims:
+            for d in step_root_dims:
                 if d in val:
                     nd = PersistDimension(tr(val[d]), name=sname(d.name))
                     sub[d] = Expression({nd: 1})
@@ -947,10 +1027,13 @@ class GraphFolder:
                     name: tr(expr) if isinstance(expr, Expression) else expr
                     for name, expr in pg.input_tokens.items()
                 }
-                new_outputs = {
-                    name: tr(fout[name]) if name in fout else expr
-                    for name, expr in pg.output_tokens.items()
-                }
+                new_outputs = (
+                    {
+                        name: tr(fout[name]) if name in fout else expr
+                        for name, expr in pg.output_tokens.items()
+                    }
+                    if not _execution else {}
+                )
 
         assert new_inputs is not None and new_outputs is not None
         prev = new_outputs.get(keep_alive_token)
@@ -977,6 +1060,11 @@ class GraphFolder:
             folded_roots=tuple(folded_roots),
             n_steps=n_steps,
             read_log=tuple(read_log),
+        )
+
+    def fold_execution_sequence(self, pin_list, feedback, **kwargs) -> FoldResult:
+        return self.fold_sequence(
+            pin_list, feedback, _execution=True, **kwargs,
         )
 
 

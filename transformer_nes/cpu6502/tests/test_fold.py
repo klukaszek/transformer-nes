@@ -35,6 +35,7 @@ from transformer_nes.cpu6502.backends.weights.experts import (
     project_sequence_execution,
     schedule_and_build,
     semantic_recurrence,
+    sparse_forward_work,
 )
 from transformer_nes.cpu6502.backends.weights.runner import VERIFY_START, verify_program
 from transformer_nes.cpu6502.interpreter import build
@@ -600,6 +601,44 @@ def test_external_memory_read_exposes_only_consumed_bits():
     assert [read.output_kinds for read in execution.memory_reads] == [
         ("value", "address", "bit7"),
     ]
+
+
+def test_execution_proof_materializes_only_license_facts(folder):
+    code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
+    pins = sequence_pins(POLL_HEAD, code, OPCODES)
+    ops = decode_ops(code)
+    structural = GraphFolder(
+        folder.pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
+    )
+    full = structural.fold_sequence(
+        pins, SEQUENCE_FEEDBACK, label="full_proof", inline_linear=True,
+        bit_feedback_until=last_a_bit_step(ops),
+    )
+    facts = structural.fold_execution_sequence(
+        pins, SEQUENCE_FEEDBACK, label="proof_facts", inline_linear=True,
+        bit_feedback_until=last_a_bit_step(ops),
+    )
+    for k in range(len(pins) - 1):
+        assert f"next_pc__s{k}" in facts.dim_of_name
+        assert f"new_halted__s{k}" in facts.dim_of_name
+        assert f"fetched_opcode__s{k}" not in facts.dim_of_name
+        assert f"data_out__s{k}" not in facts.dim_of_name
+    assert len(facts.program_graph.all_dims) < len(full.program_graph.all_dims)
+
+    full_execution = project_sequence_execution(
+        full, len(pins), pinned_sequence_control(full, pins, ops),
+    )
+    fact_execution = project_sequence_execution(
+        facts, len(pins), pinned_sequence_control(facts, pins, ops),
+    )
+    full_model, _t1, _r1, full_info = schedule_and_build(full_execution)
+    fact_model, _t2, _r2, fact_info = schedule_and_build(fact_execution)
+    assert (fact_info.n_layers, fact_info.d_model) == (
+        full_info.n_layers, full_info.d_model,
+    )
+    assert sparse_forward_work(fact_model, fact_info.n_layers) == (
+        sparse_forward_work(full_model, full_info.n_layers)
+    )
 
 
 @pytest.mark.parametrize("byte", SHADOW_OPCODES)

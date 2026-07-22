@@ -233,6 +233,18 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    0.0073 s with identical final state (~172×); traced execution continues
    through the per-instruction model.
 
+21. **Build proof facts on the dependency closure, not the union graph.**
+   Interior sequence steps materialize only feedback plus the facts consumed
+   by licenses: control, halt, effective address and ordered writes.  The
+   final step alone materializes the architectural ABI, and structural
+   `MemoryRead` depends only on its address rather than fictional token-side
+   values.  Partial evaluation walks the static ancestor closure of those
+   roots; the full receipt remains available for trace rollback.  A 24-step
+   proof fell from 796 → 543 dimensions and 1,472 → 1,104 graph terms, with
+   construction time 0.547 → 0.264 s.  The 15-shape library built in
+   1.674 → 0.820 s while emitting the identical 59 layers / 4,013 sparse
+   terms.
+
 ## Dead ends (kept so they stay dead)
 
 - GPU per-matrix sparse matvec for a single stream: one dispatch costs a
