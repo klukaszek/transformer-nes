@@ -45,6 +45,18 @@ class ControlFlow:
 
 
 @dataclass(frozen=True)
+class RecurrenceSummary:
+    kind: Literal["identity", "affine_until"]
+    steps_per_iteration: int
+    cycles_per_iteration: int
+    register: Literal["x", "y"] | None = None
+    delta: int = 0
+    fallthrough_offset: int = 0
+    closure_operand_offset: int | None = None
+    closure_operand_value: int | None = None
+
+
+@dataclass(frozen=True)
 class ExecutionGraph:
     program_graph: ProgramGraph
     n_steps: int
@@ -53,6 +65,7 @@ class ExecutionGraph:
     memory_writes: tuple[MemoryWrite, ...]
     outputs: tuple[ArchitecturalOutput, ...]
     control: ControlFlow
+    recurrence: RecurrenceSummary | None
     dim_of_name: dict[str, Dimension]
 
     def output(self, name: str) -> ArchitecturalOutput:

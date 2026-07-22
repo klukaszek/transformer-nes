@@ -689,6 +689,70 @@ PYBIND_STEP_METHODS = """\
 SEQ_MAX_K = 32
 
 
+def emit_recurrence_dispatch(emit, exp, E: str, step_call: str, indent: str) -> None:
+    recurrence = exp.get("recurrence")
+    if recurrence is None:
+        return
+    cycles = recurrence.cycles_per_iteration
+    if recurrence.kind == "identity":
+        emit(f"{indent}long recurrence_n = max_steps - i;")
+        emit(f"{indent}if (max_cycles > 0) {{")
+        emit(f"{indent}    const long room = max_cycles - cycles_this;")
+        emit(f"{indent}    const long cap = room > 0 ? (room + {cycles - 1}) / {cycles} : 0;")
+        emit(f"{indent}    if (recurrence_n > cap) recurrence_n = cap;")
+        emit(f"{indent}}}")
+        emit(f"{indent}const int recurrence_head = {E}st_pc;")
+        emit(f"{indent}{E}st_ir = {E}ram[recurrence_head];")
+        emit(f"{indent}{E}st_oplo = {E}ram[(recurrence_head + 1) & 0xFFFF];")
+        emit(f"{indent}{E}st_ophi = {E}ram[(recurrence_head + 2) & 0xFFFF];")
+        emit(f"{indent}{E}st_ea = {E}st_oplo | ({E}st_ophi << 8);")
+        emit(f"{indent}{E}st_data = 0; {E}st_p |= 0x20;")
+        emit(f"{indent}{E}st_pc = {E}st_ea;")
+        emit(f"{indent}{E}seq_cycles = recurrence_n * {cycles};")
+        emit(f"{indent}return (int)recurrence_n;")
+        return
+    if recurrence.kind != "affine_until":
+        raise RuntimeError(f"unknown recurrence kind {recurrence.kind!r}")
+    register = f"{E}st_{recurrence.register}"
+    closure = (
+        f"{E}ram[({E}st_pc + {recurrence.closure_operand_offset}) & 0xFFFF] "
+        f"== 0x{recurrence.closure_operand_value:02X}"
+    )
+    steps = recurrence.steps_per_iteration
+    delta = recurrence.delta
+    emit(f"{indent}if ({closure}) {{")
+    emit(f"{indent}    const int recurrence_head = {E}st_pc;")
+    emit(f"{indent}    const int recurrence_initial = {register};")
+    if delta < 0:
+        emit(f"{indent}    const long recurrence_terminal = "
+             "recurrence_initial ? recurrence_initial : 256;")
+    else:
+        emit(f"{indent}    const long recurrence_terminal = "
+             "recurrence_initial ? 256 - recurrence_initial : 256;")
+    emit(f"{indent}    long recurrence_n = recurrence_terminal;")
+    emit(f"{indent}    const long step_cap = (max_steps - i) / {steps};")
+    emit(f"{indent}    if (recurrence_n > step_cap) recurrence_n = step_cap;")
+    emit(f"{indent}    if (max_cycles > 0) {{")
+    emit(f"{indent}        const long room = max_cycles - cycles_this;")
+    emit(f"{indent}        const long cycle_cap = "
+         f"room > 0 ? (room + {cycles - 1}) / {cycles} : 0;")
+    emit(f"{indent}        if (recurrence_n > cycle_cap) recurrence_n = cycle_cap;")
+    emit(f"{indent}    }}")
+    emit(f"{indent}    {step_call}")
+    emit(f"{indent}    if (recurrence_n > 1) {{")
+    emit(f"{indent}        {register} = "
+         f"(recurrence_initial + {delta} * recurrence_n) & 0xFF;")
+    emit(f"{indent}        {E}st_p = ({E}st_p & ~0x82) | 0x20"
+         f" | ({register} == 0 ? 0x02 : 0) | ({register} & 0x80);")
+    emit(f"{indent}        {E}st_pc = recurrence_n == recurrence_terminal"
+         f" ? (recurrence_head + {recurrence.fallthrough_offset}) & 0xFFFF"
+         " : recurrence_head;")
+    emit(f"{indent}    }}")
+    emit(f"{indent}    {E}seq_cycles = recurrence_n * {cycles};")
+    emit(f"{indent}    return (int)(recurrence_n * {steps});")
+    emit(f"{indent}}}")
+
+
 def assemble_seq_module(lines, body, experts, core_digest, elem,
                          n_seen, emit_step_core) -> tuple[str, int, bool]:
     """Assemble the per-ROM sequence-module TU from the emitted expert
@@ -750,6 +814,8 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
         for exp in by_head[head]:
             window = exp["window"]
             k, prefix = exp["n_steps"], exp["cycles_prefix"]
+            if exp.get("recurrence") is not None and exp["recurrence"].kind == "identity":
+                k, prefix = 1, 0
             match = " && ".join(
                 f"E.ram[0x{(head + j) & 0xFFFF:04X}] == 0x{b:02X}"
                 for j, b in enumerate(window)
@@ -761,6 +827,11 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
             emit(f"            if (i + {k} <= max_steps")
             emit(f"                && (max_cycles <= 0 || cycles_this + {prefix} < max_cycles)")
             emit(f"                && {match}) {{")
+            emit_recurrence_dispatch(
+                emit, exp, "E.",
+                f"step_core__{exp['name']}(E, E.seq_out);",
+                "                ",
+            )
             emit(f"                step_core__{exp['name']}(E, E.seq_out);")
             emit(f"                E.seq_cycles = {exp['cycles']};")
             emit(f"                return {k};")
@@ -1653,11 +1724,19 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     # dispatch while any write watch reaches below it.
                     checks = f"watch_write_lo >= 0x2000 && {checks}"
                 emit(f"        case {j + 1}:  // {exp['name']}")
-                emit(f"            if (i + {exp['n_steps']} <= max_steps")
+                guard_steps, guard_prefix = exp["n_steps"], exp["cycles_prefix"]
+                if exp.get("recurrence") is not None and exp["recurrence"].kind == "identity":
+                    guard_steps, guard_prefix = 1, 0
+                emit(f"            if (i + {guard_steps} <= max_steps")
                 emit(f"                && (max_cycles <= 0 || cycles_this + "
-                     f"{exp['cycles_prefix']} < max_cycles)")
+                     f"{guard_prefix} < max_cycles)")
                 emit(f"                && {checks}) {{")
                 emit("                ++fallback_count[st_pc];")
+                emit_recurrence_dispatch(
+                    emit, exp, "",
+                    f"step_core__{exp['name']}(seq_out);",
+                    "                ",
+                )
                 emit(f"                step_core__{exp['name']}(seq_out);")
                 emit(f"                seq_cycles = {exp['cycles']};")
                 emit(f"                return {exp['n_steps']};")

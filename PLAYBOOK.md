@@ -222,6 +222,17 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
    from 1,574 → 825 layers and 140,764 → 126,706 sparse terms; shapes fell
    from 91 → 59 layers and 5,657 → 4,013 terms.
 
+20. **Summarize recurrences from ISA semantics, with the ordinary execution
+   graph as fallback.**  Identity/self-JMP regions retire with no transformer
+   forward.  DEX/DEY/INX/INY followed by BNE use an affine byte recurrence
+   and terminal zero predicate; the router applies it only when the live
+   signed branch operand closes to the region head.  Odd step/cycle budgets
+   cap the exact iteration count, and one ordinary forward supplies trace
+   context before any affine bulk retirement.  On a sustained reset +
+   DEX/BNE loop, 50 million untraced instructions fell from 1.256 s to
+   0.0073 s with identical final state (~172×); traced execution continues
+   through the per-instruction model.
+
 ## Dead ends (kept so they stay dead)
 
 - GPU per-matrix sparse matvec for a single stream: one dispatch costs a

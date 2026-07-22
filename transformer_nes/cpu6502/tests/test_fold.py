@@ -34,6 +34,7 @@ from transformer_nes.cpu6502.backends.weights.experts import (
     pinned_sequence_control,
     project_sequence_execution,
     schedule_and_build,
+    semantic_recurrence,
 )
 from transformer_nes.cpu6502.backends.weights.runner import VERIFY_START, verify_program
 from transformer_nes.cpu6502.interpreter import build
@@ -832,6 +833,27 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
         "relative_operand_offset": 2,
     }
     assert spec["sequence_control"]["predicate"] is not None
+    recurrence = experts[0]["recurrence"]
+    assert (
+        recurrence.kind, recurrence.register, recurrence.delta,
+        recurrence.closure_operand_offset, recurrence.closure_operand_value,
+    ) == ("affine_until", "x", -1, 2, 0xFD)
+
+
+@pytest.mark.parametrize(
+    ("code", "register", "delta"),
+    (("cad0fd", "x", -1), ("e8d0fd", "x", 1),
+     ("88d0fd", "y", -1), ("c8d0fd", "y", 1)),
+)
+def test_affine_recurrences_are_isa_semantic(code, register, delta):
+    ops = decode_ops(bytes.fromhex(code))
+    recurrence = semantic_recurrence(ops, [0, 1])
+
+    assert recurrence.kind == "affine_until"
+    assert (recurrence.register, recurrence.delta) == (register, delta)
+    assert recurrence.steps_per_iteration == 2
+    assert recurrence.cycles_per_iteration == 4
+    assert recurrence.fallthrough_offset == 3
 
 
 def test_shape_interior_branch_requires_explicit_speculation(union_pg):

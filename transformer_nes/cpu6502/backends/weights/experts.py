@@ -36,6 +36,7 @@ from transformer_nes.graph.execution import (
     ControlFlow,
     ExecutionGraph,
     MemoryWrite,
+    RecurrenceSummary,
     StateField,
 )
 from transformer_nes.graph.fold import (
@@ -197,6 +198,7 @@ def classify_sequence_state(fold_result, final_names) -> dict:
 
 def project_sequence_execution(
     fold_result, n_steps: int, control: ControlFlow,
+    recurrence: RecurrenceSummary | None = None,
 ) -> ExecutionGraph:
     """Replace the proof graph's per-step trace ABI with its execution ABI.
 
@@ -261,6 +263,7 @@ def project_sequence_execution(
         memory_writes=tuple(writes),
         outputs=tuple(outputs),
         control=control,
+        recurrence=recurrence,
         dim_of_name=dim_of_name,
     )
 
@@ -443,6 +446,38 @@ def shape_sequence_control(
         predicate=None, fallthrough=length, target=length,
         relative_to_head=True,
     )
+
+
+def semantic_recurrence(
+    ops, offsets, *, self_target: bool = False,
+) -> RecurrenceSummary | None:
+    if self_target:
+        return RecurrenceSummary(
+            kind="identity", steps_per_iteration=1,
+            cycles_per_iteration=ops[0].cycles,
+        )
+    affine = {
+        "dex": ("x", -1), "inx": ("x", 1),
+        "dey": ("y", -1), "iny": ("y", 1),
+    }
+    if (
+        len(ops) == 2
+        and ops[0].operation in affine
+        and ops[1].operation == "bne"
+    ):
+        register, delta = affine[ops[0].operation]
+        length = sum(op.length for op in ops)
+        return RecurrenceSummary(
+            kind="affine_until",
+            steps_per_iteration=2,
+            cycles_per_iteration=sum(op.cycles for op in ops),
+            register=register,
+            delta=delta,
+            fallthrough_offset=length,
+            closure_operand_offset=offsets[1] + 1,
+            closure_operand_value=(-length) & 0xFF,
+        )
+    return None
 
 
 def check_reads_licensed(fold_result, ops, label: str) -> None:
@@ -741,7 +776,11 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
     label = f"sequence @{head:04X}"
     pin_list = sequence_pins(head, code, OPCODES) * repeat
     n_steps = len(pin_list)
-    ops = decode_ops(code) * repeat
+    base_ops = decode_ops(code)
+    ops = base_ops * repeat
+    base_offsets = [0]
+    for op in base_ops[:-1]:
+        base_offsets.append(base_offsets[-1] + op.length)
     assume_taken_steps = tuple(sorted(set(int(k) for k in assume_taken_steps)))
     for k in assume_taken_steps:
         if k < 0 or k >= n_steps:
@@ -782,8 +821,26 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                 "(next_pc != the next step's pc)"
             )
 
+    def execution_control(candidate):
+        control = pinned_sequence_control(candidate, pin_list, ops)
+        self_target = (
+            len(base_ops) == 1
+            and base_ops[0].operation == "jmp"
+            and base_ops[0].mode == "abs"
+            and control.target == head
+        )
+        recurrence = semantic_recurrence(
+            base_ops, base_offsets, self_target=self_target,
+        )
+        if recurrence is not None and recurrence.kind == "affine_until" and (
+            control.predicate is None or control.target != head
+        ):
+            recurrence = None
+        return control, recurrence
+
+    control, recurrence = execution_control(r)
     execution = project_sequence_execution(
-        r, n_steps, pinned_sequence_control(r, pin_list, ops),
+        r, n_steps, control, recurrence,
     )
     materialized = schedule_and_build(execution)
     if inline_linear is None:
@@ -793,9 +850,9 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
                 f"{label}: pins reach insert-side expressions "
                 f"of {inlined_r.insert_side_hazards}"
             )
+        inlined_control, inlined_recurrence = execution_control(inlined_r)
         inlined_execution = project_sequence_execution(
-            inlined_r, n_steps,
-            pinned_sequence_control(inlined_r, pin_list, ops),
+            inlined_r, n_steps, inlined_control, inlined_recurrence,
         )
         inlined = schedule_and_build(inlined_execution)
         if prefer_inlined(
@@ -814,6 +871,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
         "cycles_prefix": cycles - ops[-1].cycles, "model": model,
         "step_spec": sequence_step_spec(execution, info),
         "union_lookup_of": r.union_lookup_of,
+        "recurrence": execution.recurrence,
         "assume_taken_steps": assume_taken_steps,
         "layers": info.n_layers, "_d": info.d_model,
     }
@@ -1224,11 +1282,13 @@ def build_shape_experts(pg, shapes, *,
                         "head + offset for every head"
                     )
 
+        recurrence = semantic_recurrence(ops, offs, self_target=self_target)
         execution = project_sequence_execution(
             r, n_steps,
             shape_sequence_control(
                 r, n_steps, ops, offs, len(template), self_target,
             ),
+            recurrence,
         )
         materialized = schedule_and_build(execution)
         if inline_linear is None:
@@ -1243,6 +1303,7 @@ def build_shape_experts(pg, shapes, *,
                 shape_sequence_control(
                     inlined_r, n_steps, ops, offs, len(template), self_target,
                 ),
+                recurrence,
             )
             inlined = schedule_and_build(inlined_execution)
             if prefer_inlined(
@@ -1263,6 +1324,7 @@ def build_shape_experts(pg, shapes, *,
             "cycles": cycles,
             "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
             "step_spec": sequence_step_spec(execution, info),
+            "recurrence": execution.recurrence,
             "union_lookup_of": r.union_lookup_of,
             "layers": info.n_layers, "_d": info.d_model,
         })
