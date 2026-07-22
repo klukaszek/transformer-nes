@@ -225,13 +225,15 @@ state fields, one `MemoryRead`, zero token `LookUp`s and none of
 20. **Summarize recurrences from ISA semantics, with the ordinary execution
    graph as fallback.**  Identity/self-JMP regions retire with no transformer
    forward.  DEX/DEY/INX/INY followed by BNE use an affine byte recurrence
-   and terminal zero predicate; the router applies it only when the live
-   signed branch operand closes to the region head.  Odd step/cycle budgets
-   cap the exact iteration count, and one ordinary forward supplies trace
-   context before any affine bulk retirement.  On a sustained reset +
-   DEX/BNE loop, 50 million untraced instructions fell from 1.256 s to
-   0.0073 s with identical final state (~172×); traced execution continues
-   through the per-instruction model.
+   and terminal zero predicate.  LDA/BIT, optional AND, and a closing branch
+   form an invariant polling recurrence after one ordinary forward; finite
+   read-lease queues explicitly disable bulk retirement.  Every family is
+   applied only when the live signed branch operand closes to the region
+   head.  Step/cycle caps price the prefix before the final instruction, so
+   partial regions fall back instruction-by-instruction; traced execution
+   always does.  Fifty million untraced instructions fell from 1.256 s to
+   0.0073 s on reset + DEX/BNE (~172×), and from 1.741 s to 19 µs on a stable
+   LDA/AND/BEQ poll (>90,000×), with identical final state.
 
 21. **Build proof facts on the dependency closure, not the union graph.**
    Interior sequence steps materialize only feedback plus the facts consumed

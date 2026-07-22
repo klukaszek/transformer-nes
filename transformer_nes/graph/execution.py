@@ -46,9 +46,10 @@ class ControlFlow:
 
 @dataclass(frozen=True)
 class RecurrenceSummary:
-    kind: Literal["identity", "affine_until"]
+    kind: Literal["identity", "affine_until", "invariant_poll"]
     steps_per_iteration: int
     cycles_per_iteration: int
+    cycles_prefix: int
     register: Literal["x", "y"] | None = None
     delta: int = 0
     fallthrough_offset: int = 0

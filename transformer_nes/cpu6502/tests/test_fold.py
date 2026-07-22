@@ -892,7 +892,20 @@ def test_affine_recurrences_are_isa_semantic(code, register, delta):
     assert (recurrence.register, recurrence.delta) == (register, delta)
     assert recurrence.steps_per_iteration == 2
     assert recurrence.cycles_per_iteration == 4
+    assert recurrence.cycles_prefix == 2
     assert recurrence.fallthrough_offset == 3
+
+
+def test_poll_recurrence_is_isa_semantic():
+    ops = decode_ops(bytes.fromhex("ad00072940f0f9"))
+    recurrence = semantic_recurrence(ops, [0, 3, 5])
+
+    assert recurrence.kind == "invariant_poll"
+    assert recurrence.steps_per_iteration == 3
+    assert recurrence.cycles_per_iteration == 8
+    assert recurrence.cycles_prefix == 6
+    assert recurrence.closure_operand_offset == 6
+    assert recurrence.closure_operand_value == 0xF9
 
 
 def test_shape_interior_branch_requires_explicit_speculation(union_pg):

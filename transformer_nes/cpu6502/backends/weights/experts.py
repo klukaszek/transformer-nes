@@ -454,7 +454,7 @@ def semantic_recurrence(
     if self_target:
         return RecurrenceSummary(
             kind="identity", steps_per_iteration=1,
-            cycles_per_iteration=ops[0].cycles,
+            cycles_per_iteration=ops[0].cycles, cycles_prefix=0,
         )
     affine = {
         "dex": ("x", -1), "inx": ("x", 1),
@@ -471,10 +471,32 @@ def semantic_recurrence(
             kind="affine_until",
             steps_per_iteration=2,
             cycles_per_iteration=sum(op.cycles for op in ops),
+            cycles_prefix=sum(op.cycles for op in ops[:-1]),
             register=register,
             delta=delta,
             fallthrough_offset=length,
             closure_operand_offset=offsets[1] + 1,
+            closure_operand_value=(-length) & 0xFF,
+        )
+    prefix = tuple(op.operation for op in ops[:-1])
+    poll_prefixes = {
+        ("load_a",), ("bit",), ("load_a", "and"),
+    }
+    if (
+        len(ops) >= 2
+        and prefix in poll_prefixes
+        and ops[-1].operation in BRANCH_OPERATIONS
+        and ops[0].operation in READS_MEMORY
+        and ops[0].mode not in ("imp", "acc", "imm")
+    ):
+        length = sum(op.length for op in ops)
+        return RecurrenceSummary(
+            kind="invariant_poll",
+            steps_per_iteration=len(ops),
+            cycles_per_iteration=sum(op.cycles for op in ops),
+            cycles_prefix=sum(op.cycles for op in ops[:-1]),
+            fallthrough_offset=length,
+            closure_operand_offset=offsets[-1] + 1,
             closure_operand_value=(-length) & 0xFF,
         )
     return None
@@ -832,7 +854,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int, *,
         recurrence = semantic_recurrence(
             base_ops, base_offsets, self_target=self_target,
         )
-        if recurrence is not None and recurrence.kind == "affine_until" and (
+        if recurrence is not None and recurrence.kind != "identity" and (
             control.predicate is None or control.target != head
         ):
             recurrence = None

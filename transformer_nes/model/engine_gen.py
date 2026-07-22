@@ -694,11 +694,13 @@ def emit_recurrence_dispatch(emit, exp, E: str, step_call: str, indent: str) -> 
     if recurrence is None:
         return
     cycles = recurrence.cycles_per_iteration
+    prefix = recurrence.cycles_prefix
     if recurrence.kind == "identity":
         emit(f"{indent}long recurrence_n = max_steps - i;")
         emit(f"{indent}if (max_cycles > 0) {{")
         emit(f"{indent}    const long room = max_cycles - cycles_this;")
-        emit(f"{indent}    const long cap = room > 0 ? (room + {cycles - 1}) / {cycles} : 0;")
+        emit(f"{indent}    const long cap = room > {prefix}"
+             f" ? (room - {prefix} - 1) / {cycles} + 1 : 0;")
         emit(f"{indent}    if (recurrence_n > cap) recurrence_n = cap;")
         emit(f"{indent}}}")
         emit(f"{indent}const int recurrence_head = {E}st_pc;")
@@ -711,13 +713,38 @@ def emit_recurrence_dispatch(emit, exp, E: str, step_call: str, indent: str) -> 
         emit(f"{indent}{E}seq_cycles = recurrence_n * {cycles};")
         emit(f"{indent}return (int)recurrence_n;")
         return
-    if recurrence.kind != "affine_until":
-        raise RuntimeError(f"unknown recurrence kind {recurrence.kind!r}")
-    register = f"{E}st_{recurrence.register}"
     closure = (
         f"{E}ram[({E}st_pc + {recurrence.closure_operand_offset}) & 0xFFFF] "
         f"== 0x{recurrence.closure_operand_value:02X}"
     )
+    if recurrence.kind == "invariant_poll":
+        steps = recurrence.steps_per_iteration
+        emit(f"{indent}if ({closure}) {{")
+        emit(f"{indent}    const int recurrence_head = {E}st_pc;")
+        emit(f"{indent}    {step_call}")
+        emit(f"{indent}    long recurrence_n = 1;")
+        emit(f"{indent}    const int recurrence_read = {E}shadow_read_target();")
+        emit(f"{indent}    const int recurrence_lease = "
+             f"{E}lease_slot(recurrence_read);")
+        emit(f"{indent}    const bool recurrence_stable = "
+             f"!{E}in_ranges({E}rwatch, recurrence_read)"
+             f" || recurrence_lease < 0 || {E}lease_n[recurrence_lease] == 0;")
+        emit(f"{indent}    if ({E}st_pc == recurrence_head && recurrence_stable) {{")
+        emit(f"{indent}        recurrence_n = (max_steps - i) / {steps};")
+        emit(f"{indent}        if (max_cycles > 0) {{")
+        emit(f"{indent}            const long room = max_cycles - cycles_this;")
+        emit(f"{indent}            const long cap = room > {prefix}"
+             f" ? (room - {prefix} - 1) / {cycles} + 1 : 0;")
+        emit(f"{indent}            if (recurrence_n > cap) recurrence_n = cap;")
+        emit(f"{indent}        }}")
+        emit(f"{indent}    }}")
+        emit(f"{indent}    {E}seq_cycles = recurrence_n * {cycles};")
+        emit(f"{indent}    return (int)(recurrence_n * {steps});")
+        emit(f"{indent}}}")
+        return
+    if recurrence.kind != "affine_until":
+        raise RuntimeError(f"unknown recurrence kind {recurrence.kind!r}")
+    register = f"{E}st_{recurrence.register}"
     steps = recurrence.steps_per_iteration
     delta = recurrence.delta
     emit(f"{indent}if ({closure}) {{")
@@ -734,8 +761,8 @@ def emit_recurrence_dispatch(emit, exp, E: str, step_call: str, indent: str) -> 
     emit(f"{indent}    if (recurrence_n > step_cap) recurrence_n = step_cap;")
     emit(f"{indent}    if (max_cycles > 0) {{")
     emit(f"{indent}        const long room = max_cycles - cycles_this;")
-    emit(f"{indent}        const long cycle_cap = "
-         f"room > 0 ? (room + {cycles - 1}) / {cycles} : 0;")
+    emit(f"{indent}        const long cycle_cap = room > {prefix}"
+         f" ? (room - {prefix} - 1) / {cycles} + 1 : 0;")
     emit(f"{indent}        if (recurrence_n > cycle_cap) recurrence_n = cycle_cap;")
     emit(f"{indent}    }}")
     emit(f"{indent}    {step_call}")
