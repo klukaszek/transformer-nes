@@ -1,7 +1,7 @@
 # Optimization playbook
 
 Levers that took the 6502 weights transformer from 0.13 instr/s to
-~406K instr/s (full Klaus incl. lockstep; SMB gameplay tape ~1,050 fps),
+~750K instr/s (full Klaus incl. lockstep; SMB gameplay tape ~1,700 fps),
 stated architecture-agnostically so they
 transfer to future targets (other CPUs, WASM, batched fleets).  Each
 entry: the lever, the receipt here, and what it needs to transfer.
@@ -20,8 +20,27 @@ leases) are unverifiable.
 **Measure before choosing.**  Three plans this project skipped because a
 measurement overturned them: per-expert artifact caching (the 25 s
 premise was stale), the width-objective MILP (the engine is nnz-bound,
-not width-bound), the poll-loop sequence expert as the 60 fps lever
-(the frame was pause-bound, not forward-bound).
+not width-bound), unconditional linear inlining (symbolic bytes can
+explode one row even when depth falls).
+
+## Current construction receipts
+
+Sparse terms below count the four emitted forward matrices (attention
+in/out and FFN in/out), not zeroes or the unused dense shape.
+
+| Model set | Previous construction | Current construction | Delta |
+| --- | --- | --- | --- |
+| 227 documented-opcode experts | 3,719 layers; max `d_model` 294; 265,934 sparse terms | 1,574 layers; max `d_model` 76; 140,764 sparse terms | −57.7% layers; −74.1% max width; −47.1% sparse work |
+| 15 workload-independent shape experts | 257 layers; max `d_model` 60; 17,463 sparse terms | 104 layers; max `d_model` 52; 6,178 sparse terms | −59.5% layers; −13.3% max width; −64.6% sparse work |
+
+The deterministic 24-instruction self-JMP is the clearest construction
+trace.  Its full proof receipt built as 38 layers / `d_model` 596 / 6,889
+sparse terms.  Projecting to one final execution receipt first made that
+38 / 50 / 2,616; structural serving plus guarded inlining made it
+1 / 44 / 188; classified state updates made it 0 / 32 / 0; deriving the
+live-in ABI finally made it 0 / 2 / 0.  The proof graph still exists long
+enough to license the optimization; none of it survives merely to explain
+an already-proven execution.
 
 ## The levers
 
@@ -96,17 +115,16 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
    unselected branches, and the substitute equals a state the arithmetic
    already handles for real.
 
-10. **Multi-instruction sequence experts** (~2x frame time here; the
-   trio runs at 0.07 µs/instr, 5.7x its per-instruction cost).  Fold a
-   K-step composition of the union graph under router pins (pc + every
-   window byte); state chains through a feedback map, and everything
-   the router verifies becomes a pin (lever 6 again).  License checked
-   per window at generation: write-free, non-halting, straight-line,
-   only the first instruction reads memory.  Find windows by ISA
-   pattern (closed poll loops, self-jump spins), never by workload —
-   and re-verify the window bytes at dispatch so self-modifying code
-   only loses the fast path.  Budget guards keep dispatch step-for-step
-   equivalent to the per-instruction path.
+10. **Separate the proof graph from the execution receipt before building
+   weights.**  Fold the complete K-step composition under router pins and
+   retain every intermediate readout until control, memory, write, halt,
+   watch and self-modification licenses pass.  Then project it to one final
+   architectural update plus its statically-live ordered writes; traced
+   execution uses the per-instruction path.  Generic shapes keep symbolic
+   pc/operands, while concrete hot windows spend stronger byte pins.  The
+   router re-verifies those facts live, and budget/speculation guards keep
+   retirement step-for-step equivalent.  Proof state is compiler evidence,
+   not a runtime ABI.
 
 11. **Attribute emitted cost to construction gadgets before touching the
    construction** (found the 4x).  Wrap the graph's dim constructors to
@@ -117,19 +135,15 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
    Transfers to any generated-from-graph system: the emitted artifact
    tells you *how much*, only creation-site attribution tells you *what*.
 
-12. **Serve formulation constraints only to the consumer that has them**
-   (~4x emitted lines; SMB3/CV3 tapes 2.5-3x).  The union model splits
-   memory into 16 lookup groups purely so the exported artifact's f32
-   attention scores stay exactly representable — but the exact-int
-   engines never compute those scores.  The construction annotates each
-   read site with its raw ingredients (address/value/write-gate exprs);
-   expert folds rebuild the site as ONE full-span lookup + exact-address
-   mask, and emission serves it as a single computed-group structure
-   query.  General form: when a graph pattern exists to satisfy a
-   numeric constraint of one consumer (export dtype, score range,
-   normalization), let every other consumer serve a rebuilt equivalent —
-   licensed by the same receipts as everything else, with the artifact
-   untouched.
+12. **Serve formulation constraints only to the consumer that has them.**
+   The union model splits memory into 16 lookup groups so exported f32
+   attention scores stay distinguishable.  The exact engine does not
+   compute those scores: a structural fold embeds current state directly
+   and rebuilds each live RAM read as one externally-served full-address
+   lookup.  Its exact-address test lives in the memory primitive, so the
+   graph carries no group gates, exact mask, key rows or WRITE-token value
+   rows.  General form: preserve the formulation required by the portable
+   artifact, but erase it from a consumer with a stronger exact primitive.
 
 13. **Share one monotone threshold ladder across parallel decodes of the
    same value** (union d_model 1762 → 702).  k separate bit/range
@@ -160,6 +174,26 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
    sweep too: check what the objective does NOT see before trusting a
    win on what it does.
 
+16. **Inline linear intermediates only when the emitted model proves the
+   trade is favorable.**  Inlining deletes materialization depth but can
+   duplicate a symbolic value into thousands of downstream terms.  Build
+   the structural materialized and inlined candidates, count their actual
+   sparse forward work, and accept the inlined model only when it uses no
+   more terms and no more layers.  This policy applies uniformly to all
+   227 opcode experts, generic shapes and concrete sequences; it is not a
+   ROM knob.  Together with structural serving it cut the opcode census
+   from 3,719 to 1,574 layers and 265,934 to 140,764 sparse terms.
+
+17. **Make architectural deltas and dependency closure the model ABI.**
+   Classify every final field as preserved, compile-time constant, or
+   model-computed; only computed fields remain output roots.  Non-halting
+   is already a construction license, so sequence models carry no halt
+   classifier.  Then project input tokens too: embed only state dimensions
+   reachable from computed outputs or ordered writes.  Structural memory
+   values are supplied externally and therefore create no false WRITE-token
+   live-ins.  This is what lets a deterministic sequence become a genuine
+   zero-layer model with only the constant-one residual slot (`d_model=2`).
+
 ## Dead ends (kept so they stay dead)
 
 - GPU per-matrix sparse matvec for a single stream: one dispatch costs a
@@ -189,8 +223,7 @@ not width-bound), the poll-loop sequence expert as the 60 fps lever
 - Paced slices are not throughput: a frame loop that runs 1.3 ms of
   emulation then idles 15 ms to the next display callback measures
   4.3 ms/frame for the SAME work (DVFS drops the clocks and cools the
-  caches between slices), and the penalty compresses real differences
-  between workloads into near-identical numbers (SMB/SMB3/CV3 all read
-  ~240 fps paced vs 1,050/800/440 sustained).  Extrapolating "uncapped
-  fps" from paced slice times understates throughput ~3x; measure
-  sustained regimes (tape replay) for throughput claims.
+  caches between slices), and the penalty compresses real workload
+  differences into near-identical numbers.  Extrapolating "uncapped fps"
+  from paced slice times severely understates throughput; measure sustained
+  regimes (tape replay) for throughput claims.
