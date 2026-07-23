@@ -201,6 +201,14 @@ def flat_nz(raw: ExprLike) -> tuple[Expression, Expression]:
     return n, z
 
 
+def bitwise_nz(bits_msb_first) -> tuple[ExprLike, ExprLike]:
+    """(N, Z) of a logical result from its bits (MSB-first): N is the MSB,
+    Z is set iff no bit is -- one parallel stage off the served result bits,
+    not the reassembled byte's flag chain."""
+    one = graph.one
+    return bits_msb_first[0], 1 - stepglu(one, sum(bits_msb_first) - 1)
+
+
 def extract_bits(value: ExprLike, name: str) -> list[Expression]:
     """Extract bits 7..0 of an 8-bit value expression using binary thresholds.
 
@@ -871,6 +879,9 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     and_result = persist(and_result, name="and_result")
     ora_result = persist(ora_result, name="ora_result")
     eor_result = persist(eor_result, name="eor_result")
+    and_n, and_z = bitwise_nz(and_bit_list)
+    ora_n, ora_z = bitwise_nz(or_bit_list)
+    eor_n, eor_z = bitwise_nz(xor_bit_list)
 
     # BIT
     bit_n = operand_bits[0]
@@ -1054,7 +1065,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     # ── Flags ───────────────────────────────────────────────────────
     # NZ source selection
     nz_alu = mux(
-        op_load_a + op_adc + op_sbc + op_and + op_ora + op_eor + op_pla + op_txa + op_tya
+        op_load_a + op_adc + op_sbc + op_pla + op_txa + op_tya
         + op_lax + op_slo + op_rla + op_sre + op_rra + op_isb,
         new_a,
         mux(
@@ -1127,7 +1138,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
 
     # Zero flag updates
     writes_z = (
-        op_load_a + op_load_x + op_load_y + op_adc + op_sbc + op_and + op_ora + op_eor
+        op_load_a + op_load_x + op_load_y + op_adc + op_sbc
         + op_pla + op_inx + op_iny + op_dex + op_dey + op_tax + op_tay + op_txa + op_tya + op_tsx
         + op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror
         + op_lax + op_slo + op_rla + op_sre + op_rra + op_isb
@@ -1138,6 +1149,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         current_p_z,
     )
     new_p_z = mux(op_cmp, cmp_z, mux(op_cpx, cpx_z, mux(op_cpy, cpy_z, mux(op_dcp, dcp_z, new_p_z))))
+    new_p_z = mux(op_and, and_z, mux(op_ora, ora_z, mux(op_eor, eor_z, new_p_z)))
     new_p_z = persist(new_p_z, name="new_p_z")
 
     # Negative flag updates
@@ -1147,6 +1159,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         current_p_n,
     )
     new_p_n = mux(op_cmp, cmp_n, mux(op_cpx, cpx_n, mux(op_cpy, cpy_n, mux(op_dcp, dcp_n, new_p_n))))
+    new_p_n = mux(op_and, and_n, mux(op_ora, ora_n, mux(op_eor, eor_n, new_p_n)))
     new_p_n = persist(new_p_n, name="new_p_n")
 
     # Overflow flag updates
