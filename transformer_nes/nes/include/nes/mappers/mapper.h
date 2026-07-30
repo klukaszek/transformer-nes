@@ -27,6 +27,8 @@ using std::vector;
 
 constexpr size_t BANK8 = 0x2000;
 constexpr size_t BANK16 = 0x4000;
+constexpr size_t CHR_BANK1 = 0x400;
+constexpr size_t CHR_RAM_BANKS = 0x2000 / CHR_BANK1;
 
 // Everything a mapper drives outside its own cartridge state: the PPU
 // (mirroring, CHR banks, MMC5 substitution state), the machine image

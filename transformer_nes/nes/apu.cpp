@@ -1,25 +1,14 @@
-// Native NES APU (2A03 audio).  Registers $4000-$4017 behind the MMIO
-// bus, the five channels' state, a frame sequencer, and a per-frame
-// sample generator that advances the channels by a frame's CPU cycles
-// and mixes them with the 2A03's nonlinear DAC.  Plain fixed silicon --
-// nothing here is model-generated -- compiled once and cached by content
-// digest, like the PPU.
-//
-// Frame-level approximation (documented, revisit when a game needs it):
-// register writes take effect at frame granularity and the frame's
-// samples are generated in one batch at frame end, so the vast-majority
-// case of once-per-frame (NMI) music updates is exact while a rapid
-// intra-frame sweep resolves at frame granularity. DMC memory fetches use
-// a callback into the console's current CPU image; their four-cycle DMA
-// stalls are reported to the console for clock accounting.
+// Native NES APU (2A03): MMIO registers, channel state, frame sequencer,
+// sample generation, and DMC memory reads on the CPU-clock timeline.
 
 #include <algorithm>
+#include <utility>
 
 #include "nes/apu.h"
 
 namespace transformer_nes::nes {
 
-// ── Device protocol ($4000-$4017) ───────────────────────────────
+// Device protocol ($4000-$4017)
 
 int Apu::read(int addr) {
   if ((addr & 0xFFFF) == 0x4015) {
@@ -178,6 +167,15 @@ void Apu::fill_dmc_buffer(const MemoryReader& reader) {
   }
 }
 
+int64_t Apu::cycles_until_dmc_dma() const {
+  if (dmc.bytes_remaining == 0)
+    return -1;
+  if (dmc.buffer_empty)
+    return 1;
+  return static_cast<int64_t>(dmc.timer_counter) + 2 +
+         static_cast<int64_t>(dmc.bits_remaining - 1) * dmc.period;
+}
+
 void Apu::clock_dmc(const MemoryReader& reader) {
   fill_dmc_buffer(reader);
   if (dmc.timer_counter-- > 0)
@@ -204,7 +202,7 @@ void Apu::clock_dmc(const MemoryReader& reader) {
   }
 }
 
-// ── Frame sequencer ─────────────────────────────────────────────
+// Frame sequencer
 
 void Apu::clock_quarter() { // envelopes + triangle linear counter
   pulse[0].env.clock();
@@ -240,7 +238,7 @@ void Apu::clock_frame_sequencer() {
   seq_step = 0;
 }
 
-// ── Mixing (2A03 nonlinear DAC + DC blocker) ────────────────────
+// Mixing (2A03 nonlinear DAC + DC blocker)
 
 // Raw mixed level in ~[0, 1] from the two nonlinear DAC groups.
 double Apu::mix_level() const {
@@ -285,21 +283,29 @@ void Apu::clock_cycle(const MemoryReader& reader) {
   clock_frame_sequencer();
 }
 
-vector<float> Apu::end_frame(int cpu_cycles, MemoryReader reader) {
-  // sample_accum is kept in [0, cycles_per_sample), so this is the
-  // exact number the loop below will emit.  Write straight into the
-  // exact result size instead of growing the vector during every frame.
-  const auto sample_count = static_cast<size_t>((sample_accum + cpu_cycles) / cycles_per_sample);
-  vector<float> out(sample_count);
-  size_t written = 0;
-  for (int i = 0; i < cpu_cycles; ++i) {
+void Apu::advance_to(int64_t cpu_cycle, MemoryReader reader) {
+  if (cpu_cycle <= clocked_cycles)
+    return;
+  const int64_t delta = cpu_cycle - clocked_cycles;
+  for (int64_t i = 0; i < delta; ++i) {
     clock_cycle(reader);
     if (++sample_accum >= cycles_per_sample) {
       sample_accum -= cycles_per_sample;
-      out[written++] = sample();
+      pending_samples.push_back(sample());
     }
   }
+  clocked_cycles = cpu_cycle;
+}
+
+vector<float> Apu::take_samples() {
+  vector<float> out;
+  out.swap(pending_samples);
   return out;
+}
+
+vector<float> Apu::end_frame(int cpu_cycles, MemoryReader reader) {
+  advance_to(clocked_cycles + cpu_cycles, std::move(reader));
+  return take_samples();
 }
 
 } // namespace transformer_nes::nes

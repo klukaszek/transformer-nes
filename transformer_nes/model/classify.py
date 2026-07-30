@@ -1,14 +1,11 @@
-"""Attention-serving classification licenses for the generated engine.
+"""Attention-serving licenses for the generated engine.
 
-The engine replaces hull attention with O(1) state wherever a lookup's
-queries license it: memory lookups whose query is a positive scalar
-multiple of [local_address, 1] are served by the exact nearest-written-
-address structure, and constant-query LATEST lookups by running-argmax
-registers (replace-on->= at insert time reproduces the positional LATEST
-tie-break exactly).  The numeric decisions live HERE so the weights
-engine adapts its representation (queries as in_proj matrix rows) to
-linear ``(coeff, id)`` terms against one set of licenses.  Classification is a
-speed decision only -- anything unmatched keeps a real hull.
+Memory lookups whose query is a positive scalar multiple of
+``[local_address, 1]`` are served by the exact nearest-written-address
+structure, and constant-query LATEST lookups by running-argmax registers.
+The numeric decisions live here so the weights engine can apply one set of
+licenses to both graph expressions and generated projection rows. Unsupported
+lookup shapes are rejected during code generation.
 """
 
 from __future__ import annotations

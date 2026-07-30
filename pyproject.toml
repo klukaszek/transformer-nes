@@ -9,7 +9,6 @@ dependencies = [
     "ninja>=1.13.0",
     "numpy>=2.0.0",
     "pybind11>=3.0.2",
-    "pyyaml>=6.0.3",
     "safetensors>=0.8.0",
     "scipy>=1.17.1",
     "setuptools>=82.0.0",
@@ -26,7 +25,6 @@ dev = [
 
 [project.scripts]
 6502-reference = "transformer_nes.cpu6502.backends.reference:main"
-6502-eval = "transformer_nes.cpu6502.cli:main"
 6502-klaus = "transformer_nes.cpu6502.examples.klaus.harness:main"
 6502-nestest = "transformer_nes.cpu6502.examples.nestest:main"
 6502-transformer = "transformer_nes.cpu6502.backends.weights.runner:main"
@@ -41,9 +39,6 @@ include = ["transformer_nes*"]
 
 [tool.setuptools.package-data]
 "transformer_nes" = [
-    "attention/hull2d_cht.h",
-    "attention/hull_ext.cpp",
-    "attention/CMakeLists.txt",
     "cpu6502/examples/klaus/*",
     "nes/examples/nestest.*",
     "nes/*.cpp",

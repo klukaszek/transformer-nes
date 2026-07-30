@@ -56,14 +56,15 @@ class _Weight:
 
 
 class _Attn:
-    """One attention layer's weights: a fused Q/K/V projection (rows 0..D-1 Q,
-    D..2D-1 K, 2D..3D-1 V) and an output projection."""
+    """One attention layer's weights: a fused Q/K/V projection over this
+    layer's own H heads (rows 0..2H-1 Q, 2H..4H-1 K, 4H..6H-1 V, two dims per
+    head) and an output projection (d_model, 2H)."""
 
     __slots__ = ("in_proj_weight", "out_proj", "num_heads")
 
     def __init__(self, d_model, num_heads):
-        self.in_proj_weight = np.zeros((3 * d_model, d_model), dtype=np.float64)
-        self.out_proj = _Weight((d_model, d_model))
+        self.in_proj_weight = np.zeros((6 * num_heads, d_model), dtype=np.float64)
+        self.out_proj = _Weight((d_model, 2 * num_heads))
         self.num_heads = num_heads
 
 
@@ -87,23 +88,31 @@ class WeightModel:
     one_slot: int
 
     def __init__(self, vocab, d_model, n_heads, n_layers, d_ffn, stop_token_id=0):
+        # n_heads / d_ffn are per-layer sequences: the layers are ragged.
         self.stop_token_id = stop_token_id
         self.tok = _Weight((vocab, d_model))
-        self.attn = [_Attn(d_model, n_heads) for _ in range(n_layers)]
-        self.ff_in = [_Weight((2 * d_ffn, d_model)) for _ in range(n_layers)]
-        self.ff_out = [_Weight((d_model, d_ffn)) for _ in range(n_layers)]
+        self.attn = [_Attn(d_model, n_heads[li]) for li in range(n_layers)]
+        self.ff_in = [_Weight((2 * d_ffn[li], d_model)) for li in range(n_layers)]
+        self.ff_out = [_Weight((d_model, d_ffn[li])) for li in range(n_layers)]
         self.head = _Weight((vocab, d_model))
 
 
-def build_model(program_graph=None, schedule=None):
+def build_model(program_graph=None, schedule=None, recycle_slots=True):
     """Build transformer weight matrices from a computation graph.
 
     Args:
         program_graph: a ProgramGraph wrapping the input/output tokens.
         schedule: a precomputed schedule dict (asap_schedule output).
-
-    Slots are reused across dead dims (interval coloring) and freed slots are
-    erased before reuse, so the represented computation is unchanged.
+        recycle_slots: reuse a dead dim's residual slot (interval coloring).
+            Recycling narrows d_model but costs one erase per reuse, because
+            the residual update is additive and the stale value has to be
+            subtracted.  Giving every dim its own slot removes that traffic
+            entirely.  Measured 2026-07-31: on the union the escape is a bad
+            deal (d_model 622 -> 4284 for 15.8% fewer non-zeros), but on the
+            folded experts it is a good one (max d_model 36 -> 56 for 13.6%
+            fewer), and the experts are what execute -- so they build with
+            this off (experts.py:schedule_and_build) and the union keeps
+            recycling.
     """
     if program_graph is not None:
         pg = program_graph
@@ -140,39 +149,53 @@ def build_model(program_graph=None, schedule=None):
     free_slots = []
     pending_free = []  # freed this half-layer, available next
     reused_at = {}  # (L, sp) -> slots written (already 0)
-    erased_at = {}  # (L, sp) -> slots being erased to 0
+    death_of_slot = {}  # slot -> boundary index where its occupant died
+    # An erase only stops a stale value from polluting the additive update
+    # that reuses the slot, so it is created on reuse, not on death: a dead
+    # value nobody reallocates rides the residual unread and costs nothing.
+    erase_events = []  # (death index, reuse index, slot)
 
+    boundaries = [(L, sp) for L in range(n_layers) for sp in (1, 3)]
     cur = frozenset(input_dims)
-    for L in range(n_layers):
-        for sp in (1, 3):
-            c = 4 * L + sp
-            nxt = alive_after.get(c, cur)
-            dying = cur - nxt
-            born = nxt - cur
+    for i, (L, sp) in enumerate(boundaries):
+        c = 4 * L + sp
+        nxt = alive_after.get(c, cur)
+        dying = cur - nxt
+        born = nxt - cur
 
-            free_slots.extend(pending_free)
-            free_slots.sort()
-            pending_free = []
+        free_slots.extend(pending_free)
+        free_slots.sort()
+        pending_free = []
 
-            erased = set()
-            for d in dying:
-                s = slot_of[d]
-                pending_free.append(s)
-                erased.add(s)
+        for d in dying:
+            s = slot_of[d]
+            pending_free.append(s)
+            death_of_slot[s] = i
 
-            reused = set()
-            for d in sorted(born, key=lambda x: x.id):
-                if free_slots:
-                    s = free_slots.pop(0)
-                    slot_of[d] = s
-                    reused.add(s)
-                else:
-                    slot_of[d] = next_slot
-                    next_slot += 1
+        if not recycle_slots:
+            free_slots.clear()
+            pending_free.clear()
 
-            reused_at[(L, sp)] = reused
-            erased_at[(L, sp)] = erased
-            cur = nxt
+        reused = set()
+        for d in sorted(born, key=lambda x: x.id):
+            if free_slots:
+                s = free_slots.pop(0)
+                slot_of[d] = s
+                reused.add(s)
+                erase_events.append((death_of_slot[s], i, s))
+            else:
+                slot_of[d] = next_slot
+                next_slot += 1
+
+        reused_at[(L, sp)] = reused
+        cur = nxt
+
+    # An erase may sit at any boundary between death and reuse, but the death
+    # boundary is cheapest on non-zeros; concentrating them wastes the spare V
+    # slots and shared Q/K rows the genuine passthroughs already pay for.
+    erased_at = {b: set() for b in boundaries}
+    for death_i, _reuse_i, s in erase_events:
+        erased_at[boundaries[death_i]].add(s)
 
     # Assign slots to output-referenced dims not yet covered
     output_dims_need = set()
@@ -230,9 +253,12 @@ def build_model(program_graph=None, schedule=None):
                 w[slot_of[dim]] += coeff
         return w
 
-    # ── Count resources (n_heads, d_ffn) ──────────────────────
-    max_heads = 0
-    max_ffn = 1
+    # ── Count resources per layer ─────────────────────────────
+    # Layers are RAGGED: each gets exactly the heads and FFN units its phase
+    # needs.  Residual width is set by liveness and is unrelated to head
+    # count, which used to be pinned at d_model // 2.
+    heads_per_layer = []
+    ffn_per_layer = []
 
     cur = frozenset(input_dims)
     for L in range(n_layers):
@@ -258,7 +284,7 @@ def build_model(program_graph=None, schedule=None):
                 ):
                     pt_srcs.add(slot_of[d])
 
-        max_heads = max(max_heads, n_lu_heads + (len(pt_srcs) + 1) // 2)
+        heads_per_layer.append(n_lu_heads + (len(pt_srcs) + 1) // 2)
         cur = nxt1
 
         c3 = 4 * L + 3
@@ -274,14 +300,8 @@ def build_model(program_graph=None, schedule=None):
                 if d not in same_rg:
                     pt_srcs_ffn.add(slot_of[d])
 
-        max_ffn = max(max_ffn, len(ffn) + len(pt_srcs_ffn))
+        ffn_per_layer.append(max(1, len(ffn) + len(pt_srcs_ffn)))
         cur = nxt3
-
-    if 2 * max_heads > D:
-        D = 2 * max_heads
-        D += D % 2
-    n_heads = D // 2
-    d_ffn = max_ffn
 
     # ── Vocabulary ────────────────────────────────────────────
     all_tokens = sorted(set(input_tokens.keys()) | set(output_tokens.keys()))
@@ -292,15 +312,15 @@ def build_model(program_graph=None, schedule=None):
     model = WeightModel(
         vocab=vocab_size,
         d_model=D,
-        n_heads=n_heads,
+        n_heads=heads_per_layer,
         n_layers=n_layers,
-        d_ffn=d_ffn,
+        d_ffn=ffn_per_layer,
         stop_token_id=tok_to_idx_map.get("halt", 0),
     )
 
     # ── Populate weights ──────────────────────────────────────────
     sqrt_dh = math.sqrt(2.0)
-    n_hulls = n_pt_h = n_pt_g = 0
+    n_pt_h = n_pt_g = 0
     head_map = {}  # layer_idx -> {head_idx -> info}
 
     # Embedding
@@ -326,9 +346,14 @@ def build_model(program_graph=None, schedule=None):
 
         ip = model.attn[layer_idx].in_proj_weight
         op_w = model.attn[layer_idx].out_proj.weight
+        n_heads = model.attn[layer_idx].num_heads
+        # Q/K/V row bases within this layer's own head block.
+        k_base = 2 * n_heads
+        v_base = 4 * n_heads
 
         fi = model.ff_in[layer_idx].weight
         fo = model.ff_out[layer_idx].weight
+        d_ffn = model.ff_out[layer_idx].weight.shape[1]
 
         # ── ATTENTION HALF-LAYER ──────────────────────────────
         c1 = 4 * layer_idx + 1
@@ -360,15 +385,14 @@ def build_model(program_graph=None, schedule=None):
             for p in range((nv + 1) // 2):
                 h = head_idx
                 head_idx += 1
-                n_hulls += 1
                 layer_tiebreak.append(1 if tie_break == "latest" else 0)
                 ip[h * 2] = expr_to_tensor(query_exprs[0]) * HARD_K * sqrt_dh
                 ip[h * 2 + 1] = expr_to_tensor(query_exprs[1]) * HARD_K * sqrt_dh
-                ip[D + h * 2] = expr_to_tensor(key_exprs[0])
-                ip[D + h * 2 + 1] = expr_to_tensor(key_exprs[1])
-                ip[2 * D + h * 2] = expr_to_tensor(value_exprs[p * 2])
+                ip[k_base + h * 2] = expr_to_tensor(key_exprs[0])
+                ip[k_base + h * 2 + 1] = expr_to_tensor(key_exprs[1])
+                ip[v_base + h * 2] = expr_to_tensor(value_exprs[p * 2])
                 if p * 2 + 1 < nv:
-                    ip[2 * D + h * 2 + 1] = expr_to_tensor(value_exprs[p * 2 + 1])
+                    ip[v_base + h * 2 + 1] = expr_to_tensor(value_exprs[p * 2 + 1])
 
                 d0 = lu.dims[p * 2]
                 lookup_dim_to_head[d0] = (h, 0)
@@ -441,18 +465,18 @@ def build_model(program_graph=None, schedule=None):
             head_idx += 1
             ip[h * 2] = expr_to_tensor(erase_q2d[0]) * HARD_K * sqrt_dh
             ip[h * 2 + 1] = expr_to_tensor(erase_q2d[1]) * HARD_K * sqrt_dh
-            ip[D + h * 2] = expr_to_tensor(erase_k2d[0])
-            ip[D + h * 2 + 1] = expr_to_tensor(erase_k2d[1])
+            ip[k_base + h * 2] = expr_to_tensor(erase_k2d[0])
+            ip[k_base + h * 2 + 1] = expr_to_tensor(erase_k2d[1])
 
             src1, dsts1 = pt_items[pair_idx]
-            ip[2 * D + h * 2, src1] = 1.0
+            ip[v_base + h * 2, src1] = 1.0
             for dst, coeff in dsts1.items():
                 op_w[dst, h * 2] += coeff
 
             pt_info = {"type": "passthrough", "slot_v0": src1}
             if pair_idx + 1 < len(pt_items):
                 src2, dsts2 = pt_items[pair_idx + 1]
-                ip[2 * D + h * 2 + 1, src2] = 1.0
+                ip[v_base + h * 2 + 1, src2] = 1.0
                 for dst, coeff in dsts2.items():
                     op_w[dst, h * 2 + 1] += coeff
                 pt_info["slot_v1"] = src2
@@ -529,7 +553,7 @@ def build_model(program_graph=None, schedule=None):
     model.one_slot = slot_of[next(iter(one_expr.terms))]
     # Head classification per layer (0 unused, 1 lookup, 2 passthrough).
     # Passthrough/erase heads provably attend to self (their key is 2*pos,
-    # strictly increasing), which lets a fast engine skip their hulls.
+    # strictly increasing), which lets the generated engine skip them.
     model.head_kinds = []
     model.head_cache_groups = []
     model.head_memory_groups = []
@@ -541,12 +565,13 @@ def build_model(program_graph=None, schedule=None):
     model.head_pairs = []
     model.head_memory_outputs = []
     for layer_idx in range(n_layers):
-        kinds = [0] * n_heads
-        cache_groups = [-1] * n_heads
-        memory_groups = [-1] * n_heads
-        lookup_ids = [-1] * n_heads
-        pairs = [-1] * n_heads
-        memory_outputs = [None] * n_heads
+        nh = model.attn[layer_idx].num_heads
+        kinds = [0] * nh
+        cache_groups = [-1] * nh
+        memory_groups = [-1] * nh
+        lookup_ids = [-1] * nh
+        pairs = [-1] * nh
+        memory_outputs = [None] * nh
         cache_group_of_key = {}
         for h, info in head_map.get(layer_idx, {}).items():
             if info["type"] == "lookup":
@@ -570,16 +595,19 @@ def build_model(program_graph=None, schedule=None):
 
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
     logger.info(
-        "Built model: d_model=%d, n_layers=%d, n_heads=%d, d_ffn=%d",
+        "Built model: d_model=%d, n_layers=%d, heads/layer max=%d mean=%.1f, "
+        "d_ffn/layer max=%d mean=%.1f",
         D,
         n_layers,
-        n_heads,
-        d_ffn,
+        max(heads_per_layer, default=0),
+        sum(heads_per_layer) / max(len(heads_per_layer), 1),
+        max(ffn_per_layer, default=0),
+        sum(ffn_per_layer) / max(len(ffn_per_layer), 1),
     )
     logger.info(
-        "  vocab=%d, hulls=%d, persist=%d, pt_h=%d, pt_g=%d",
+        "  vocab=%d, lookups=%d, persist=%d, pt_h=%d, pt_g=%d",
         vocab_size,
-        n_hulls,
+        sum(sum(kind == 1 for kind in kinds) for kinds in model.head_kinds),
         n_persist,
         n_pt_h,
         n_pt_g,

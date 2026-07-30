@@ -9,8 +9,7 @@ public:
     if (cart_.prg.empty() || cart_.prg.size() % BANK8)
       throw std::invalid_argument("MMC3 PRG must use 8 KiB banks");
     n_prg_ = cart_.prg.size() / BANK8;
-    n_chr_ = std::max(cart_.chr.size() / 0x400, 1uz);
-    chr_rom = !cart_.chr.empty();
+    n_chr_ = cart_.chr.empty() ? CHR_RAM_BANKS : cart_.chr.size() / CHR_BANK1;
   }
   bool banked() const override { return true; }
   array<size_t, 4> prg_banks() const {
@@ -73,7 +72,7 @@ public:
   }
 
 private:
-  bool chr_rom = false, irq_enabled = false, irq_pending = false;
+  bool irq_enabled = false, irq_pending = false;
   uint8_t bank_select = 0;
   int irq_latch = 0;
   int reload_line = -1; // scanline of a mid-frame $C001 clear (-1: vblank)
@@ -102,13 +101,12 @@ private:
       host_.irq->sched_dirty = true;
   }
   void notify_chr(int reg) {
-    if (chr_rom && (reg == 0x8000 || reg == 0x8001))
+    if (reg == 0x8000 || reg == 0x8001)
       host_.ppu->set_chr_banks(chr_banks());
   }
 
   void on_connected() override {
-    if (chr_rom)
-      host_.ppu->set_chr_banks(chr_banks());
+    host_.ppu->set_chr_banks(chr_banks());
   }
 };
 

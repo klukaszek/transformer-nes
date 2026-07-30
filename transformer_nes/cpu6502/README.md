@@ -1,10 +1,7 @@
 # 6502 in the computation graph
 
-A MOS 6502 CPU expressed as a Percepta computation graph — the same
-Append-Only Lookup Machine (ALM) construction as Percepta's original WASM
-interpreter (which this repo previously housed), but for a real-world ISA
-with the NES as the target application.  One transformer step executes one
-6502 instruction.
+A MOS 6502 CPU expressed as an analytic computation graph for the NES.  One
+transformer step executes one 6502 instruction.
 
 This package is the *pure* CPU: cores, conformance suites, and nothing
 console-shaped.  The system layer (MMIO bus, devices, frame-level PPU,
@@ -17,9 +14,9 @@ package one-way.
 |------|------|
 | `spec.py` | Single source of truth: 227-opcode table (151 official + stable unofficial), flags, addressing modes, tiny assembler |
 | `interpreter.py` | The 6502 as a graph: ~6,500 dimensions built from ReGLU/persist/lookup primitives |
-| `trace.py` | Canonical trace format shared by every backend |
+| `construction.py` | Construction boundary: builds the CPU graph and exposes handles used by folding, scheduling, and export |
+| `trace.py` | Canonical trace format shared by the reference and weights backends |
 | `backends/reference.py` | Plain-Python oracle core.  Trusted by construction; every other backend is verified against it |
-| `backends/graph.py` | Exact evaluator: compiles the graph's static schedule to one generated Python function |
 | `backends/weights/run_protocol.py` | The weights engine's native run-loop protocol (tables + C++ blocks) |
 | `backends/weights/runner.py` | The transformer machine: fixed production construction, engine-cache orchestration, and machine protocol |
 | `backends/weights/experts.py` | Fold-and-build expert models (per-opcode, sequence, shape) with their dispatch licenses |
@@ -27,13 +24,16 @@ package one-way.
 | `examples/klaus/harness.py` | Klaus Dormann functional-test harness (`6502-klaus`), next to its binary |
 
 The nestest harness (`6502-nestest`, Nintendulator golden-log comparison)
-lives in `transformer_nes/nes/examples/nestest.py` — nestest.nes is an NES
-ROM, so it sits with its assets and depends downward on cpu6502.
+lives in `examples/nestest.py`; its ROM and golden log sit with the other
+NES assets in `transformer_nes/nes/examples/`, which the harness reads by
+path.
 
-## Execution model
+## Construction and execution model
 
-The machine is an append-only token sequence; all mutable state lives in
-attention:
+`interpreter.py` constructs one static append-only CPU graph. The graph is
+folded into licensed experts, scheduled into transformer layers, and compiled
+to the generated C++ weights engine. Its runtime state is represented by the
+engine's residual slots and exact attention structures:
 
 - **`start` token** — carries the initial PC.
 - **WRITE tokens** — one per memory write, carrying `(addr, value)`.  The
@@ -45,36 +45,24 @@ attention:
   bits) plus the previous instruction's fetch/EA/data fields.  The graph
   reads "current state" via a latest-STATE attention lookup.
 
-Each step evaluates the graph over the latest token: per-opcode one-hot
-gates decode the fetched opcode, mode gates resolve the effective address
-(indirect modes via pointer reads), ALU results are computed for every
-operation family in parallel, and `mux` chains select the new state.  The
-run loop reads back ~22 named result dims, emits up to three WRITE tokens
-(JSR pushes two bytes, BRK three), builds the next STATE token, and stops
-when the HALT output token outscores STATE (or on a jump-to-self trap).
+The weights run loop reads the named result dimensions, emits up to three
+WRITE records (JSR pushes two bytes, BRK three), builds the next STATE record,
+and stops on HALT or a jump-to-self trap. The reference core provides the
+independent execution oracle.
 
-## Three backends, one semantics
+## Two backends, one semantics
 
 | Backend | Speed (steps/s) | Role |
 |---------|-----------------|------|
 | `reference.py` (`run_traps`) | ~2.5M | Oracle; defines correct behavior |
-| `graph.py` (generated Python) | ~6K | Exact graph semantics, debuggable |
-| `weights/runner.py` (real transformer) | ~420K (full Klaus, incl. the lockstep reference) | The thesis: actual hardmax-attention + ReGLU transformer weights |
-
-A fourth backend — `kernel.py`, a C++ emission of the evaluator's f64
-schedule — was retired 2026-07-13: its verification role is subsumed by
-reference ⇔ weights receipts (the oracle shares no code with the graph
-pipeline, while the kernel shared the graph, schedule, run protocol, and
-classification with the weights engine), and the weights engine had
-become the faster backend besides.  The recorded rationale lives in
-ROADMAP.md.
+| `weights/runner.py` (real transformer) | ~435K (full Klaus, incl. the lockstep reference) | The graph compiled to actual hardmax-attention + ReGLU transformer weights |
 
 ### The transformer itself
 
 `backends/weights/` (`6502-transformer`) closes the loop on the project's
 premise: the graph is scheduled onto layers and compiled by
 `model/weights.py` into actual transformer weight matrices
-(`WeightModel` — decimal-enabled d_model=630, 69 layers, 315 attention heads),
+(`WeightModel` — decimal-enabled d_model=624, 56 layers, 312 attention heads),
 constructed analytically, no training.  Execution is genuine transformer
 inference: embeddings, Q/K/V projections, hardmax attention, ReGLU FFN,
 residual stream, output head.  There is **no position encoding** — token
@@ -83,9 +71,8 @@ heads tie every token with constant Q/K and take the latest, i.e.
 themselves).  The runtime is the generated straight-line C++
 engine (`model/engine_gen.py`), exact integer end-to-end: a fixed-point
 int32 residual, exact nearest-address memory structures, and integer
-running-argmax registers (`model/classify.py` holds the licenses; anything
-unlicensed keeps a real hull, so classification is a speed decision, never
-a correctness one).
+running-argmax registers (`model/classify.py` holds the licenses; unsupported
+lookup shapes are rejected during code generation).
 
 Scheduling: `model/schedule.py:asap_schedule` takes the critical path and
 load-balances ops across its slack with a reverse-topological leveling
@@ -104,8 +91,8 @@ Performance: the analytic weights are ~99.9% zeros, so inference runs the
 same linear maps sparsely. `model/engine_gen.py` emits model-specific C++
 with indices and coefficients embedded in expressions. The residual is exact
 fixed-point int32; shifts are guarded and signed wrap is defined. Memory heads
-use exact nearest-address structures, constant-query heads use integer
-running-argmax registers, and remaining heads use hull attention. Expert
+use exact nearest-address structures and constant-query heads use integer
+running-argmax registers. Expert
 folds additionally rebuild each `memory_at` site as ONE fused 64K-span
 lookup plus its exact-address mask (`graph/fold.py:masked_exact_read`) —
 the 16-group form serves the union's f32 export score range, which the
@@ -123,19 +110,19 @@ instruction windows as one forward (~160 KB TU, ~1 s cached). Interrupts,
 unknown bytes retain the exact union path. Documented opcodes derive their full
 trace receipt in the engine around compact execution instead of carrying a
 second diagnostic transformer. Compact writes are
-staged and routed through the same mapper, journal and watch machinery as full
+staged and routed through the same mapper and watch machinery as full
 receipts before the instruction retires. Static control is engine metadata;
 dynamic control returns one target slot, and only BRK returns a halt slot.
 
 With the generated engine, **the full 8,991-instruction nestest suite runs
 through the actual transformer weights in under 0.1 s** (`6502-nestest
 --runner weights`) and the full 30.6M-instruction Klaus suite
-lockstep-matches with decimal mode in ~68 s, checkpointing disabled
-entirely (engine state is O(1); the snapshot-and-rebuild machinery remains
-for the NES console).  Gameplay through the weights on the recorded input
-tapes runs at ~1,050 fps (SMB), 756-885 fps (SMB3), and 386-485 fps (CV3),
-byte-identical frame-for-frame to the reference-driven console under the
-same tapes.
+lockstep-matches with decimal mode in ~70 s (435 K instructions/s); engine
+state is O(1).  Gameplay
+through the weights on the recorded input tapes runs at ~2,290 fps (SMB),
+~1,300 fps (Zelda), ~930 fps (SMB3), ~920 fps (Mega Man 6) and ~850 fps
+(Castlevania III), byte-identical frame-for-frame to the reference-driven
+console under the same tapes.
 
 Memory is split into 16 × 4 KiB groups in the union graph. Address scores
 therefore remain in an exactly represented range, while LATEST ties are
@@ -144,16 +131,15 @@ float32 by default; that storage choice is separate from the generated
 runtime's int32 arithmetic (and from the expert folds' fused 64K reads,
 which exist only in the engines' execution strategy, never the artifact).
 
-### Compilation pipeline (evaluator)
+### Compilation pipeline
 
 1. The graph's dimensions form a static schedule in id (creation) order,
    which is topological by construction.
 2. A backward liveness pass keeps only entries that transitively feed an
    externally read dim (`RUNTIME_READ_DIMS` + output-score terms).
 3. Expressions are emitted as straight-line arithmetic over locals; lookup
-   queries are inlined against the classified attention state (exact
-   memory structure, running-argmax register, or hull — `model/classify.py`
-   decides).
+   queries are inlined against the licensed exact attention state (nearest
+   memory structure or running-argmax register).
 4. Token inserts are compiled separately: each lookup's key/value
    expressions depend only on input dims through a small Persist/ReGLU
    chain, so inserting a token never evaluates the full graph.
@@ -168,7 +154,7 @@ which exist only in the engines' execution strategy, never the artifact).
 Chain of trust, each link checked instruction-by-instruction:
 
 ```
-nestest golden log (Nintendulator)  ⇔  reference.py  ⇔  graph.py  ⇔  weights/runner.py
+nestest golden log (Nintendulator)  ⇔  reference.py  ⇔  weights/runner.py
 Klaus functional test (self-checking)  ⇑
 ```
 
@@ -186,9 +172,8 @@ Klaus functional test (self-checking)  ⇑
 
 ```bash
 uv run 6502-klaus --runner reference          # full suite, ~13s
-uv run 6502-klaus --runner weights --graph-steps 30700000  # full suite through the WEIGHTS, ~90s
-uv run 6502-klaus --runner graph --graph-steps N       # lockstep vs reference
-uv run 6502-nestest --runner both             # reference vs golden log + graph lockstep
+uv run 6502-klaus --runner weights --max-steps 30700000  # full suite through the WEIGHTS, ~90s
+uv run 6502-nestest --runner both             # reference vs golden log + weights lockstep
 uv run 6502-nestest --runner weights
 ```
 
@@ -214,7 +199,7 @@ that only surface millions of instructions into a run.
    integer seq comparison / insertion order; the C++ default (AVERAGE)
    silently blends neighboring memory values.
 5. **Decimal-mode V flag comes from the binary sum** on NMOS hardware;
-   reference and graph both follow that convention.
+   reference and weights both follow that convention.
 
 ## MMIO and NMI
 
@@ -237,9 +222,9 @@ CPU over the model's own bus, like real hardware.  The split is:
   the same attention lookup as any other byte — a real 6502 also just
   reads whatever is on the bus.
 
-`transformer_nes/nes/bus.py` implements this once over the two
-Python-stepped cores (`Bus` + `ReferenceCore`/`GraphCore` adapters, part
-of the NES system layer), and `EngineBus` drives the generated weights
+The native bus (`nes/include/nes/bus.h`) implements this once. The reference
+core reaches it through a thin adapter in `nes/backends.py`, and
+`PythonEngineMachine` (`nes/bindings.cpp`) drives the generated weights
 engine through one protocol
 (`weights/run_protocol.py` emits it): `load_image()` / `run(max_steps)`
 execute until a step budget, halt, jump-to-self trap, or a watched address
@@ -247,39 +232,31 @@ is touched (`watch_read` pauses *before* the reading instruction;
 `watch_write` after the writing step), `inject_write()` / `set_nmi()` are
 the device-side entry points, a read lease serves idempotent device
 polls (the `$2002` vblank wait) natively without pausing, and a write
-journal applies order-only device writes (PPU scroll/VRAM/OAM, APU
-channel registers) natively, draining them in program order at every
-run() return instead of pausing per write.  The shadow
+Device writes pause at the instruction boundary.  The shadow
 decode uses a generated 256-entry table derived from `spec.READS_MEMORY`,
 so every backend classifies device reads identically.
 
-Verified in `nes/tests/test_mmio.py`: one device scenario (absolute and
-(zp),Y device reads, device writes, NMIs at fixed instruction indices
-including one nested into the handler) runs on all three backends and
-must produce identical traces, memory writes, and device event logs.
+Verified in `nes/tests/native_hardware_test.cpp` (the C++ port replaced the
+Python MMIO/console tests) plus `nes/tests/test_console_backends.py`, which
+runs the reference and weights backends over SMB and Zelda and requires
+identical frames, cycle counts and RAM.
 
 ## The NES on top of this
 
 The console layer in `transformer_nes/nes/` (cartridge loader, the native
-C++ frame-level PPU, controllers, frame loop) runs NROM ROMs against any
-of the four CPU backends; frame pacing uses base-cycle counting
-implemented identically in the native engines and the Python bus.  nestest boots through its reset
+C++ frame-level PPU, clocked APU, controllers, mappers MMC1/MMC2/MMC3/MMC4/MMC5
+alongside NROM, frame loop) runs ROMs against the reference or weights CPU
+backend; frame pacing uses CPU-cycle accounting implemented identically in the
+native engines and the Python bus.  nestest boots through its reset
 vector and passes its full official-opcode suite interactively (controller
-input, vblank NMI, OAM DMA); SMB gameplay replays at ~1,050 fps through
+input, vblank NMI, OAM DMA); SMB gameplay replays at ~2,290 fps through
 the transformer weights on its recorded tape, frames byte-identical across
 backends.  See `transformer_nes/nes/`.
 
-Long runs stay bounded via **snapshot-and-rebuild checkpointing**: past a
-token threshold the console reseeds the machine's append-only log from
-the RAM mirror at a frame boundary (`EngineBus.checkpoint()` /
-`Bus.checkpoint()`).  This is semantically invisible -- unwritten and
-zero bytes both read as 0 through the exact-address mask, so reseeding
-only the nonzero RAM bytes preserves every future read; the invisibility
-is asserted pixel-for-pixel and cycle-for-cycle in
-`nes/tests/test_console.py`.
-
-Still open on the CPU side of that boundary:
-- Cycle accuracy: base cycles only (no branch-taken or page-cross
-  penalties); revisit when a timing-sensitive game needs it.
-- NES RAM mirroring (`$0800-$1FFF`) is not folded (PPU register mirrors
-  through `$3FFF` are); add a mirror device if a ROM relies on it.
+Remaining accuracy work is on the console side of that boundary:
+- The PPU remains frame-at-once, with event and split-state modeling rather
+  than per-dot rendering.
+- DMC DMA stalls are charged at run boundaries; interleave them with CPU
+  execution if cycle-exact CPU/audio interaction becomes necessary.
+- Dynamic cycle classification is duplicated in the reference core, native
+  bus, and generated run protocol; derive the native tables from `spec.py`.

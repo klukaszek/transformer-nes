@@ -1,10 +1,4 @@
-// Native frame-level NES PPU (2C02).  Registers $2000-$2007 behind the
-// MMIO bus, VRAM/OAM, and a frame-at-once renderer; ported from a Python
-// reference and proven pixel-identical before that reference was deleted
-// (receipts in ROADMAP.md, 2026-07-11), then upgraded same day with the
-// shared loopy-t scroll state and the sprite-0 split render (see ROADMAP.md
-// for the model). Plain fixed silicon -- nothing here is
-// model-generated -- compiled once and cached by content digest.
+// Native frame-level NES PPU (2C02): MMIO registers, VRAM/OAM, and rendering.
 
 #include <algorithm>
 #include <array>
@@ -48,12 +42,12 @@ void Ppu::mark_split(int scanline) {
   mid_fine_x = fine_x;
   mid_v_addr = vram_addr;
   mid_chr_bank = chr_bank;
-  // At most one state transition can affect each visible scanline.
-  // Keep the journal and render scratch arrays on the same explicit
-  // bound; the former used to grow past the latter's eight entries.
+  // At most one split is stored per visible scanline.
   if (raster_split_count >= raster_splits.size())
     return;
-  RasterSplit split{scanline, ctrl, mask, mirroring, t_addr, fine_x, vram_addr, {}, {}};
+  RasterSplit split{scanline,       ctrl,       mask,       mirroring,
+                    t_addr,        fine_x,     vram_addr, v_reload_generation,
+                    {},            {}};
   split.chr_banks = chr_bank;
   if (mmc5.active()) {
     mmc5.snapshot();
@@ -68,7 +62,7 @@ bool Ppu::same_band(const BandState& a, const BandState& b) {
          a.fine_x == b.fine_x && a.y_base == b.y_base && std::equal(a.banks, a.banks + 8, b.banks);
 }
 
-// ── Device protocol (registers $2000-$3FFF, mirrored every 8) ──
+// Device protocol (registers $2000-$3FFF, mirrored every 8)
 
 size_t Ppu::palette_index(int addr) {
   size_t offset = (addr - 0x3F00) & 0x1F;
@@ -147,6 +141,7 @@ int Ppu::read(int addr) {
   if (reg == 2) { // PPUSTATUS
     const int value = (vblank ? 0x80 : 0) | (sprite0_hit ? 0x40 : 0);
     vblank = false;
+    nmi_edge = false;
     write_latch = false;
     return value;
   }
@@ -208,6 +203,7 @@ void Ppu::write(int addr, int value, int row) {
     if (write_latch) {
       t_addr = (t_addr & 0x7F00) | value;
       vram_addr = t_addr & 0x3FFF;
+      ++v_reload_generation;
       if (in_span)
         span_v_load = t_addr; // 15-bit v reload, effective immediately
     } else {
@@ -227,7 +223,7 @@ void Ppu::write(int addr, int value, int row) {
   }
 }
 
-// ── Console-side control ────────────────────────────────────────
+// Console-side control
 
 void Ppu::end_vblank() {
   vblank = false;
@@ -237,6 +233,7 @@ void Ppu::end_vblank() {
   frame_mirroring = mirroring;
   frame_t_addr = t_addr;
   frame_fine_x = fine_x;
+  frame_v_reload_generation = v_reload_generation;
   frame_chr_bank = chr_bank;
   if (mmc5.active())
     mmc5.snapshot_frame();
@@ -249,7 +246,7 @@ void Ppu::end_vblank() {
   span_v_load = -1;
 }
 
-// ── Rendering ───────────────────────────────────────────────────
+// Rendering
 
 std::pair<uint8_t, uint8_t> Ppu::fetch_pattern_pair(int pattern_addr) {
   const uint8_t b0 = chr[chr_index(chr_bank.data(), pattern_addr)];
@@ -323,7 +320,8 @@ void Ppu::render_bg_rows(uint8_t* frame, const uint8_t* pal, uint8_t backdrop,
   // band's first row (a mid-frame $2006 v load; y self-increments
   // from there on hardware, so the band scans forward from it).
   const int sy =
-      band.y_base >= 0 ? ((band.y_base - y0) % 480 + 480) % 480 : scroll_row_480(bt_addr) % 480;
+      band.y_base >= 0 ? ((band.y_base - y0) % 480 + 480) % 480
+                       : scroll_row_480(bt_addr) % 480;
   const bool extended = mmc5.active() && mmc5.extended_attributes();
   // Left-edge masking: the leftmost 8 pixels show the backdrop (and
   // count as transparent for sprite priority) with the bit clear.
@@ -505,13 +503,13 @@ Ppu::Frame Ppu::render_frame() {
     sprite0_scanline = -1;
     for (auto& row : sprite_claimed)
       std::fill(std::begin(row), std::end(row), false);
-    const bool tall = (ctrl & 0x20) != 0;
-    const int h = tall ? 16 : 8;
-    const int sprite_x_min = (fmask & 0x04) ? 0 : 8;
     for (int y = 0; y < 240; ++y) {
       const BandState& band = (split_s0 >= 0 && y > split_s0) ? live : span;
+      const bool tall = (band.ctrl & 0x20) != 0;
+      const int h = tall ? 16 : 8;
+      const int sprite_x_min = (band.mask & 0x04) ? 0 : 8;
       render_ordered_bg_row(frame, pal.data(), backdrop, band, y);
-      if (!(fmask & 0x10))
+      if (!(band.mask & 0x10))
         continue;
       int slots = 0; // sprite evaluation: first eight in-range per line
       for (size_t i = 0; i < 64 && (!sprite_limit || slots < 8); ++i) {
@@ -524,7 +522,8 @@ Ppu::Frame Ppu::render_frame() {
         const int x = oam[i * 4 + 3];
         const int src_r0 = y - sy;
         const int src_r = (attr & 0x80) ? (h - 1 - src_r0) : src_r0;
-        const auto [b0, b1] = fetch_pattern_pair(sprite_pattern_addr(ctrl, tile, src_r, tall));
+        const auto [b0, b1] = fetch_pattern_pair(
+            sprite_pattern_addr(band.ctrl, tile, src_r, tall));
         const int cols = (256 - x) < 8 ? (256 - x) : 8;
         for (int c = 0; c < cols; ++c) {
           const int px = x + c;
@@ -533,7 +532,7 @@ Ppu::Frame Ppu::render_frame() {
           const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
           if (!pix)
             continue;
-          if (i == 0 && bg_opaque[y][px] && !(px < 8 && (fmask & 0x06) != 0x06)) {
+          if (i == 0 && bg_opaque[y][px] && !(px < 8 && (band.mask & 0x06) != 0x06)) {
             if (sprite0_scanline < 0)
               sprite0_scanline = y;
           }
@@ -569,10 +568,8 @@ Ppu::Frame Ppu::render_frame() {
 
   const int s0 = sprite0_scanline;
   const bool have_mid = mid_scanline >= 0 && mid_scanline + 1 < 240;
-  // The game's post-hit scroll writes land some scanlines below the
-  // hit (Zelda busy-waits ~15 lines to reach its HUD edge).  The
-  // stamped row is exact for OUR clock, which runs base cycles only;
-  // games time splits to tile-row boundaries, so snap up to one.
+  // Post-hit scroll writes land several scanlines below the hit. Games
+  // align these splits to tile rows, so snap the stamped row up to one.
   const int split_row = span_scroll_row >= 0 ? (span_scroll_row + 7) & ~7 : -1;
   const int s0_start = split_row > s0 ? split_row : s0 + 1;
   // A sprite-0 split only means something ABOVE the IRQ split (the
@@ -608,37 +605,38 @@ Ppu::Frame Ppu::render_frame() {
   int nseg = 0;
   segs[nseg++] = {0, &span};
   if (raster_mode) {
-    // State after split i is observable at split i+1, whose capture
-    // occurred before that next handler. The final band is live.
-    bool pinned_y = false;
-    int pinned_origin = 0, pinned_start = 0;
-    int previous_v = raster_splits[0].v_addr;
+    // Each split is captured before its handler; the following snapshot
+    // supplies the handler's state for the band below that split. Advance
+    // vertical position continuously unless a second $2006 write reloaded v.
+    int y_at_start = scroll_row_480(span.t_addr);
+    int previous_start = 0;
+    uint64_t previous_reload = frame_v_reload_generation;
     for (size_t i = 0; i + 1 < raster_split_count; ++i) {
       const auto& next = raster_splits[i + 1];
       const int start = raster_splits[i].line + 1;
-      if ((next.v_addr & 0x7FFF) != (previous_v & 0x7FFF)) {
-        pinned_y = true;
-        pinned_origin = scroll_row_480(next.v_addr);
-        pinned_start = start;
-      }
+      const bool v_reloaded = next.v_reload_generation != previous_reload;
+      if (v_reloaded)
+        y_at_start = scroll_row_480(next.v_addr);
+      else
+        y_at_start = (y_at_start + start - previous_start) % 480;
       const size_t* banks = !mmc5.active()       ? next.chr_banks.data()
                             : (next.ctrl & 0x20) ? next.mapper_banks.background.data()
                                                  : next.mapper_banks.sprite.data();
       raster_bands[i] = BandState{
           next.ctrl,   next.mask,   next.mirroring,
-          next.t_addr, next.fine_x, pinned_y ? (pinned_origin + start - pinned_start) % 480 : -1,
+          next.t_addr, next.fine_x, y_at_start,
           banks};
       segs[nseg++] = {start, &raster_bands[i]};
-      previous_v = next.v_addr;
+      previous_start = start;
+      previous_reload = next.v_reload_generation;
     }
     const int live_start = raster_splits[raster_split_count - 1].line + 1;
-    if ((vram_addr & 0x7FFF) != (previous_v & 0x7FFF)) {
-      pinned_y = true;
-      pinned_origin = scroll_row_480(vram_addr);
-      pinned_start = live_start;
-    }
-    if (pinned_y)
-      raster_live.y_base = (pinned_origin + live_start - pinned_start) % 480;
+    const bool v_reloaded = v_reload_generation != previous_reload;
+    if (v_reloaded)
+      y_at_start = scroll_row_480(vram_addr);
+    else
+      y_at_start = (y_at_start + live_start - previous_start) % 480;
+    raster_live.y_base = y_at_start;
     segs[nseg++] = {live_start, &raster_live};
   } else {
     if (have_s0)

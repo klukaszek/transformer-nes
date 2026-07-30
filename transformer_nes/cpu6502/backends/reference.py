@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from transformer_nes.cpu6502.spec import (
+    BRANCH_CONDITIONS,
     FLAG_B,
     FLAG_C,
     FLAG_D,
@@ -35,6 +36,7 @@ from transformer_nes.cpu6502.spec import (
     MODE_ZERO_PAGE_Y,
     OPCODES,
     Opcode,
+    dynamic_cycle_kind,
     opcode_for,
 )
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
@@ -48,12 +50,43 @@ def irq_deliverable(p: int, irq_pending: bool | int,
     return bool(irq_pending and not nmi_pending and not (p & FLAG_I))
 
 
+def instruction_cycles(cpu: Cpu6502, opcode: Opcode, pc: int,
+                       x: int, y: int, p: int) -> int:
+    """Return one instruction's NMOS cycle count, including live penalties."""
+    cycles = opcode.cycles
+    kind = dynamic_cycle_kind(opcode)
+    if kind <= 8 and opcode.operation in BRANCH_CONDITIONS:
+        mask, expected = BRANCH_CONDITIONS[opcode.operation]
+        if (p & mask) == expected:
+            cycles += 1
+            next_pc = (pc + 2) & 0xFFFF
+            offset = cpu.read_memory(pc + 1)
+            offset = offset if offset < 0x80 else offset - 0x100
+            target = (next_pc + offset) & 0xFFFF
+            cycles += int((next_pc ^ target) & 0xFF00 != 0)
+        return cycles
+
+    if not kind:
+        return cycles
+    if opcode.mode == MODE_ABSOLUTE_X:
+        base = cpu.read_memory(pc + 1) | (cpu.read_memory(pc + 2) << 8)
+        cycles += int((base & 0xFF00) != ((base + x) & 0xFFFF & 0xFF00))
+    elif opcode.mode == MODE_ABSOLUTE_Y:
+        base = cpu.read_memory(pc + 1) | (cpu.read_memory(pc + 2) << 8)
+        cycles += int((base & 0xFF00) != ((base + y) & 0xFFFF & 0xFF00))
+    elif opcode.mode == MODE_INDIRECT_Y:
+        pointer = cpu.read_memory(pc + 1)
+        base = cpu.read_memory(pointer) | (cpu.read_memory((pointer + 1) & 0xFF) << 8)
+        cycles += int((base & 0xFF00) != ((base + y) & 0xFFFF & 0xFF00))
+    return cycles
+
+
 @dataclass
 class Cpu6502:
     """Reference 6502 CPU.
 
     Memory is modeled as a dense 64 KiB array.  This is intentionally simple:
-    the graph interpreter will use an attention-based append-only memory log,
+    the weights compiler models as an attention-backed append-only memory log,
     but the reference is allowed to be straightforward.
     """
 
@@ -68,6 +101,8 @@ class Cpu6502:
     step_count: int = 0
     # NMOS 6502 honors the D flag; the NES 2A03 ignores it (always binary).
     bcd_enabled: bool = True
+    # Enable the NES's $0000-$1FFF internal-RAM mirrors when needed.
+    mirror_cpu_ram: bool = False
     # Level-style NMI request: when set, the next step() executes the NMI
     # sequence instead of the instruction at PC, then clears the flag.
     nmi_pending: bool = False
@@ -81,6 +116,9 @@ class Cpu6502:
     )
 
     def __post_init__(self):
+        if self.mirror_cpu_ram:
+            for addr in range(0x0800, 0x2000):
+                self.memory[addr] = self.memory[addr & 0x07FF]
         self._ops = {
             "load_a": self.op_load_a,
             "load_x": self.op_load_x,
@@ -177,8 +215,25 @@ class Cpu6502:
         if start_pc is None:
             start_pc = self.pc
         for i, b in enumerate(program):
-            self.memory[(start_pc + i) & 0xFFFF] = b
+            self.write_memory(start_pc + i, b)
         self.pc = start_pc & 0xFFFF
+
+    def memory_address(self, addr: int) -> int:
+        addr &= 0xFFFF
+        return (addr & 0x07FF) if self.mirror_cpu_ram and addr < 0x2000 else addr
+
+    def read_memory(self, addr: int) -> int:
+        return self.memory[self.memory_address(addr)]
+
+    def write_memory(self, addr: int, value: int) -> None:
+        addr &= 0xFFFF
+        value &= 0xFF
+        if self.mirror_cpu_ram and addr < 0x2000:
+            physical = addr & 0x07FF
+            for mirror in range(physical, 0x2000, 0x0800):
+                self.memory[mirror] = value
+        else:
+            self.memory[addr] = value
 
     # ── Flag helpers ────────────────────────────────────────────────
 
@@ -196,12 +251,12 @@ class Cpu6502:
     # ── Stack helpers ───────────────────────────────────────────────
 
     def push_byte(self, value: int) -> None:
-        self.memory[0x0100 + self.s] = value & 0xFF
+        self.write_memory(0x0100 + self.s, value)
         self.s = (self.s - 1) & 0xFF
 
     def pull_byte(self) -> int:
         self.s = (self.s + 1) & 0xFF
-        return self.memory[0x0100 + self.s]
+        return self.read_memory(0x0100 + self.s)
 
     def push_word(self, value: int) -> None:
         self.push_byte((value >> 8) & 0xFF)
@@ -215,7 +270,7 @@ class Cpu6502:
     # ── Instruction execution ───────────────────────────────────────
 
     def fetch_byte(self, addr: int) -> int:
-        return self.memory[addr & 0xFFFF]
+        return self.read_memory(addr)
 
     def read_operand(self, opcode: Opcode) -> tuple[int, int, int]:
         """Return (operand_lo, operand_hi, next_pc_after_operand_fetch)."""
@@ -391,25 +446,24 @@ class Cpu6502:
         """
         if start_pc is not None:
             self.pc = start_pc & 0xFFFF
-        memory = self.memory
         dispatch = self.dispatch
         resolve_ea = self.resolve_ea
         steps = 0
         while steps < max_steps:
             pc = self.pc
-            entry = dispatch[memory[pc]]
+            entry = dispatch[self.read_memory(pc)]
             if entry is None:
-                raise ValueError(f"unsupported opcode 0x{memory[pc]:02X}")
+                raise ValueError(f"unsupported opcode 0x{self.read_memory(pc):02X}")
             opcode, handler = entry
             length = opcode.length
             if length == 1:
                 lo = hi = 0
             elif length == 2:
-                lo = memory[(pc + 1) & 0xFFFF]
+                lo = self.read_memory(pc + 1)
                 hi = 0
             else:
-                lo = memory[(pc + 1) & 0xFFFF]
-                hi = memory[(pc + 2) & 0xFFFF]
+                lo = self.read_memory(pc + 1)
+                hi = self.read_memory(pc + 2)
             ea = resolve_ea(opcode, lo, hi)
             _, new_pc, _ = handler(opcode, lo, hi, ea)
             new_pc &= 0xFFFF
@@ -444,19 +498,19 @@ class Cpu6502:
 
     def op_store_a(self, opcode: Opcode, lo: int, hi: int, ea: int
                      ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.memory[ea] = self.a & 0xFF
+        self.write_memory(ea, self.a)
         write = MemWrite(self.step_count, ea, self.a & 0xFF)
         return self.a, self.pc + opcode.length, (write,)
 
     def op_store_x(self, opcode: Opcode, lo: int, hi: int, ea: int
                      ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.memory[ea] = self.x & 0xFF
+        self.write_memory(ea, self.x)
         write = MemWrite(self.step_count, ea, self.x & 0xFF)
         return self.x, self.pc + opcode.length, (write,)
 
     def op_store_y(self, opcode: Opcode, lo: int, hi: int, ea: int
                      ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.memory[ea] = self.y & 0xFF
+        self.write_memory(ea, self.y)
         write = MemWrite(self.step_count, ea, self.y & 0xFF)
         return self.y, self.pc + opcode.length, (write,)
 
@@ -604,7 +658,7 @@ class Cpu6502:
             return self.a, self.pc + opcode.length, ()
         value = self.fetch_byte(ea)
         new_value = (value << 1) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         self.set_flag("C", value & 0x80)
         self.set_nz(new_value)
         write = MemWrite(self.step_count, ea, new_value)
@@ -621,7 +675,7 @@ class Cpu6502:
             return self.a, self.pc + opcode.length, ()
         value = self.fetch_byte(ea)
         new_value = (value >> 1) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         self.set_flag("C", value & 0x01)
         self.set_nz(new_value)
         write = MemWrite(self.step_count, ea, new_value)
@@ -639,7 +693,7 @@ class Cpu6502:
             return self.a, self.pc + opcode.length, ()
         value = self.fetch_byte(ea)
         new_value = ((value << 1) | carry) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         self.set_flag("C", value & 0x80)
         self.set_nz(new_value)
         write = MemWrite(self.step_count, ea, new_value)
@@ -657,7 +711,7 @@ class Cpu6502:
             return self.a, self.pc + opcode.length, ()
         value = self.fetch_byte(ea)
         new_value = ((value >> 1) | (carry << 7)) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         self.set_flag("C", value & 0x01)
         self.set_nz(new_value)
         write = MemWrite(self.step_count, ea, new_value)
@@ -666,7 +720,7 @@ class Cpu6502:
     def op_inc(self, opcode: Opcode, lo: int, hi: int, ea: int
                 ) -> tuple[int, int, tuple[MemWrite, ...]]:
         new_value = (self.fetch_byte(ea) + 1) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         self.set_nz(new_value)
         write = MemWrite(self.step_count, ea, new_value)
         return new_value, self.pc + opcode.length, (write,)
@@ -674,7 +728,7 @@ class Cpu6502:
     def op_dec(self, opcode: Opcode, lo: int, hi: int, ea: int
                 ) -> tuple[int, int, tuple[MemWrite, ...]]:
         new_value = (self.fetch_byte(ea) - 1) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         self.set_nz(new_value)
         write = MemWrite(self.step_count, ea, new_value)
         return new_value, self.pc + opcode.length, (write,)
@@ -888,14 +942,14 @@ class Cpu6502:
     def op_sax(self, opcode: Opcode, lo: int, hi: int, ea: int
                 ) -> tuple[int, int, tuple[MemWrite, ...]]:
         value = self.a & self.x & 0xFF
-        self.memory[ea] = value
+        self.write_memory(ea, value)
         write = MemWrite(self.step_count, ea, value)
         return value, self.pc + opcode.length, (write,)
 
     def op_dcp(self, opcode: Opcode, lo: int, hi: int, ea: int
                 ) -> tuple[int, int, tuple[MemWrite, ...]]:
         new_value = (self.fetch_byte(ea) - 1) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         write = MemWrite(self.step_count, ea, new_value)
         result = self.a - new_value
         self.set_flag("C", result >= 0)
@@ -905,7 +959,7 @@ class Cpu6502:
     def op_isb(self, opcode: Opcode, lo: int, hi: int, ea: int
                 ) -> tuple[int, int, tuple[MemWrite, ...]]:
         new_value = (self.fetch_byte(ea) + 1) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         write = MemWrite(self.step_count, ea, new_value)
         self.sbc_apply(new_value)
         return new_value, self.pc + opcode.length, (write,)
@@ -914,7 +968,7 @@ class Cpu6502:
                 ) -> tuple[int, int, tuple[MemWrite, ...]]:
         value = self.fetch_byte(ea)
         new_value = (value << 1) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         write = MemWrite(self.step_count, ea, new_value)
         self.set_flag("C", value & 0x80)
         self.a = (self.a | new_value) & 0xFF
@@ -926,7 +980,7 @@ class Cpu6502:
         value = self.fetch_byte(ea)
         carry = 1 if self.p & FLAG_C else 0
         new_value = ((value << 1) | carry) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         write = MemWrite(self.step_count, ea, new_value)
         self.set_flag("C", value & 0x80)
         self.a = (self.a & new_value) & 0xFF
@@ -937,7 +991,7 @@ class Cpu6502:
                 ) -> tuple[int, int, tuple[MemWrite, ...]]:
         value = self.fetch_byte(ea)
         new_value = (value >> 1) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         write = MemWrite(self.step_count, ea, new_value)
         self.set_flag("C", value & 0x01)
         self.a = (self.a ^ new_value) & 0xFF
@@ -949,7 +1003,7 @@ class Cpu6502:
         value = self.fetch_byte(ea)
         carry = 1 if self.p & FLAG_C else 0
         new_value = ((value >> 1) | (carry << 7)) & 0xFF
-        self.memory[ea] = new_value
+        self.write_memory(ea, new_value)
         write = MemWrite(self.step_count, ea, new_value)
         # ADC consumes the carry that ROR just produced.
         self.set_flag("C", value & 0x01)

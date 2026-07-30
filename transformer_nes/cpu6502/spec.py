@@ -1,4 +1,4 @@
-"""6502 opcode table and flag definitions shared by reference and graph code."""
+"""6502 opcode table and flag definitions shared by the CPU implementations."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ FLAG_MASKS = {
 class Opcode:
     """A single 6502 opcode entry.
 
-    The reference core and the graph interpreter both consume this table so
+    The reference core and graph construction both consume this table so
     behavior is declared in exactly one place.
     """
 
@@ -59,9 +59,32 @@ MODE_RELATIVE = "rel"
 MODE_IMPLIED = "imp"
 MODE_ACCUMULATOR = "acc"
 
+# Read operations with conditional indexed page-cross penalties.
+PAGE_CROSS_READ_OPERATIONS = frozenset({
+    "load_a", "load_x", "load_y", "adc", "sbc", "cmp",
+    "and", "ora", "eor", "lax",
+})
+BRANCH_CONDITIONS = {
+    "bpl": (FLAG_N, 0), "bmi": (FLAG_N, FLAG_N),
+    "bvc": (FLAG_V, 0), "bvs": (FLAG_V, FLAG_V),
+    "bcc": (FLAG_C, 0), "bcs": (FLAG_C, FLAG_C),
+    "bne": (FLAG_Z, 0), "beq": (FLAG_Z, FLAG_Z),
+}
+BRANCH_OPERATIONS = frozenset(BRANCH_CONDITIONS)
+BRANCH_CYCLE_CODES = {
+    "bpl": 1, "bmi": 2, "bvc": 3, "bvs": 4,
+    "bcc": 5, "bcs": 6, "bne": 7, "beq": 8,
+}
+INDEXED_READ_CYCLE_CODES = {
+    MODE_ABSOLUTE_X: 9,
+    MODE_ABSOLUTE_Y: 10,
+    MODE_INDIRECT_Y: 11,
+}
 
-# Full official NMOS 6502 opcode set (151 opcodes).  Cycle counts are not
-# modeled exactly; they are kept as the nominal cycle count for reference only.
+
+# Full official NMOS 6502 opcode set (151 opcodes). ``cycles`` is the base
+# timing; branch and indexed-read penalties are computed by the execution
+# backends from the live operands and flags.
 OPCODES: dict[int, Opcode] = {
     0xA9: Opcode(0xA9, "LDA", MODE_IMMEDIATE, 2, 2, "load_a", ("N", "Z")),
     0xA5: Opcode(0xA5, "LDA", MODE_ZERO_PAGE, 2, 3, "load_a", ("N", "Z")),
@@ -304,6 +327,21 @@ OPCODES: dict[int, Opcode] = {
 }
 
 
+def dynamic_cycle_kind(opcode: Opcode) -> int:
+    if opcode.operation in BRANCH_CYCLE_CODES:
+        return BRANCH_CYCLE_CODES[opcode.operation]
+    if opcode.operation in PAGE_CROSS_READ_OPERATIONS:
+        return INDEXED_READ_CYCLE_CODES.get(opcode.mode, 0)
+    return 0
+
+
+def dynamic_cycle_table() -> tuple[int, ...]:
+    return tuple(
+        dynamic_cycle_kind(OPCODES[byte]) if byte in OPCODES else 0
+        for byte in range(256)
+    )
+
+
 def opcode_for(byte: int) -> Opcode:
     """Return the opcode entry for a byte, raising on unsupported bytes."""
     try:
@@ -313,13 +351,10 @@ def opcode_for(byte: int) -> Opcode:
 
 
 # ── MMIO classification ────────────────────────────────────────────
-# Operations whose execution reads their memory operand.  Combined with a
-# memory addressing mode, these are the instructions that can trigger a
-# device read on the bus.  Stores (STA/STX/STY/SAX), control flow, and
-# stack operations are excluded; read-modify-write ops are included (they
-# read before writing, and device registers observe that read).  NOP is
-# included because the unofficial memory-mode NOPs issue real bus reads on
-# hardware (reading e.g. $2007 through them has side effects on a NES).
+# Operations whose execution reads their memory operand, so with a memory
+# addressing mode they can trigger a device read.  RMW ops count (they read
+# before writing); so does NOP, whose unofficial memory modes issue real
+# bus reads on hardware.
 READS_MEMORY = frozenset({
     "load_a", "load_x", "load_y", "adc", "sbc", "cmp", "cpx", "cpy",
     "and", "ora", "eor", "bit", "asl", "lsr", "rol", "ror", "inc", "dec",

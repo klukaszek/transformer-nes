@@ -110,13 +110,6 @@ class Expression:
         elif value != 0:
             self.terms[dim] = value
 
-    def evaluate(self, values):
-        total = 0.0
-        for d, c in self.terms.items():
-            total += c * values.get(d, 0.0)
-        return total
-
-
 class Dimension:
     counter = 0
 

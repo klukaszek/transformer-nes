@@ -24,6 +24,11 @@ using std::uint8_t;
 using std::variant;
 using std::vector;
 
+constexpr size_t cpu_ram_index(int address) {
+  const auto a = static_cast<uint16_t>(address);
+  return a < 0x2000 ? a & 0x07FF : a;
+}
+
 struct CpuWrite {
   int addr = 0;
   int value = 0;
@@ -48,6 +53,7 @@ public:
   virtual int pc() const = 0;
   virtual int x() const = 0;
   virtual int y() const = 0;
+  virtual int p() const = 0;
   virtual bool halted() const = 0;
   virtual bool nmi_pending() const = 0;
   virtual bool irq_ready() const = 0;
@@ -136,8 +142,23 @@ struct IrqLine {
 };
 
 struct OpcodeInfo {
+  enum class DynamicKind : uint8_t {
+    none = 0,
+    bpl = 1,
+    bmi = 2,
+    bvc = 3,
+    bvs = 4,
+    bcc = 5,
+    bcs = 6,
+    bne = 7,
+    beq = 8,
+    absolute_x = 9,
+    absolute_y = 10,
+    indirect_y = 11,
+  };
   int cycles = 0;
   int read_mode = -1;
+  DynamicKind dynamic_kind = DynamicKind::none;
 };
 using OpcodeTable = array<OpcodeInfo, 256>;
 
@@ -166,7 +187,9 @@ public:
   int64_t cycles() const { return cycles_; }
 
 private:
-  static constexpr size_t address_index(int address) { return static_cast<uint16_t>(address); }
+  static constexpr size_t address_index(int address) {
+    return cpu_ram_index(address);
+  }
   optional<int> read_target(int pc, int x, int y) const;
   SteppedRuntime& runtime_;
   OpcodeTable opcodes_{};

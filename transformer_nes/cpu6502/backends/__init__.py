@@ -1,6 +1,6 @@
-"""The 6502 machine backends, one semantics each way.
+"""The 6502 execution backends.
 
-reference is the oracle; graph is the exact evaluator (and the runtime the
-generated engine compiles from); weights/ is the machine as actual
-transformer weights, with its run-loop protocol in weights/run_protocol.py.
+``reference`` is the oracle; ``weights`` is the generated machine as actual
+transformer weights. Graph construction lives in ``cpu6502.construction`` and is
+consumed by the weights compiler.
 """

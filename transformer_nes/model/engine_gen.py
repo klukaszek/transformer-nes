@@ -1,8 +1,8 @@
 """Emit model-specific C++ for analytic transformer weights.
 
 Sparse indices and coefficients become C++ expressions, removing CSR gather
-overhead. The residual uses exact fixed-point int32. Attention uses exact
-memory structures, running argmax registers, or hulls according to
+overhead. The residual uses exact fixed-point int32. Attention is served by
+the exact memory structures and running-argmax registers licensed by
 :mod:`model.classify`.
 """
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import re
 import sys
@@ -36,9 +37,8 @@ from transformer_nes.model.classify import (
     register_query,
 )
 
-ATTENTION_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "attention"
-)
+logger = logging.getLogger(__name__)
+
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_engine_cache")
 MANIFEST_PATH = os.path.join(CACHE_DIR, "manifest.json")
 # Shards bound the size of each generated C++ translation unit; jobs bound how
@@ -67,11 +67,11 @@ def compile_shards() -> int:
 
 # Everything whose content can change the emitted engine, hashed into the
 # config key so any edit is a cache miss (over-inclusion is safe).
-CODE_DIRS = ("graph", "model", "attention")
+CODE_DIRS = ("graph", "model")
 CODE_FILES = (
     "cpu6502/spec.py",
     "cpu6502/interpreter.py",
-    "cpu6502/backends/graph.py",
+    "cpu6502/construction.py",
     "cpu6502/backends/reference.py",
     "cpu6502/backends/weights/run_protocol.py",
     "cpu6502/backends/weights/windows.py",
@@ -104,10 +104,13 @@ def code_digest() -> str:
     return code_digest_cache
 
 
-def engine_config_key(*, bcd: bool) -> str:
+def engine_config_key(*, bcd: bool, union_only: bool = False,
+                      mirror_cpu_ram: bool = False) -> str:
     """Cache key for a built engine, computable without folding or emitting:
-    decimal mode plus every source file that shapes the fixed production core."""
-    raw = f"{code_digest()}|bcd={int(bcd)}"
+    decimal mode plus every source file that shapes the fixed production core.
+    A union-only engine holds no experts, so it keys separately."""
+    raw = (f"{code_digest()}|bcd={int(bcd)}|union_only={int(union_only)}"
+           f"|mirror_cpu_ram={int(mirror_cpu_ram)}")
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -190,13 +193,20 @@ def load_module(
     build_dir = os.path.join(CACHE_DIR, f"build_{digest}")
     so_path = os.path.join(build_dir, f"{name}.so")
     if os.path.exists(so_path):
-        spec = importlib.util.spec_from_file_location(name, so_path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        sys.modules[name] = module
-        return module, 0.0
+        try:
+            spec = importlib.util.spec_from_file_location(name, so_path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            sys.modules[name] = module
+            return module, 0.0
+        except ImportError as exc:
+            # A cached extension can outlive the process that provided its
+            # dynamic-library search path (notably torch's libc10 on macOS).
+            logger.info("rebuilding unavailable cached engine %s: %s", name, exc)
+            os.unlink(so_path)
 
+    import torch
     from torch.utils.cpp_extension import load
 
     build_start = time.perf_counter()
@@ -214,7 +224,10 @@ def load_module(
             name=name,
             sources=sources,
             extra_cflags=cflags,
-            extra_include_paths=[ATTENTION_DIR, CACHE_DIR],
+            extra_ldflags=[
+                f"-Wl,-rpath,{os.path.join(os.path.dirname(torch.__file__), 'lib')}"
+            ],
+            extra_include_paths=[CACHE_DIR],
             build_directory=build_dir,
             verbose=False,
         )
@@ -250,14 +263,6 @@ def load_seqmod_module(digest: str) -> tuple[object, float]:
     )
 
 
-def lit_d(value: float) -> str:
-    """A float64 value as an exact C++ hexfloat literal."""
-    f = float(value)
-    if f == int(f) and abs(f) < 2**53:
-        return f"{int(f)}.0"
-    return f.hex()
-
-
 def join(terms) -> str:
     if not terms:
         return ""
@@ -266,20 +271,6 @@ def join(terms) -> str:
     for sign, term in terms[1:]:
         out += f" {sign} {term}"
     return out
-
-
-def expr_dbl(indices, data, ref) -> str:
-    """One CSR row as a float64 expression (hull-bound Q/K/V rows)."""
-    terms = []
-    for idx, c in zip(indices, data, strict=True):
-        c = float(c)
-        if c == 1.0:
-            terms.append(("+", ref(idx)))
-        elif c == -1.0:
-            terms.append(("-", ref(idx)))
-        else:
-            terms.append(("+", f"{lit_d(c)}*{ref(idx)}"))
-    return join(terms) or "0.0"
 
 
 def expr_int(indices, data, ref, where: str) -> str:
@@ -397,11 +388,7 @@ def check_ffn_kinds(model, layer_idx):
 
 
 # ── Static C++ blocks ───────────────────────────────────────────────────
-# These sections do not depend on the built model (or depend only on the
-# integer element type, spliced in for "ELEM").  Keeping them as readable
-# C++ here, rather than hundreds of per-line emit() calls, is exact: the
-# generated source is `"\n".join(lines)`, so emitting one multi-line block is
-# byte-for-byte identical to emitting each of its lines.
+# Static C++ templates.
 
 INCLUDES = """\
 #include <pybind11/pybind11.h>
@@ -412,7 +399,6 @@ INCLUDES = """\
 #include <stdexcept>
 #include <utility>
 #include <vector>
-#include "hull2d_cht.h"
 
 namespace py = pybind11;
 using FArr = py::array_t<float, py::array::c_style | py::array::forcecast>;
@@ -448,12 +434,7 @@ FIXED_POINT_HELPERS = """\
 # emission comes from run_protocol.py.
 MEM_QUERY = mem_query_cpp("long long")
 
-# Per-ROM sequence-module hook: a separately compiled window module attaches
-# its dispatch through a raw function pointer, so a new ROM's window set never
-# recompiles this TU.  Execution models return one final state and apply their
-# ordered writes directly; traced runs bypass them.  A pinned module window
-# outranks the canonical shape table (it folded the operands too, so its
-# forward is cheaper); both fall back to per-step.
+# Per-ROM sequence-module hook; pinned windows outrank canonical shapes.
 SEQ_HOOK = """\
     typedef int (*SeqFn)(void*, void*, long, long, long, long, int);
     SeqFn seq_fn = nullptr;
@@ -514,10 +495,9 @@ ENGINE_STEP_BODY = """\
             const bool was_int = nmi_pending || irq_ready();
             const int prev_pc = st_pc;
             const unsigned char exec_opcode = ram[prev_pc];
-            int pre_a = 0, pre_x = 0, pre_y = 0, pre_p = 0;
+            int pre_a = st_a, pre_x = st_x, pre_y = st_y, pre_p = st_p;
             int tr_lo = 0, tr_hi = 0, tr_ea = 0, tr_operand = 0;
             if (trace) {
-                pre_a = st_a; pre_x = st_x; pre_y = st_y; pre_p = st_p;
                 const int tr_len = TRACE_LENGTH[exec_opcode];
                 if (tr_len > 1) tr_lo = ram[(prev_pc + 1) & 0xFFFF];
                 if (tr_len > 2) tr_hi = ram[(prev_pc + 2) & 0xFFFF];
@@ -525,6 +505,46 @@ ENGINE_STEP_BODY = """\
                 const int data_kind = TRACE_DATA[exec_opcode];
                 if (data_kind >= 11)
                     tr_operand = TRACE_MODE[exec_opcode] == 11 ? tr_lo : ram[tr_ea];
+                // Preserve interrupted-PC bytes in trace receipts.
+                if (was_int) {
+                    tr_lo = ram[(prev_pc + 1) & 0xFFFF];
+                    tr_hi = ram[(prev_pc + 2) & 0xFFFF];
+                }
+            }
+            if (was_int && interrupt_step(nmi_pending)) {
+                // Interrupts report the interrupted PC with no effective address.
+                int exec_hits = 0;
+                for (int w = 0; w < exec_n_writes; ++w) {
+                    const int wa = exec_write_addr[w], wv = exec_write_value[w];
+                    if (trace) {
+                        w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);
+                    }
+                    insert_write(wa, wv, seq + 1);
+                    if (wa >= 0x8000 && mapper_kind) {
+                        mapper_write(wa, wv);
+                    } else if (!wwatch.empty() && in_ranges(wwatch, wa)) {
+                        hit_addr.push_back(wa); hit_value.push_back(wv);
+                        ++exec_hits;
+                    }
+                }
+                if (trace) {
+                    t_pc.push_back(prev_pc); t_a.push_back(st_a);
+                    t_x.push_back(st_x); t_y.push_back(st_y);
+                    t_s.push_back(st_s); t_p.push_back(st_p);
+                    t_ir.push_back(exec_opcode); t_oplo.push_back(tr_lo);
+                    t_ophi.push_back(tr_hi); t_ea.push_back(0);
+                    t_data.push_back(0);
+                    t_halted.push_back(st_halted ? 1 : 0);
+                    st_ir = exec_opcode; st_oplo = tr_lo; st_ophi = tr_hi;
+                    st_ea = 0; st_data = 0;
+                }
+                nmi_pending = false;
+                ++step_index;
+                cycles_this += 7; cycles_total += 7;
+                if (exec_hits > 0) { reason = "watch_write"; break; }
+                if (st_halted) { reason = "halt"; break; }
+                if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }
+                continue;
             }
             if (!was_int && execution_step(exec_opcode)) {
                 const int tr_data = trace
@@ -539,8 +559,6 @@ ENGINE_STEP_BODY = """\
                     insert_write(wa, wv, seq + 1);
                     if (wa >= 0x8000 && mapper_kind) {
                         mapper_write(wa, wv);
-                    } else if (wjournal[wa]) {
-                        journal_write(wa, wv);
                     } else if (!wwatch.empty() && in_ranges(wwatch, wa)) {
                         hit_addr.push_back(wa); hit_value.push_back(wv);
                         ++exec_hits;
@@ -558,7 +576,8 @@ ENGINE_STEP_BODY = """\
                     st_ea = tr_ea; st_data = tr_data;
                 }
                 ++step_index;
-                const long step_cycles = (long)CYCLES[exec_opcode];
+                const long step_cycles = dynamic_cycles(
+                    exec_opcode, prev_pc, pre_x, pre_y, pre_p);
                 cycles_this += step_cycles; cycles_total += step_cycles;
                 if (stop_on_trap && st_pc == prev_pc) { reason = "trap"; break; }
                 if (exec_hits > 0) {
@@ -568,7 +587,7 @@ ENGINE_STEP_BODY = """\
                 if (max_cycles > 0 && cycles_this >= max_cycles) { reason = "cycles"; break; }
                 continue;
             }
-            step_core(o);  // union model: opcode has no compact expert (NMI, unknown, union-only families)
+            step_core(o);  // union: undefined bytes
             if (trace) {
                 t_pc.push_back((int)o[0]); t_a.push_back((int)o[1]);
                 t_x.push_back((int)o[2]); t_y.push_back((int)o[3]);
@@ -588,14 +607,15 @@ ENGINE_STEP_BODY = """\
                 }
                 if (wa >= 0x8000 && mapper_kind) {
                     mapper_write(wa, wv);  // native banking; no pause
-                } else if (wjournal[wa]) {
-                    journal_write(wa, wv);  // order-only device state; no pause
                 } else if (!wwatch.empty() && in_ranges(wwatch, wa)) {
                     sh_addr[n_hits] = wa; sh_value[n_hits] = wv; ++n_hits;
                 }
             }
             ++step_index;
-            const long step_cycles = was_int ? 7 : (long)CYCLES[(unsigned char)o[6]];
+            const long step_cycles = was_int
+                ? 7
+                : dynamic_cycles((unsigned char)o[6], prev_pc,
+                                  pre_x, pre_y, pre_p);
             cycles_this += step_cycles; cycles_total += step_cycles;
             for (int k = 0; k < n_hits; ++k) { hit_addr.push_back(sh_addr[k]); hit_value.push_back(sh_value[k]); }
             if (halted) { st_halted = true; reason = "halt"; break; }
@@ -653,6 +673,7 @@ RUN_LOOP = "\n\n".join((
             throw std::runtime_error("seed_image needs a 64 KiB image");
         long n = 0;
         for (int a = 0; a < 65536; ++a) {
+            if (MIRROR_CPU_RAM && a >= 0x0800 && a < 0x2000) continue;
             const unsigned char v = (unsigned char)d[a];
             if (v) { insert_write(a, v, seq + 1); ++n; }
         }
@@ -689,7 +710,6 @@ PYBIND_STEP_METHODS = """\
         .def("watch_read", &ENGINE_T::watch_read)
         .def("watch_write", &ENGINE_T::watch_write)
         .def("clear_watches", &ENGINE_T::clear_watches)
-        .def("set_write_journal", &ENGINE_T::set_write_journal)
         .def("set_read_lease", &ENGINE_T::set_read_lease,
              py::arg("addr"), py::arg("value"), py::arg("group") = 0)
         .def("set_read_lease_seq", &ENGINE_T::set_read_lease_seq,
@@ -807,7 +827,7 @@ def emit_recurrence_dispatch(emit, exp, E: str, step_call: str, indent: str) -> 
 
 
 def assemble_seq_module(lines, body, experts, core_digest, elem,
-                         n_seen, emit_step_core) -> tuple[str, int, bool]:
+                         emit_step_core) -> tuple[str, int, bool]:
     """Assemble the per-ROM sequence-module TU from the emitted expert
     bodies: a SEQMOD_T struct compiled against the core's generated header,
     exporting its dispatch as a raw function pointer for attach_seq()."""
@@ -823,8 +843,7 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
     emit("// Generated per-ROM sequence module (model/engine_gen.py): folded")
     emit("// window experts + dispatch, compiled against the core engine's")
     emit("// generated header and attached at runtime via attach_seq().  All")
-    emit("// shared machine state is reached through the typed reference E;")
-    emit("// only scratch (xbuf, the hull_seen guards) lives in the module.")
+    emit("// shared machine state is reached through the typed reference E.")
     emit(f'#include "engine_{core_digest}.hpp"')
     emit("")
     emit("struct SEQMOD_T {")
@@ -836,24 +855,13 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
     emit(f"    static long long shr2({elem} v) {{ return Eng::shr2(v); }}")
     emit(f"    static {elem} half({elem} v) {{ return Eng::half(v); }}")
     emit(f"    {elem} xbuf[{mod_xbuf}];")
-    emit("    // Guard state only: module memory heads never hold hull data")
-    emit("    // (ids are shared with the discarded union planning pass, so")
-    emit("    // the array is sparse -- a few hundred longs, not worth rebasing).")
-    emit(f"    long hull_seen[{max(n_seen, 1)}];")
-    emit(f"    SEQMOD_T() {{ for (int i = 0; i < {max(n_seen, 1)}; ++i) "
-         "hull_seen[i] = -1; }")
     emit("")
     lines.extend(body)
     for exp in experts:
         emit("")
         emit_step_core(f"step_core__{exp['name']}", f"__{exp['name']}",
                        exp["model"], exp["step_spec"])
-    # Window dispatch: same guards as the per-instruction path needs for
-    # step-for-step equivalence -- pc at the head, every window byte
-    # matched, no deliverable interrupt, enough step/cycle budget.  A
-    # switch on st_pc keeps dispatch O(log windows); several banks may
-    # carry different windows at one head, so byte checks arbitrate
-    # within a case.
+    # Window dispatch checks the head PC, bytes, interrupts, and budget.
     by_head: dict[int, list] = {}
     for exp in experts:
         by_head.setdefault(exp["head"], []).append(exp)
@@ -865,6 +873,8 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
     for head in sorted(by_head):
         emit(f"        case 0x{head:04X}:")
         for exp in by_head[head]:
+            if not exp.get("cycle_safe", True):
+                continue
             window = exp["window"]
             k, prefix = exp["n_steps"], exp["cycles_prefix"]
             if exp.get("recurrence") is not None and exp["recurrence"].kind == "identity":
@@ -916,8 +926,8 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
 
 
 class EmitterContext:
-    """Shared emission state: the union pass allocates (hulls, memory
-    targets, registers), expert passes resolve onto it, the epilogue
+    """Shared emission state: the union pass allocates memory targets and
+    registers, expert passes resolve onto it, the epilogue
     emits from it.  Also the dialect: element type and member prefix
     ("" for the engine, "E." for a sequence module)."""
 
@@ -925,11 +935,7 @@ class EmitterContext:
         self.elem = elem
         self.E = E
         self.inv_scale = inv_scale
-        self.hull_tiebreak: list[int] = []  # flat hull id -> latest?
-        self.mem_hulls: list[list[int]] = [[] for _ in range(16)]
-        self.mem_fallback_hulls: list[int] = []
         self.n_memory_heads = 0
-        self.n_hull_heads = 0  # heads still on real hulls
         # Running-argmax registers for constant-query heads, keyed by
         # (union lookup id, value pair): the union pass allocates in
         # head-scan order, expert passes resolve through fold provenance.
@@ -954,20 +960,20 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
     """Per-layer emission plans for one model.
 
     The union pass (union_lookup_of is None) allocates the shared engine
-    state -- hull ids, the memory-structure insert targets, and the
-    running-argmax registers keyed by (lookup id, value pair) -- in
-    head-scan order.  Expert passes resolve their heads onto that state
-    through the fold's lookup provenance and never allocate: an expert
-    head whose classification disagrees with the union's is a hard
-    error, because a per-expert hull would accumulate divergent history
-    across routed steps.
+    state -- the memory-structure targets and running-argmax registers keyed
+    by (lookup id, value pair) -- in head-scan order. Expert passes resolve
+    their heads onto that state through the fold's lookup provenance and
+    never allocate.
     """
     is_union = union_lookup_of is None
     dm = mdl.tok.weight.shape[1]
-    nh = mdl.attn[0].num_heads if mdl.attn else 0
     plans: list[dict] = []
     for li in range(len(mdl.attn)):
         check_ffn_kinds(mdl, li)
+        # Layers are ragged: Q/K/V rows live in this layer's own head block.
+        nh = mdl.attn[li].num_heads
+        k_base = 2 * nh
+        v_base = 4 * nh
         ip = csr(mdl.attn[li].in_proj_weight)
         op = csr(mdl.attn[li].out_proj.weight)
         fi = csr(mdl.ff_in[li].weight)
@@ -976,12 +982,12 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
         kinds = mdl.head_kinds[li]
         ffn_kinds = mdl.ffn_kinds[li]
         tiebreak = mdl.head_tiebreak[li]
-        groups = mdl.head_cache_groups[li]
         mem_groups = mdl.head_memory_groups[li]
         lookup_ids = mdl.head_lookup_ids[li]
         pairs = mdl.head_pairs[li]
         memory_outputs = getattr(
-            mdl, "head_memory_outputs", [[None] * nh for _ in mdl.attn]
+            mdl, "head_memory_outputs",
+            [[None] * a.num_heads for a in mdl.attn],
         )[li]
 
         lookup = [h for h in range(nh) if kinds[h] == 1]
@@ -989,34 +995,18 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
         for h in lookup:
             if not tiebreak[h]:
                 raise RuntimeError(
-                    f"{label} L{li} head {h}: AVERAGE tie-break can return "
-                    "fractional hull outputs"
+                    f"{label} L{li} head {h}: AVERAGE tie-break is not "
+                    "supported by the exact integer attention structures"
                 )
 
-        # Shared hulls, first-seen in ascending head order (engine order).
-        # Expert hull ids exist only for the hull_seen live-insert guard;
-        # only the union's memory hulls receive insert_write tokens.
-        hull_base = len(ctx.hull_tiebreak)
-        hull_of_group: dict[int, int] = {}
-        hull_of_head: dict[int, int] = {}
         for h in lookup:
-            if mem_groups[h] == MEMORY_GROUP_FUSED:
-                continue
-            g = groups[h]
-            if g < 0:
-                raise RuntimeError(f"{label} L{li} head {h}: negative cache group")
-            if g not in hull_of_group:
-                hull_of_group[g] = hull_base + len(hull_of_group)
-                ctx.hull_tiebreak.append(int(tiebreak[h]))
-            hull_of_head[h] = hull_of_group[g]
             if mem_groups[h] >= 0 and is_union:
-                ctx.mem_hulls[mem_groups[h]].append(hull_of_head[h])
                 ctx.n_memory_heads += 1
 
         # Structural passthrough/erase fusion: fold kind-2 heads and
-        # neurons into direct D->D residual maps (no hull/ReGLU needed).
+        # neurons into direct D->D residual maps (no attention/ReGLU needed).
         pt_cols = [2 * h + c for h in passthrough for c in range(2)]
-        attn_direct = compose(op, pt_cols, ip[[2 * dm + c for c in pt_cols], :])
+        attn_direct = compose(op, pt_cols, ip[[v_base + c for c in pt_cols], :])
         op_kept = zero_columns(op, pt_cols)
 
         lookup_cols = {2 * h + c for h in lookup for c in range(2)}
@@ -1038,11 +1028,9 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
         memory_read_blocks: list[str] = []
         memory_read_names: dict[int, tuple[str, str, str]] = {}
 
-        # ── Attention: hull heads, then residual updates ─────────
+        # ── Attention: licensed heads, then residual updates ────────
         for h in lookup:
             b = head_blocks.setdefault(h, [])
-            hid = hull_of_head.get(h)
-            tb = "TieBreak::LATEST" if tiebreak[h] else "TieBreak::AVERAGE"
             # Eligibility decisions live in model/classify.py, shared
             # in model/classify.py, the single license source.
             q0_idx, q0_dat = row(ip, 2 * h)
@@ -1059,7 +1047,7 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
             if not is_union and (mem_groups[h] >= 0 or fused) and not mem_ok:
                 raise RuntimeError(
                     f"{label} L{li} head {h}: memory head is not "
-                    "structure-eligible; a per-expert hull would diverge"
+                    "structure-eligible"
                 )
             if fused and is_union:
                 raise RuntimeError(
@@ -1078,8 +1066,8 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
                     # license: qx == qy > 0 makes the score a positive
                     # multiple of kx + ky, and the clear gate an exact
                     # zero test -- no f64 in the fold or the compare.
-                    k0_idx, k0_dat = row(ip, dm + 2 * h)
-                    k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
+                    k0_idx, k0_dat = row(ip, k_base + 2 * h)
+                    k1_idx, k1_dat = row(ip, k_base + 2 * h + 1)
                     reg_score = integer_score_terms(
                         reg_q[0], reg_q[1],
                         list(zip(k0_dat, k0_idx, strict=True)),
@@ -1089,9 +1077,9 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
                         reg_q = None
                 if reg_q is not None:
                     try:
-                        v0_i = expr_int(*row(ip, 2 * dm + 2 * h),
+                        v0_i = expr_int(*row(ip, v_base + 2 * h),
                                          ctx.xref, f"{label} L{li} reg v0")
-                        v1_i = expr_int(*row(ip, 2 * dm + 2 * h + 1),
+                        v1_i = expr_int(*row(ip, v_base + 2 * h + 1),
                                          ctx.xref, f"{label} L{li} reg v1")
                     except RuntimeError:
                         reg_q = None
@@ -1124,30 +1112,7 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
                         ))
                     _qname, vname, aname = names
                 else:
-                    assert hid is not None
                     b.append(f"            const long long qi = shr2({qi_expr});")
-                    k1_idx, k1_dat = row(ip, dm + 2 * h + 1)
-                    guard = integer_score_terms(
-                        1.0, 1.0, [],
-                        list(zip(k1_dat, k1_idx, strict=True)),
-                    )
-                    b.append(f"            if (hull_seen[{hid}] != {ctx.E}seq) {{")
-                    if guard is not None:
-                        # A live (unrescinded) K row means the model would
-                        # insert into a memory hull, which this engine cannot
-                        # do; the clear gate is an exact zero test.
-                        live_cond = " && ".join(
-                            f"x[{g_id}] == 0" for g_id in guard[1]
-                        ) or "true"
-                        b.append(f"                if ({live_cond})")
-                    else:
-                        k1 = expr_dbl(*row(ip, dm + 2 * h + 1), ctx.dref)
-                        b.append(f"                const double kyg = {k1};")
-                        b.append("                if (kyg > -1.0e29)")
-                    b.append('                    throw std::runtime_error('
-                             '"live forward insert into a memory-group hull");')
-                    b.append(f"                hull_seen[{hid}] = {ctx.E}seq;")
-                    b.append("            }")
                     b.append("            long long mo[2] = {0, 0};")
                     # Group dispatch: qi is the address minus this group's
                     # base, so qi in [0, 4096) iff the address falls in this
@@ -1225,53 +1190,14 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
                 b.append(f"            ho{2 * h + 1} = {ctx.E}reg_any[{r}] ? {ctx.E}reg_v1[{r}] : 0;")
                 b.append("        }")
             else:
-                if not is_union:
-                    raise RuntimeError(
-                        f"{label} L{li} head {h}: expert lookup head needs a "
-                        "real hull; refusing (its history would diverge from "
-                        "the union's across routed steps)"
-                    )
-                ctx.n_hull_heads += 1
-                if mem_groups[h] >= 0:
-                    ctx.mem_fallback_hulls.append(hid)
-                # Q/K/V straight to double: the hull resolves in double.
-                q0 = expr_dbl(*row(ip, 2 * h), ctx.dref)
-                q1 = expr_dbl(*row(ip, 2 * h + 1), ctx.dref)
-                k0 = expr_dbl(*row(ip, dm + 2 * h), ctx.dref)
-                k1 = expr_dbl(*row(ip, dm + 2 * h + 1), ctx.dref)
-                v0 = expr_dbl(*row(ip, 2 * dm + 2 * h), ctx.dref)
-                v1 = expr_dbl(*row(ip, 2 * dm + 2 * h + 1), ctx.dref)
-                b.append(f"        {ctx.elem} ho{2 * h}, ho{2 * h + 1};")
-                b.append("        {")
-                b.append(f"            if (hull_seen[{hid}] != seq) {{")
-                b.append(f"                const double key[2] = {{{k0}, {k1}}};")
-                b.append("                // clear_key-gated tokens (ky -= 1e30) can never")
-                b.append("                // win a query; skipping the insert is invisible.")
-                b.append("                if (key[1] > -1.0e29) {")
-                b.append(f"                    const double val[2] = {{{v0}, {v1}}};")
-                b.append(f"                    hulls[{hid}].insert(key, val, seq);")
-                b.append("                }")
-                b.append(f"                hull_seen[{hid}] = seq;")
-                b.append("            }")
-                b.append(f"            const double query[2] = {{{q0}, {q1}}};")
-                b.append("            double od[2] = {0.0, 0.0};")
-                b.append(f"            hulls[{hid}].query(query, {tb}, od);")
-                b.append("            const double s0 = od[0] * SCALE_D, "
-                         "s1 = od[1] * SCALE_D;")
-                b.append("            const long long t0 = (long long)s0, "
-                         "t1 = (long long)s1;")
-                b.append(f"            ho{2 * h} = ({ctx.elem})t0;")
-                b.append(f"            ho{2 * h + 1} = ({ctx.elem})t1;")
-                b.append(f"            if ((double)t0 != s0 || (double)t1 != s1 "
-                         f"|| ho{2 * h} != t0 || ho{2 * h + 1} != t1)")
-                b.append('                throw std::runtime_error('
-                         '"hull output not representable at the fixed-point '
-                         'scale");')
-                b.append("        }")
+                raise RuntimeError(
+                    f"{label} L{li} head {h}: lookup is not served by a "
+                    "supported exact attention structure"
+                )
             b.append(f"        (void)ho{2 * h}; (void)ho{2 * h + 1};")
 
-        # attn_direct reads pre-attention x; out_proj rows read the
-        # hull outputs ho{..} and apply first.
+        # attn_direct reads pre-attention x; out_proj rows read the attention
+        # outputs ho{..} and apply first.
         ad_rows = [r for r in range(dm)
                    if attn_direct.indptr[r + 1] > attn_direct.indptr[r]]
         opkept: list[tuple[int, list[int], list[float]]] = []
@@ -1319,7 +1245,8 @@ def plan_model(ctx, mdl, label, union_lookup_of=None):
 
 
 def generate_source(model, step_spec: dict | None = None, experts=None,
-                    seq_module_core: str | None = None) -> tuple[str, int, bool]:
+                    seq_module_core: str | None = None,
+                    mirror_cpu_ram: bool = False) -> tuple[str, int, bool]:
     """Return ``(source, memory_head_count, has_machine_step)``.
 
     ``step_spec`` enables the native machine protocol. Core ``experts`` are
@@ -1330,9 +1257,11 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     experts = experts or []
     seq_mode = seq_module_core is not None
     if not seq_mode and any(
-        e.get("kind") not in {"exec_opcode", "shape"} for e in experts
+        e.get("kind") not in {"exec_opcode", "shape", "exec_int"} for e in experts
     ):
-        raise RuntimeError("core experts must be compact opcodes or shapes")
+        raise RuntimeError(
+            "core experts must be compact opcodes, shapes or interrupts"
+        )
     if seq_mode and (
         not experts or any(e.get("kind") != "seq" for e in experts)
     ):
@@ -1342,7 +1271,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
 
     # Shared-state prefix: "" emitting the engine itself (its own members),
     # "E." emitting a sequence module (a typed reference to the core engine).
-    # Module-private scratch (xbuf, the hull_seen guards) stays unprefixed.
+    # Module-private scratch (xbuf) stays unprefixed.
     E = "E." if seq_mode else ""
 
     d_model = model.tok.weight.shape[1]
@@ -1367,11 +1296,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                          exp["union_lookup_of"]))
         for exp in experts
     ]
-    hull_tiebreak = ctx.hull_tiebreak
-    mem_hulls = ctx.mem_hulls
-    mem_fallback_hulls = ctx.mem_fallback_hulls
     n_memory_heads = ctx.n_memory_heads
-    n_hull_heads = ctx.n_hull_heads
     n_regs = len(ctx.reg_of)
     layer_sig = f"{elem}* x"
     if seq_mode:
@@ -1616,10 +1541,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     if seq_mode:
         return assemble_seq_module(
             lines, body, experts, seq_module_core, elem,
-            len(hull_tiebreak), emit_step_core,
+            emit_step_core,
         )
 
-    n_hulls = len(hull_tiebreak)
     # The C++ run loop (KernelBus shape) needs the same memory-write path the
     # machine_step uses, so it is emitted under the same condition.
     has_run = step_spec is not None and n_memory_heads > 0
@@ -1628,13 +1552,9 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit(INCLUDES)
     emit("")
     emit("struct ENGINE_T {")
+    emit(f"    static constexpr bool MIRROR_CPU_RAM = {'true' if mirror_cpu_ram else 'false'};")
     emit(f"    static constexpr int D = {d_model};")
     emit("    long seq = -1;")
-    # hull_seen doubles as the per-seq live-insert guard for classified
-    # heads, so it survives even when no head keeps a real hull.
-    if n_hull_heads:
-        emit(f"    HardAttentionHead hulls[{n_hulls}];")
-    emit(f"    long hull_seen[{max(n_hulls, 1)}];")
     emit(f"    static constexpr int F = {f_bits};")
     emit(f"    static constexpr {elem} SCALE = 1 << F;")
     emit("    static constexpr double SCALE_D = (double)SCALE;")
@@ -1659,11 +1579,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit("    ENGINE_T() { reset(); }")
     emit("")
     emit("    void reset() {")
-    emit(f"        for (int i = 0; i < {n_hulls}; ++i) {{")
-    if n_hull_heads:
-        emit("            hulls[i].clear();")
-    emit("            hull_seen[i] = -1;")
-    emit("        }")
     emit("        for (int g = 0; g < 16; ++g)")
     emit("            for (int w = 0; w < 64; ++w) mem_bits[g][w] = 0ULL;")
     if n_regs:
@@ -1696,41 +1611,22 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit("        for (int i = 0; i < D; ++i) x[i] = (float)((double)xi[i] / SCALE_D);")
     emit("    }")
     emit("")
-    fb_set = set(mem_fallback_hulls)
-    fb_offs = [0]
-    fb_flat: list[int] = []
-    for g in range(16):
-        fb_flat.extend(i for i in mem_hulls[g] if i in fb_set)
-        fb_offs.append(len(fb_flat))
-
     emit("    void insert_write(int addr, int value, long pos) {")
     emit("        ++seq;")
     emit("        if (seq != pos)")
     emit('            throw std::runtime_error("direct WRITE position does not match engine sequence");')
+    emit("        addr &= 0xFFFF; value &= 0xFF;")
+    emit("        const int first = (MIRROR_CPU_RAM && addr < 0x2000) ? (addr & 0x07FF) : addr;")
+    emit("        const int last = (MIRROR_CPU_RAM && addr < 0x2000) ? first + 0x1800 : first;")
+    emit("        for (int mapped = first; mapped <= last; mapped += 0x0800) {")
     if has_run:
-        emit("        ram[addr & 0xFFFF] = (unsigned char)(value & 0xFF);  // shadow-decode mirror")
-    emit("        const int group = (addr >> 12) & 0xF;")
-    emit("        const int wl = addr & 0xFFF;")
-    emit("        mem_val[group][wl] = value & 0xFF;")
-    emit("        mem_seq[group][wl] = pos;")
-    emit("        mem_bits[group][wl >> 6] |= 1ULL << (wl & 63);")
-    hull_targets = fb_flat
-    hull_offs = fb_offs
-    if hull_targets:
-        emit("        const int local_i = addr - group * 4096;")
-        emit("        const float local = (float)local_i;")
-        emit("        const float kx_f = 2.0f * local;")
-        emit("        const float ky_f = -local * local;")
-        emit("        const double key[2] = {(double)kx_f, (double)ky_f};")
-        emit("        const double val[2] = {(double)(value & 0xFF), (double)(addr & 0xFFFF)};")
-        emit(f"        static const int offs[17] = {{{', '.join(map(str, hull_offs))}}};")
-        emit(f"        static const int ids[{len(hull_targets)}] = {{{', '.join(str(i) for i in hull_targets)}}};")
-        emit("        for (int i = offs[group]; i < offs[group + 1]; ++i) {")
-        emit("            const int hid = ids[i];")
-        emit("            if (hull_seen[hid] == seq) continue;")
-        emit("            hulls[hid].insert(key, val, seq);")
-        emit("            hull_seen[hid] = seq;")
-        emit("        }")
+        emit("            ram[mapped] = (unsigned char)value;  // shadow-decode mirror")
+    emit("            const int group = (mapped >> 12) & 0xF;")
+    emit("            const int wl = mapped & 0xFFF;")
+    emit("            mem_val[group][wl] = value;")
+    emit("            mem_seq[group][wl] = pos;")
+    emit("            mem_bits[group][wl >> 6] |= 1ULL << (wl & 63);")
+    emit("        }")
     emit("    }")
 
     has_step = has_run
@@ -1746,7 +1642,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             emit("")
             emit_step_core(f"step_core__{exp['name']}", f"__{exp['name']}",
                            exp["model"], exp["step_spec"],
-                           stage_writes=exp.get("kind") == "exec_opcode")
+                           stage_writes=exp.get("kind")
+                           in ("exec_opcode", "exec_int"))
 
         # Compact opcode execution is selected by the byte at st_pc. Pending
         # interrupts and tracing bypass it through step_core's union receipt.
@@ -1770,12 +1667,22 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit("        return false;")
         emit("    }")
 
-        # Canonical shape windows (native run loop only): compiled once into
-        # this core with pc and operands symbolic, dispatched through a
-        # runtime table -- zero per-ROM compile.  add_window() entries come
-        # from the boot-time image scan; dispatch re-verifies the shape's
-        # opcode bytes (and the JMP self-target) against live RAM, so a
-        # stale entry only loses the fast path, never correctness.
+        int_experts = {e["nmi"]: e for e in experts
+                       if e.get("kind") == "exec_int"}
+        emit("")
+        emit("    bool interrupt_step(bool nmi) {")
+        emit("        exec_n_writes = 0;")
+        for is_nmi in (True, False):
+            exp = int_experts.get(is_nmi)
+            if exp is None:
+                continue
+            cond = "nmi" if is_nmi else "!nmi"
+            emit(f"        if ({cond}) {{ step_core__{exp['name']}();"
+                 f" return true; }}")
+        emit("        return false;")
+        emit("    }")
+
+        # Canonical shape windows are compiled once and revalidated against RAM.
         emit("")
         emit("    unsigned char shape_of_pc[65536];")
         n_shapes = len(shape_experts)
@@ -1802,6 +1709,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             emit("        if (!sid || nmi_pending || irq_ready() || stop_on_trap) return 0;")
             emit("        switch (sid) {")
             for j, exp in enumerate(shape_experts):
+                if not exp.get("cycle_safe", True):
+                    continue
                 # add_window guarantees head + length <= 0x10000: no wrap.
                 checks = " && ".join(
                     f"ram[st_pc + {off}] == 0x{b:02X}" if off
@@ -1886,7 +1795,6 @@ class GeneratedWeightsEngine:
     watch_read: Callable
     watch_write: Callable
     clear_watches: Callable
-    set_write_journal: Callable
     set_read_lease: Callable
     set_read_lease_seq: Callable
     take_lease_served: Callable
@@ -1911,13 +1819,15 @@ class GeneratedWeightsEngine:
 
     def __init__(self, model, *, step_spec: dict | None = None,
                  experts=None, cache_key: str | None = None,
-                 shapes_meta=None):
+                 shapes_meta=None, mirror_cpu_ram: bool = False):
         self.n_experts = len(experts or [])
+        self.mirror_cpu_ram = bool(mirror_cpu_ram)
         # Shape-window scan metadata (id/signature/length/close rule) so a
         # cache-hit load can populate the runtime table without refolding.
         self.shapes_meta = list(shapes_meta or [])
         source, self.n_memory_heads, self.has_machine_step = generate_source(
-            model, step_spec, experts=experts
+            model, step_spec, experts=experts,
+            mirror_cpu_ram=self.mirror_cpu_ram,
         )
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         self.digest = digest
@@ -1949,6 +1859,7 @@ class GeneratedWeightsEngine:
                 "digest": digest, "n_experts": self.n_experts,
                 "n_memory_heads": self.n_memory_heads,
                 "has_machine_step": self.has_machine_step,
+                "mirror_cpu_ram": self.mirror_cpu_ram,
                 "shapes": self.shapes_meta,
                 "compile_shards": n_shards,
             })
@@ -1972,6 +1883,7 @@ class GeneratedWeightsEngine:
         self.n_experts = entry["n_experts"]
         self.n_memory_heads = entry["n_memory_heads"]
         self.has_machine_step = entry["has_machine_step"]
+        self.mirror_cpu_ram = bool(entry.get("mirror_cpu_ram", False))
         self.shapes_meta = entry.get("shapes") or []
         module, self.compile_seconds = load_engine_module(entry["digest"])
         self.bind(module)
@@ -1991,7 +1903,6 @@ class GeneratedWeightsEngine:
             self.watch_read = self.engine.watch_read
             self.watch_write = self.engine.watch_write
             self.clear_watches = self.engine.clear_watches
-            self.set_write_journal = self.engine.set_write_journal
             self.set_read_lease = self.engine.set_read_lease
             self.set_read_lease_seq = self.engine.set_read_lease_seq
             self.take_lease_served = self.engine.take_lease_served

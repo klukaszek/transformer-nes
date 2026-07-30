@@ -15,7 +15,7 @@ public:
     if (cart_.prg.empty() || cart_.prg.size() % BANK8 || cart_.chr.size() % 0x400)
       throw std::invalid_argument("MMC5 requires 8 KiB PRG and 1 KiB CHR banks");
     n_prg_ = cart_.prg.size() / BANK8;
-    n_chr_ = std::max(cart_.chr.size() / 0x400, 1uz);
+    n_chr_ = cart_.chr.empty() ? CHR_RAM_BANKS : cart_.chr.size() / CHR_BANK1;
   }
   bool banked() const override { return true; }
   vector<pair<int, int>> register_ranges() const override { return {{0x5000, 0x7FFF}}; }

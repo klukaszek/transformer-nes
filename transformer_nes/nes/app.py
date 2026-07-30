@@ -74,7 +74,7 @@ def main():
     parser.add_argument("rom")
     parser.add_argument(
         "--backend",
-        choices=("reference", "graph", "weights"),
+        choices=("reference", "weights"),
         default="weights",
     )
     parser.add_argument("--scale", type=int, default=3)

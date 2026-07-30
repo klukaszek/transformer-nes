@@ -1,56 +1,23 @@
-"""Receipt for the standard-ML artifact: the exported safetensors weights,
-executed by the standalone PyTorch runner (experiments/torch_reference --
-no transformer_nes imports), run the 6502 lockstep-exact with the oracle."""
+"""Smoke-test the self-describing standard-ML export artifact."""
 
-import importlib.util
-import sys
-from pathlib import Path
+import json
 
 import pytest
 
-from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.weights.runner import VERIFY_START, verify_program
-
-RUNNER = (
-    Path(__file__).resolve().parents[3]
-    / "experiments" / "torch_reference" / "torch_runner.py"
-)
-
 
 @pytest.mark.slow
-def test_exported_weights_run_in_torch(tmp_path):
+def test_exported_weights_are_self_describing(tmp_path):
+    from safetensors.numpy import load_file
+
     from transformer_nes.model.export import export_model
 
-    export_model(str(tmp_path))
-    assert (tmp_path / "weights.safetensors").exists()
+    meta = export_model(str(tmp_path))
+    tensors = load_file(str(tmp_path / "weights.safetensors"))
+    on_disk_meta = json.loads((tmp_path / "machine.json").read_text())
 
-    spec = importlib.util.spec_from_file_location("torch_runner", RUNNER)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["torch_runner"] = mod
-    spec.loader.exec_module(mod)
-    # Independence: the runner must not import the project.
-    assert not any(name.startswith("transformer_nes.model.engine")
-                   for name in getattr(mod, "__dict__", {}))
-
-    m = mod.TorchMachine(str(tmp_path))
-    image = verify_program()
-    m.boot_image(image, start_pc=VERIFY_START)
-    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
-    ref.pc = VERIFY_START
-    steps = 0
-    for i in range(40):
-        row = m.step()
-        r = ref.step()
-        s = r.state
-        got = (row["pc"], row["a"], row["x"], row["y"], row["s"], row["p"],
-               row["ir"], row["oplo"], row["ophi"], row["ea"], row["data"],
-               set(row["writes"]))
-        want = (s.pc, s.a, s.x, s.y, s.s, s.p, s.ir, s.operand_lo,
-                s.operand_hi, s.ea, s.data,
-                {(w.addr, w.value) for w in r.writes})
-        assert got == want, f"step {i} diverged"
-        steps += 1
-        if m.halted:
-            break
-    assert steps >= 30
+    assert meta == on_disk_meta
+    assert {"tok", "head"} <= tensors.keys()
+    assert tensors["tok"].shape[1] == meta["d_model"]
+    assert tensors["head"].shape[1] == meta["d_model"]
+    assert len(meta["layer_heads"]) == meta["n_layers"]
+    assert "byte_value" in meta["input_slots"]

@@ -99,70 +99,16 @@ def run_reference(image: bytearray, log_rows) -> tuple[bool, int, float]:
     return True, len(log_rows), elapsed
 
 
-def run_graph(image: bytearray, log_rows, *, max_steps: int) -> tuple[bool, int, float, float]:
-    """Run the graph evaluator in lockstep with the reference core.
-
-    The reference is the oracle here; it is itself validated against the
-    golden log by run_reference.  Returns (matched, steps, build_s, run_s).
-    """
-    from transformer_nes.cpu6502.backends.graph import Cpu6502Runtime
-
-    build_start = time.perf_counter()
-    rt = Cpu6502Runtime(bcd=False)
-    build_elapsed = time.perf_counter() - build_start
-
-    run_start = time.perf_counter()
-    graph_trace = rt.run_image(bytes(image), start_pc=START_PC, max_steps=max_steps)
-    run_elapsed = time.perf_counter() - run_start
-
-    ref = new_cpu(image)
-    for i, row in enumerate(graph_trace):
-        ref_row = ref.step()
-        s1, s2 = ref_row.state, row.state
-        if (
-            s1.pc != s2.pc
-            or s1.a != s2.a
-            or s1.x != s2.x
-            or s1.y != s2.y
-            or s1.s != s2.s
-            or s1.p != s2.p
-        ):
-            logger.error(
-                "graph diverged from reference at step %d:\nREF:   PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X\nGRAPH: PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X",
-                i,
-                s1.pc,
-                s1.a,
-                s1.x,
-                s1.y,
-                s1.s,
-                s1.p,
-                s2.pc,
-                s2.a,
-                s2.x,
-                s2.y,
-                s2.s,
-                s2.p,
-            )
-            return False, i, build_elapsed, run_elapsed
-        if {(w.addr, w.value) for w in ref_row.writes} != {(w.addr, w.value) for w in row.writes}:
-            logger.error(
-                "graph writes diverged at step %d: ref=%s graph=%s",
-                i,
-                ref_row.writes,
-                row.writes,
-            )
-            return False, i, build_elapsed, run_elapsed
-    return True, len(graph_trace), build_elapsed, run_elapsed
-
-
-def run_weights(image: bytearray, *, max_steps: int) -> tuple[bool, int, float, float, str]:
+def run_weights(
+    image: bytearray, *, max_steps: int, union_only: bool = False,
+) -> tuple[bool, int, float, float, str]:
     """Run the real weights-based transformer in lockstep with the reference."""
     from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
     from transformer_nes.cpu6502.examples.klaus.harness import lockstep_arrays_vs_reference
 
     build_start = time.perf_counter()
-    machine = Cpu6502TransformerMachine(bcd=False)
-    mode = "codegen-exact-int32-runloop"
+    machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only)
+    mode = "union-only" if union_only else "codegen-exact-int32-runloop"
     build_elapsed = time.perf_counter() - build_start
 
     # Whole suite through the C++ run loop, then lockstep the arrays.
@@ -179,13 +125,19 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description="Run the nestest CPU suite.")
     parser.add_argument(
-        "--runner", choices=["reference", "graph", "weights", "both"], default="reference"
+        "--runner", choices=["reference", "weights", "both"], default="reference"
     )
     parser.add_argument(
-        "--graph-steps",
+        "--max-steps",
         type=int,
         default=8991,
-        help="instruction count for the graph run (default: the full log)",
+        help="maximum instructions for the weights run (default: the full log)",
+    )
+    parser.add_argument(
+        "--union-only",
+        action="store_true",
+        help="build the weights engine with no experts, so every opcode "
+             "executes on the union proof model",
     )
     args = parser.parse_args()
 
@@ -201,24 +153,11 @@ def main() -> None:
         )
         failed |= not passed
 
-    if args.runner in ("graph", "both"):
-        matched, steps, build_s, run_s = run_graph(image, log_rows, max_steps=args.graph_steps)
-        status = "MATCHED" if matched else "DIVERGED"
-        rate = steps / run_s if run_s > 0 else 0.0
-        logger.info(
-            "graph: %s  %d steps in %.2fs (%.0f steps/s), graph build %.2fs",
-            status,
-            steps,
-            run_s,
-            rate,
-            build_s,
-        )
-        failed |= not matched
-
-    if args.runner == "weights":
+    if args.runner in ("weights", "both"):
         matched, steps, build_s, run_s, mode = run_weights(
             image,
-            max_steps=args.graph_steps,
+            max_steps=args.max_steps,
+            union_only=args.union_only,
         )
         status = "MATCHED" if matched else "DIVERGED"
         rate = steps / run_s if run_s > 0 else 0.0

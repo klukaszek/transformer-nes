@@ -13,8 +13,9 @@ constexpr int max_frame_events = 32;
 
 Console::Console(unique_ptr<Mapper> mapper_in, Ppu ppu_in, Apu apu_in, ConsoleMachine& machine_in)
     : mapper(std::move(mapper_in)), ppu(std::move(ppu_in)), apu(std::move(apu_in)),
-      machine(machine_in), dma_(machine, ppu), ppu_device_(ppu, frame_base_), apu_device_(apu),
-      mapper_device_(*mapper, frame_base_), frame_counter_(apu) {
+      machine(machine_in), dma_(machine, ppu), ppu_device_(ppu, frame_base_),
+      apu_device_(apu, machine), mapper_device_(*mapper, frame_base_),
+      frame_counter_(apu, machine) {
   irq_.machine = &machine;
   attach_devices();
 }
@@ -48,16 +49,32 @@ void Console::check_interrupts() {
 void Console::run_until(int64_t target, bool replan) {
   if (halted || target <= cycles)
     return;
-  auto out = machine.run_cycles(
-      target - cycles,
-      [this, replan] {
-        check_interrupts();
-        const bool dirty = std::exchange(irq_.sched_dirty, false);
-        return replan && dirty;
-      },
-      cycles);
-  cycles += out.cycles;
-  halted = out.halted;
+  bool dirty = false;
+  while (cycles < target && !halted) {
+    const int64_t dmc_until = apu.cycles_until_dmc_dma();
+    const int64_t dmc_target = dmc_until >= 0 ? cycles + dmc_until : target;
+    const int64_t chunk_target = std::min(target, dmc_target);
+    auto out = machine.run_cycles(
+        std::max<int64_t>(1, chunk_target - cycles),
+        [this, replan, &dirty] {
+          check_interrupts();
+          dirty = replan && std::exchange(irq_.sched_dirty, false);
+          return dirty;
+        },
+        cycles);
+    if (out.cycles <= 0)
+      break;
+    cycles += out.cycles;
+    halted = out.halted;
+    apu.advance_to(cycles, [this](int address) { return machine.read_ram(address); });
+    if (const int stall = apu.take_dma_stall()) {
+      cycles += stall;
+      apu.advance_to(cycles, [this](int address) { return machine.read_ram(address); });
+    }
+    if (dirty)
+      break;
+  }
+  check_interrupts();
 }
 Ppu::Frame Console::run_frame() {
   const int64_t base = frame_base_;
@@ -120,8 +137,7 @@ Ppu::Frame Console::run_frame() {
   ppu.end_vblank();
   frame_base_ += frame_cycles;
   ++frame_index;
-  last_audio = apu.end_frame(frame_cycles, [this](int address) { return machine.read_ram(address); });
-  cycles += apu.take_dma_stall();
+  last_audio = apu.take_samples();
   irq_.set(IRQ_APU, apu.irq_pending());
   return frame;
 }

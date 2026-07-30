@@ -1,4 +1,4 @@
-"""6502 CPU expressed in Percepta's computation graph DSL.
+"""6502 CPU expressed in the computation graph DSL.
 
 This is an instruction-level interpreter (one transformer step = one 6502 instruction) for the full official NMOS 6502 opcode set plus the stable unofficial opcodes exercised by nestest.
 
@@ -311,8 +311,12 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
           ) -> tuple[dict[str, Expression], dict[str, Expression]]:
     """Build the 6502 graph.  See the module docstring for the construction
     contract; bcd=False builds the NES 2A03 variant (no decimal mode).
+
     wide_bits swaps the serial bit extractions for the depth-lean ladder
-    (extract_bits_wide) -- for GPU-mapped engines only."""
+    (extract_bits_wide) and has the harness serve each byte's bits as 16
+    extra inputs -- less depth, wider token contract.  The generated engine
+    builds True; the safetensors export builds False because an artifact
+    must derive its own bits to stand alone.  Both are load-bearing."""
     one = graph.one
     bits_of = extract_bits_wide if wide_bits else extract_bits
 
@@ -976,41 +980,46 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     rra_overflow = overflow(current_a, ror_result, rra_result)
 
     # ── New register values ─────────────────────────────────────────
-    new_a = current_a
-    new_a = mux(op_load_a + op_lax, operand, new_a)
-    new_a = mux(op_and, and_result, new_a)
-    new_a = mux(op_ora, ora_result, new_a)
-    new_a = mux(op_eor, eor_result, new_a)
-    new_a = mux(op_adc, decimal_adc, new_a)
-    new_a = mux(op_sbc, decimal_sbc, new_a)
-    new_a = mux(op_pla, stack_pull_byte, new_a)
-    new_a = mux(op_txa, current_x, new_a)
-    new_a = mux(op_tya, current_y, new_a)
-    new_a = mux(op_slo, slo_result, new_a)
-    new_a = mux(op_rla, rla_result, new_a)
-    new_a = mux(op_sre, sre_result, new_a)
-    new_a = mux(op_rra, rra_result, new_a)
-    new_a = mux(op_isb, isb_result, new_a)
-    # Shifts only write A in accumulator mode (memory modes leave A alone).
-    shift_result = mux(op_asl, asl_result,
-        mux(op_lsr, lsr_result,
-            mux(op_rol, rol_result,
-                mux(op_ror, ror_result, 0))))
-    new_a = mux(is_acc, shift_result, new_a)
+    # The A-writing families are a mutually exclusive one-hot, so new_a is a
+    # *parallel* gated sum (depth 2) rather than a sixteen-deep mux chain.
+    # Shifts write A only in accumulator mode; memory-mode RMW leaves it be.
+    arith_a = (op_adc + op_sbc + op_tya + op_slo + op_rla + op_sre
+               + op_rra + op_isb)
+    writes_a = (op_load_a + op_lax + op_and + op_ora + op_eor + op_pla
+                + op_txa + is_acc + arith_a)
+    shift_acc_result = (
+        multiply(op_asl, asl_result)
+        + multiply(op_lsr, lsr_result)
+        + multiply(op_rol, rol_result)
+        + multiply(op_ror, ror_result)
+    )
+    new_a = (
+        multiply(op_load_a + op_lax, operand)
+        + multiply(op_and, and_result)
+        + multiply(op_ora, ora_result)
+        + multiply(op_eor, eor_result)
+        + multiply(op_adc, decimal_adc)
+        + multiply(op_sbc, decimal_sbc)
+        + multiply(op_pla, stack_pull_byte)
+        + multiply(op_txa, current_x)
+        + multiply(op_tya, current_y)
+        + multiply(op_slo, slo_result)
+        + multiply(op_rla, rla_result)
+        + multiply(op_sre, sre_result)
+        + multiply(op_rra, rra_result)
+        + multiply(op_isb, isb_result)
+        + multiply(is_acc, shift_acc_result)
+        + multiply(1 - writes_a, current_a)
+    )
     new_a = mux(is_int, current_a, new_a)
     new_a = persist(new_a, name="new_a")
 
     if wide_bits:
         # A's bits as state: each writer family contributes its bit list
         # (free for loads/logic/pulls/acc-shifts); arithmetic shares one
-        # ladder on the muxed new_a that liveness prunes whenever no later
-        # step does bitwise work on A.  Gates are the same one-hots as
-        # new_a's own muxes, so the sum is exact.
-        arith_a = (op_adc + op_sbc + op_tya + op_slo + op_rla + op_sre
-                   + op_rra + op_isb)
+        # ladder on the summed new_a that liveness prunes whenever no later
+        # step does bitwise work on A.
         arith_a_bits = extract_bits_wide(new_a, "newa_arith")
-        writes_a = (op_load_a + op_lax + op_and + op_ora + op_eor + op_pla
-                    + op_txa + is_acc + arith_a)
         ror_bit_list = [carry_in] + operand_bits[:-1]
         for j in range(8):
             shift_sel = (
@@ -1033,50 +1042,60 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
             )
             persist(mux(is_int, a_bits[j], expr), name=f"new_a_bit{7 - j}")
 
-    new_x = current_x
-    new_x = mux(op_load_x + op_lax, operand, new_x)
-    new_x = mux(op_inx, inx_result, new_x)
-    new_x = mux(op_dex, dex_result, new_x)
-    new_x = mux(op_tax, current_a, new_x)
-    new_x = mux(op_tsx, current_s, new_x)
+    # X, Y and S select the same way: disjoint family gates around an
+    # unchanged-register default, so each is one parallel stage.
+    writes_x = op_load_x + op_lax + op_inx + op_dex + op_tax + op_tsx
+    new_x = (
+        multiply(op_load_x + op_lax, operand)
+        + multiply(op_inx, inx_result)
+        + multiply(op_dex, dex_result)
+        + multiply(op_tax, current_a)
+        + multiply(op_tsx, current_s)
+        + multiply(1 - writes_x, current_x)
+    )
     new_x = mux(is_int, current_x, new_x)
     new_x = persist(new_x, name="new_x")
 
-    new_y = current_y
-    new_y = mux(op_load_y, operand, new_y)
-    new_y = mux(op_iny, iny_result, new_y)
-    new_y = mux(op_dey, dey_result, new_y)
-    new_y = mux(op_tay, current_a, new_y)
+    writes_y = op_load_y + op_iny + op_dey + op_tay
+    new_y = (
+        multiply(op_load_y, operand)
+        + multiply(op_iny, iny_result)
+        + multiply(op_dey, dey_result)
+        + multiply(op_tay, current_a)
+        + multiply(1 - writes_y, current_y)
+    )
     new_y = mux(is_int, current_y, new_y)
     new_y = persist(new_y, name="new_y")
 
-    new_s = current_s
-    new_s = mux(op_pha + op_php, wrap8(current_s - 1), new_s)
-    new_s = mux(op_jsr, wrap8(current_s - 2), new_s)
-    new_s = mux(op_brk, wrap8(current_s - 3), new_s)
-    new_s = mux(op_pla + op_plp, wrap8(current_s + 1), new_s)
-    new_s = mux(op_rts, wrap8(current_s + 2), new_s)
-    new_s = mux(op_rti, wrap8(current_s + 3), new_s)
-    new_s = mux(op_txs, current_x, new_s)
+    writes_s = (op_pha + op_php + op_jsr + op_brk + op_pla + op_plp
+                + op_rts + op_rti + op_txs)
+    new_s = (
+        multiply(op_pha + op_php, wrap8(current_s - 1))
+        + multiply(op_jsr, wrap8(current_s - 2))
+        + multiply(op_brk, wrap8(current_s - 3))
+        + multiply(op_pla + op_plp, wrap8(current_s + 1))
+        + multiply(op_rts, wrap8(current_s + 2))
+        + multiply(op_rti, wrap8(current_s + 3))
+        + multiply(op_txs, current_x)
+        + multiply(1 - writes_s, current_s)
+    )
     # NMI pushes three bytes, exactly like BRK.
     new_s = mux(is_int, wrap8(current_s - 3), new_s)
     new_s = persist(new_s, name="new_s")
 
     # ── Flags ───────────────────────────────────────────────────────
     # NZ source selection
-    nz_alu = mux(
-        op_load_a + op_adc + op_sbc + op_pla + op_txa + op_tya
-        + op_lax + op_slo + op_rla + op_sre + op_rra + op_isb,
-        new_a,
-        mux(
-            op_load_x + op_inx + op_dex + op_tax + op_tsx,
-            new_x,
-            mux(
-                op_load_y + op_iny + op_dey + op_tay,
-                new_y,
-                0,
-            ),
-        ),
+    # The three register groups are disjoint (LAX reports A, and A == X for
+    # it anyway), and non-flag-setting families report 0, so the source is a
+    # parallel gated sum rather than a nested select.
+    nz_alu = (
+        multiply(
+            op_load_a + op_adc + op_sbc + op_pla + op_txa + op_tya
+            + op_lax + op_slo + op_rla + op_sre + op_rra + op_isb,
+            new_a,
+        )
+        + multiply(op_load_x + op_inx + op_dex + op_tax + op_tsx, new_x)
+        + multiply(op_load_y + op_iny + op_dey + op_tay, new_y)
     )
     nz_alu = persist(nz_alu, name="nz_alu")
     n_alu = stepglu(one, nz_alu - 128)
@@ -1143,23 +1162,41 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         + op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror
         + op_lax + op_slo + op_rla + op_sre + op_rra + op_isb
     )
-    new_p_z = mux(
-        writes_z,
-        mux(op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror, z_mem, z_alu),
-        current_p_z,
+    # N and Z share one gate partition: the memory-result families (RMW and
+    # both shift modes) report the memory result, the rest of writes_z reports
+    # the ALU result, and compares/logic are disjoint from both -- so each flag
+    # is one parallel gated sum instead of a nine-deep select.  op_bit
+    # overrides further down, once bit_z/bit_n exist.
+    nz_from_mem = op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror
+    nz_writers = (writes_z + op_cmp + op_cpx + op_cpy + op_dcp
+                  + op_and + op_ora + op_eor)
+    new_p_z = (
+        multiply(nz_from_mem, z_mem)
+        + multiply(writes_z - nz_from_mem, z_alu)
+        + multiply(op_cmp, cmp_z)
+        + multiply(op_cpx, cpx_z)
+        + multiply(op_cpy, cpy_z)
+        + multiply(op_dcp, dcp_z)
+        + multiply(op_and, and_z)
+        + multiply(op_ora, ora_z)
+        + multiply(op_eor, eor_z)
+        + multiply(1 - nz_writers, current_p_z)
     )
-    new_p_z = mux(op_cmp, cmp_z, mux(op_cpx, cpx_z, mux(op_cpy, cpy_z, mux(op_dcp, dcp_z, new_p_z))))
-    new_p_z = mux(op_and, and_z, mux(op_ora, ora_z, mux(op_eor, eor_z, new_p_z)))
     new_p_z = persist(new_p_z, name="new_p_z")
 
     # Negative flag updates
-    new_p_n = mux(
-        writes_z,
-        mux(op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror, n_mem, n_alu),
-        current_p_n,
+    new_p_n = (
+        multiply(nz_from_mem, n_mem)
+        + multiply(writes_z - nz_from_mem, n_alu)
+        + multiply(op_cmp, cmp_n)
+        + multiply(op_cpx, cpx_n)
+        + multiply(op_cpy, cpy_n)
+        + multiply(op_dcp, dcp_n)
+        + multiply(op_and, and_n)
+        + multiply(op_ora, ora_n)
+        + multiply(op_eor, eor_n)
+        + multiply(1 - nz_writers, current_p_n)
     )
-    new_p_n = mux(op_cmp, cmp_n, mux(op_cpx, cpx_n, mux(op_cpy, cpy_n, mux(op_dcp, dcp_n, new_p_n))))
-    new_p_n = mux(op_and, and_n, mux(op_ora, ora_n, mux(op_eor, eor_n, new_p_n)))
     new_p_n = persist(new_p_n, name="new_p_n")
 
     # Overflow flag updates
@@ -1322,15 +1359,10 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     persist(0x0100 + wrap8(current_s - 2), name="write_addr3_out")
     persist(mux(is_int, int_push_p, php_push_value), name="write_value3_out")
 
-    # ── Trace-context outputs (reference-aligned, 2026-07-09) ────────
-    # The trace reports exactly what reference.py reports, field for field:
-    # operands only when the instruction fetches them (raw on an NMI step,
-    # which reports the not-executed instruction bytes), and data as the
-    # operation's *primary result* -- the value a load loads, a store
-    # stores, an RMW writes, a compare computes -- 0 for pure control
-    # flow.  Previously these reported the raw pc+1/pc+2/[ea] reads, which
-    # kept those memory lookups alive in every routed expert even when the
-    # instruction never used them.
+    # ── Trace-context outputs ────────────────────────────────────────
+    # Field-for-field what reference.py reports: operands only when the
+    # instruction fetches them, and data as the operation's primary result
+    # (0 for pure control flow).
     has_operand_lo = length - 1  # 0 for 1-byte instructions, else >= 1
     has_operand_hi = is_abs + is_abx + is_aby + is_ind
     report_operand_lo = stepglu(fetched_operand_lo, has_operand_lo + is_int - 1)
@@ -1338,11 +1370,9 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     report_operand_hi = stepglu(fetched_operand_hi, has_operand_hi + is_int - 1)
     report_operand_hi = persist(report_operand_hi, name="fetched_operand_hi")
 
-    # The operation-family gates are a mutually exclusive one-hot, so data
-    # is a *parallel* gated sum (depth 2), not a mux chain.  Families with
-    # data == 0 (jmp/jsr/rts/rti/brk, branches, flag ops, nop) are simply
-    # absent.  Shift families report the shift result in both accumulator
-    # and memory modes, exactly as the reference handlers return it.
+    # The family gates are a mutually exclusive one-hot, so data is a
+    # *parallel* gated sum (depth 2), not a mux chain; families with
+    # data == 0 are simply absent.
     data_ref = (
         multiply(op_store_a + op_pha, current_a)
         + multiply(op_store_x, current_x)

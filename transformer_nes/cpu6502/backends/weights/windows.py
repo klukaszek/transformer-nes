@@ -7,7 +7,7 @@ returned descriptions across that boundary explicitly.
 
 from __future__ import annotations
 
-from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
+from transformer_nes.cpu6502.spec import BRANCH_OPERATIONS, OPCODES, READS_MEMORY
 
 # Ops that end a window: subroutine/interrupt flow and stack PULLS (reads
 # past the first instruction).  Plain stores, pushes, and leading RMW
@@ -16,7 +16,6 @@ from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
 SEQUENCE_WRITERS = frozenset({
     "sax", "jsr", "brk", "rti", "rts", "pla", "plp",
 })
-BRANCH_OPERATIONS = frozenset({"bcc", "bcs", "beq", "bmi", "bne", "bpl", "bvc", "bvs"})
 # Long enough to amortize a transformer forward on ordinary straight-line
 # 6502 basic blocks, still far below the sequence ABI's 32-row output bound.
 # Safety comes from folding/licensing, not this profitability horizon.

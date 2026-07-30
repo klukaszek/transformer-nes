@@ -5,6 +5,86 @@
 
 namespace transformer_nes::nes {
 
+namespace {
+
+using DynamicKind = OpcodeInfo::DynamicKind;
+
+bool is_branch_kind(DynamicKind kind) {
+  switch (kind) {
+  case DynamicKind::bpl:
+  case DynamicKind::bmi:
+  case DynamicKind::bvc:
+  case DynamicKind::bvs:
+  case DynamicKind::bcc:
+  case DynamicKind::bcs:
+  case DynamicKind::bne:
+  case DynamicKind::beq:
+    return true;
+  default:
+    return false;
+  }
+}
+
+bool branch_taken(DynamicKind kind, int p) {
+  switch (kind) {
+  case DynamicKind::bpl:
+    return !(p & 0x80);
+  case DynamicKind::bmi:
+    return p & 0x80;
+  case DynamicKind::bvc:
+    return !(p & 0x40);
+  case DynamicKind::bvs:
+    return p & 0x40;
+  case DynamicKind::bcc:
+    return !(p & 0x01);
+  case DynamicKind::bcs:
+    return p & 0x01;
+  case DynamicKind::bne:
+    return !(p & 0x02);
+  case DynamicKind::beq:
+    return p & 0x02;
+  default:
+    return false;
+  }
+}
+
+int dynamic_cycles(uint8_t opcode, int pc, int x, int y, int p,
+                   const array<uint8_t, 0x10000>& ram,
+                   const OpcodeTable& opcodes) {
+  int cycles = opcodes[opcode].cycles;
+  const DynamicKind kind = opcodes[opcode].dynamic_kind;
+  if (is_branch_kind(kind)) {
+    if (!branch_taken(kind, p))
+      return cycles;
+    ++cycles;
+    const int next = (pc + 2) & 0xFFFF;
+    const int target = (next + static_cast<int8_t>(ram[cpu_ram_index(pc + 1)])) & 0xFFFF;
+    if ((next & 0xFF00) != (target & 0xFF00)) ++cycles;
+    return cycles;
+  }
+  if (kind == OpcodeInfo::DynamicKind::none)
+    return cycles;
+
+  int base = 0;
+  int index = 0;
+  const int lo = ram[cpu_ram_index(pc + 1)];
+  if (kind == OpcodeInfo::DynamicKind::absolute_x ||
+      kind == OpcodeInfo::DynamicKind::absolute_y) {
+    base = lo | (ram[cpu_ram_index(pc + 2)] << 8);
+    index = kind == OpcodeInfo::DynamicKind::absolute_x ? x : y;
+  } else if (kind == OpcodeInfo::DynamicKind::indirect_y) {
+    const int pointer = lo & 0xFF;
+    base = ram[cpu_ram_index(pointer)] | (ram[cpu_ram_index((pointer + 1) & 0xFF)] << 8);
+    index = y;
+  } else {
+    return cycles;
+  }
+  if ((base & 0xFF00) != (((base + index) & 0xFFFF) & 0xFF00)) ++cycles;
+  return cycles;
+}
+
+} // namespace
+
 void DeviceMap::attach(Device& device, int first, int last, bool writes_only) {
   if (first < 0 || last > 0xFFFF || first > last)
     throw std::invalid_argument("invalid device address range");
@@ -62,7 +142,8 @@ CpuStep Bus::step() {
     cycles_ += 7;
   else {
     int pc = runtime_.pc();
-    cycles_ += opcodes_[ram_[address_index(pc)]].cycles;
+    cycles_ += dynamic_cycles(opcode, pc, runtime_.x(), runtime_.y(), runtime_.p(),
+                              ram_, opcodes_);
     auto target = read_target(pc, runtime_.x(), runtime_.y());
     if (target)
       if (auto* d = devices_.find(*target, true)) {

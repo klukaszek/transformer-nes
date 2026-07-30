@@ -71,12 +71,17 @@ private:
   };
   class ApuDevice final : public Device {
   public:
-    explicit ApuDevice(Apu& apu) : apu_(apu) {}
+    ApuDevice(Apu& apu, ConsoleMachine& machine) : apu_(apu), machine_(machine) {}
     int read(int address) override { return apu_.read(address); }
-    void write(int address, int value, int64_t) override { apu_.write(address, value); }
+    void write(int address, int value, int64_t cycle) override {
+      if (cycle >= 0)
+        apu_.advance_to(cycle, [this](int a) { return machine_.read_ram(a); });
+      apu_.write(address, value);
+    }
 
   private:
     Apu& apu_;
+    ConsoleMachine& machine_;
   };
   class MapperDevice final : public Device {
   public:
@@ -97,27 +102,31 @@ private:
   // writes program the frame sequencer.
   class FrameCounter final : public Device {
   public:
-    explicit FrameCounter(Apu& apu) : apu_(apu) {}
+    FrameCounter(Apu& apu, ConsoleMachine& machine) : apu_(apu), machine_(machine) {}
     int read(int address) override { return apu_.read(address); }
-    void write(int address, int value, int64_t) override { apu_.write(address, value); }
+    void write(int address, int value, int64_t cycle) override {
+      if (cycle >= 0)
+        apu_.advance_to(cycle, [this](int a) { return machine_.read_ram(a); });
+      apu_.write(address, value);
+    }
     ReadLease read_lease(int) override { return 0x40; }
 
   private:
     Apu& apu_;
+    ConsoleMachine& machine_;
   };
-  // $4014: copy a 256-byte CPU page into OAM, stalling the CPU 513
-  // cycles (charged through take_stall at the dispatching write).
+  // $4014: copy a 256-byte CPU page into OAM, stalling for 513 or 514 cycles.
   class OamDma final : public Device {
   public:
     OamDma(ConsoleMachine& machine, Ppu& ppu) : machine_(machine), ppu_(ppu) {}
     int read(int) override { return 0; }
-    void write(int, int value, int64_t) override {
+    void write(int, int value, int64_t cycle) override {
       array<uint8_t, 256> page{};
       const int base = (value & 0xFF) << 8;
       for (size_t i = 0; i < page.size(); ++i)
         page[i] = static_cast<uint8_t>(machine_.read_ram(base + static_cast<int>(i)));
       ppu_.oam_dma(page);
-      stall_ += 513;
+      stall_ += 513 + static_cast<int>(cycle & 1);
     }
     int take_stall() override {
       const int out = stall_;

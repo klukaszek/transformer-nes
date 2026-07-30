@@ -24,6 +24,7 @@ from transformer_nes.cpu6502.spec import (
     MODE_ZERO_PAGE_Y,
     OPCODES,
     READS_MEMORY,
+    dynamic_cycle_table,
 )
 
 READ_MODE_CODE = {
@@ -48,7 +49,7 @@ def read_mode_table() -> tuple[int, ...]:
 
 
 def cycle_table() -> tuple[int, ...]:
-    """Base opcode cycles; dynamic penalties are outside the run protocol.
+    """Base opcode cycles. Dynamic penalties are added by ``dynamic_cycles``.
 
     Unknown bytes cost 2, never 0: a zero-cycle step can never satisfy a
     cycle budget, so garbage execution (a bad pointer landing between
@@ -288,12 +289,13 @@ IN_RANGES_CPP = """\
 def run_state_members_cpp() -> str:
     """Persistent-machine state shared by both run loops: RAM mirror,
     architectural registers, pause/lease flags, counters, watch ranges, and
-    the shadow-decode / base-cycle tables."""
+    the shadow-decode / cycle-accounting tables."""
     read_mode = ", ".join(str(v) for v in read_mode_table())
     cycles_tab = ", ".join(str(v) for v in cycle_table())
     trace_mode = ", ".join(str(v) for v in trace_mode_table())
     trace_length = ", ".join(str(v) for v in trace_length_table())
     trace_data = ", ".join(str(v) for v in trace_data_table())
+    dynamic = ", ".join(str(v) for v in dynamic_cycle_table())
     return f"""\
     unsigned char ram[65536];  // mirror of the write log, for shadow decode
     int st_pc = 0, st_a = 0, st_x = 0, st_y = 0, st_s = 0xFD, st_p = 0x24;
@@ -325,18 +327,11 @@ def run_state_members_cpp() -> str:
     // windows dispatch only while this stays >= 0x2000, making a watched
     // write inside a window statically impossible.
     int watch_write_lo = 0x10000;
-    // Journaled watched writes: a nonzero wjournal[addr] applies the write
-    // to the journal instead of pausing (order-only device state, drained
-    // at every run() return); the value is the lease group the write must
-    // invalidate, standing in for the pause path's per-device lease drop.
-    unsigned char wjournal[65536] = {{}};
     // Native cartridge PRG banking (console silicon, like the PPU):
     // $8000-$FFFF register writes decode natively -- bank switches copy
     // from the resident PRG ROM, the clobbered ROM byte is repaired --
-    // and are journaled for the Python mapper's CHR/IRQ/mirroring side
-    // effects, drained at every run() return.  The frame-at-once PPU
-    // samples that state only at split/render boundaries, which all
-    // follow a drain, so the deferral is invisible.
+    // and are reported for the Python mapper's CHR/IRQ/mirroring side
+    // effects.
     int mapper_kind = 0;  // 0 none, 1 MMC1, 3 MMC3
     std::vector<unsigned char> mapper_prg;
     int mapper_nbanks = 0;
@@ -344,14 +339,48 @@ def run_state_members_cpp() -> str:
     int m3_bank_select = 0;
     int m3_regs[8] = {{0, 0, 0, 0, 0, 0, 0, 0}};
     int m1_shift = 0x10, m1_control = 0x0C, m1_prg = 0;
-    std::vector<int> wj_addr, wj_value;  // write journal since last drain
+    std::vector<int> mapper_addr, mapper_value;
     std::vector<int> ls_addr; std::vector<long> ls_served;  // native lease kills
     static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};
     static constexpr unsigned char TRACE_MODE[256] = {{ {trace_mode} }};
     static constexpr unsigned char TRACE_LENGTH[256] = {{ {trace_length} }};
     static constexpr unsigned char TRACE_DATA[256] = {{ {trace_data} }};
-    // Base cycles per opcode (no penalty cycles); NMI costs 7.
-    static constexpr unsigned char CYCLES[256] = {{ {cycles_tab} }};"""
+    // Base opcode cycles; dynamic penalties are added by dynamic_cycles().
+    static constexpr unsigned char CYCLES[256] = {{ {cycles_tab} }};
+    static constexpr unsigned char DYNAMIC[256] = {{ {dynamic} }};
+
+    int dynamic_cycles(int opcode, int pc, int xr, int yr, int p) const {{
+        int cycles = CYCLES[opcode & 0xFF];
+        const int kind = DYNAMIC[opcode & 0xFF];
+        if (kind >= 1 && kind <= 8) {{
+            const bool taken =
+                (kind == 1 && !(p & 0x80)) || (kind == 2 && (p & 0x80)) ||
+                (kind == 3 && !(p & 0x40)) || (kind == 4 && (p & 0x40)) ||
+                (kind == 5 && !(p & 0x01)) || (kind == 6 && (p & 0x01)) ||
+                (kind == 7 && !(p & 0x02)) || (kind == 8 && (p & 0x02));
+            if (!taken) return cycles;
+            ++cycles;
+            const int next = (pc + 2) & 0xFFFF;
+            const int target = (next + (int)(std::int8_t)ram[(pc + 1) & 0xFFFF]) & 0xFFFF;
+            if ((next & 0xFF00) != (target & 0xFF00)) ++cycles;
+            return cycles;
+        }}
+        if (kind >= 9 && kind <= 11) {{
+            const int lo = ram[(pc + 1) & 0xFFFF];
+            int base;
+            int index;
+            if (kind == 11) {{
+                const int pointer = lo & 0xFF;
+                base = ram[pointer] | (ram[(pointer + 1) & 0xFF] << 8);
+                index = yr;
+            }} else {{
+                base = lo | (ram[(pc + 2) & 0xFFFF] << 8);
+                index = kind == 9 ? xr : yr;
+            }}
+            if ((base & 0xFF00) != (((base + index) & 0xFFFF) & 0xFF00)) ++cycles;
+        }}
+        return cycles;
+    }}"""
 
 
 MACHINE_API_CPP = """\
@@ -362,27 +391,6 @@ MACHINE_API_CPP = """\
     }
     void clear_watches() {
         rwatch.clear(); wwatch.clear(); watch_write_lo = 0x10000;
-        for (int a = 0; a < 65536; ++a) wjournal[a] = 0;
-    }
-    void set_write_journal(py::bytes groups) {
-        const std::string g = groups;
-        for (int a = 0; a < 65536 && a < (int)g.size(); ++a)
-            wjournal[a] = (unsigned char)g[a];
-    }
-    // Journaled watched write: applied natively, drained at run() return.
-    // Kills same-group read leases exactly where the pause path would
-    // (drop_device_leases); every kill is reported with its served count
-    // so the bus can advance the device model and drop its tracking.
-    void journal_write(int addr, int value) {
-        wj_addr.push_back(addr); wj_value.push_back(value);
-        const int g = wjournal[addr];
-        for (int s = 0; s < NLEASE; ++s) {
-            if (lease_addr[s] < 0 || lease_group[s] != g) continue;
-            ls_addr.push_back(lease_addr[s]);
-            ls_served.push_back(lease_served[s]);
-            lease_addr[s] = -1; lease_n[s] = lease_i[s] = 0;
-            lease_served[s] = 0; lease_group[s] = 0;
-        }
     }
     int lease_slot(int addr) const {
         for (int s = 0; s < NLEASE; ++s) if (lease_addr[s] == addr) return s;
@@ -489,10 +497,9 @@ MACHINE_API_CPP = """\
         return mapper_prg[(size_t)bank * 0x2000 + (addr & 0x1FFF)];
     }
     // Decode a $8000-$FFFF register write, apply any PRG switch, repair
-    // the clobbered ROM byte, journal for the Python mapper's CHR/IRQ/
-    // mirroring side effects.
+    // the clobbered ROM byte, and report the mapper side effects.
     void mapper_write(int addr, int value) {
-        wj_addr.push_back(addr); wj_value.push_back(value);
+        mapper_addr.push_back(addr); mapper_value.push_back(value);
         if (mapper_kind == 3) {
             const int reg = addr & 0xE001;
             if (reg == 0x8000) { m3_bank_select = value; mapper_apply_mmc3(); }
@@ -545,7 +552,7 @@ MACHINE_API_CPP = """\
         m1_shift = 0x10; m1_control = 0x0C; m1_prg = 0;
         m3_bank_select = 0;
         for (int i = 0; i < 8; ++i) m3_regs[i] = 0;
-        wj_addr.clear(); wj_value.clear();
+        mapper_addr.clear(); mapper_value.clear();
     }"""
 
 
@@ -564,6 +571,7 @@ RUN_LOOP_TEMPLATE = """\
         int read_addr = -1;
         long cycles_this = 0;
         const long steps_entry = step_index;
+        long n_forward = 0;
 {EXTRA_LOCALS}
         for (long i = 0; i < max_steps; ++i) {
             if (st_halted) { reason = "halt"; break; }
@@ -591,6 +599,7 @@ RUN_LOOP_TEMPLATE = """\
                     }
                 }
             }
+            ++n_forward;
 {STEP_BODY}
         }
         py::dict out;
@@ -619,13 +628,9 @@ RUN_LOOP_TEMPLATE = """\
         }
         out["hit_addr"] = arr(hit_addr);
         out["hit_value"] = arr(hit_value);
-        // Natively applied writes since the last return, in program order:
-        // mapper registers (side effects only) and journaled device
-        // registers; the bus drains them into the device models, after
-        // any served counts from natively killed read leases.
-        out["wj_addr"] = arr(wj_addr);
-        out["wj_value"] = arr(wj_value);
-        wj_addr.clear(); wj_value.clear();
+        out["mapper_addr"] = arr(mapper_addr);
+        out["mapper_value"] = arr(mapper_value);
+        mapper_addr.clear(); mapper_value.clear();
         out["ls_addr"] = arr(ls_addr);
         out["ls_served"] = py::array_t<long>((py::ssize_t)ls_served.size(), ls_served.data());
         ls_addr.clear(); ls_served.clear();
@@ -633,6 +638,7 @@ RUN_LOOP_TEMPLATE = """\
         out["reason"] = reason;
         out["cycles"] = cycles_this;
         out["steps"] = step_index - steps_entry;
+        out["forwards"] = n_forward;
         return out;
     }"""
 

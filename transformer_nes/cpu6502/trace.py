@@ -1,4 +1,4 @@
-"""Canonical trace format shared by reference, graph, and transformer runners."""
+"""Canonical trace format shared by the reference and weights runners."""
 
 from __future__ import annotations
 
@@ -11,9 +11,8 @@ class Cpu6502State:
     """A snapshot of the 6502 CPU state.
 
     The ``ir``, ``operand_lo``, ``operand_hi``, ``ea``, and ``data`` fields
-    are part of the internal instruction-fetch / execute machinery so that
-    the graph interpreter and reference can emit identical intermediate
-    state.
+    are part of the internal instruction-fetch / execute machinery so the
+    reference trace and generated engine share one state contract.
     """
 
     pc: int

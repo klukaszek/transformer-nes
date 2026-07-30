@@ -1,9 +1,6 @@
 #pragma once
 
-// Native frame-level NES PPU (2C02): registers $2000-$2007 behind the
-// MMIO bus, VRAM/OAM, and a frame-at-once renderer (ppu.cpp; the render
-// model -- loopy scroll state, sprite-0/IRQ split bands, span blanking
-// -- is documented there and in ROADMAP.md).
+// Native frame-level NES PPU (2C02): MMIO registers, VRAM/OAM, and rendering.
 
 #include "nes/chr.h"
 
@@ -22,6 +19,7 @@ using std::size_t;
 using std::span;
 using std::uint16_t;
 using std::uint8_t;
+using std::uint64_t;
 using std::vector;
 
 class Ppu {
@@ -45,7 +43,7 @@ public:
       oam[(oam_addr + i) & 0xFF] = page[i];
   }
 
-  // ── Console-side control ────────────────────────────────────────
+  // Console-side control
 
   [[nodiscard]] Frame render_frame();
   void begin_vblank() {
@@ -89,7 +87,7 @@ public:
     mmc5.configure_chr(sprite, background);
   }
 
-  // ── State ───────────────────────────────────────────────────────
+  // State
 
   // Full CHR data (ROM of any 1 KiB-multiple size, or 8 KiB CHR RAM);
   // the PPU's $0000-$1FFF window maps through eight 1 KiB bank slots.
@@ -109,6 +107,7 @@ public:
   int ctrl = 0, mask = 0;
   uint8_t oam_addr = 0;
   uint16_t vram_addr = 0;
+  uint64_t v_reload_generation = 0;
   // Shared scroll/address state (loopy t + fine x): $2000 sets its
   // nametable bits, $2005 its scroll bits, $2006 overwrites it as an
   // address -- so an address-then-scroll reset sequence really does
@@ -131,6 +130,7 @@ public:
   // below from the live registers -- the sprite-0 split.
   int frame_ctrl = 0, frame_mask = 0, frame_mirroring = 3;
   int frame_t_addr = 0, frame_fine_x = 0;
+  uint64_t frame_v_reload_generation = 0;
   ChrBanks frame_chr_bank{};
   bool frame_latch_valid = false;
 
@@ -165,6 +165,7 @@ public:
 
   struct RasterSplit {
     int line, ctrl, mask, mirroring, t_addr, fine_x, v_addr;
+    uint64_t v_reload_generation;
     ChrBanks chr_banks{};
     Mmc5BankSnapshot mapper_banks;
   };

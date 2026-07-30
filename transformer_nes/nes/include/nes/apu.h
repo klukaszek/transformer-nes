@@ -1,8 +1,7 @@
 #pragma once
 
 // Native NES APU (2A03 audio): registers $4000-$4017 behind the MMIO
-// bus, the five channels' state, a frame sequencer, and a per-frame
-// sample generator (see apu.cpp for the frame-level approximation).
+// bus, the five channels' state, a frame sequencer, and continuous samples.
 
 #include <array>
 #include <cstdint>
@@ -14,6 +13,7 @@ namespace transformer_nes::nes {
 
 using std::array;
 using std::function;
+using std::int64_t;
 using std::size_t;
 using std::uint16_t;
 using std::uint8_t;
@@ -238,14 +238,17 @@ public:
 
   int read(int address);
   void write(int address, int value);
-  // Run a frame's worth of CPU cycles, emitting one sample every
-  // cycles_per_sample cycles; returns the generated mono samples.
+  // Advance state to a stamped CPU cycle before applying an MMIO write.
+  void advance_to(int64_t cpu_cycle, MemoryReader reader = {});
+  [[nodiscard]] vector<float> take_samples();
+  // Compatibility wrapper for callers that advance in frame-sized chunks.
   [[nodiscard]] vector<float> end_frame(int cpu_cycles, MemoryReader reader = {});
   [[nodiscard]] int take_dma_stall() {
     const int stall = dma_stall;
     dma_stall = 0;
     return stall;
   }
+  [[nodiscard]] int64_t cycles_until_dmc_dma() const;
   [[nodiscard]] bool irq_pending() const { return frame_irq || dmc.irq; }
 
   array<Pulse, 2> pulse{};
@@ -267,6 +270,8 @@ public:
   double sample_accum = 0.0;
   double hp_prev_in = 0.0, hp_prev_out = 0.0; // DC-blocker state
   int dma_stall = 0;
+  int64_t clocked_cycles = 0;
+  vector<float> pending_samples;
 
 private:
   void fill_dmc_buffer(const MemoryReader& reader);

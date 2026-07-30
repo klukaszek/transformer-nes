@@ -28,18 +28,15 @@ vendor/pybind11/
 # Battery saves are user data, written next to the ROM
 *.sav
 
-# Commercial ROMs stay local (test ROMs like nestest are tracked)
-transformer_nes/nes/examples/smb.nes
-transformer_nes/nes/examples/smb3.nes
-transformer_nes/nes/examples/ff.nes
-transformer_nes/nes/examples/punchout.nes
-transformer_nes/nes/examples/megaman6.nes
-transformer_nes/nes/examples/castlevania3.nes
-transformer_nes/nes/examples/legendofzelda.nes
-transformer_nes/nes/examples/zelda2.nes
+# ROMs and tape captures stay local
+*.nes
+tapes/
 
 # F1 debug snapshots
 _debug_dumps/
 
 # Finder litter
 .DS_Store
+
+# Generated experiment artifacts (hundreds of MB, rebuilt by build.py)
+experiments/*/artifact/

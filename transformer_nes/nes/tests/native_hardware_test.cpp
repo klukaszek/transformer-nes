@@ -78,6 +78,29 @@ static void test_mappers() {
   mmc3.write(0xA000, 1, -1);
   assert(ppu.mirroring == 3);
 
+  Cartridge c3_ram{banks(32, BANK8), {}, Mirroring::Horizontal, 4};
+  Mmc3 mmc3_ram(c3_ram);
+  wire(mmc3_ram, memory, machine, ppu, irq);
+  mmc3_ram.write(0x8000, 0, -1);
+  mmc3_ram.write(0x8001, 6, -1);
+  assert(ppu.chr_bank[0] == 6 * CHR_BANK1 && ppu.chr_bank[1] == 7 * CHR_BANK1);
+  auto set_ppu_addr = [&ppu](int address) {
+    ppu.write(0x2006, address >> 8);
+    ppu.write(0x2006, address & 0xFF);
+  };
+  ppu.chr[6 * CHR_BANK1] = 0xA6;
+  set_ppu_addr(0);
+  assert(ppu.read(0x2007) == 0);
+  assert(ppu.read(0x2007) == 0xA6);
+  ppu.chr[2 * CHR_BANK1] = 0xB2;
+  mmc3_ram.write(0x8001, 2, -1);
+  set_ppu_addr(0);
+  assert(ppu.read(0x2007) == 0);
+  assert(ppu.read(0x2007) == 0xB2);
+  set_ppu_addr(0);
+  ppu.write(0x2007, 0xC2);
+  assert(ppu.chr[2 * CHR_BANK1] == 0xC2);
+
   mmc3.write(0xC000, 2, -1);
   mmc3.write(0xC001, 0, -1);
   mmc3.write(0xE001, 0, -1);
@@ -122,8 +145,9 @@ static void test_mappers() {
 class FakeRuntime final : public SteppedRuntime {
 public:
   int pc() const override { return pc_; }
-  int x() const override { return 0; }
-  int y() const override { return 0; }
+  int x() const override { return x_; }
+  int y() const override { return y_; }
+  int p() const override { return p_; }
   bool halted() const override { return false; }
   bool nmi_pending() const override { return nmi_; }
   bool irq_ready() const override { return false; }
@@ -141,6 +165,7 @@ public:
     return out;
   }
   int pc_ = 0x8000;
+  int x_ = 0, y_ = 0, p_ = 0;
   bool nmi_ = false;
   vector<CpuWrite> next_writes;
   array<uint8_t, 0x10000> memory{};
@@ -186,6 +211,39 @@ static void test_bus_and_controller() {
   rmw_bus.step();
   assert(rmw_device.rmw_cycle == 6 && rmw_device.value == 0x42);
 
+  FakeRuntime timing_runtime;
+  timing_runtime.pc_ = 0x80FE;
+  timing_runtime.p_ = 0;
+  image[0x80FE] = 0xD0; // BNE, taken across the page
+  image[0x80FF] = 0x80;
+  opcodes[0xD0] = {2, -1, OpcodeInfo::DynamicKind::bne};
+  Bus timing_bus(timing_runtime, image, opcodes);
+  timing_bus.step();
+  assert(timing_bus.cycles() == 4);
+
+  FakeRuntime mirrored_timing_runtime;
+  mirrored_timing_runtime.pc_ = 0x07FF;
+  image[0x07FF] = 0xD0; // BNE, with its operand at mirrored $0000
+  image[0x0000] = 0x01;
+  image[0x0800] = 0x80;
+  opcodes[0xD0] = {2, -1, OpcodeInfo::DynamicKind::bne};
+  Bus mirrored_timing_bus(mirrored_timing_runtime, image, opcodes);
+  mirrored_timing_bus.step();
+  assert(mirrored_timing_bus.cycles() == 3);
+
+  FakeRuntime mirror_runtime;
+  image[0x8000] = 0xAD; // LDA $1803
+  image[0x8001] = 0x03;
+  image[0x8002] = 0x18;
+  image[0x0003] = 0xA7;
+  image[0x1803] = 0;
+  opcodes[0xAD] = {4, 3};
+  Bus mirror_bus(mirror_runtime, image, opcodes);
+  assert(mirror_bus.read_ram(0x0003) == 0xA7);
+  assert(mirror_bus.read_ram(0x0803) == 0xA7);
+  assert(mirror_bus.read_ram(0x1003) == 0xA7);
+  assert(mirror_bus.read_ram(0x1803) == 0xA7);
+
   Controller controller;
   controller.set_button(0, true);
   controller.write(0x4016, 1, 0);
@@ -207,11 +265,27 @@ static void test_ppu_and_apu() {
   auto frame = ppu.render_frame();
   assert(frame.size() == 240 * 256);
 
+  Ppu status(vector<uint8_t>(0x2000), false, true);
+  status.begin_vblank();
+  status.write(0x2000, 0x80);
+  assert(status.take_nmi_edge());
+  status.write(0x2000, 0x00);
+  status.write(0x2000, 0x80);
+  assert((status.read(0x2002) & 0x80) != 0);
+  assert(!status.take_nmi_edge());
+
   Apu apu(44'100.0);
   apu.write(0x4015, 0);
   auto audio = apu.end_frame(29'781);
   assert(audio.size() >= 733 && audio.size() <= 734);
   assert(apu.take_dma_stall() == 0);
+
+  Apu chunked(44'100.0);
+  chunked.advance_to(10'000);
+  const auto first = chunked.take_samples();
+  chunked.advance_to(29'781);
+  const auto second = chunked.take_samples();
+  assert(first.size() + second.size() >= 733 && first.size() + second.size() <= 734);
 }
 
 static void test_tape() {

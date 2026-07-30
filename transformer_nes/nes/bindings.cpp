@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -23,10 +24,10 @@ namespace {
 
 using std::function;
 using std::int64_t;
-using std::pair;
 using std::size_t;
 using std::span;
 using std::string;
+using std::tuple;
 using std::uint8_t;
 using std::unique_ptr;
 using std::vector;
@@ -42,6 +43,7 @@ public:
   int pc() const override { return py::cast<int>(core_.attr("pc")); }
   int x() const override { return py::cast<int>(core_.attr("x")); }
   int y() const override { return py::cast<int>(core_.attr("y")); }
+  int p() const override { return py::cast<int>(core_.attr("p")); }
   bool halted() const override { return py::cast<bool>(core_.attr("halted")); }
   bool nmi_pending() const override { return py::cast<bool>(core_.attr("nmi_pending")); }
   bool irq_ready() const override { return py::cast<bool>(core_.attr("irq_ready")); }
@@ -102,15 +104,9 @@ public:
                                      py::arg("trace") = false)
                          .cast<py::dict>();
       cycles += py::cast<int64_t>(out["cycles"]);
-      // Journaled device writes (PPU registers): applied in-engine without
-      // pausing and drained here in program order, before the chunk's
-      // paused write.  The frame-at-once PPU samples state only at split/
-      // render boundaries, which all follow a drain, so the deferral is
-      // invisible.  Native PRG banking still fails loudly (not wired).
-      drain_journal(out, cycle_base + cycles);
+      drain_mapper(out, cycle_base + cycles);
       drain_leases(out);
-      // A watched write pauses the engine, so the chunk's writes
-      // executed at its end: stamp them with the cycle there.
+      // Paused writes are stamped at the end of the returned chunk.
       cycles += service_writes(out, cycle_base + cycles);
       string reason = py::cast<string>(out["reason"]);
       if (reason == "watch_read")
@@ -179,13 +175,11 @@ private:
         owner->second->lease_consumed(addr, count);
     }
   }
-  void drain_journal(const py::dict& out, int64_t cycle) {
-    py::sequence aa = out["wj_addr"], vv = out["wj_value"];
+  void drain_mapper(const py::dict& out, int64_t cycle) {
+    py::sequence aa = out["mapper_addr"], vv = out["mapper_value"];
     if (py::len(aa) != py::len(vv))
-      throw std::runtime_error("CPU engine returned mismatched journal arrays");
-    // Order-only device state (PPU $2000-$3FFF): route each to its device
-    // in program order.  These never carry a mapper side effect (PRG
-    // banking still routes through the pause path), so no lease kill.
+      throw std::runtime_error("CPU engine returned mismatched mapper arrays");
+    // Apply natively decoded mapper writes in program order.
     for (py::size_t i = 0; i < py::len(aa); ++i) {
       int a = py::cast<int>(aa[i]);
       if (auto* d = device_at(a))
@@ -227,13 +221,14 @@ private:
 
 class ConsoleHost {
 public:
-  ConsoleHost(Cartridge cart, py::object factory, const vector<pair<int, int>>& opcode_values,
+  ConsoleHost(Cartridge cart, py::object factory, const vector<tuple<int, int, int>>& opcode_values,
               double sample_rate) {
     if (opcode_values.size() != OpcodeTable{}.size())
       throw std::invalid_argument("opcode table must contain exactly 256 entries");
     OpcodeTable opcodes{};
     for (size_t i = 0; i < opcode_values.size(); ++i)
-      opcodes[i] = {opcode_values[i].first, opcode_values[i].second};
+      opcodes[i] = {std::get<0>(opcode_values[i]), std::get<1>(opcode_values[i]),
+                    static_cast<OpcodeInfo::DynamicKind>(std::get<2>(opcode_values[i]))};
     Ppu ppu(cart.chr.empty() ? vector<uint8_t>(0x2000) : cart.chr, cart.chr.empty(),
             cart.mirroring == Mirroring::Vertical);
     auto mapper = make_mapper(std::move(cart));
@@ -326,7 +321,7 @@ PYBIND11_MODULE(nes_hardware, m) {
       .def_readonly("mapper", &Cartridge::mapper)
       .def_readonly("battery", &Cartridge::battery);
   py::class_<ConsoleHost>(m, "Console")
-      .def(py::init<Cartridge, py::object, const vector<pair<int, int>>&, double>(),
+      .def(py::init<Cartridge, py::object, const vector<tuple<int, int, int>>&, double>(),
            py::arg("cartridge"), py::arg("backend_factory"), py::arg("opcodes"),
            py::arg("sample_rate") = 44100.0)
       .def("run_frame", &ConsoleHost::run_frame)

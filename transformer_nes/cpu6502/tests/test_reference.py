@@ -7,7 +7,14 @@ import os
 import pytest
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.spec import FLAG_C, FLAG_N, FLAG_Z, asm
+from transformer_nes.cpu6502.spec import (
+    FLAG_C,
+    FLAG_N,
+    FLAG_Z,
+    MODE_ABSOLUTE_X,
+    asm,
+    opcode_for,
+)
 from transformer_nes.cpu6502.trace import format_trace_row
 
 EXAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "examples", "tiny")
@@ -79,6 +86,25 @@ def test_bne_loop_counts_down():
     # Three DEX iterations plus fetch of final BRK => expect branch taken 3x.
     taken_branches = [r for r in trace.rows if r.opcode == 0xD0 and r.state.pc != r.pc + 2]
     assert len(taken_branches) == 3
+
+
+def test_dynamic_cycles_include_branch_and_indexed_read_penalties():
+    cpu = reference.Cpu6502()
+    cpu.memory[0x80FE:0x8100] = bytes([0xD0, 0x80])
+    branch = opcode_for(0xD0)
+    assert reference.instruction_cycles(cpu, branch, 0x80FE, 0, 0, 0) == 4
+    assert reference.instruction_cycles(cpu, branch, 0x80FE, 0, 0, FLAG_Z) == 2
+
+    cpu.memory[0x8000:0x8003] = bytes([0xBD, 0xFF, 0x20])
+    indexed = opcode_for(0xBD)
+    assert indexed.mode == MODE_ABSOLUTE_X
+    assert reference.instruction_cycles(cpu, indexed, 0x8000, 1, 0, 0) == 5
+
+
+def test_nes_internal_ram_mirrors_are_write_through():
+    cpu = reference.Cpu6502(mirror_cpu_ram=True)
+    cpu.write_memory(0x1803, 0xA7)
+    assert [cpu.read_memory(addr) for addr in (0x0003, 0x0803, 0x1003, 0x1803)] == [0xA7] * 4
 
 
 # ── Acceptance-criteria opcode subset ─────────────────────────────

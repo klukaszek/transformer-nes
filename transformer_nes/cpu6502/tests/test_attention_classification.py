@@ -1,4 +1,4 @@
-"""Contracts for attention structures shared by both generated backends."""
+"""Contracts for attention structures used by the generated engine."""
 
 from __future__ import annotations
 

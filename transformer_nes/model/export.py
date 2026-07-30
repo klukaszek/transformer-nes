@@ -9,6 +9,9 @@ self-contained: a standalone runner needs only these two files and the
 execution semantics documented in the JSON -- hardmax attention with the
 LATEST tie-break, ReGLU FFN, residual stream, no normalization.
 
+The exported model is the self-contained ``wide_bits=False`` build, which is
+NOT the shape the generated engine runs; see ``export_model``.
+
 Usage: ``uv run python -m transformer_nes.model.export OUT_DIR [--bcd]``
 """
 
@@ -22,7 +25,13 @@ import time
 import numpy as np
 import scipy.sparse as sp
 
-from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS, Cpu6502Runtime
+from transformer_nes.cpu6502.backends.weights.experts import (
+    UNION_FALLBACK_OPERATIONS,
+    build_interrupt_experts,
+    build_opcode_execution_experts,
+)
+from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS, Cpu6502Graph
+from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.graph.core import InputDimension, ProgramGraph
 from transformer_nes.model.schedule import asap_schedule
 from transformer_nes.model.weights import build_model
@@ -31,12 +40,12 @@ from transformer_nes.model.weights import build_model
 def csr_tensors(name: str, mat: np.ndarray, out: dict) -> None:
     m = sp.csr_matrix(mat)
     m.sort_indices()
-    out[f"{name}.data"] = m.data.astype(np.float32)
+    out[f"{name}.data"] = to_fixed_point(m.data, f"{name}.data")
     out[f"{name}.indices"] = m.indices.astype(np.int32)
     out[f"{name}.indptr"] = m.indptr.astype(np.int32)
 
 
-def prune_layer(ip, op, fi, fo, d_model, num_heads, d_ffn):
+def prune_layer(ip, op, fi, fo, num_heads, d_ffn):
     """Drop dead heads and FFN units from one layer's matrices, exactly.
 
     A head contributes 0 to the residual when its V rows or its out_proj
@@ -44,14 +53,16 @@ def prune_layer(ip, op, fi, fo, d_model, num_heads, d_ffn):
     an FFN unit contributes 0 when its gate row, value row, or ff_out
     column is all zero.  Returns ragged matrices plus the kept counts.
     """
-    D = d_model
+    k_base, v_base = 2 * num_heads, 4 * num_heads
     heads = [
         h for h in range(num_heads)
-        if ip[2 * D + 2 * h:2 * D + 2 * h + 2].any()
+        if ip[v_base + 2 * h:v_base + 2 * h + 2].any()
         and op[:, 2 * h:2 * h + 2].any()
     ]
     hi = [r for h in heads for r in (2 * h, 2 * h + 1)]
-    ip = np.vstack([ip[hi], ip[[D + r for r in hi]], ip[[2 * D + r for r in hi]]])
+    ip = np.vstack(
+        [ip[hi], ip[[k_base + r for r in hi]], ip[[v_base + r for r in hi]]]
+    )
     op = op[:, hi]
     units = [
         j for j in range(d_ffn)
@@ -87,11 +98,49 @@ def rescale_head_queries(in_proj: np.ndarray, num_heads: int) -> np.ndarray:
     return out
 
 
+CLEAR_GATE_THRESHOLD = -1e29
+SCALE_BITS = 1
+
+
+def split_clear_gates(ip: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Lift the -1e30 clear gates out of a layer's Q/K/V projection.
+
+    A clear gate exists only to lose the argmax, never to be exact, so it is
+    a *predicate*, not a coefficient: token t is masked for head h when the
+    gated input is non-zero.  Extracting it leaves every surviving
+    coefficient finite and integral, which is what lets the artifact be
+    int32 with no magnitude reasoning anywhere.
+    """
+    mask = ip <= CLEAR_GATE_THRESHOLD
+    kept = np.where(mask, 0.0, ip)
+    rows, cols = np.nonzero(mask)
+    return kept, np.ascontiguousarray(rows, dtype=np.int32), \
+        np.ascontiguousarray(cols, dtype=np.int32)
+
+
+def to_fixed_point(arr: np.ndarray, name: str) -> np.ndarray:
+    """Exact int32 in units of 2**-SCALE_BITS; raises if any value is lost."""
+    scaled = arr * (1 << SCALE_BITS)
+    ints = np.rint(scaled)
+    if not np.array_equal(scaled, ints):
+        bad = scaled[scaled != ints]
+        raise AssertionError(
+            f"{name}: {bad.size} coefficients are not exact at "
+            f"SCALE_BITS={SCALE_BITS} (e.g. {bad[:3]})")
+    if np.abs(ints).max(initial=0.0) > np.iinfo(np.int32).max:
+        raise AssertionError(f"{name}: coefficient exceeds int32")
+    return ints.astype(np.int32)
+
+
 def export_model(out_dir: str, *, bcd: bool = False) -> dict:
     """Build the union model and write the artifact; returns the metadata."""
     from safetensors.numpy import save_file
 
-    rt = Cpu6502Runtime(bcd=bcd)
+    # wide_bits=False on purpose: the artifact must stand alone, so the model
+    # derives a byte's bits itself.  The generated engine builds wide_bits=True
+    # instead and has its harness serve those 16 bit inputs, trading a wider
+    # token contract for less depth -- a different model, exported nowhere.
+    rt = Cpu6502Graph(bcd=bcd)
     dim_by_id = {d.id: d for d in rt.all_dims}
     output_tokens = dict(rt.output_tokens)
     readout = 0
@@ -102,25 +151,28 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
     sched = asap_schedule(pg.input_tokens, pg.output_tokens, program_graph=pg)
     model, _tokens, tok_to_idx, info = build_model(program_graph=pg, schedule=sched)
 
-    # f32 storage loads on every GPU (WebGPU has no f64) and is exact:
-    # after query rescaling every coefficient but the -1e30 clear gates
-    # (argmax losers, exactness-free) is an integer below 2^24.
-    # The READOUT head row is scheduling scaffolding (1e-6 keep-alive
-    # coefficients, ignored at prediction time -- only the STATE and HALT
-    # rows compete); zeroed so every exported coefficient is an integer
-    # or +-0.5.
+    # Every coefficient is an exact int32 in units of 2**-SCALE_BITS: query
+    # rescaling makes them integers, and the only half-integers left
+    # ((in_p_d - in_p_n)/2 in one FFN) are exact at SCALE_BITS=1.  The
+    # READOUT head row is scheduling scaffolding, zeroed first.
     head = model.head.weight.copy()
     head[tok_to_idx["READOUT"]] = 0.0
     tensors: dict[str, np.ndarray] = {
-        "tok": model.tok.weight.astype(np.float32),
-        "head": head.astype(np.float32),
+        "tok": to_fixed_point(model.tok.weight, "tok"),
+        "head": to_fixed_point(head, "head"),
     }
     layer_heads, layer_ffn = [], []
+    # Consumers that can exploit the generated engine's structural fusion
+    # need the classifications after pruning.  Keeping these in the
+    # artifact makes the optimization available to standalone runners too;
+    # old artifacts simply omit them and retain the generic path.
+    layer_head_kinds, layer_ffn_kinds = [], []
+    n_clear = 0
     for li in range(info.n_layers):
         ip, op, fi, fo, heads, units = prune_layer(
             model.attn[li].in_proj_weight, model.attn[li].out_proj.weight,
             model.ff_in[li].weight, model.ff_out[li].weight,
-            info.d_model, model.attn[li].num_heads,
+            model.attn[li].num_heads,
             model.ff_in[li].weight.shape[0] // 2)
         # Everything kept must be live by the model's own classification
         # (head_kinds/ffn_kinds 0 = unused); pruning MORE is fine -- the
@@ -132,19 +184,21 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
             raise AssertionError(f"L{li}: kept an FFN unit classified unused")
         layer_heads.append(len(heads))
         layer_ffn.append(len(units))
-        csr_tensors(f"L{li}.in_proj", rescale_head_queries(ip, len(heads)), tensors)
+        layer_head_kinds.append([
+            int(model.head_kinds[li][h]) for h in heads
+        ])
+        layer_ffn_kinds.append([
+            int(model.ffn_kinds[li][j]) for j in units
+        ])
+        ip_kept, clear_rows, clear_cols = split_clear_gates(
+            rescale_head_queries(ip, len(heads)))
+        csr_tensors(f"L{li}.in_proj", ip_kept, tensors)
+        tensors[f"L{li}.clear_rows"] = clear_rows
+        tensors[f"L{li}.clear_cols"] = clear_cols
         csr_tensors(f"L{li}.out_proj", op, tensors)
         csr_tensors(f"L{li}.ff_in", fi, tensors)
         csr_tensors(f"L{li}.ff_out", fo, tensors)
-    for name, arr in tensors.items():
-        if name.endswith((".indices", ".indptr")):
-            continue
-        vals = arr[arr != 0.0]
-        bad = vals[(vals != np.trunc(vals)) & (np.abs(vals) != 0.5)]
-        if bad.size:
-            raise AssertionError(
-                f"{name}: {bad.size} non-integer coefficients survive "
-                f"query rescaling (e.g. {bad[:3]})")
+        n_clear += int(clear_rows.shape[0])
 
     input_slots = {
         d.name: int(info.slot_of[d])
@@ -171,23 +225,41 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
             "normalization, no position encoding: order enters ONLY "
             "through the LATEST tie-break (passthrough heads tie every "
             "token with constant Q/K and take the latest = themselves).  "
-            "Readouts round half-to-even.  Precision contract: EVERY "
-            "coefficient is an integer or +-0.5 (enforced at export: each "
-            "head's Q row pair is stored divided by its hardmax "
-            "temperature -- a positive per-head score scale, invisible to "
-            "the argmax and its exact ties), so storage is exact in any "
-            "dtype with 24 mantissa bits and every attention score is an "
-            "integer-coefficient function of integer inputs -- no "
-            "irrational arithmetic anywhere.  Non-clear coefficients stay "
-            "below 2^24; clear-gated keys are shifted by -1e30 and only "
-            "need to lose the argmax, never to be exact."
+            "Readouts round half-to-even.  Precision contract: THERE IS NO "
+            "FLOATING POINT.  Every coefficient is an exact int32 in units "
+            "of 2**-scale_bits, so a conforming runner is pure integer "
+            "arithmetic: multiply, add, shift right by scale_bits after "
+            "each matmul and after the ReGLU product, compare.  Two things "
+            "make that possible.  (1) Each head's Q row pair is stored "
+            "divided by its hardmax temperature -- a positive per-head "
+            "score scale, invisible to the argmax and its exact ties -- "
+            "which turns the queries into integers; the only half-integers "
+            "left are one FFN's (in_p_d - in_p_n)/2, exact at "
+            "scale_bits=1.  (2) The -1e30 clear gates are NOT stored as "
+            "coefficients: a clear gate exists only to lose the argmax, "
+            "never to be exact, so it is lifted into `clear_gates` as "
+            "(row, col) pairs.  Token t is masked for the head owning that "
+            "row when input col is non-zero at insert time.  That removes "
+            "the last unbounded magnitude, so scores need no headroom "
+            "argument -- accumulate in int64.  This artifact is "
+            "the SELF-CONTAINED construction: it derives each byte's bits "
+            "inside the graph, so input_slots is the whole token contract.  "
+            "The repo's generated C++ engine executes a different build of "
+            "the same semantics in which the harness serves those bits as "
+            "16 extra inputs, trading token width for depth; its shape "
+            "therefore differs from the one reported here."
         ),
-        "dtype": "float32",
+        "dtype": "int32",
+        "scale_bits": SCALE_BITS,
+        "accumulator": "int64",
+        "clear_gates": n_clear,
         "bcd": bcd,
         "d_model": int(info.d_model),
         "n_layers": int(info.n_layers),
         "layer_heads": layer_heads,
         "layer_ffn": layer_ffn,
+        "layer_head_kinds": layer_head_kinds,
+        "layer_ffn_kinds": layer_ffn_kinds,
         "one_slot": int(info.slot_of[rt.one]),
         "input_slots": input_slots,
         "readout_slots": {
@@ -205,18 +277,114 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
     return meta
 
 
+def _expert_metadata(expert: dict, index: int) -> dict:
+    """Return the JSON-only contract for one folded execution expert."""
+    model = expert["model"]
+    return {
+        "index": index,
+        "byte": None if "byte" not in expert else int(expert["byte"]),
+        "name": expert["name"],
+        "kind": expert["kind"],
+        "nmi": bool(expert.get("nmi", False)),
+        "d_model": int(model.tok.weight.shape[1]),
+        "n_layers": len(model.attn),
+        "one_slot": int(model.one_slot),
+        "layer_heads": [int(a.num_heads) for a in model.attn],
+        "layer_ffn": [int(w.weight.shape[0] // 2) for w in model.ff_in],
+        "layer_head_kinds": [list(map(int, kinds))
+                             for kinds in model.head_kinds],
+        "layer_ffn_kinds": [list(map(int, kinds))
+                            for kinds in model.ffn_kinds],
+        "head_memory_groups": [list(map(int, groups))
+                                for groups in model.head_memory_groups],
+        "head_memory_outputs": [
+            [None if outputs is None else list(outputs) for outputs in layer]
+            for layer in model.head_memory_outputs
+        ],
+        "step_spec": expert["step_spec"],
+    }
+
+
+def export_experts(
+    out_dir: str, *, bcd: bool = False, opcodes=None,
+) -> dict:
+    """Export the generated engine's folded one-opcode execution experts.
+
+    The union artifact and the folded artifact intentionally have separate
+    contracts.  These experts use ``wide_bits=True`` (the generated engine's
+    shape), and each expert carries only its own small residual matrices plus
+    the sequence ABI needed to apply state, control flow, and writes.
+    """
+    from safetensors.numpy import save_file
+
+    rt = Cpu6502Graph(bcd=bcd, wide_bits=True)
+    pg = ProgramGraph(rt.input_tokens, rt.output_tokens)
+    if opcodes is None:
+        opcodes = sorted(
+            byte for byte in OPCODES
+            if OPCODES[byte].operation not in UNION_FALLBACK_OPERATIONS
+        )
+    experts = build_opcode_execution_experts(pg, opcodes)
+    experts.extend(build_interrupt_experts(pg))
+    tensors: dict[str, np.ndarray] = {}
+    metadata = []
+
+    for ei, expert in enumerate(experts):
+        model = expert["model"]
+        metadata.append(_expert_metadata(expert, ei))
+        for li, (attn, ff_in, ff_out) in enumerate(
+            zip(model.attn, model.ff_in, model.ff_out, strict=True)
+        ):
+            heads = attn.num_heads
+            ip, clear_rows, clear_cols = split_clear_gates(
+                rescale_head_queries(attn.in_proj_weight.copy(), heads)
+            )
+            csr_tensors(f"E{ei}.L{li}.in_proj", ip, tensors)
+            tensors[f"E{ei}.L{li}.clear_rows"] = clear_rows
+            tensors[f"E{ei}.L{li}.clear_cols"] = clear_cols
+            csr_tensors(f"E{ei}.L{li}.out_proj", attn.out_proj.weight, tensors)
+            csr_tensors(f"E{ei}.L{li}.ff_in", ff_in.weight, tensors)
+            csr_tensors(f"E{ei}.L{li}.ff_out", ff_out.weight, tensors)
+
+    meta = {
+        "format": "6502 folded opcode execution experts",
+        "dtype": "int32",
+        "scale_bits": SCALE_BITS,
+        "accumulator": "int64",
+        "bcd": bcd,
+        "n_experts": len(metadata),
+        "experts": metadata,
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    save_file(tensors, os.path.join(out_dir, "expert_weights.safetensors"))
+    with open(os.path.join(out_dir, "experts.json"), "w") as f:
+        json.dump(meta, f, indent=1, sort_keys=True)
+    return meta
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out_dir")
     parser.add_argument("--bcd", action="store_true")
+    parser.add_argument(
+        "--experts", action="store_true",
+        help="export folded wide-bit opcode experts instead of the union",
+    )
     args = parser.parse_args()
     t0 = time.perf_counter()
-    meta = export_model(args.out_dir, bcd=args.bcd)
-    print(
-        f"exported d_model={meta['d_model']} n_layers={meta['n_layers']} "
-        f"heads={sum(meta['layer_heads'])} ffn={sum(meta['layer_ffn'])} "
-        f"to {args.out_dir} in {time.perf_counter() - t0:.1f}s"
-    )
+    if args.experts:
+        meta = export_experts(args.out_dir, bcd=args.bcd)
+        print(
+            f"exported {meta['n_experts']} folded experts to {args.out_dir} "
+            f"in {time.perf_counter() - t0:.1f}s"
+        )
+    else:
+        meta = export_model(args.out_dir, bcd=args.bcd)
+        print(
+            f"exported d_model={meta['d_model']} n_layers={meta['n_layers']} "
+            f"heads={sum(meta['layer_heads'])} ffn={sum(meta['layer_ffn'])} "
+            f"to {args.out_dir} in {time.perf_counter() - t0:.1f}s"
+        )
 
 
 if __name__ == "__main__":

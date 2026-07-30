@@ -245,12 +245,9 @@ class GraphMaterializer:
                 made.add(lu)
                 fx = lookup_exprs[lu]
                 if self.structural_reads and lu.state_fetch:
-                    # The structural backend embeds the latest state, so
-                    # this fetch is an identity: each value substitutes
-                    # directly (its raw state-input expression), and no
-                    # attention head or register materializes.  Only the
-                    # first step of a sequence keeps the fetch live; later
-                    # steps resolve through feedback pins.
+                    # The structural backend embeds the latest state, so this
+                    # fetch is an identity: values substitute directly and no
+                    # head or register materializes.
                     for ud, ve in zip(lu.dims, fx["values"], strict=True):
                         sub[ud] = tr(ve)
                     continue
@@ -356,11 +353,10 @@ class GraphFolder:
                  structural_reads: bool = False):
         self.pg = program_graph
         self.root_names = tuple(root_names)
-        # Surviving memory reads rebuild without the exact mask or key
-        # rows -- only for backends whose lookup execution is itself
-        # exact (the Metal kernel); token-attention backends need both.
+        # Structural execution folds retain only the address/read facts the
+        # generated engine consumes; ordinary folds retain full lookup rows.
         self.structural_reads = structural_reads
-        # The O(1) attention backends classify lookup rows structurally.
+        # The generated engine classifies lookup rows structurally.
         # Keep direct linear lookup operands as residual coordinates rather
         # than expanding (for example) an exact clear-gate coordinate back
         # into ``1e30 * is_state - 1e30 * one``.
@@ -493,13 +489,10 @@ class GraphFolder:
                          or getattr(d, "read_bit", None) is None)
                     and (inline_budget is None or len(e.terms) <= inline_budget)
                 ):
-                    # A persist is a pure linear map.  Expert folds may
-                    # substitute it into its consumers to trade wider rows
-                    # for a shorter dependency chain; inline_budget bounds
-                    # the substituted width so wide fan-outs (a symbolic
-                    # PLP flag decode) stay materialized.  Keep annotated
-                    # memory reads materialized so their grouped fabric can
-                    # still be rebuilt as one fused lookup below.
+                    # A persist is a pure linear map, so folds may substitute
+                    # it into consumers to trade wider rows for a shorter
+                    # chain; inline_budget bounds that width, and annotated
+                    # memory reads stay materialized for the fused lookup.
                     val[d] = e
                 else:
                     folded[d] = (e,)
@@ -718,12 +711,10 @@ class GraphFolder:
         n_steps = len(pin_list)
         root_dims = [self.by_name[n] for n in self.root_names]
         feedback = dict(feedback)
-        # Bit-state feedback (wide_bits graphs only): A's bits chain like
-        # A itself, so a load/pull's served bits reach later steps free.
+        # Bit-state feedback (wide_bits only): A's bits chain like A itself.
         # ``bit_feedback_until`` prunes the chain past the last step whose
-        # opcode consumes A bits (callers know the ops): unseeded steps
-        # drop the arith bit ladder instead of keeping it live for a
-        # feedback nothing reads.  Wrong pruning fails loudly in tr().
+        # opcode consumes A bits, so unseeded steps drop the arith ladder
+        # rather than keep it live; wrong pruning fails loudly in tr().
         bit_ins, bit_outs = set(), set()
         for b in range(8):
             if f"new_a_bit{b}" in self.by_name:

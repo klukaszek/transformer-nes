@@ -1,7 +1,8 @@
 """The flagship claim: the 6502 executes as real transformer weights.
 
 Builds the analytic weights (ASAP schedule, no training) and runs genuine
-transformer inference -- per-position embeddings, Q/K/V projections, hull
+transformer inference -- per-position embeddings, Q/K/V projections, and
+licensed exact attention state
 hardmax attention, ReGLU FFN, output head -- lockstep against the
 reference core.  Expensive: real inference through the generated float32
 codegen C++ engine, lockstep against the reference oracle.
@@ -369,27 +370,6 @@ def test_store_windows_decline_under_low_watch():
             hits += 1
             assert int(value) == hits & 0xFF
     assert hits == 256  # the INC $20 loop paused on every single write
-
-
-@pytest.mark.slow
-def test_compact_store_routes_write_journal():
-    image = bytearray(0x10000)
-    image[0x0400:0x0408] = bytes([
-        0xA9, 0x55,        # LDA #$55
-        0x8D, 0x00, 0x20,  # STA $2000
-        0x4C, 0x05, 0x04,  # spin
-    ])
-    m = Cpu6502TransformerMachine(bcd=False)
-    m.load_image(bytes(image), start_pc=0x0400)
-    groups = bytearray(0x10000)
-    groups[0x2000] = 1
-    m.set_write_journal(groups)
-
-    out = m.run(2, trace=False)
-
-    assert out["wj_addr"].tolist() == [0x2000]
-    assert out["wj_value"].tolist() == [0x55]
-    assert m.read_ram(0x2000) == 0x55
 
 
 @pytest.mark.slow

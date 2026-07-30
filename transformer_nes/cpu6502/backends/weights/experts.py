@@ -17,11 +17,18 @@ import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.weights.windows import (
-    BRANCH_OPERATIONS,
     MEMORY_WRITE_OPERATIONS,
     SEQUENCE_WRITERS,
 )
-from transformer_nes.cpu6502.spec import OPCODES, READS_MEMORY
+from transformer_nes.cpu6502.spec import (
+    BRANCH_OPERATIONS,
+    MODE_ABSOLUTE_X,
+    MODE_ABSOLUTE_Y,
+    MODE_INDIRECT_Y,
+    OPCODES,
+    PAGE_CROSS_READ_OPERATIONS,
+    READS_MEMORY,
+)
 from transformer_nes.graph.core import (
     Dimension,
     Expression,
@@ -51,12 +58,20 @@ from transformer_nes.model.weights import build_model
 logger = logging.getLogger(__name__)
 STACK_CONTROL_OPERATIONS = SEQUENCE_WRITERS - {"sax"}
 
-# Undocumented composite ops get no compact expert and dispatch to the union
-# path (which executes them exactly): they cost ~half the opcode-expert terms
-# yet run zero times across every gameplay tape.
-UNION_FALLBACK_OPERATIONS = frozenset({
-    "sax", "slo", "isb", "sre", "rla", "rra", "dcp", "lax",
-})
+
+def cycle_safe_window(ops) -> bool:
+    """Whether a folded window has timing independent of live state."""
+    indexed_modes = {MODE_ABSOLUTE_X, MODE_ABSOLUTE_Y, MODE_INDIRECT_Y}
+    return all(
+        op.operation not in BRANCH_OPERATIONS
+        and not (
+            op.operation in PAGE_CROSS_READ_OPERATIONS
+            and op.mode in indexed_modes
+        )
+        for op in ops
+    )
+
+UNION_FALLBACK_OPERATIONS: frozenset[str] = frozenset()
 
 # Residual input slots shared by every generated step spec: spec key -> the
 # graph dimension name it resolves through (union slot map or fold name map).
@@ -722,7 +737,7 @@ def schedule_and_build(graph):
     fp = graph.program_graph
     sched = asap_schedule(fp.input_tokens, fp.output_tokens,
                           program_graph=fp, log=logger.debug)
-    return build_model(program_graph=fp, schedule=sched)
+    return build_model(program_graph=fp, schedule=sched, recycle_slots=False)
 
 
 def sparse_forward_work(model, n_layers: int) -> int:
@@ -784,6 +799,51 @@ def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
         sum(expert["layers"] for expert in experts),
         sum(sparse_forward_work(expert["model"], expert["layers"])
             for expert in experts),
+    )
+    return experts
+
+
+INTERRUPT_CYCLES = 7
+
+
+def build_interrupt_experts(pg) -> list[dict]:
+    """Build folded NMI and IRQ experts."""
+    experts: list[dict] = []
+    for name, pins in (
+        ("int_nmi", {"is_nmi": 1.0, "is_irq": 0.0}),
+        ("int_irq", {"is_nmi": 0.0, "is_irq": 1.0}),
+    ):
+        label = f"interrupt {name}"
+        folder = GraphFolder(pg, root_names=SEQUENCE_ROOT_DIMS,
+                             structural_reads=True)
+        r = folder.fold_execution_sequence(
+            [pins], SEQUENCE_FEEDBACK, label=name,
+            pc_offsets=[0], inline_linear=False,
+        )
+        if r.insert_side_hazards:
+            raise RuntimeError(
+                f"{label}: pins reach insert-side expressions "
+                f"of {r.insert_side_hazards}"
+            )
+        control = ControlFlow(
+            predicate=None, fallthrough=0, target=0,
+            target_dimension=r.dim_of_name["next_pc__s0"],
+        )
+        execution = project_sequence_execution(r, 1, control, None, None)
+        model, _tokens, _tok_to_idx, info = schedule_and_build(execution)
+        experts.append({
+            "kind": "exec_int", "name": name, "nmi": name == "int_nmi",
+            "n_steps": 1, "cycles": INTERRUPT_CYCLES,
+            "cycles_prefix": 0, "model": model,
+            "step_spec": sequence_step_spec(execution, info),
+            "recurrence": execution.recurrence,
+            "union_lookup_of": r.union_lookup_of,
+            "layers": info.n_layers, "_d": info.d_model,
+        })
+    logger.info(
+        "interrupt experts: %d folded, %d layers, %d sparse terms",
+        len(experts), sum(e["layers"] for e in experts),
+        sum(sparse_forward_work(e["model"], e["layers"]) for e in experts),
     )
     return experts
 
@@ -880,6 +940,7 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     return {
         "kind": "seq", "name": f"seq_{head:04X}_{bytes(code).hex()}",
         "head": head, "has_stores": has_stores,
+        "cycle_safe": cycle_safe_window(ops),
         "window": bytes(code), "n_steps": n_steps, "cycles": cycles,
         "cycles_prefix": cycles - ops[-1].cycles, "model": model,
         "step_spec": sequence_step_spec(execution, info),
@@ -1023,6 +1084,7 @@ def _build_symbolic_execution_experts(
             "kind": expert_kind, "name": f"shape_{name}", "shape_id": sid,
             "opcode_checks": checks, "length": len(template),
             "self_target": self_target, "n_steps": n_steps,
+            "cycle_safe": cycle_safe_window(ops_full),
             "cycles": cycles,
             "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
             "step_spec": sequence_step_spec(execution, info),

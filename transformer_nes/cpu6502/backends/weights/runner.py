@@ -14,9 +14,9 @@ import time
 import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.graph import RUNTIME_READ_DIMS, Cpu6502Runtime
 from transformer_nes.cpu6502.backends.weights.experts import (
     UNION_FALLBACK_OPERATIONS,
+    build_interrupt_experts,
     build_opcode_execution_experts,
     build_sequence_expert,
     build_shape_experts,
@@ -27,6 +27,7 @@ from transformer_nes.cpu6502.backends.weights.windows import (
     SHAPE_LIBRARY,
     match_shape_windows,
 )
+from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS, Cpu6502Graph
 from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_nes.graph.core import ProgramGraph
@@ -45,27 +46,30 @@ logger = logging.getLogger(__name__)
 class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
-    def __init__(self, *, bcd: bool = False):
+    def __init__(self, *, bcd: bool = False, union_only: bool = False,
+                 mirror_cpu_ram: bool = False):
         self.bcd = bool(bcd)
-        # Build the graph (and keep the evaluator's dim handles; its Python
-        # step function is not used here).
-        self.rt = Cpu6502Runtime(bcd=bcd, wide_bits=True)
-        dim_by_id = {d.id: d for d in self.rt.all_dims}
+        self.union_only = bool(union_only)
+        self.mirror_cpu_ram = bool(mirror_cpu_ram)
+        # Build the graph description only. The weights backend has its own
+        # native execution path and does not execute the graph in Python.
+        self.graph = Cpu6502Graph(bcd=bcd, wide_bits=True)
+        dim_by_id = {d.id: d for d in self.graph.all_dims}
         self.dim_by_name = {
-            name: dim_by_id[dim_id] for name, dim_id in self.rt.dim_id_by_name.items()
+            name: dim_by_id[dim_id] for name, dim_id in self.graph.dim_id_by_name.items()
         }
 
         # The run loop reads the machine outputs from the residual stream,
         # so they must survive to the final layer: a synthetic output token
         # marks them as outputs for the scheduler.  Its head row is ignored
         # at prediction time (only STATE vs HALT compete).
-        output_tokens = dict(self.rt.output_tokens)
+        output_tokens = dict(self.graph.output_tokens)
         readout = 0
         for name in RUNTIME_READ_DIMS:
             readout = readout + 1e-6 * self.dim_by_name[name]
         output_tokens["READOUT"] = readout
 
-        pg = ProgramGraph(self.rt.input_tokens, output_tokens)
+        pg = ProgramGraph(self.graph.input_tokens, output_tokens)
         self.pg = pg  # kept for the expert folds (graph/fold.py)
         build_start = time.perf_counter()
         sched = asap_schedule(pg.input_tokens, pg.output_tokens, program_graph=pg)
@@ -82,37 +86,38 @@ class Cpu6502TransformerMachine:
             name: self.slot_of[self.dim_by_name[name]]
             for name in RUNTIME_READ_DIMS
         }
-        self.one_slot = self.slot_of[self.rt.one]
+        self.one_slot = self.slot_of[self.graph.one]
 
-        # The whole layer stack -- hull attention plus the structural
-        # passthrough fusion -- runs inside the generated C++ engine
-        # (model/engine_gen.py): model-specific straight-line code with an
-        # exact fixed-point int32 residual.  The grouped memory lookup keeps
-        # K-side address scores below 2^24, so float32 Q/K rounding still
-        # distinguishes adjacent high addresses.
-        #
-        # There is one production core per decimal-mode setting: the whole ISA,
-        # compact untraced execution, and the workload-independent shape table.
-        # Source content is part of the cache key, so these are construction
-        # rules rather than a second configuration vocabulary.
-        cache_key = engine_config_key(bcd=bcd)
+        # The whole layer stack runs as generated straight-line C++ with an
+        # exact fixed-point int32 residual (model/engine_gen.py); source
+        # content is part of the cache key, so cores are construction rules
+        # rather than a configuration vocabulary.
+        cache_key = engine_config_key(
+            bcd=bcd, union_only=union_only, mirror_cpu_ram=self.mirror_cpu_ram,
+        )
         engine = GeneratedWeightsEngine.from_cache(cache_key)
         if engine is not None:
             logger.info("engine cache hit (%d experts)", engine.n_experts)
         if engine is None:
-            opcode_bytes = tuple(
-                byte for byte in sorted(OPCODES)
-                if OPCODES[byte].operation not in UNION_FALLBACK_OPERATIONS
-            )
-            experts = build_opcode_execution_experts(self.pg, opcode_bytes)
-            shape_experts, shapes_meta = build_shape_experts(
-                self.pg, SHAPE_LIBRARY,
-            )
-            experts.extend(shape_experts)
+            experts: list[dict] = []
+            shapes_meta: list[dict] = []
+            # Without experts every opcode misses dispatch and falls to
+            # step_core, so the union alone executes the whole ISA.
+            if not union_only:
+                opcode_bytes = tuple(
+                    byte for byte in sorted(OPCODES)
+                    if OPCODES[byte].operation not in UNION_FALLBACK_OPERATIONS
+                )
+                experts = build_opcode_execution_experts(self.pg, opcode_bytes)
+                experts.extend(build_interrupt_experts(self.pg))
+                shape_experts, shapes_meta = build_shape_experts(
+                    self.pg, SHAPE_LIBRARY,
+                )
+                experts.extend(shape_experts)
             engine = GeneratedWeightsEngine(
                 self.model, step_spec=self.step_spec(),
                 experts=experts, cache_key=cache_key,
-                shapes_meta=shapes_meta,
+                shapes_meta=shapes_meta, mirror_cpu_ram=self.mirror_cpu_ram,
             )
         self.engine = engine
         # The ROM's windows land in a tiny per-ROM module attached through
@@ -217,8 +222,7 @@ class Cpu6502TransformerMachine:
         spec["state_head"] = head_row(self.model, self.state_row)
         return spec
 
-    # ── Machine protocol (mirrors evaluator.Cpu6502Runtime, so the NES
-    # bus's GraphCore adapter can drive this machine unchanged) ──────
+    # ── Machine protocol used by the NES bus and test harness ────────
 
     def boot_image(self, memory_image, *, start_pc: int, state: dict | None = None):
         # Fresh token log: clear the engine's attention state so a machine
@@ -229,11 +233,14 @@ class Cpu6502TransformerMachine:
         ram = bytearray(0x10000)
         ram[: len(memory_image)] = bytes(memory_image)
         self.ram = ram
-        rt = self.rt
+        if self.mirror_cpu_ram:
+            for addr in range(0x0800, 0x2000):
+                self.ram[addr] = self.ram[addr & 0x07FF]
+        graph = self.graph
         self.forward_values({
-            rt.start_pc_lo: start_pc & 0xFF,
-            rt.start_pc_hi: (start_pc >> 8) & 0xFF,
-            rt.is_start: 1,
+            graph.start_pc_lo: start_pc & 0xFF,
+            graph.start_pc_hi: (start_pc >> 8) & 0xFF,
+            graph.is_start: 1,
         })
         # Native seed: one call for the image instead of one per byte.
         self.pos += int(self.engine.seed_image(bytes(ram)))
@@ -280,7 +287,8 @@ class Cpu6502TransformerMachine:
         engine-side, so the position mirror advances by len(data)."""
         base &= 0xFFFF
         data = bytes(data)
-        self.ram[base:base + len(data)] = data
+        for offset, value in enumerate(data):
+            self._set_ram(base + offset, value)
         self.engine.inject_region(base, data)
         self.pos += len(data)
 
@@ -304,9 +312,19 @@ class Cpu6502TransformerMachine:
     def insert_write(self, addr: int, value: int):
         addr &= 0xFFFF
         value &= 0xFF
-        self.ram[addr] = value
+        self._set_ram(addr, value)
         self.engine.insert_write(addr, value, self.pos)
         self.pos += 1
+
+    def _set_ram(self, addr: int, value: int) -> None:
+        addr &= 0xFFFF
+        value &= 0xFF
+        if self.mirror_cpu_ram and addr < 0x2000:
+            physical = addr & 0x07FF
+            for mirror in range(physical, 0x2000, 0x0800):
+                self.ram[mirror] = value
+        else:
+            self.ram[addr] = value
 
     def machine_step(self) -> TraceRow:
         """One instruction entirely in generated C++ (embed, layers,
@@ -415,7 +433,7 @@ class Cpu6502TransformerMachine:
 
         Engine state is O(1) in the token log (memory on the exact
         nearest-address structure, constant-query heads on running-argmax
-        registers), so streaming needs no checkpoint rebuild between chunks.
+        registers), so streaming stays bounded between chunks.
         """
         if not self.supports_run_loop:
             raise RuntimeError("this engine has no C++ run loop")
@@ -462,9 +480,6 @@ class Cpu6502TransformerMachine:
     def watch_write(self, lo: int, hi: int) -> None:
         self.engine.watch_write(lo, hi)
 
-    def set_write_journal(self, groups: bytes) -> None:
-        self.engine.set_write_journal(bytes(groups))
-
     def set_read_lease(self, addr: int, value: int, group: int = 0) -> int:
         return int(self.engine.set_read_lease(addr, value, group))
 
@@ -500,21 +515,6 @@ class Cpu6502TransformerMachine:
 
     def get_state(self) -> dict:
         return dict(self.engine.get_run_state())
-
-    def set_state(self, state: dict) -> None:
-        """Restore architectural state after a snapshot rebuild (mirrors the
-        run protocol's set_state; the trace context fields carry over)."""
-        st = dict(self.mstate)
-        for k in st:
-            if k in state:
-                st[k] = int(state[k])
-        self.engine.set_run_state(
-            st["pc"], st["a"], st["x"], st["y"], st["s"], st["p"],
-            st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"],
-            1 if state.get("halted") else 0,
-        )
-        self.mstate.update(st)
-        self.machine_halted = bool(state.get("halted", self.machine_halted))
 
 
 # ── Verification program (low addresses; see numerics caveat above) ──

@@ -11,8 +11,7 @@ public:
     if (cart_.chr.size() % 0x1000)
       throw std::invalid_argument("MMC1 CHR must use 4 KiB banks");
     n_prg_ = cart_.prg.size() / BANK16;
-    n_chr_ = std::max(cart_.chr.size() / 0x400, 1uz);
-    chr_rom = !cart_.chr.empty();
+    n_chr_ = cart_.chr.empty() ? CHR_RAM_BANKS : cart_.chr.size() / CHR_BANK1;
     control = 0x0C | (cart_.mirroring == Mirroring::Vertical ? 2 : 3);
   }
   bool banked() const override { return true; }
@@ -74,7 +73,6 @@ public:
   }
 
 private:
-  bool chr_rom = false;
   uint8_t control = 0, prg_reg = 0, shift = 0x10;
   array<uint8_t, 2> chr_regs{};
   size_t n_prg_ = 0, n_chr_ = 1;
@@ -101,13 +99,12 @@ private:
     if ((control & 3) != old_mirror)
       host_.ppu->mirroring = control & 3;
     auto now = chr_banks();
-    if (chr_rom && now != old_chr)
+    if (now != old_chr)
       host_.ppu->set_chr_banks(now);
   }
 
   void on_connected() override {
-    if (chr_rom)
-      host_.ppu->set_chr_banks(chr_banks());
+    host_.ppu->set_chr_banks(chr_banks());
   }
 };
 
