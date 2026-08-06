@@ -54,6 +54,39 @@ uv run nes-run path/to/rom.nes --tape tapes/game_tape
 
 ROMs and tape captures are local inputs and are not included in the repository. The `6502-nestest` command expects `nestest.nes` at `transformer_nes/nes/examples/nestest.nes`; `nes-run` accepts a local ROM path and tape path directly.
 
+## Interactive Emulator
+
+Run a ROM without `--tape` to open the interactive emulator window:
+
+```bash
+uv run nes-run path/to/rom.nes
+```
+
+The default CPU backend is `weights`. Use `--backend reference` to run the plain-Python CPU instead.
+
+| Key | NES control |
+|-----|-------------|
+| `X` | A |
+| `Z` | B |
+| `Tab` | Select |
+| `Enter` | Start |
+| Arrow keys | D-pad |
+| `Esc` | Quit the emulator |
+| Grave accent / tilde | Open or close the debug overlay |
+
+### Debug overlay
+
+Press the grave-accent/tilde key to open the Dear ImGui debug window. Press `Esc` while it is open to close the overlay; keyboard input is returned to the game afterward.
+
+The overlay provides:
+
+- **Stats:** display FPS, backend name, frame number, CPU cycles, and emulation time per frame.
+- **Options:** toggle overscan cropping, pause emulation, remove the PPU's eight-sprites-per-scanline limit, or mute audio.
+- **Step frame:** pause the emulator and advance exactly one frame.
+- **Memory:** inspect the full CPU address space from `$0000` through `$FFFF`. Enter a hexadecimal address in the `addr` field to jump to it.
+
+The `--debug` command-line flag enables verbose logging. It does not open the overlay. Battery-backed saves are loaded from and written to a `.sav` file next to the ROM; tape replays intentionally ignore saves.
+
 ## CLI Commands
 
 | Command | Description |
