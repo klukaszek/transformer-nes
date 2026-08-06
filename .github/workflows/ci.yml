@@ -27,6 +27,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - run: ./vendor/install_deps.sh
       - run: uv sync --extra dev
       - run: uv run pytest -m "not slow" --tb=short
 
@@ -40,5 +41,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - run: ./vendor/install_deps.sh
       - run: uv sync --extra dev
       - run: uv run pytest -m "slow" --tb=short
