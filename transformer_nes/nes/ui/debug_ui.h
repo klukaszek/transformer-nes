@@ -26,7 +26,9 @@ struct DebugHooks {
 // Frontend-owned toggles the app reads back each frame.
 struct UiState {
   bool open = false;
-  bool crop = true; // NTSC overscan crop of the blit
+  // Keep the complete NES framebuffer visible by default. Some HUDs use the
+  // first nametable column, which an 8-pixel overscan crop would remove.
+  bool crop = false;
 };
 
 void setup();    // after sg_setup
