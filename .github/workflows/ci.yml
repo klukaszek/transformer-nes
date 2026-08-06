@@ -27,6 +27,13 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Select C++26 toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18
+          printf 'int main() {}\n' | clang++-18 -std=c++26 -x c++ -c -o /tmp/cxx26-smoke.o -
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
       - run: ./vendor/install_deps.sh
       - run: uv sync --extra dev
       - run: uv run pytest -m "not slow" --tb=short
@@ -41,6 +48,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+      - name: Select C++26 toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18
+          printf 'int main() {}\n' | clang++-18 -std=c++26 -x c++ -c -o /tmp/cxx26-smoke.o -
+          echo "CXX=clang++-18" >> "$GITHUB_ENV"
       - run: ./vendor/install_deps.sh
       - run: uv sync --extra dev
       - run: uv run pytest -m "slow" --tb=short
