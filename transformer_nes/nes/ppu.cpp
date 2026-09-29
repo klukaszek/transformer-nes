@@ -1,9 +1,11 @@
-// Native frame-level NES PPU (2C02): MMIO registers, VRAM/OAM, and rendering.
+// NES PPU (2C02): loopy registers, tile-slot rendering, and timed events
+// on an absolute dot clock.  See ppu.h for the line timeline.
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
-#include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -14,14 +16,16 @@ namespace transformer_nes::nes {
 
 namespace {
 
-// Pattern byte address for a sprite row: 8x16 sprites take their bank
-// from tile bit 0 and the tile pair from the remaining bits; 8x8 take
-// the bank from ctrl bit 3.
-int sprite_pattern_addr(int ctrl, int tile, int src_r, bool tall) {
-  if (tall)
-    return ((tile & 1) * 256 + (tile & 0xFE) + (src_r >> 3)) * 16 + (src_r & 7);
-  return (((ctrl & 0x08) ? 256 : 0) + tile) * 16 + src_r;
-}
+// A pattern plane byte (MSB = leftmost pixel) as eight byte lanes, one
+// per pixel, leftmost in the lowest address.
+constexpr auto plane = [] {
+  array<uint64_t, 256> t{};
+  for (int b = 0; b < 256; ++b)
+    for (int c = 0; c < 8; ++c)
+      if (b & (0x80 >> c))
+        t[static_cast<size_t>(b)] |= uint64_t{1} << (8 * c);
+  return t;
+}();
 
 } // namespace
 
@@ -33,36 +37,7 @@ Ppu::Ppu(vector<uint8_t> chr_data, bool writable, bool vertical_mirroring)
     chr_bank[i] = i * 0x400;
 }
 
-void Ppu::mark_split(int scanline) {
-  mid_scanline = scanline;
-  mid_ctrl = ctrl;
-  mid_mask = mask;
-  mid_mirroring = mirroring;
-  mid_t_addr = t_addr;
-  mid_fine_x = fine_x;
-  mid_v_addr = vram_addr;
-  mid_chr_bank = chr_bank;
-  // At most one split is stored per visible scanline.
-  if (raster_split_count >= raster_splits.size())
-    return;
-  RasterSplit split{scanline,       ctrl,       mask,       mirroring,
-                    t_addr,        fine_x,     vram_addr, v_reload_generation,
-                    {},            {}};
-  split.chr_banks = chr_bank;
-  if (mmc5.active()) {
-    mmc5.snapshot();
-    split.mapper_banks = mmc5.bank_snapshot();
-  }
-  raster_splits[raster_split_count++] = split;
-}
-
-bool Ppu::same_band(const BandState& a, const BandState& b) {
-  return (a.ctrl & 0x10) == (b.ctrl & 0x10) && (a.mask & 0x0A) == (b.mask & 0x0A) &&
-         a.mirroring == b.mirroring && (a.t_addr & 0x7FFF) == (b.t_addr & 0x7FFF) &&
-         a.fine_x == b.fine_x && a.y_base == b.y_base && std::equal(a.banks, a.banks + 8, b.banks);
-}
-
-// Device protocol (registers $2000-$3FFF, mirrored every 8)
+// ── Memory ──
 
 size_t Ppu::palette_index(int addr) {
   size_t offset = (addr - 0x3F00) & 0x1F;
@@ -92,657 +67,964 @@ size_t Ppu::nt_offset_for(int addr, int mirr) {
   return phys * 0x400 + offset;
 }
 
-// With MMC5 active, arrangement IS a $5105 map (possibly latched by a
-// render band): each table's 2-bit source decodes from that value, so
-// ExRAM/fill substitution survives a mid-frame $5105 change.
-int Ppu::nt_read_for(int addr, int arrangement) const {
-  const int a = (addr - 0x2000) & 0xFFF;
-  const int table = a >> 10, offset = a & 0x3FF;
-  if (mmc5.active())
-    return mmc5.read_nametable(arrangement, table, offset, nametables.data());
-  return nametables[nt_offset_for(addr, arrangement)];
+void Ppu::map_nametables() {
+  nt_mirroring_ = mirroring;
+  for (int table = 0; table < 4; ++table)
+    nt_base_[static_cast<size_t>(table)] =
+        static_cast<uint16_t>(nt_offset_for(0x2000 + table * 0x400, mirroring));
 }
 
-int Ppu::chr_at(int addr) {
-  const int value = chr[chr_index(chr_bank.data(), addr)];
-  if (chr_latch_active)
-    chr_latch.after_fetch(addr);
-  return value;
+std::pair<uint8_t, uint8_t> Ppu::fetch_pattern(const size_t* banks, int pattern_addr) {
+  if (!chr_latch_active) {
+    const uint8_t* bank = chr.data() + banks[(pattern_addr >> 10) & 7] + (pattern_addr & 0x3FF);
+    return {bank[0], bank[8]};
+  }
+  // The FD/FE tile itself still fetches through the old bank: both
+  // pattern bytes are read before either fetch flips its latch.
+  const uint8_t lo = chr[chr_index(banks, pattern_addr)];
+  const uint8_t hi = chr[chr_index(banks, pattern_addr + 8)];
+  const bool flipped_lo = chr_latch.after_fetch(pattern_addr);
+  if (chr_latch.after_fetch(pattern_addr + 8) || flipped_lo)
+    chr_map_changed();
+  return {lo, hi};
 }
 
-int Ppu::vram_read(int addr) {
+int Ppu::vram_peek(int addr) {
   addr &= 0x3FFF;
   if (addr < 0x2000)
-    return chr_at(addr);
+    return chr[chr_index(chr_bank.data(), static_cast<size_t>(addr))];
   if (addr < 0x3F00)
-    return nt_read_for(addr, mirroring);
+    return nt_read(addr);
   return palette[palette_index(addr)];
 }
 
 void Ppu::vram_write(int addr, int value) {
   addr &= 0x3FFF;
   if (addr < 0x2000) {
-    if (chr_writable)
-      chr[chr_bank[(addr >> 10) & 7] + (addr & 0x3FF)] = static_cast<uint8_t>(value);
+    if (chr_writable) {
+      const size_t source = chr_bank[(addr >> 10) & 7] + (addr & 0x3FF);
+      chr[source] = static_cast<uint8_t>(value);
+      mark_chr(source);
+    }
   } else if (addr < 0x3F00) {
     const int a = (addr - 0x2000) & 0xFFF;
-    const int table = a >> 10, offset = a & 0x3FF;
-    if (mmc5.active())
-      mmc5.write_nametable(table, offset, value, nametables.data());
-    else
-      nametables[nt_offset_for(addr, mirroring)] = static_cast<uint8_t>(value);
-  } else {
-    palette[palette_index(addr)] = static_cast<uint8_t>(value);
-  }
-}
-
-int Ppu::read(int addr) {
-  const int reg = (addr - 0x2000) & 7;
-  if (reg == 2) { // PPUSTATUS
-    const int value = (vblank ? 0x80 : 0) | (sprite0_hit ? 0x40 : 0);
-    vblank = false;
-    nmi_edge = false;
-    write_latch = false;
-    return value;
-  }
-  if (reg == 4)
-    return oam[oam_addr]; // OAMDATA
-  if (reg == 7) {         // PPUDATA (buffered below $3F00, direct for palette)
-    const int a = vram_addr & 0x3FFF;
-    int value;
-    if (a >= 0x3F00) {
-      value = palette[palette_index(a)] & 0x3F;
-      // The buffer still loads from the nametable "underneath".
-      read_buffer = vram_read(a - 0x1000);
+    if (mmc5.active()) {
+      mmc5.write_nametable(a >> 10, a & 0x3FF, value, nametables.data());
+      mark_page(static_cast<size_t>(((nt_map() >> (2 * (a >> 10))) & 3) * 0x400 + (a & 0x3FF)));
     } else {
-      value = read_buffer;
-      read_buffer = vram_read(a);
+      const size_t offset = nt_offset_for(addr, mirroring);
+      nametables[offset] = static_cast<uint8_t>(value);
+      mark_page(offset);
     }
-    vram_addr = (vram_addr + increment()) & 0x3FFF;
-    return value;
+  } else {
+    palette_changed();
+    palette[palette_index(addr)] = static_cast<uint8_t>(value & 0x3F); // 6-bit RAM
   }
-  return 0; // write-only registers read as open bus; model as 0
 }
 
-optional<int> Ppu::read_lease(int addr) const {
-  if (((addr - 0x2000) & 7) != 2 || vblank)
-    return std::nullopt;
-  return sprite0_hit ? 0x40 : 0;
+// With rendering off the PPU outputs the backdrop -- or, while v points
+// into palette RAM, that palette entry (the NESDEV backdrop override).
+uint8_t Ppu::backdrop() const {
+  const int a = r_.v & 0x3FFF;
+  const uint8_t gmask = (mask & 0x01) ? 0x30 : 0x3F;
+  return (a >= 0x3F00 ? palette[palette_index(a)] : palette[0]) & gmask;
 }
 
-void Ppu::write(int addr, int value, int row) {
+int Ppu::status(int64_t dot) const {
+  return (r_.vblank ? 0x80 : 0) | (r_.hit_dot <= dot ? 0x40 : 0) |
+         (r_.overflow_dot <= dot ? 0x20 : 0);
+}
+
+// ── Registers ──
+
+int Ppu::read(int addr, int64_t dot) {
+  catch_up(dot);
+  return access((addr - 0x2000) & 7, 0, false, dot);
+}
+
+void Ppu::write(int addr, int value, int64_t dot) {
   const int reg = (addr - 0x2000) & 7;
-  value &= 0xFF;
-  if (reg == 0) { // PPUCTRL
-    const bool rising = (value & 0x80) && !(ctrl & 0x80);
+  // PPUMASK reaches the renderer one dot late (the rendering-enable
+  // latch), which decides e.g. whether this frame skips its odd dot.
+  catch_up(reg == 1 ? dot + 1 : dot);
+  (void)access(reg, value & 0xFF, true, dot);
+}
+
+// One register access in two parts: the register-file transition --
+// natively, or through an attached external step (the register graph,
+// ppu2c02/registers.py, which computes exactly this) -- and then the
+// effects that depend on the dot rather than on the access.
+int Ppu::access(int reg, int value, bool is_write, int64_t dot) {
+  const RegisterFile before = register_file();
+  const RegisterAccess request{reg, value, is_write, status(dot),
+                               rendering_enabled() && rendering_line()};
+  RegisterResult result;
+  if (register_step_.access) {
+    deliver_memory_changes(!is_write && reg == 7 && (r_.v & 0x3FFF) < 0x2000);
+    result = external_transition(request, before);
+  } else {
+    result = transition(request);
+  }
+  access_effects(request, before, dot);
+  return result.read_value;
+}
+
+// The register file's own semantics: loopy t/v/x/w, ctrl, mask, the OAM
+// address, and the $2007 read buffer.  A memory write is applied here and
+// reported at its graph-memory address (graph_address).
+Ppu::RegisterResult Ppu::transition(const RegisterAccess& request) {
+  RegisterResult out;
+  const int value = request.value;
+  switch (request.reg + (request.is_write ? 8 : 0)) {
+  case 8: // PPUCTRL
     ctrl = value;
-    t_addr = (t_addr & ~0x0C00) | ((value & 3) << 10);
-    if (rising && vblank)
-      nmi_edge = true;
-  } else if (reg == 1) { // PPUMASK
-    if (in_span && ((mask ^ value) & 0x18)) {
-      if (!(value & 0x18))
-        span_blank_row = row >= 0 ? row : 0;
-      else
-        span_blank_row = -1;
-    }
+    t = static_cast<uint16_t>((t & ~0x0C00) | ((value & 3) << 10));
+    break;
+  case 9: // PPUMASK
     mask = value;
-  } else if (reg == 3) { // OAMADDR
-    oam_addr = value;
-  } else if (reg == 4) { // OAMDATA
+    break;
+  case 2: // PPUSTATUS
+    out.read_value = request.status;
+    write_latch = false;
+    break;
+  case 11: // OAMADDR
+    oam_addr = static_cast<uint8_t>(value);
+    break;
+  case 12: // OAMDATA
+    out.mem_addr = 0x4000 + oam_addr;
+    out.mem_value = value;
     oam[oam_addr++] = static_cast<uint8_t>(value);
-  } else if (reg == 5) { // PPUSCROLL (x then y)
+    oam_changed();
+    break;
+  case 4: // OAMDATA
+    out.read_value = oam[oam_addr];
+    break;
+  case 13: // PPUSCROLL (x then y, into t)
     if (write_latch) {
-      t_addr = (t_addr & ~0x73E0) | ((value & 7) << 12) | ((value >> 3) << 5);
+      t = static_cast<uint16_t>((t & ~0x73E0) | ((value & 7) << 12) | ((value & 0xF8) << 2));
     } else {
       fine_x = value & 7;
-      t_addr = (t_addr & ~0x001F) | (value >> 3);
+      t = static_cast<uint16_t>((t & ~0x001F) | (value >> 3));
     }
     write_latch = !write_latch;
-  } else if (reg == 6) { // PPUADDR (high then low, shared latch + t)
+    break;
+  case 14: // PPUADDR (high then low); the second write loads v
     if (write_latch) {
-      t_addr = (t_addr & 0x7F00) | value;
-      vram_addr = t_addr & 0x3FFF;
-      ++v_reload_generation;
-      if (in_span)
-        span_v_load = t_addr; // 15-bit v reload, effective immediately
+      t = static_cast<uint16_t>((t & 0x7F00) | value);
+      r_.v = t;
     } else {
-      t_addr = (t_addr & 0x00FF) | ((value & 0x3F) << 8);
+      t = static_cast<uint16_t>((t & 0x00FF) | ((value & 0x3F) << 8));
     }
     write_latch = !write_latch;
-  } else if (reg == 7) { // PPUDATA
-    vram_write(vram_addr & 0x3FFF, value);
-    vram_addr = (vram_addr + increment()) & 0x3FFF;
-  }
-  if (span_watch && row >= 0 && (reg == 0 || reg == 5 || reg == 6)) {
-    if (span_scroll_row < 0)
-      span_scroll_row = row;
-    span_ctrl = ctrl;
-    span_t = t_addr;
-    span_fx = fine_x;
-  }
-}
-
-// Console-side control
-
-void Ppu::end_vblank() {
-  vblank = false;
-  sprite0_hit = false;
-  frame_ctrl = ctrl;
-  frame_mask = mask;
-  frame_mirroring = mirroring;
-  frame_t_addr = t_addr;
-  frame_fine_x = fine_x;
-  frame_v_reload_generation = v_reload_generation;
-  frame_chr_bank = chr_bank;
-  if (mmc5.active())
-    mmc5.snapshot_frame();
-  raster_split_count = 0;
-  frame_latch_valid = true;
-  in_span = true;
-  span_watch = false;
-  span_blank_row = (mask & 0x18) ? -1 : 0; // the next span starts blanked
-  span_scroll_row = -1;
-  span_v_load = -1;
-}
-
-// Rendering
-
-std::pair<uint8_t, uint8_t> Ppu::fetch_pattern_pair(int pattern_addr) {
-  const uint8_t b0 = chr[chr_index(chr_bank.data(), pattern_addr)];
-  const uint8_t b1 = chr[chr_index(chr_bank.data(), pattern_addr + 8)];
-  // The switching tile itself uses the old bank. Both pattern bytes
-  // are fetched before the latch affects subsequent PPU reads.
-  chr_latch.after_fetch(pattern_addr);
-  chr_latch.after_fetch(pattern_addr + 8);
-  return {b0, b1};
-}
-
-void Ppu::render_ordered_bg_row(uint8_t* frame, const uint8_t* pal, uint8_t backdrop,
-                                const BandState& band, int y) {
-  if (!(band.mask & 0x08)) {
-    std::memset(frame + y * 256, backdrop, 256);
-    std::fill(std::begin(bg_opaque[y]), std::end(bg_opaque[y]), false);
-    return;
-  }
-  const int px_x = ((band.t_addr & 0x1F) << 3) | band.fine_x;
-  const int coarse_start = ((px_x - band.fine_x) >> 3) + ((band.t_addr >> 10) & 1) * 32;
-  const int sy = band.y_base >= 0 ? ((band.y_base - y) % 480 + 480) % 480
-                                  : scroll_row_480(band.t_addr) % 480;
-  const int cy = (y + sy) % 480;
-  const int ly = cy % 240, quad_y = cy / 240;
-  const int trow = ly >> 3;
-  const int x0 = (band.mask & 0x02) ? 0 : 8;
-  for (int x = 0; x < x0; ++x) {
-    frame[y * 256 + x] = backdrop;
-    bg_opaque[y][x] = false;
-  }
-  // The 2C02 fetches 32 visible tiles plus two prefetch tiles. PxROM
-  // games intentionally hide latch tiles in those final fetch slots.
-  for (int fetch = 0; fetch < 34; ++fetch) {
-    const int coarse = (coarse_start + fetch) & 63;
-    const int quad_x = coarse >> 5, tcol = coarse & 31;
-    const int logical = 0x2000 + (quad_y * 2 + quad_x) * 0x400;
-    const int tile = nt_read_for(logical + trow * 32 + tcol, band.mirroring);
-    const int pattern = ((band.ctrl & 0x10) ? 0x1000 : 0) + tile * 16 + (ly & 7);
-    const auto [b0, b1] = fetch_pattern_pair(pattern);
-    const auto attr = static_cast<uint8_t>(
-        nt_read_for(logical + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2), band.mirroring));
-    const int shift = ((trow % 4) / 2) * 4 + ((tcol % 4) / 2) * 2;
-    const int palsel = (attr >> shift) & 3;
-    const int screen_x = fetch * 8 - band.fine_x;
-    for (int col = 0; col < 8; ++col) {
-      const int x = screen_x + col;
-      if (x < x0 || x >= 256)
-        continue;
-      const int bit = 7 - col;
-      const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
-      frame[y * 256 + x] = pix ? pal[palsel * 4 + pix] : backdrop;
-      bg_opaque[y][x] = pix != 0;
+    break;
+  case 15: { // PPUDATA
+    const int a = r_.v & 0x3FFF;
+    // CHR ROM and MMC5's fill-mode page take no write.
+    const int32_t phys = graph_address(a);
+    if ((a >= 0x2000 || chr_writable) && !(phys >= 0x2C00 && phys < 0x3000)) {
+      out.mem_addr = phys;
+      out.mem_value = a >= 0x3F00 ? value & 0x3F : value;
     }
+    vram_write(a, value);
+    step_vram_address(request.rendering);
+    break;
   }
-}
-
-void Ppu::render_bg_rows(uint8_t* frame, const uint8_t* pal, uint8_t backdrop,
-                         const BandState& band, int y0, int y1) {
-  if (!(band.mask & 0x08)) { // background disabled in this band
-    for (int y = y0; y < y1; ++y) {
-      std::memset(frame + y * 256, backdrop, 256);
-      std::fill(std::begin(bg_opaque[y]), std::end(bg_opaque[y]), false);
+  case 7: { // PPUDATA (buffered below $3F00, direct for palette)
+    const int a = r_.v & 0x3FFF;
+    if (a >= 0x3F00) {
+      out.read_value = palette[palette_index(a)];
+      // The buffer still loads from the nametable "underneath".
+      read_buffer = vram_peek(a - 0x1000);
+    } else {
+      out.read_value = read_buffer;
+      read_buffer = vram_peek(a);
     }
-    return;
+    step_vram_address(request.rendering);
+    break;
   }
-  const int bctrl = band.ctrl, bt_addr = band.t_addr;
-  const int bg_table = (bctrl & 0x10) ? 256 : 0;
-  const int px_x = ((bt_addr & 0x1F) << 3) | band.fine_x;
-  const int sx = (px_x + ((bt_addr >> 10) & 1) * 256) % 512;
-  // y: relative to the screen from t, or pinned absolute at the
-  // band's first row (a mid-frame $2006 v load; y self-increments
-  // from there on hardware, so the band scans forward from it).
-  const int sy =
-      band.y_base >= 0 ? ((band.y_base - y0) % 480 + 480) % 480
-                       : scroll_row_480(bt_addr) % 480;
-  const bool extended = mmc5.active() && mmc5.extended_attributes();
-  // Left-edge masking: the leftmost 8 pixels show the backdrop (and
-  // count as transparent for sprite priority) with the bit clear.
-  const int x0 = (band.mask & 0x02) ? 0 : 8;
-  for (int y = y0; y < y1; ++y) {
-    const int cy = (y + sy) % 480;
-    const int ly = cy % 240, quad_y = cy / 240;
-    auto* row = frame + y * 256;
-    auto* opaque = bg_opaque[y];
-    for (int x = 0; x < x0; ++x) {
-      row[x] = backdrop;
-      opaque[x] = false;
-    }
-    int x = x0;
-    int cx = (x0 + sx) & 0x1FF;
-    while (x < 256) {
-      const int lx = cx & 0xFF, quad_x = cx >> 8;
-      const int trow = ly >> 3, tcol = lx >> 3;
-      const int logical = 0x2000 + (quad_y * 2 + quad_x) * 0x400;
-      const int tile = nt_read_for(logical + trow * 32 + tcol, band.mirroring);
-      int b0, b1, palsel;
-      if (extended) {
-        const int pattern = mmc5.extended_chr_base(trow * 32 + tcol) + tile * 16 + (ly & 7);
-        b0 = chr[pattern % chr.size()];
-        b1 = chr[(pattern + 8) % chr.size()];
-        palsel = mmc5.extended_value(trow * 32 + tcol) >> 6;
-      } else {
-        const int pattern = (bg_table + tile) * 16 + (ly & 7);
-        b0 = chr[chr_index(band.banks, pattern)];
-        b1 = chr[chr_index(band.banks, pattern + 8)];
-        const auto attr = static_cast<uint8_t>(
-            nt_read_for(logical + 0x3C0 + (trow >> 2) * 8 + (tcol >> 2), band.mirroring));
-        const int shift = ((trow & 2) << 1) | (tcol & 2);
-        palsel = (attr >> shift) & 3;
-      }
-      const int tile_x = lx & 7;
-      const int count = std::min(8 - tile_x, 256 - x);
-      for (int pixel = 0; pixel < count; ++pixel) {
-        const int bit = 7 - tile_x - pixel;
-        const int value = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
-        row[x + pixel] = value ? pal[palsel * 4 + value] : backdrop;
-        opaque[x + pixel] = value != 0;
-      }
-      x += count;
-      cx = (cx + count) & 0x1FF;
-    }
+  default: // write-only registers read as open bus; model as 0
+    break;
   }
-}
-
-// First scanline where an opaque sprite-0 pixel overlaps opaque bg.
-int Ppu::detect_sprite0(const size_t* banks) {
-  const int fmask = frame_latch_valid ? frame_mask : mask;
-  const bool tall = (ctrl & 0x20) != 0;
-  const int y = oam[0], tile = oam[1], attr = oam[2], x = oam[3];
-  const int top = y + 1;
-  if (top >= 240)
-    return -1;
-  const int h = tall ? 16 : 8;
-  const int rows = (240 - top) < h ? (240 - top) : h;
-  const int cols = (256 - x) < 8 ? (256 - x) : 8;
-  for (int r = 0; r < rows; ++r) {
-    const int src_r = (attr & 0x80) ? (h - 1 - r) : r;
-    const int pattern = sprite_pattern_addr(ctrl, tile, src_r, tall);
-    const int b0 = chr[chr_index(banks, pattern)];
-    const int b1 = chr[chr_index(banks, pattern + 8)];
-    for (int c = 0; c < cols; ++c) {
-      // No hit in the left 8 columns when either side is masked.
-      if (x + c < 8 && (fmask & 0x06) != 0x06)
-        continue;
-      const int src_c = (attr & 0x40) ? (7 - c) : c;
-      const int bit = 7 - src_c;
-      const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
-      if (pix && bg_opaque[top + r][x + c])
-        return top + r;
-    }
-  }
-  return -1;
-}
-
-Ppu::Frame Ppu::render_frame() {
-  Frame out{};
-  uint8_t* frame = out.data();
-
-  // Sprite enable/edge bits come from the frame-start latch: the live
-  // mask can already be blanked by a spilled NMI whose effect on
-  // hardware lands after the visible span.
-  const int fmask = frame_latch_valid ? frame_mask : mask;
-
-  // Greyscale ($2001 bit 0) masks every color to the grey column.
-  const uint8_t color_mask = (fmask & 0x01) ? 0x30 : 0x3F;
-  array<uint8_t, 0x20> pal{};
-  for (size_t i = 0; i < pal.size(); ++i)
-    pal[i] = palette[i] & color_mask;
-
-  uint8_t backdrop = pal[0];
-
-  // A span that ends blanked shows backdrop from the on->off row
-  // down (verified on the reference backend: Zelda blanks a few rows
-  // into the span at NMI end before vblank VRAM updates -- menus and
-  // room loads redraw behind this, and rendering content there leaks
-  // the half-drawn redraw).  The backdrop override (NESDEV PPU
-  // palettes) applies while off with v parked in palette RAM.
-  const bool off_now = !(mask & 0x18);
-  const int blank_from = off_now ? (span_blank_row >= 0 ? span_blank_row : 0) : -1;
-  if (blank_from >= 0 && (vram_addr & 0x3F00) == 0x3F00)
-    backdrop = palette[palette_index(vram_addr)] & color_mask;
-  // Leaving a whole-frame blank takes one clean span: a load's tail
-  // can alias so that one span runs fully enabled over a half-drawn
-  // nametable -- the single flicker frame at a room load's end.
-  const bool full_blank = blank_from == 0 || prev_full_blank;
-  prev_full_blank = blank_from == 0;
-  if (full_blank) {
-    std::memset(frame, backdrop, out.size());
-    // Keep the sprite-0 prediction: rows above the blank row still
-    // render on hardware, and Zelda's NMI polls the hit mid-load to
-    // time its below-HUD blank -- dropping the event would starve
-    // the $2002 lease refresh and pull the blank into the HUD.
-    mid_scanline = -1;
-    return out;
-  }
-  // Partial blank: applied after sprite compositing at every exit.
-  auto apply_blank = [&](uint8_t* f) {
-    if (blank_from > 0)
-      std::memset(f + blank_from * 256, backdrop, static_cast<size_t>(240 - blank_from) * 256);
-  };
-
-  // Piecewise state: rows through the sprite-0 hit render from the
-  // visible-span-start state, rows through the IRQ split (when the
-  // console marked one) from the state latched at delivery, rows
-  // below from the live registers.  Each band carries its own
-  // enable/edge bits, mirroring, scroll, and CHR banks.
-  // A live v differing from the one latched at the split means the
-  // IRQ handler loaded v via a $2006 pair -- the hardware mid-frame
-  // y-jump; the post-split band pins its y to it.
-  int live_y_base = -1;
-  if (mid_scanline >= 0 && (vram_addr & 0x7FFF) != (mid_v_addr & 0x7FFF)) {
-    live_y_base = scroll_row_480(vram_addr);
-  } else if (mid_scanline < 0 && span_v_load >= 0) {
-    // No IRQ split, but the visible span reloaded v via a $2006 pair
-    // (sprite-0 y-split): pin the post-split band to the loaded row.
-    live_y_base = scroll_row_480(span_v_load);
-  }
-  // MMC5 banks the CHR windows mid-frame at the IRQ split just like
-  // scroll: rows above the split render from the windows frozen at
-  // delivery (mmc5.split_*), rows below from the live windows.  The
-  // split line is captured here because mid_scanline is cleared below.
-  // In 8x8 sprite mode the hardware ignores $5128-$512B entirely and
-  // background fetches use the sprite set; each band's own ctrl bit
-  // picks its set.
-  const size_t* bg_banks;
-  const size_t* above_banks;
-  if (mmc5.active()) {
-    bg_banks = mmc5.live_background_banks(ctrl);
-    const int frame_mode = frame_latch_valid ? frame_ctrl : ctrl;
-    above_banks = frame_latch_valid ? mmc5.frame_background_banks(frame_mode) : bg_banks;
-  } else {
-    bg_banks = chr_bank.data();
-    above_banks = frame_chr_bank.data();
-  }
-  const BandState live{ctrl, mask, mirroring, t_addr, fine_x, live_y_base, bg_banks};
-  const BandState span = frame_latch_valid
-                             ? BandState{frame_ctrl,   frame_mask, frame_mirroring, frame_t_addr,
-                                         frame_fine_x, -1,         above_banks}
-                             : BandState{ctrl,
-                                         mask,
-                                         mirroring,
-                                         t_addr,
-                                         fine_x,
-                                         -1,
-                                         mmc5.active() ? above_banks : chr_bank.data()};
-
-  // MMC2's CHR latches observe the real fetch order. The ordinary
-  // renderer can batch all backgrounds and then all sprites because
-  // fixed-bank pixels are order-independent; PxROM cannot. Render it
-  // scanline by scanline (background fetches, then OAM-order sprite
-  // fetches) so the next row and next frame inherit the right latch.
-  if (chr_latch_active) {
-    const int split_s0 = sprite0_scanline; // prediction from prior frame
-    sprite0_scanline = -1;
-    for (auto& row : sprite_claimed)
-      std::fill(std::begin(row), std::end(row), false);
-    for (int y = 0; y < 240; ++y) {
-      const BandState& band = (split_s0 >= 0 && y > split_s0) ? live : span;
-      const bool tall = (band.ctrl & 0x20) != 0;
-      const int h = tall ? 16 : 8;
-      const int sprite_x_min = (band.mask & 0x04) ? 0 : 8;
-      render_ordered_bg_row(frame, pal.data(), backdrop, band, y);
-      if (!(band.mask & 0x10))
-        continue;
-      int slots = 0; // sprite evaluation: first eight in-range per line
-      for (size_t i = 0; i < 64 && (!sprite_limit || slots < 8); ++i) {
-        const int sy = oam[i * 4] + 1;
-        if (y < sy || y >= sy + h)
-          continue;
-        ++slots;
-        const int tile = oam[i * 4 + 1];
-        const int attr = oam[i * 4 + 2];
-        const int x = oam[i * 4 + 3];
-        const int src_r0 = y - sy;
-        const int src_r = (attr & 0x80) ? (h - 1 - src_r0) : src_r0;
-        const auto [b0, b1] = fetch_pattern_pair(
-            sprite_pattern_addr(band.ctrl, tile, src_r, tall));
-        const int cols = (256 - x) < 8 ? (256 - x) : 8;
-        for (int c = 0; c < cols; ++c) {
-          const int px = x + c;
-          const int src_c = (attr & 0x40) ? (7 - c) : c;
-          const int bit = 7 - src_c;
-          const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
-          if (!pix)
-            continue;
-          if (i == 0 && bg_opaque[y][px] && !(px < 8 && (band.mask & 0x06) != 0x06)) {
-            if (sprite0_scanline < 0)
-              sprite0_scanline = y;
-          }
-          if (px < sprite_x_min || sprite_claimed[y][px])
-            continue;
-          sprite_claimed[y][px] = true;
-          if ((attr & 0x20) && bg_opaque[y][px])
-            continue;
-          frame[y * 256 + px] = pal[0x10 + (attr & 3) * 4 + pix];
-        }
-      }
-    }
-    mid_scanline = -1;
-    apply_blank(frame);
-    return out;
-  }
-
-  // Ordered raster snapshots serve any mapper that split more than
-  // once this frame (SMB3's spade minigame chains four MMC3 IRQs);
-  // single-split frames keep the mid_* path.  MMC5 always renders
-  // through its snapshots because they carry its CHR windows.
-  const bool raster_mode = raster_split_count != 0 && (mmc5.active() || raster_split_count > 1);
-  if (!raster_mode)
-    render_bg_rows(frame, pal.data(), backdrop, span, 0, 240);
-
-  // Sprite 0's pattern fetches through the SPRITE banks: on MMC5 in
-  // 8x16 mode the background set is a different window, and a bogus
-  // hit from the wrong set would reshape the render bands.
-  const size_t* s0_banks = mmc5.active() ? mmc5.frame_sprite_banks() : span.banks;
-  sprite0_scanline = -1;
-  if (!raster_mode && (fmask & 0x10))
-    sprite0_scanline = detect_sprite0(s0_banks);
-
-  const int s0 = sprite0_scanline;
-  const bool have_mid = mid_scanline >= 0 && mid_scanline + 1 < 240;
-  // Post-hit scroll writes land several scanlines below the hit. Games
-  // align these splits to tile rows, so snap the stamped row up to one.
-  const int split_row = span_scroll_row >= 0 ? (span_scroll_row + 7) & ~7 : -1;
-  const int s0_start = split_row > s0 ? split_row : s0 + 1;
-  // A sprite-0 split only means something ABOVE the IRQ split (the
-  // SMB-style poll-then-scroll pattern).  A hit below it is just a
-  // status bit -- an ordinary sprite over opaque background (CV3's
-  // player with the MMC5 IRQ at the HUD edge) -- and must not eat
-  // the IRQ split.
-  const bool have_s0 = s0 >= 0 && s0_start < 240 && (!have_mid || s0 < mid_scanline);
-  const size_t* mid_banks =
-      mmc5.active() ? mmc5.split_background_banks(mid_ctrl) : mid_chr_bank.data();
-  // The pure sprite-0 band renders the split batch's captured scroll
-  // state, but its enable bits come from the frame-start latch: a
-  // spilled NMI may already have blanked the live mask, and that
-  // blank lands after the visible span on hardware.
-  const BandState post_hit =
-      span_scroll_row >= 0
-          ? BandState{span_ctrl, fmask, mirroring, span_t, span_fx, live_y_base, bg_banks}
-          : live;
-  const BandState mid_band = have_mid ? BandState{mid_ctrl,   mid_mask, mid_mirroring, mid_t_addr,
-                                                  mid_fine_x, -1,       mid_banks}
-                                      : post_hit;
-
-  // The frame's ordered background bands, each starting at its first
-  // row: span from the top, then the post-sprite-0 and post-IRQ
-  // splits (mid_band collapses to live when there is no IRQ split).
-  struct Segment {
-    int y0;
-    const BandState* band;
-  };
-  Segment segs[MAX_RASTER_SPLITS + 2];
-  BandState raster_bands[MAX_RASTER_SPLITS];
-  BandState raster_live = live;
-  int nseg = 0;
-  segs[nseg++] = {0, &span};
-  if (raster_mode) {
-    // Each split is captured before its handler; the following snapshot
-    // supplies the handler's state for the band below that split. Advance
-    // vertical position continuously unless a second $2006 write reloaded v.
-    int y_at_start = scroll_row_480(span.t_addr);
-    int previous_start = 0;
-    uint64_t previous_reload = frame_v_reload_generation;
-    for (size_t i = 0; i + 1 < raster_split_count; ++i) {
-      const auto& next = raster_splits[i + 1];
-      const int start = raster_splits[i].line + 1;
-      const bool v_reloaded = next.v_reload_generation != previous_reload;
-      if (v_reloaded)
-        y_at_start = scroll_row_480(next.v_addr);
-      else
-        y_at_start = (y_at_start + start - previous_start) % 480;
-      const size_t* banks = !mmc5.active()       ? next.chr_banks.data()
-                            : (next.ctrl & 0x20) ? next.mapper_banks.background.data()
-                                                 : next.mapper_banks.sprite.data();
-      raster_bands[i] = BandState{
-          next.ctrl,   next.mask,   next.mirroring,
-          next.t_addr, next.fine_x, y_at_start,
-          banks};
-      segs[nseg++] = {start, &raster_bands[i]};
-      previous_start = start;
-      previous_reload = next.v_reload_generation;
-    }
-    const int live_start = raster_splits[raster_split_count - 1].line + 1;
-    const bool v_reloaded = v_reload_generation != previous_reload;
-    if (v_reloaded)
-      y_at_start = scroll_row_480(vram_addr);
-    else
-      y_at_start = (y_at_start + live_start - previous_start) % 480;
-    raster_live.y_base = y_at_start;
-    segs[nseg++] = {live_start, &raster_live};
-  } else {
-    if (have_s0)
-      segs[nseg++] = {s0_start, &mid_band};
-    if (have_mid)
-      segs[nseg++] = {mid_scanline + 1, &live};
-  }
-  mid_scanline = -1;
-
-  if (raster_mode) {
-    // The bands are known before drawing, so render each visible row
-    // exactly once.  Previously MMC5 first painted all 240 rows from
-    // span and then repainted every changed lower band.
-    for (int i = 0; i < nseg; ++i) {
-      const int end = (i + 1 < nseg) ? segs[i + 1].y0 : 240;
-      render_bg_rows(frame, pal.data(), backdrop, *segs[i].band, segs[i].y0, end);
-    }
-    if (fmask & 0x10)
-      sprite0_scanline = detect_sprite0(s0_banks);
-  } else {
-    // The initial span was needed to discover a sprite-0 split;
-    // repaint only the lower bands whose state actually changes.
-    for (int i = 1; i < nseg; ++i) {
-      const int end = (i + 1 < nseg) ? segs[i + 1].y0 : 240;
-      if (!same_band(*segs[i].band, *segs[i - 1].band))
-        render_bg_rows(frame, pal.data(), backdrop, *segs[i].band, segs[i].y0, end);
-    }
-  }
-  if (!(fmask & 0x10)) {
-    apply_blank(frame);
-    return out;
-  }
-
-  // Sprite pixels fetch through the banks of the band their row
-  // falls in (per-scanline fetches on hardware -- how games blank
-  // sprites below the split by switching to an empty CHR page).
-  auto banks_for_row = [&](int row) -> const size_t* {
-    const BandState* b = segs[0].band;
-    for (int i = 1; i < nseg; ++i)
-      if (row >= segs[i].y0)
-        b = segs[i].band;
-    return b->banks;
-  };
-
-  auto mmc5_sprite_banks_for_row = [&](int row) -> const size_t* {
-    if (raster_split_count == 0 || row <= raster_splits[0].line)
-      return mmc5.frame_sprite_banks();
-    for (size_t i = 0; i + 1 < raster_split_count; ++i)
-      if (row <= raster_splits[i + 1].line)
-        return raster_splits[i + 1].mapper_banks.sprite.data();
-    return mmc5.sprite_banks();
-  };
-
-  const bool tall = (ctrl & 0x20) != 0;
-  const int sprite_x_min = (fmask & 0x04) ? 0 : 8;
-  for (auto& row : sprite_claimed)
-    std::fill(std::begin(row), std::end(row), false);
-  // Sprite evaluation admits the first eight in-range sprites per
-  // scanline in OAM order (transparent pixels still take the slot);
-  // games rotate OAM to spread the dropout -- the hardware flicker.
-  uint8_t row_slots[240] = {};
-  // Low index first: the first opaque sprite claims the pixel, and
-  // only its priority bit decides front-vs-behind (an obscured
-  // behind-background sprite hides higher-index sprites too).
-  for (size_t i = 0; i < 64; ++i) {
-    const int y = oam[i * 4];
-    const int tile = oam[i * 4 + 1];
-    const int attr = oam[i * 4 + 2];
-    const int x = oam[i * 4 + 3];
-    const int top = y + 1;
-    if (top >= 240)
-      continue;
-    const int h = tall ? 16 : 8;
-    const int rows = (240 - top) < h ? (240 - top) : h;
-    const int cols = (256 - x) < 8 ? (256 - x) : 8;
-    if (rows <= 0 || cols <= 0)
-      continue;
-    for (int r = 0; r < rows; ++r) {
-      if (sprite_limit && row_slots[top + r] >= 8)
-        continue;
-      ++row_slots[top + r];
-      const int src_r = (attr & 0x80) ? (h - 1 - r) : r;
-      const size_t* sbanks =
-          mmc5.active() ? mmc5_sprite_banks_for_row(top + r) : banks_for_row(top + r);
-      const int pattern = sprite_pattern_addr(ctrl, tile, src_r, tall);
-      const int b0 = chr[chr_index(sbanks, pattern)];
-      const int b1 = chr[chr_index(sbanks, pattern + 8)];
-      for (int c = 0; c < cols; ++c) {
-        if (x + c < sprite_x_min)
-          continue;
-        const int src_c = (attr & 0x40) ? (7 - c) : c;
-        const int bit = 7 - src_c;
-        const int pix = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
-        if (!pix)
-          continue;
-        if (sprite_claimed[top + r][x + c])
-          continue;
-        sprite_claimed[top + r][x + c] = true;
-        if ((attr & 0x20) && bg_opaque[top + r][x + c])
-          continue; // behind background
-        frame[(top + r) * 256 + (x + c)] = pal[0x10 + (attr & 3) * 4 + pix];
-      }
-    }
-  }
-  apply_blank(frame);
   return out;
+}
+
+// $2007 steps v by 1/32 -- except during rendering, where the access
+// collides with the fetch pipeline and bumps coarse x and y instead.
+void Ppu::step_vram_address(bool rendering) {
+  if (rendering) {
+    increment_x();
+    increment_y();
+  } else {
+    r_.v = static_cast<uint16_t>((r_.v + increment()) & 0x7FFF);
+  }
+}
+
+// Everything an access does that depends on the dot or on the rest of
+// the console: the vblank/NMI races, mapper-visible A12 edges and CHR
+// latches, and the renderer's caches.
+void Ppu::access_effects(const RegisterAccess& request, const RegisterFile& before,
+                         int64_t dot) {
+  const int reg = request.reg;
+  if (reg == 2 && !request.is_write) {
+    // The vblank race (NESDEV PPU frame timing): a read one dot before
+    // the flag sets reads it clear and cancels this frame's flag and
+    // NMI; a read on the setting dot or the next reads it set but still
+    // cancels the NMI; later reads behave normally.
+    if (dot == vblank_dot() && r_.vblank_set_dot < 0)
+      r_.vblank_suppressed = true;
+    if (r_.vblank_set_dot >= 0 && dot - r_.vblank_set_dot <= 2)
+      r_.nmi_edge = false;
+    r_.vblank = false;
+  }
+  if (reg == 0 && request.is_write) {
+    const bool rising = (ctrl & 0x80) && !(before.ctrl & 0x80);
+    const bool falling = !(ctrl & 0x80) && (before.ctrl & 0x80);
+    // The NMI output lags by a dot: enabling on the flag's last dot
+    // raises no pulse.
+    if (rising && r_.vblank && dot != r_.frame_start + int64_t{prerender_line} * dots_per_line + 1)
+      r_.nmi_delayed = true;
+    // Disabling within two dots of the flag setting drops the NMI line
+    // before the CPU's edge detector latches it.
+    if (falling && r_.vblank_set_dot >= 0 && dot - r_.vblank_set_dot <= 2)
+      r_.nmi_edge = false;
+  }
+  // Outside rendering the PPU address bus shows v, so loading or
+  // stepping it can raise A12 (an MMC3 clock).
+  const bool v_loaded = reg == 6 && request.is_write && before.w && !rendering_enabled();
+  const bool v_stepped = reg == 7 && !request.rendering;
+  if ((v_loaded || v_stepped) && a12((r_.v & 0x1000) != 0, dot))
+    schedule_changed_ = true;
+  // A $2007 read below $2000 is a pattern fetch the MMC2/MMC4 latches see.
+  if (reg == 7 && !request.is_write && chr_latch_active && (before.v & 0x3FFF) < 0x2000 &&
+      chr_latch.after_fetch(static_cast<size_t>(before.v & 0x3FFF)))
+    chr_map_changed();
+  if (before.ctrl != ctrl)
+    chr_map_changed(); // MMC5's background set follows the sprite size
+  if (((before.ctrl ^ ctrl) & 0x38) || ((before.mask ^ mask) & 0x18) ||
+      (reg == 4 && request.is_write && (ctrl & 0x20)))
+    schedule_changed_ = true;
+  if ((reg == 4 && request.is_write) || ((before.ctrl ^ ctrl) & 0x20))
+    sprites_indexed_ = false;
+}
+
+// The transition through the attached step (its memory is already up
+// to date): load the register file it returns and apply its write.
+Ppu::RegisterResult Ppu::external_transition(const RegisterAccess& request,
+                                             const RegisterFile& before) {
+  const auto [after, result] = register_step_.access(request, nt_map(), chr_writable, before);
+  t = static_cast<uint16_t>(after.t);
+  r_.v = static_cast<uint16_t>(after.v);
+  fine_x = after.fine_x;
+  write_latch = after.w != 0;
+  ctrl = after.ctrl;
+  mask = after.mask;
+  oam_addr = static_cast<uint8_t>(after.oam_addr);
+  read_buffer = after.read_buffer;
+  if (result.mem_addr >= 0)
+    write_physical(result.mem_addr, result.mem_value);
+  return result;
+}
+
+// A graph-memory write (the physical space of ppu2c02/space.py) into
+// PPU state: CHR RAM through the window, CIRAM pages, MMC5 ExRAM (page
+// 2), palette, OAM.  The fill-mode page holds no memory.
+void Ppu::write_physical(int addr, int value) {
+  const auto byte = static_cast<uint8_t>(value);
+  if (addr < 0x2000) {
+    if (chr_writable) {
+      const size_t source = chr_bank[(addr >> 10) & 7] + (addr & 0x3FF);
+      chr[source] = byte;
+      mark_chr(source);
+    }
+  } else if (addr < 0x2800) {
+    nametables[static_cast<size_t>(addr - 0x2000)] = byte;
+    mark_page(static_cast<size_t>(addr - 0x2000));
+  } else if (addr < 0x2C00) {
+    mmc5.write_exram(addr - 0x2800, byte);
+    mark_page(static_cast<size_t>(addr - 0x2000));
+  } else if (addr >= 0x4000) {
+    oam_changed();
+    oam[static_cast<size_t>(addr - 0x4000)] = byte;
+  } else if (addr >= 0x3F00) {
+    palette_changed();
+    palette[static_cast<size_t>(addr - 0x3F00)] = byte & 0x3F;
+  }
+}
+
+void Ppu::set_register_step(RegisterStep step) {
+  register_step_ = std::move(step);
+  register_sync_.reset(); // the new step's memory starts empty
+}
+
+void Ppu::set_render_engine(RenderEngine engine) {
+  render_ = engine;
+  render_sync_.reset();
+}
+
+int Ppu::nt_map() const {
+  if (mmc5.active())
+    return mirroring & 0xFF; // the $5105 map itself
+  static constexpr int maps[4] = {0x00, 0x55, 0x44, 0x50};
+  return maps[mirroring & 3];
+}
+
+// A nametable source page's content as the PPU reads it.
+int Ppu::page_byte(int page, int offset) const {
+  if (page < 2)
+    return nametables[static_cast<size_t>(page * 0x400 + offset)];
+  return mmc5.active() ? mmc5.page_view(page, offset) : 0;
+}
+
+// Deliver the graph-memory view's changes since `sync` last saw it.
+// Nametable pages go by written 64-byte chunk, palette and OAM by change
+// count; CHR goes by 1 KiB slot, resent when the slot's source moves and
+// otherwise by written chunk.  The register view maps CHR as $2007 reads
+// see it (current banks and latches); the render view maps the
+// background banks, both latch windows, and for MMC5 the whole CHR ROM.
+template <class Write>
+void Ppu::sync_graph_memory(GraphMemorySync& sync, ChrView view, bool chr_window, bool chr_full,
+                            Write&& write) {
+  if (chr_window && sync.seen == memory_epoch_)
+    return;
+  auto deliver = [&](size_t index, int addr, uint8_t value) {
+    if (sync.shadow[index] == value)
+      return;
+    sync.shadow[index] = value;
+    write(addr, value);
+  };
+  for (uint64_t dirty = std::exchange(sync.pages_dirty, 0); dirty; dirty &= dirty - 1)
+    for (int a = std::countr_zero(dirty) * 64, end = a + 64; a < end; ++a)
+      deliver(static_cast<size_t>(a), 0x2000 + a, static_cast<uint8_t>(page_byte(a >> 10, a & 0x3FF)));
+  if (sync.palette != palette_epoch_) {
+    sync.palette = palette_epoch_;
+    for (int a = 0; a < 0x20; ++a)
+      deliver(static_cast<size_t>(0x1000 + a), 0x3F00 + a, palette[static_cast<size_t>(a)]);
+  }
+  if (sync.oam != oam_epoch_) {
+    sync.oam = oam_epoch_;
+    for (int a = 0; a < 0x100; ++a)
+      deliver(static_cast<size_t>(0x1020 + a), 0x4000 + a, oam[static_cast<size_t>(a)]);
+  }
+  if (!chr_window)
+    return; // CHR changes wait for the next delivery that wants the window
+  auto dirty = [&](size_t source) {
+    return (sync.chr_dirty[source >> 12] >> ((source >> 6) & 63)) & 1;
+  };
+  if (sync.chr_any || sync.chr_map != chr_map_epoch_) {
+    sync.chr_map = chr_map_epoch_;
+    const bool latches = view == ChrView::render && chr_latch_active;
+    for (int s = 0; s < (latches ? 16 : 8); ++s) {
+      const int slot = s & 7;
+      size_t source;
+      if (view == ChrView::registers)
+        source = chr_index(chr_bank.data(), static_cast<size_t>(slot) * 0x400);
+      else if (latches)
+        source = chr_latch.banks[(slot >> 2) * 2 + (s >> 3)] + (slot & 3) * 0x400;
+      else
+        source = bg_banks()[slot];
+      const int base = (s < 8 ? 0 : 0x5000) + slot * 0x400;
+      const bool moved = std::exchange(sync.chr_source[static_cast<size_t>(s)], source) != source;
+      if (!moved && !sync.chr_any)
+        continue;
+      for (int i = 0; i < 0x400; i += 64)
+        if (moved || dirty(source + static_cast<size_t>(i)))
+          for (int j = i; j < i + 64; ++j)
+            write(base + j, chr[source + static_cast<size_t>(j)]);
+    }
+  }
+  if (chr_full && (!sync.full_sent || sync.chr_any))
+    for (size_t i = 0; i < chr.size(); i += 64)
+      if (!sync.full_sent || (sync.chr_any && dirty(i)))
+        for (size_t j = i; j < i + 64; ++j)
+          write(0x10000 + static_cast<int>(j), chr[j]);
+  sync.full_sent |= chr_full;
+  if (std::exchange(sync.chr_any, false))
+    std::fill(sync.chr_dirty.begin(), sync.chr_dirty.end(), 0);
+  sync.seen = memory_epoch_;
+}
+
+// One tile slot through the render graph: slots 0-31 output pixels and
+// fetch tile slot+2; 32-33 are the next line's prefetches.
+void Ppu::render_slot(int slot, int64_t dot) {
+  sync_graph_memory(render_sync_, ChrView::render, true, mmc5.active(),
+                    [this](int addr, int value) { render_.write(render_.ctx, addr, value); });
+  const bool visible = slot < 32;
+  const bool extended = mmc5.active() && mmc5.extended_attributes();
+  const int map = nt_map();
+  int in[render_inputs] = {1,
+                           slot,
+                           r_.hit_dot != NEVER,
+                           fine_x,
+                           ctrl,
+                           mask,
+                           map & 3,
+                           (map >> 2) & 3,
+                           (map >> 4) & 3,
+                           (map >> 6) & 3,
+                           chr_latch_active && chr_latch.latch_fe[0],
+                           chr_latch_active && chr_latch.latch_fe[1],
+                           chr_latch.wide_low,
+                           extended,
+                           mmc5.chr_upper(),
+                           r_.v & 0x1F,
+                           (r_.v >> 5) & 0x1F,
+                           (r_.v >> 10) & 3,
+                           (r_.v >> 12) & 7};
+  const bool sprites = visible && ((r_.sprite_slots >> slot) & 1);
+  if (visible) {
+    std::copy_n(r_.bg.data() + slot * 8, 16, in + in_bg);
+    if (sprites)
+      std::copy_n(r_.sprites.data() + slot * 8, 8, in + in_sprites);
+  }
+  // A folded expert when its pins hold: background on (so rendering), no
+  // greyscale, no extended attributes; by slot, table and fine x.  Edge
+  // slots with sprites have none.
+  int model = 0;
+  if ((mask & 0x08) && !(mask & 0x01) && !extended && !force_full_render) {
+    const RenderDispatch& d = render_.dispatch[chr_latch_active ? 1 : 0];
+    const int table = (ctrl & 0x10) ? 1 : 0;
+    if (slot == 0 || slot == 31)
+      model = sprites ? 0 : slot == 0 ? d.first[table] : d.last[table];
+    else
+      model = sprites ? d.sprites : d.inner[table][fine_x];
+  }
+  int out[render_outputs];
+  render_.step(render_.ctx, model, in, out);
+  if (render_.trace && !dry_ && slot_trace_request_ == std::pair{r_.line, slot}) {
+    SlotTrace trace{r_.line, slot, model,
+                    vector<int>(static_cast<size_t>(render_.trace_rows * render_.trace_width))};
+    render_.trace(render_.ctx, in, trace.residual.data());
+    slot_trace_ = std::move(trace);
+    slot_trace_request_ = {-1, -1};
+  }
+  if (visible && r_.line < 240) {
+    experts_[static_cast<size_t>(r_.line * 32 + slot)] = static_cast<uint8_t>(model);
+    uint8_t* row = frame_.data() + static_cast<size_t>(r_.line) * 256 + slot * 8;
+    for (int i = 0; i < 8; ++i)
+      row[i] = static_cast<uint8_t>(out[i]);
+    for (int i = 0; i < 8 && r_.hit_dot == NEVER; ++i)
+      if (out[out_hit + i]) {
+        r_.hit_dot = dot + i;
+        mark_status_change(dot + i);
+      }
+  }
+  if (out[out_fetched]) { // the tile, v, the latches, and the fetch's A12 edge
+    a12(false, dot);
+    if (!extended)
+      a12((ctrl & 0x10) != 0, dot + 4);
+    const int index = visible ? slot + 2 : slot - 32;
+    for (int c = 0; c < 8; ++c)
+      r_.bg[static_cast<size_t>(index * 8 + c)] = static_cast<uint8_t>(out[out_tile + c]);
+    const int* v = out + out_v;
+    r_.v = static_cast<uint16_t>(v[0] | (v[1] << 5) | (v[2] << 10) | (v[3] << 12));
+    const bool latch_lo = out[out_latch] != 0, latch_hi = out[out_latch + 1] != 0;
+    if (chr_latch_active &&
+        (chr_latch.latch_fe[0] != latch_lo || chr_latch.latch_fe[1] != latch_hi)) {
+      chr_latch.latch_fe[0] = latch_lo;
+      chr_latch.latch_fe[1] = latch_hi;
+      chr_map_changed();
+    }
+  }
+}
+
+optional<int> Ppu::read_lease(int addr, int64_t horizon) {
+  if (((addr - 0x2000) & 7) != 2 || r_.vblank)
+    return std::nullopt;
+  const int64_t now = r_.pos;
+  int64_t expiry = NEVER;
+  if (r_.hit_dot > now)
+    expiry = r_.hit_dot;
+  if (r_.overflow_dot > now)
+    expiry = std::min(expiry, r_.overflow_dot);
+  // The machine may finish an instruction or two past its horizon
+  // before the console drops leases; look that far too.
+  const int64_t until = std::min(horizon + 3 * 16, expiry);
+  if (const int64_t change = preview(until, nullptr, true); change >= 0)
+    expiry = std::min(expiry, change);
+  lease_expiry_ = expiry;
+  return status(now);
+}
+
+void Ppu::oam_dma(span<const uint8_t, 256> page, int64_t dot) {
+  catch_up(dot);
+  for (size_t i = 0; i < page.size(); ++i)
+    oam[(oam_addr + i) & 0xFF] = page[i];
+  sprites_indexed_ = false;
+  oam_changed();
+  if (ctrl & 0x20)
+    schedule_changed_ = true;
+}
+
+// ── The register file as an external step ──
+
+Ppu::RegisterFile Ppu::register_file() const {
+  return {t, r_.v, fine_x, write_latch, ctrl, mask, oam_addr, read_buffer};
+}
+
+// A PPU address's place in graph memory (ppu2c02/space.py).
+int32_t Ppu::graph_address(int addr) const {
+  addr &= 0x3FFF;
+  if (addr < 0x2000)
+    return addr;
+  if (addr < 0x3F00) {
+    const int table = (addr >> 10) & 3;
+    return 0x2000 + 0x400 * ((nt_map() >> (2 * table)) & 3) + (addr & 0x3FF);
+  }
+  return static_cast<int32_t>(0x3F00 + palette_index(addr));
+}
+
+// Deliver the register view's changes since the last access to the
+// step.  The CHR window is only read through a $2007 read below $2000,
+// so bank switches (several a frame under MMC3) are delivered just
+// before one.
+void Ppu::deliver_memory_changes(bool chr_window) {
+  sync_graph_memory(register_sync_, ChrView::registers, chr_window, false,
+                    [this](int addr, int value) { register_step_.write(addr, value); });
+}
+
+// ── Clock ──
+
+const vector<Ppu::EventAt>& Ppu::events_for(int line) {
+  static const auto tables = [] {
+    array<vector<EventAt>, 5> t{};
+    auto slots = [](vector<EventAt>& v, bool scanline) {
+      for (int k = 0; k < 32; ++k) {
+        v.push_back({1 + 8 * k, Ev::Slot, k});
+        if (k == 0 && scanline)
+          v.push_back({3, Ev::Scanline, 0});
+      }
+      v.push_back({257, Ev::Sprites, 0});
+    };
+    slots(t[0], true); // visible
+    t[0].insert(t[0].begin() + 9, {65, Ev::Evaluate, 0}); // after slot 7 (dot 57)
+    t[0].push_back({321, Ev::Prefetch, 0});
+    t[1].push_back({0, Ev::FrameDone, 0});
+    t[2].push_back({1, Ev::VBlank, 0});
+    t[4].push_back({1, Ev::Clear, 0}); // pre-render
+    slots(t[4], false);
+    t[4].push_back({280, Ev::VCopy, 0});
+    t[4].push_back({321, Ev::Prefetch, 0});
+    t[4].push_back({339, Ev::OddSkip, 0});
+    return t;
+  }();
+  if (line < 240)
+    return tables[0];
+  if (line == 240)
+    return tables[1];
+  if (line == vblank_line)
+    return tables[2];
+  if (line == prerender_line)
+    return tables[4];
+  return tables[3];
+}
+
+void Ppu::catch_up(int64_t dot) {
+  if (!r_.events)
+    r_.events = &events_for(r_.line);
+  while (r_.pos < dot) {
+    const auto& events = *r_.events;
+    if (r_.next_event < static_cast<int>(events.size())) {
+      const EventAt& e = events[static_cast<size_t>(r_.next_event)];
+      const int64_t at = r_.line_start + e.dot;
+      if (at >= dot) {
+        r_.pos = dot;
+        return;
+      }
+      r_.pos = at;
+      ++r_.next_event;
+      process(e);
+      if (dry_stop_ >= 0)
+        return;
+      continue;
+    }
+    const int64_t end = r_.line_start + r_.line_len;
+    if (end > dot) {
+      r_.pos = dot;
+      return;
+    }
+    r_.pos = end;
+    advance_line();
+  }
+}
+
+void Ppu::advance_line() {
+  r_.line_start += r_.line_len;
+  r_.line_len = dots_per_line;
+  r_.next_event = 0;
+  if (++r_.line == 262) {
+    r_.line = 0;
+    r_.frame_start = r_.line_start;
+    r_.odd = !r_.odd;
+  }
+  r_.events = &events_for(r_.line);
+}
+
+int64_t Ppu::next_frame_start() const {
+  if (r_.line == prerender_line && r_.pos - r_.line_start >= 339)
+    return r_.line_start + r_.line_len;
+  return r_.frame_start + frame_dots - (r_.odd && rendering_enabled() ? 1 : 0);
+}
+
+void Ppu::process(const EventAt& e) {
+  const int64_t dot = r_.pos;
+  switch (e.ev) {
+  case Ev::Slot:
+    if (render_.ctx && !dry_) {
+      render_slot(e.slot, dot);
+      break;
+    }
+    if (r_.line < 240)
+      output_pixels(e.slot, dot);
+    if (rendering_enabled()) {
+      fetch_tile(e.slot + 2, dot);
+      increment_x();
+      if (e.slot == 31)
+        increment_y();
+    }
+    break;
+  case Ev::Scanline:
+    emit(rendering_enabled() ? PpuEvent::ScanlineStart : PpuEvent::Idle, dot);
+    break;
+  case Ev::Evaluate:
+    r_.selected_count = 0;
+    if (rendering_enabled())
+      evaluate_sprites(dot);
+    break;
+  case Ev::Sprites:
+    load_sprites(dot);
+    break;
+  case Ev::Prefetch:
+    if (render_.ctx && !dry_) {
+      if (rendering_enabled()) {
+        render_slot(32, dot);
+        render_slot(33, dot + 8);
+        a12(false, dot + 16);
+      }
+      break;
+    }
+    if (rendering_enabled()) {
+      fetch_tile(0, dot);
+      increment_x();
+      fetch_tile(1, dot + 8);
+      increment_x();
+      a12(false, dot + 16); // dots 337-340: nametable fetches
+    }
+    break;
+  case Ev::VCopy:
+    if (rendering_enabled())
+      r_.v = static_cast<uint16_t>((r_.v & ~0x7BE0) | (t & 0x7BE0));
+    break;
+  case Ev::OddSkip:
+    if (r_.odd && rendering_enabled())
+      r_.line_len = dots_per_line - 1;
+    break;
+  case Ev::FrameDone:
+    if (!dry_) {
+      completed_ = frame_;
+      completed_experts_ = experts_;
+      experts_.fill(native_slot);
+    }
+    emit(PpuEvent::Idle, dot);
+    break;
+  case Ev::VBlank:
+    if (std::exchange(r_.vblank_suppressed, false))
+      break;
+    r_.vblank = true;
+    r_.vblank_set_dot = dot;
+    if (ctrl & 0x80)
+      r_.nmi_edge = true;
+    mark_status_change(dot);
+    break;
+  case Ev::Clear:
+    sprites_indexed_ = false;
+    if (r_.vblank || r_.hit_dot != NEVER || r_.overflow_dot != NEVER)
+      mark_status_change(dot);
+    r_.vblank = false;
+    r_.vblank_set_dot = -1;
+    r_.hit_dot = r_.overflow_dot = NEVER;
+    break;
+  }
+}
+
+// ── Rendering ──
+
+void Ppu::increment_x() {
+  if ((r_.v & 0x001F) == 31)
+    r_.v = static_cast<uint16_t>((r_.v & ~0x001F) ^ 0x0400);
+  else
+    ++r_.v;
+}
+
+void Ppu::increment_y() {
+  if ((r_.v & 0x7000) != 0x7000) {
+    r_.v = static_cast<uint16_t>(r_.v + 0x1000);
+    return;
+  }
+  int v = r_.v & ~0x7000;
+  int y = (v & 0x03E0) >> 5;
+  if (y == 29) {
+    y = 0;
+    v ^= 0x0800;
+  } else if (y == 31) {
+    y = 0;
+  } else {
+    ++y;
+  }
+  r_.v = static_cast<uint16_t>((v & ~0x03E0) | (y << 5));
+}
+
+// A background tile slot: nametable, attribute, then the two pattern
+// bytes at v.  Pattern fetches drive A12 (MMC3's scanline clock) and
+// the MMC2/MMC4 latches in true fetch order.
+void Ppu::fetch_tile(int index, int64_t dot) {
+  const int v = r_.v;
+  a12(false, dot);
+  const int tile_no = nt_read(0x2000 | (v & 0x0FFF));
+  const int fine_y = (v >> 12) & 7;
+  int palette_sel;
+  uint8_t lo, hi;
+  if (mmc5.active() && mmc5.extended_attributes()) {
+    const int offset = v & 0x3FF;
+    const size_t base = mmc5.extended_chr_base(offset) + static_cast<size_t>(tile_no) * 16 + fine_y;
+    lo = chr[base % chr.size()];
+    hi = chr[(base + 8) % chr.size()];
+    palette_sel = mmc5.exram(offset) >> 6;
+  } else {
+    const int attr = nt_read(0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 0x07));
+    palette_sel = (attr >> (((v >> 4) & 4) | (v & 2))) & 3;
+    const int pattern = ((ctrl & 0x10) ? 0x1000 : 0) + tile_no * 16 + fine_y;
+    a12((pattern & 0x1000) != 0, dot + 4);
+    std::tie(lo, hi) = fetch_pattern(bg_banks(), pattern);
+  }
+  // Eight 2-bit pixels, then the palette offset on the opaque ones.
+  uint64_t pixels = plane[lo] | (plane[hi] << 1);
+  const uint64_t opaque = (pixels | (pixels >> 1)) & 0x0101010101010101ULL;
+  pixels += opaque * static_cast<uint64_t>(palette_sel * 4);
+  std::memcpy(r_.bg.data() + static_cast<size_t>(index) * 8, &pixels, 8);
+}
+
+// Pixels 8*slot .. 8*slot+7 of the current line, output at dots
+// 8*slot+1 .. 8*slot+8 from the fetched tiles and the sprite line.
+void Ppu::output_pixels(int slot, int64_t dot) {
+  // A dry run only needs pixels to find sprite-0 hits.
+  if (dry_ && !(track_status_ && r_.sprite0_on_line))
+    return;
+  uint8_t* row = frame_.data() + static_cast<size_t>(r_.line) * 256 + slot * 8;
+  const bool bg_on = mask & 0x08, sprites_on = mask & 0x10;
+  if (!bg_on && !sprites_on) {
+    if (!dry_)
+      std::memset(row, backdrop(), 8);
+    return;
+  }
+  const uint8_t gmask = (mask & 0x01) ? 0x30 : 0x3F;
+  // Background palette indices under this slot; the left-edge mask
+  // (and a disabled background) show index 0, the backdrop.
+  array<uint8_t, 8> bg{};
+  if (bg_on) {
+    std::memcpy(bg.data(), r_.bg.data() + slot * 8 + fine_x, 8);
+    if (slot == 0 && !(mask & 0x02))
+      bg.fill(0);
+  }
+  const bool sprites_here = sprites_on && ((r_.sprite_slots >> slot) & 1);
+  if (!sprites_here) {
+    if (!dry_)
+      for (int i = 0; i < 8; ++i)
+        row[i] = palette[bg[static_cast<size_t>(i)]] & gmask;
+    return;
+  }
+  const uint8_t* sprite = r_.sprites.data() + slot * 8;
+  const bool sprite_clip = slot == 0 && !(mask & 0x04);
+  for (int i = 0; i < 8; ++i) {
+    const uint8_t b = bg[static_cast<size_t>(i)];
+    uint8_t index = b;
+    const uint8_t s = sprite_clip ? 0 : sprite[i];
+    if (s) {
+      // Sprite 0 hits on opaque-over-opaque, whatever its priority,
+      // never at x=255.
+      if ((s & 0x80) && b && slot * 8 + i != 255 && r_.hit_dot == NEVER) {
+        r_.hit_dot = dot + i;
+        mark_status_change(dot + i);
+      }
+      if (!((s & 0x40) && b))
+        index = s & 0x1F;
+    }
+    if (!dry_)
+      row[i] = palette[index] & gmask;
+  }
+}
+
+// Dot 257: copy t's horizontal bits into v, then evaluate OAM for the
+// next line and run the eight sprite-slot fetches (empty slots fetch
+// tile $FF, which still drives A12).  Sprites claim pixels lowest index
+// first; only the claiming sprite's priority bit decides front/behind.
+void Ppu::load_sprites(int64_t dot) {
+  if (r_.any_sprites)
+    r_.sprites.fill(0);
+  r_.any_sprites = r_.sprite0_on_line = false;
+  r_.sprite_slots = 0;
+  if (!rendering_enabled())
+    return;
+  r_.v = static_cast<uint16_t>((r_.v & ~0x041F) | (t & 0x041F));
+  oam_addr = 0;
+  const int h = (ctrl & 0x20) ? 16 : 8;
+  const bool draw = r_.line < 239; // the next line is visible
+  const int count = r_.line < 240 ? r_.selected_count : 0;
+  for (int slot = 0; slot < count; ++slot) {
+    const int i = r_.selected[static_cast<size_t>(slot)];
+    int row = r_.line - oam[static_cast<size_t>(i) * 4];
+    const int tile = oam[static_cast<size_t>(i) * 4 + 1];
+    const int attr = oam[static_cast<size_t>(i) * 4 + 2];
+    const int x = oam[static_cast<size_t>(i) * 4 + 3];
+    if (row < 0 || row >= h) // OAM or sprite size changed since evaluation
+      continue;
+    if (attr & 0x80)
+      row = h - 1 - row;
+    const int addr = h == 16
+                         ? ((tile & 1) << 12) | ((tile & 0xFE) << 4) | ((row & 8) << 1) | (row & 7)
+                         : ((ctrl & 0x08) << 9) | (tile << 4) | row;
+    uint8_t lo, hi;
+    if (slot < 8) {
+      a12(false, dot + 8 * slot);
+      a12((addr & 0x1000) != 0, dot + 8 * slot + 4);
+      std::tie(lo, hi) = fetch_pattern(sprite_banks(), addr);
+    } else { // past the hardware cap (debug toggle): no bus side effects
+      lo = chr[chr_index(sprite_banks(), addr)];
+      hi = chr[chr_index(sprite_banks(), addr + 8)];
+    }
+    if (!draw || !(lo | hi))
+      continue;
+    const uint8_t meta = static_cast<uint8_t>(0x10 | ((attr & 3) << 2) |
+                                              ((attr & 0x20) ? 0x40 : 0) | (i == 0 ? 0x80 : 0));
+    for (int c = 0; c < 8 && x + c < 256; ++c) {
+      const int bit = (attr & 0x40) ? c : 7 - c;
+      const int value = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+      auto& pixel = r_.sprites[static_cast<size_t>(x + c)];
+      if (!value || pixel)
+        continue;
+      pixel = static_cast<uint8_t>(meta | value);
+      r_.any_sprites = true;
+      r_.sprite_slots |= 1U << ((x + c) >> 3);
+      r_.sprite0_on_line |= i == 0;
+    }
+  }
+  const int dummy = (h == 16 || (ctrl & 0x08)) ? 0x1000 : 0;
+  for (int slot = std::min(count, 8); slot < 8; ++slot) {
+    a12(false, dot + 8 * slot);
+    a12(dummy != 0, dot + 8 * slot + 4);
+  }
+}
+
+// Sprite evaluation (dots 65-256): select the next line's sprites in
+// OAM order and run the overflow search with its timing and hardware
+// bug -- each sprite takes 2 dots to reject or 8 to copy, and once 8
+// are found the search checks byte m of each sprite as its Y, bumping
+// m along with n on a miss (the diagonal scan).
+void Ppu::index_sprites() {
+  sprites_indexed_ = true;
+  line_sprite_count_.fill(0);
+  const int h = (ctrl & 0x20) ? 16 : 8;
+  for (int i = 0; i < 64; ++i) {
+    const int top = oam[static_cast<size_t>(i) * 4];
+    for (int line = top; line < top + h && line < 240; ++line) {
+      auto& count = line_sprite_count_[static_cast<size_t>(line)];
+      line_sprites_[static_cast<size_t>(line)][count++] = static_cast<uint8_t>(i);
+    }
+  }
+}
+
+void Ppu::evaluate_sprites(int64_t dot) {
+  if (!sprites_indexed_)
+    index_sprites();
+  const size_t line = static_cast<size_t>(r_.line);
+  if (line_sprite_count_[line] < 8) { // no overflow search: take the index
+    r_.selected_count = line_sprite_count_[line];
+    std::copy_n(line_sprites_[line].begin(), r_.selected_count, r_.selected.begin());
+    return;
+  }
+  const int h = (ctrl & 0x20) ? 16 : 8;
+  auto in_range = [&](int y) {
+    return static_cast<unsigned>(r_.line - y) < static_cast<unsigned>(h);
+  };
+  int64_t at = dot;
+  int n = 0, count = 0;
+  for (; n < 64 && count < 8; ++n) {
+    const bool hit = in_range(oam[static_cast<size_t>(n) * 4]);
+    if (hit)
+      r_.selected[static_cast<size_t>(count++)] = static_cast<uint8_t>(n);
+    at += hit ? 8 : 2;
+  }
+  r_.selected_count = count;
+  if (count < 8)
+    return;
+  if (!sprite_limit) // debug: render every in-range sprite
+    for (int i = n; i < 64; ++i)
+      if (in_range(oam[static_cast<size_t>(i) * 4]))
+        r_.selected[static_cast<size_t>(r_.selected_count++)] = static_cast<uint8_t>(i);
+  if (r_.overflow_dot != NEVER)
+    return;
+  for (int m = 0; n < 64; ++n, m = (m + 1) & 3, at += 2) {
+    if (in_range(oam[static_cast<size_t>(n) * 4 + m])) {
+      r_.overflow_dot = at;
+      mark_status_change(at);
+      return;
+    }
+  }
+}
+
+// ── Events ──
+
+// MMC3 counts A12 rises that follow at least ~3 CPU cycles of A12 low
+// (its M2 filter): once per line for the usual bg=$0000/sprites=$1000
+// split, never for the 4-dot dips between background fetches.
+bool Ppu::a12(bool high, int64_t dot) {
+  if (!wants_a12_)
+    return false;
+  if (high) {
+    if (!r_.a12_high) {
+      r_.a12_high = true;
+      if (dot - r_.a12_low_since > 10) {
+        emit(PpuEvent::A12Rise, dot);
+        return true;
+      }
+    }
+  } else if (r_.a12_high) {
+    r_.a12_high = false;
+    r_.a12_low_since = dot;
+  }
+  return false;
+}
+
+void Ppu::emit(PpuEvent::Kind kind, int64_t dot) {
+  PpuWatcher* watcher = dry_ ? probe_ : watcher_;
+  if (!watcher)
+    return;
+  watcher->ppu_event({kind, dot, r_.line});
+  if (dry_ && probe_->fire_dot >= 0 && dry_stop_ < 0)
+    dry_stop_ = probe_->fire_dot;
+}
+
+void Ppu::mark_status_change(int64_t dot) {
+  if (dry_ && track_status_ && dry_stop_ < 0)
+    dry_stop_ = dot;
+}
+
+int64_t Ppu::preview(int64_t until, IrqProbe* probe, bool track_status) {
+  const Render saved = r_;
+  const ChrLatch latch = chr_latch;
+  const uint8_t saved_oam_addr = oam_addr;
+  dry_ = true;
+  probe_ = probe;
+  track_status_ = track_status;
+  dry_stop_ = -1;
+  catch_up(until);
+  const int64_t found = dry_stop_;
+  r_ = saved;
+  chr_latch = latch;
+  oam_addr = saved_oam_addr;
+  dry_ = track_status_ = false;
+  probe_ = nullptr;
+  dry_stop_ = -1;
+  return found;
 }
 
 } // namespace transformer_nes::nes

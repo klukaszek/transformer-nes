@@ -40,3 +40,6 @@ _debug_dumps/
 
 # Generated experiment artifacts (hundreds of MB, rebuilt by build.py)
 experiments/*/artifact/
+
+# Editor state
+.obsidian/

@@ -82,6 +82,26 @@ def test_transformer_int32_engine_matches_high_address_nestest_prefix():
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("union_only", [False, True])
+def test_the_model_times_every_instruction(union_only):
+    """Elapsed time is an output of the forward, like the registers: each
+    nestest instruction's cycles, page-crossing branches and indexed reads
+    included, from the opcode experts and from the union model alike."""
+    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image, new_cpu
+
+    image = load_image()
+    machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only)
+    machine.load_image(bytes(image), start_pc=START_PC)
+    ref = new_cpu(image)
+    for step in range(8991):
+        op = reference.opcode_for(ref.read_memory(ref.pc))
+        expected = reference.instruction_cycles(ref, op, ref.pc, ref.x, ref.y, ref.p)
+        got = int(machine.run(1, max_cycles=0, trace=False)["cycles"])
+        assert got == expected, f"step {step} at ${ref.pc:04X}: {op.mnemonic} {op.mode}"
+        ref.step()
+
+
+@pytest.mark.slow
 def test_run_loop_matches_per_step():
     """The generated C++ run loop (EngineBus shape) must produce exactly the
     trace the verified per-step machine_step path produces -- same states,

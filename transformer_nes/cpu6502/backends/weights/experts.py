@@ -22,11 +22,7 @@ from transformer_nes.cpu6502.backends.weights.windows import (
 )
 from transformer_nes.cpu6502.spec import (
     BRANCH_OPERATIONS,
-    MODE_ABSOLUTE_X,
-    MODE_ABSOLUTE_Y,
-    MODE_INDIRECT_Y,
     OPCODES,
-    PAGE_CROSS_READ_OPERATIONS,
     READS_MEMORY,
 )
 from transformer_nes.graph.core import (
@@ -43,7 +39,6 @@ from transformer_nes.graph.execution import (
     ControlFlow,
     ExecutionGraph,
     MemoryWrite,
-    RecurrenceSummary,
     StateField,
 )
 from transformer_nes.graph.fold import (
@@ -58,18 +53,6 @@ from transformer_nes.model.weights import build_model
 logger = logging.getLogger(__name__)
 STACK_CONTROL_OPERATIONS = SEQUENCE_WRITERS - {"sax"}
 
-
-def cycle_safe_window(ops) -> bool:
-    """Whether a folded window has timing independent of live state."""
-    indexed_modes = {MODE_ABSOLUTE_X, MODE_ABSOLUTE_Y, MODE_INDIRECT_Y}
-    return all(
-        op.operation not in BRANCH_OPERATIONS
-        and not (
-            op.operation in PAGE_CROSS_READ_OPERATIONS
-            and op.mode in indexed_modes
-        )
-        for op in ops
-    )
 
 UNION_FALLBACK_OPERATIONS: frozenset[str] = frozenset()
 
@@ -152,7 +135,7 @@ WRITE_RECEIPTS = (
 SEQUENCE_ROOT_DIMS = (
     "new_a", "new_x", "new_y", "new_s",
     *(dim_name for _name, dim_name, _mask, _input_name in SEQUENCE_FLAG_DIMS),
-    "ea", "next_pc", "new_halted", "branch_taken",
+    "ea", "next_pc", "new_halted", "branch_taken", "cycles",
     *(name for receipt in WRITE_RECEIPTS for name in receipt),
 )
 
@@ -203,7 +186,6 @@ def classify_sequence_state(fold_result, final_names) -> dict:
 
 def project_sequence_execution(
     fold_result, n_steps: int, control: ControlFlow,
-    recurrence: RecurrenceSummary | None = None,
     halt_dimension: Dimension | None = None,
 ) -> ExecutionGraph:
     """Replace the proof graph's per-step trace ABI with its execution ABI.
@@ -253,6 +235,19 @@ def project_sequence_execution(
             output_tokens[f"write:{k}:{order}:address"] = Expression({address: 1})
             output_tokens[f"write:{k}:{order}:value"] = Expression({write_value: 1})
 
+    # Each step's cycles: folded to a constant where the pins decide them
+    # (most opcodes), else a model output (taken branches, page crosses).
+    one = fold_result.program_graph.one
+    cycles = []
+    for k in range(n_steps):
+        dim = fold_result.dim_of_name[f"cycles__s{k}"]
+        form = linear_input_form(Expression({dim: 1.0}))
+        if all(source is one for source in form):
+            cycles.append(int(round(form.get(one, 0.0))))
+        else:
+            cycles.append(dim)
+            output_tokens[f"cycles:{k}"] = Expression({dim: 1})
+
     if control.predicate is not None and not control.flag_mask:
         output_tokens["control:branch"] = Expression({control.predicate: 1})
     if control.target_dimension is not None:
@@ -285,7 +280,7 @@ def project_sequence_execution(
         outputs=tuple(outputs),
         control=execution_control,
         halt_dimension=halt_dimension,
-        recurrence=recurrence,
+        cycles=tuple(cycles),
         dim_of_name=dim_of_name,
     )
 
@@ -332,6 +327,10 @@ def sequence_step_spec(execution: ExecutionGraph, info) -> dict:
         "absolute_operand_offset": control.absolute_operand_offset,
         "flag_mask": control.flag_mask,
         "flag_value": control.flag_value,
+    }
+    spec["sequence_cycles"] = {
+        "constant": sum(c for c in execution.cycles if isinstance(c, int)),
+        "model": [info.slot_of[c] for c in execution.cycles if not isinstance(c, int)],
     }
     spec["sequence_halt"] = (
         None if execution.halt_dimension is None
@@ -531,58 +530,19 @@ def opcode_execution_control(fold_result, op) -> ControlFlow:
     )
 
 
-def semantic_recurrence(
-    ops, offsets, *, self_target: bool = False,
-) -> RecurrenceSummary | None:
-    if self_target:
-        return RecurrenceSummary(
-            kind="identity", steps_per_iteration=1,
-            cycles_per_iteration=ops[0].cycles, cycles_prefix=0,
-        )
-    affine = {
-        "dex": ("x", -1), "inx": ("x", 1),
-        "dey": ("y", -1), "iny": ("y", 1),
+def window_timing(execution: ExecutionGraph, spin: bool) -> dict:
+    """How the run loop times a window.  Its budget guard needs the cycles
+    before the last step up front (`cycles_prefix`; None when the pins left
+    any to the model, and the window never dispatches); the last step's may
+    stay a model output (a closing branch).  A `JMP *` spin changes nothing
+    per iteration, so the loop retires as many as the budget allows at
+    `spin` cycles each; 0 for any other window."""
+    if spin and not isinstance(execution.cycles[0], int):
+        raise RuntimeError("a JMP spin's cycles did not fold")
+    return {
+        "cycles_prefix": execution.cycles_prefix,
+        "spin": execution.cycles[0] if spin else 0,
     }
-    if (
-        len(ops) == 2
-        and ops[0].operation in affine
-        and ops[1].operation == "bne"
-    ):
-        register, delta = affine[ops[0].operation]
-        length = sum(op.length for op in ops)
-        return RecurrenceSummary(
-            kind="affine_until",
-            steps_per_iteration=2,
-            cycles_per_iteration=sum(op.cycles for op in ops),
-            cycles_prefix=sum(op.cycles for op in ops[:-1]),
-            register=register,
-            delta=delta,
-            fallthrough_offset=length,
-            closure_operand_offset=offsets[1] + 1,
-            closure_operand_value=(-length) & 0xFF,
-        )
-    prefix = tuple(op.operation for op in ops[:-1])
-    poll_prefixes = {
-        ("load_a",), ("bit",), ("load_a", "and"),
-    }
-    if (
-        len(ops) >= 2
-        and prefix in poll_prefixes
-        and ops[-1].operation in BRANCH_OPERATIONS
-        and ops[0].operation in READS_MEMORY
-        and ops[0].mode not in ("imp", "acc", "imm")
-    ):
-        length = sum(op.length for op in ops)
-        return RecurrenceSummary(
-            kind="invariant_poll",
-            steps_per_iteration=len(ops),
-            cycles_per_iteration=sum(op.cycles for op in ops),
-            cycles_prefix=sum(op.cycles for op in ops[:-1]),
-            fallthrough_offset=length,
-            closure_operand_offset=offsets[-1] + 1,
-            closure_operand_value=(-length) & 0xFF,
-        )
-    return None
 
 
 def check_reads_licensed(fold_result, ops, label: str) -> None:
@@ -788,7 +748,7 @@ def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
         pg, shapes, expert_kind="exec_opcode",
     )
     for expert, (byte, _op) in zip(experts, eligible, strict=True):
-        if expert["recurrence"] is not None:
+        if expert["spin"]:
             raise RuntimeError(
                 f"compact opcode {byte:02X} escaped its execution license"
             )
@@ -801,9 +761,6 @@ def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
             for expert in experts),
     )
     return experts
-
-
-INTERRUPT_CYCLES = 7
 
 
 def build_interrupt_experts(pg) -> list[dict]:
@@ -829,14 +786,12 @@ def build_interrupt_experts(pg) -> list[dict]:
             predicate=None, fallthrough=0, target=0,
             target_dimension=r.dim_of_name["next_pc__s0"],
         )
-        execution = project_sequence_execution(r, 1, control, None, None)
+        execution = project_sequence_execution(r, 1, control)
         model, _tokens, _tok_to_idx, info = schedule_and_build(execution)
         experts.append({
             "kind": "exec_int", "name": name, "nmi": name == "int_nmi",
-            "n_steps": 1, "cycles": INTERRUPT_CYCLES,
-            "cycles_prefix": 0, "model": model,
+            "n_steps": 1, "model": model,
             "step_spec": sequence_step_spec(execution, info),
-            "recurrence": execution.recurrence,
             "union_lookup_of": r.union_lookup_of,
             "layers": info.n_layers, "_d": info.d_model,
         })
@@ -863,9 +818,6 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     n_steps = len(pin_list)
     base_ops = decode_ops(code)
     ops = base_ops * repeat
-    base_offsets = [0]
-    for op in base_ops[:-1]:
-        base_offsets.append(base_offsets[-1] + op.length)
     folder = GraphFolder(pg, root_names=SEQUENCE_ROOT_DIMS,
                          structural_reads=True)
 
@@ -895,27 +847,14 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
                 "(next_pc != the next step's pc)"
             )
 
-    def execution_control(candidate):
-        control = pinned_sequence_control(candidate, pin_list, ops)
-        self_target = (
-            len(base_ops) == 1
-            and base_ops[0].operation == "jmp"
-            and base_ops[0].mode == "abs"
-            and control.target == head
-        )
-        recurrence = semantic_recurrence(
-            base_ops, base_offsets, self_target=self_target,
-        )
-        if recurrence is not None and recurrence.kind != "identity" and (
-            control.predicate is None or control.target != head
-        ):
-            recurrence = None
-        return control, recurrence
-
-    control, recurrence = execution_control(r)
-    execution = project_sequence_execution(
-        r, n_steps, control, recurrence,
+    control = pinned_sequence_control(r, pin_list, ops)
+    spin = (
+        len(base_ops) == 1
+        and base_ops[0].operation == "jmp"
+        and base_ops[0].mode == "abs"
+        and control.target == head
     )
+    execution = project_sequence_execution(r, n_steps, control)
     materialized = schedule_and_build(execution)
     inlined_r = fold_candidate(True)
     if inlined_r.insert_side_hazards:
@@ -923,9 +862,8 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
             f"{label}: pins reach insert-side expressions "
             f"of {inlined_r.insert_side_hazards}"
         )
-    inlined_control, inlined_recurrence = execution_control(inlined_r)
     inlined_execution = project_sequence_execution(
-        inlined_r, n_steps, inlined_control, inlined_recurrence,
+        inlined_r, n_steps, pinned_sequence_control(inlined_r, pin_list, ops),
     )
     inlined = schedule_and_build(inlined_execution)
     if prefer_inlined(
@@ -934,18 +872,15 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     ):
         r, execution, materialized = inlined_r, inlined_execution, inlined
     model, _tokens, _tok_to_idx, info = materialized
-    cycles = sum(op.cycles for op in ops)
     # Window bytes join the name: different banks may carry different
     # windows at one head, and each needs its own step_core symbol.
     return {
         "kind": "seq", "name": f"seq_{head:04X}_{bytes(code).hex()}",
         "head": head, "has_stores": has_stores,
-        "cycle_safe": cycle_safe_window(ops),
-        "window": bytes(code), "n_steps": n_steps, "cycles": cycles,
-        "cycles_prefix": cycles - ops[-1].cycles, "model": model,
+        "window": bytes(code), "n_steps": n_steps, "model": model,
         "step_spec": sequence_step_spec(execution, info),
         "union_lookup_of": r.union_lookup_of,
-        "recurrence": execution.recurrence,
+        **window_timing(execution, spin),
         "layers": info.n_layers, "_d": info.d_model,
     }
 
@@ -1037,10 +972,8 @@ def _build_symbolic_execution_experts(
                         "head + offset for every head"
                     )
 
-        recurrence = semantic_recurrence(ops, offs, self_target=self_target)
-
         def execution_of(
-            candidate, ops, offs, template, n_steps, self_target, recurrence,
+            candidate, ops, offs, template, n_steps, self_target,
         ):
             control = (
                 opcode_execution_control(candidate, ops[0])
@@ -1055,11 +988,11 @@ def _build_symbolic_execution_experts(
                 else None
             )
             return project_sequence_execution(
-                candidate, n_steps, control, recurrence, halt,
+                candidate, n_steps, control, halt,
             )
 
         execution = execution_of(
-            r, ops, offs, template, n_steps, self_target, recurrence,
+            r, ops, offs, template, n_steps, self_target,
         )
         materialized = schedule_and_build(execution)
         inlined_r = fold_candidate(True)
@@ -1069,7 +1002,7 @@ def _build_symbolic_execution_experts(
                 f"of {inlined_r.insert_side_hazards}"
             )
         inlined_execution = execution_of(
-            inlined_r, ops, offs, template, n_steps, self_target, recurrence,
+            inlined_r, ops, offs, template, n_steps, self_target,
         )
         inlined = schedule_and_build(inlined_execution)
         if prefer_inlined(
@@ -1078,17 +1011,12 @@ def _build_symbolic_execution_experts(
         ):
             r, execution, materialized = inlined_r, inlined_execution, inlined
         model, _tokens, _tok_to_idx, info = materialized
-        ops_full = ops * repeat
-        cycles = sum(op.cycles for op in ops_full)
         experts.append({
             "kind": expert_kind, "name": f"shape_{name}", "shape_id": sid,
             "opcode_checks": checks, "length": len(template),
-            "self_target": self_target, "n_steps": n_steps,
-            "cycle_safe": cycle_safe_window(ops_full),
-            "cycles": cycles,
-            "cycles_prefix": cycles - ops_full[-1].cycles, "model": model,
+            "n_steps": n_steps, "model": model,
             "step_spec": sequence_step_spec(execution, info),
-            "recurrence": execution.recurrence,
+            **window_timing(execution, self_target),
             "union_lookup_of": r.union_lookup_of,
             "layers": info.n_layers, "_d": info.d_model,
         })

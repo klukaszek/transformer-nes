@@ -40,6 +40,7 @@ from transformer_nes.cpu6502.spec import (
     MODE_ZERO_PAGE_X,
     MODE_ZERO_PAGE_Y,
     OPCODES,
+    PAGE_CROSS_READ_OPERATIONS,
 )
 from transformer_nes.graph import core as graph
 from transformer_nes.graph.core import (
@@ -48,11 +49,23 @@ from transformer_nes.graph.core import (
     InputDimension,
     auto_name,
     fetch,
-    make_multiply,
     persist,
-    reglu,
     stepglu,
     to_expr,
+)
+from transformer_nes.graph.ops import (
+    extract_bits,
+    extract_bits_wide,
+    grouped_read,
+    match_byte,
+    memory_site,
+    multiply,
+    mux,
+    read_bits,
+    select,
+    signed_byte,
+    wrap8,
+    wrap16,
 )
 
 # WRITE/start/state token input dims: module globals rebound by build()
@@ -68,103 +81,15 @@ is_state = cast("InputDimension", None)
 write_bits = cast("tuple", ())
 
 
-# ── Low-level gating helpers ───────────────────────────────────────
-
-
-def match_byte(value: ExprLike, byte: int) -> Expression:
-    """Return a 0/1 gate: 1 iff value == byte."""
-    return match_zero(value - byte)
-
-
-def match_zero(value: ExprLike) -> Expression:
-    """Return a 0/1 gate: 1 iff an integer expression is exactly zero."""
-    one = graph.one
-    abs_diff = persist(reglu(value, value) + reglu(-value, -value))
-    return stepglu(one, -abs_diff)
-
-
-def multiply(a, b) -> Expression:
-    """Multiply two scalar expressions using the graph DSL's internal helper."""
-    return make_multiply(to_expr(a), to_expr(b))
-
-
-def mux(gate: ExprLike, if_one: ExprLike, if_zero: ExprLike) -> Expression:
-    """Select between two linear expressions using a 0/1 gate."""
-    return if_zero + multiply(if_one - if_zero, gate)
-
-
-def wrap8(value: ExprLike) -> Expression:
-    """Reduce an integer expression to an unsigned 8-bit value."""
-    one = graph.one
-    return value - 256 * stepglu(one, value - 256) + 256 * stepglu(one, -value - 1)
-
-
-def wrap16(value: ExprLike) -> Expression:
-    """Reduce an integer expression to an unsigned 16-bit value."""
-    one = graph.one
-    return value - 65536 * stepglu(one, value - 65536) + 65536 * stepglu(one, -value - 1)
-
-
-def signed_byte(value: ExprLike) -> Expression:
-    """Interpret an unsigned byte as a signed 8-bit value."""
-    one = graph.one
-    return value - 256 * stepglu(one, value - 128)
-
-
 def memory_at(address: ExprLike, name: str) -> Expression:
     """Read the latest WRITE token at the given 16-bit address."""
-    one = graph.one
     write_addr_expr = addr_lo + 256 * addr_hi
-    # Split 64 KiB memory into 4 KiB lookup groups.  Each group uses a
-    # 12-bit local-address parabola, keeping K-side scores below 2^24 so
-    # adjacent addresses remain distinguishable after float32 Q/K rounding.
-    group_size = 4096
-    group_count = 16
-
-    value = 0
-    for group in range(group_count):
-        lo = group * group_size
-        hi = lo + group_size - 1
-
-        if group == 0:
-            query_in_group = stepglu(one, hi - address)
-            write_in_group = stepglu(one, hi - write_addr_expr)
-        elif group == group_count - 1:
-            query_in_group = stepglu(one, address - lo)
-            write_in_group = stepglu(one, write_addr_expr - lo)
-        else:
-            query_ge_lo = stepglu(one, address - lo)
-            query_le_hi = stepglu(one, hi - address)
-            query_in_group = multiply(query_ge_lo, query_le_hi)
-            write_ge_lo = stepglu(one, write_addr_expr - lo)
-            write_le_hi = stepglu(one, hi - write_addr_expr)
-            write_in_group = multiply(write_ge_lo, write_le_hi)
-
-        group_write = multiply(is_memory_write, write_in_group)
-        group_value, found_addr = fetch(
-            [byte_value, write_addr_expr],
-            query=address - lo,
-            key=write_addr_expr - lo,
-            clear_key=1 - group_write,
-            tie_break="latest",
-        )
-        group_value.lookup.memory_group = group
-        exact = match_zero(address - found_addr)
-        value = value + multiply(query_in_group, multiply(group_value, exact))
-    result = persist(value, name=name)
-    # The site's raw ingredients, for the expert folds: they rebuild the
-    # read as ONE 64K-span lookup + exact mask (graph/fold.py).  The
-    # 16-group form above exists for the union's f32 attention-score
-    # range; expert engines serve reads exactly and never compute it.
-    site = next(iter(result.terms))
-    site.memory_read = {
-        "address": to_expr(address),
-        "byte_value": to_expr(byte_value),
-        "write_addr": write_addr_expr,
-        "is_write": to_expr(is_memory_write),
-        "bit_values": write_bits,
-    }
-    return result
+    value = grouped_read(address, byte_value, write_addr_expr, is_memory_write, group_count=16)
+    # The 16-group form exists for the union's f32 attention-score range;
+    # expert engines serve reads exactly and never compute it.
+    return memory_site(
+        persist(value, name=name), address, byte_value, write_addr_expr, is_memory_write
+    )
 
 
 # ── Graph helper implementations ───────────────────────────────────
@@ -207,82 +132,6 @@ def bitwise_nz(bits_msb_first) -> tuple[ExprLike, ExprLike]:
     not the reassembled byte's flag chain."""
     one = graph.one
     return bits_msb_first[0], 1 - stepglu(one, sum(bits_msb_first) - 1)
-
-
-def extract_bits(value: ExprLike, name: str) -> list[Expression]:
-    """Extract bits 7..0 of an 8-bit value expression using binary thresholds.
-
-    Returns a list where bits[0] is bit 7 (MSB) and bits[7] is bit 0 (LSB).
-    """
-    one = graph.one
-    bits = []
-    remaining = value
-    for i, place in enumerate((128, 64, 32, 16, 8, 4, 2, 1)):
-        bit = stepglu(one, remaining - place)
-        bit = persist(bit, name=f"{name}bit{7 - i}")
-        bits.append(bit)
-        remaining = remaining - place * bit
-    return bits
-
-
-def extract_bits_wide(value: ExprLike, name: str) -> list[Expression]:
-    """extract_bits, depth-lean: split on the high nibble, then two
-    persist-free 15-step ladders ([v >= k] = relu(v-k+1) - relu(v-k),
-    exact for integer bytes).  Bits land ~4 layers after the value
-    instead of 8, at ~60 ReGLUs of width -- the trade the GPU mapping
-    wants (depth is what a single-threadgroup forward pays for) and the
-    emitted C++ engine does not (its cost is unit count).  The nibble
-    values are wrapped in unit-gated ReGLUs so linear inlining cannot
-    smear their ladder sums into every consumer row."""
-    v = to_expr(value)
-    hi_sum = Expression()
-    for k in range(1, 16):
-        hi_sum = hi_sum + reglu(1, v - (16 * k - 1)) - reglu(1, v - 16 * k)
-    hi = reglu(hi_sum, 1)
-    lo = reglu(v - 16 * hi_sum, 1)
-
-    def nibble_bits(nv):
-        ge = {
-            k: reglu(1, nv - (k - 1)) - reglu(1, nv - k)
-            for k in range(1, 16)
-        }
-        out = []
-        for b in range(4):
-            r = Expression()
-            for start in range(1 << b, 16, 1 << (b + 1)):
-                r = r + ge[start]
-                if start + (1 << b) < 16:
-                    r = r - ge[start + (1 << b)]
-            out.append(r)
-        return out  # bit 0..3 expressions
-
-    lo_bits = nibble_bits(lo)
-    hi_bits = nibble_bits(hi)
-    bits = []
-    for b in range(7, -1, -1):
-        src = hi_bits[b - 4] if b >= 4 else lo_bits[b]
-        bits.append(persist(src, name=f"{name}bit{b}"))
-    return bits
-
-
-def read_bits(value: Expression, name: str,
-              site_of: Expression | None = None) -> list[Expression]:
-    """Bits of a memory-read value (MSB first), annotated with the read
-    site so structural folds serve them from the fused read itself (the
-    kernel computes bits at read time, zero extra depth).  Non-structural
-    folds and the union keep the ladder circuit built here.  ``site_of``
-    names the raw read when the ladder runs on a later persist of it
-    (a pinned persist then const-folds the bits without keeping the raw
-    read alive)."""
-    site = next(iter((site_of if site_of is not None else value).terms))
-    bits = extract_bits_wide(value, name)
-    dims = []
-    for j, b in enumerate(bits):
-        d = next(iter(b.terms))
-        d.read_bit = (site, j)
-        dims.append(d)
-    site.read_bit_dims = tuple(dims)
-    return bits
 
 
 def pulled_flag_bits(value: ExprLike, name: str) -> dict[int, Expression]:
@@ -526,70 +375,8 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     is_imp = persist(mode_gates[MODE_IMPLIED], name="is_imp")
     is_acc = persist(mode_gates[MODE_ACCUMULATOR], name="is_acc")
 
-    # Operation-family gates
-    op_load_a = op_family_gates["load_a"]
-    op_load_x = op_family_gates["load_x"]
-    op_load_y = op_family_gates["load_y"]
-    op_store_a = op_family_gates["store_a"]
-    op_store_x = op_family_gates["store_x"]
-    op_store_y = op_family_gates["store_y"]
-    op_adc = op_family_gates["adc"]
-    op_sbc = op_family_gates["sbc"]
-    op_cmp = op_family_gates["cmp"]
-    op_cpx = op_family_gates["cpx"]
-    op_cpy = op_family_gates["cpy"]
-    op_and = op_family_gates["and"]
-    op_ora = op_family_gates["ora"]
-    op_eor = op_family_gates["eor"]
-    op_bit = op_family_gates["bit"]
-    op_asl = op_family_gates["asl"]
-    op_lsr = op_family_gates["lsr"]
-    op_rol = op_family_gates["rol"]
-    op_ror = op_family_gates["ror"]
-    op_inc = op_family_gates["inc"]
-    op_dec = op_family_gates["dec"]
-    op_inx = op_family_gates["inx"]
-    op_iny = op_family_gates["iny"]
-    op_dex = op_family_gates["dex"]
-    op_dey = op_family_gates["dey"]
-    op_tax = op_family_gates["tax"]
-    op_tay = op_family_gates["tay"]
-    op_txa = op_family_gates["txa"]
-    op_tya = op_family_gates["tya"]
-    op_tsx = op_family_gates["tsx"]
-    op_txs = op_family_gates["txs"]
-    op_pha = op_family_gates["pha"]
-    op_php = op_family_gates["php"]
-    op_pla = op_family_gates["pla"]
-    op_plp = op_family_gates["plp"]
-    op_jmp = op_family_gates["jmp"]
-    op_jsr = op_family_gates["jsr"]
-    op_rts = op_family_gates["rts"]
-    op_rti = op_family_gates["rti"]
-    op_brk = op_family_gates["brk"]
-    op_bpl = op_family_gates["bpl"]
-    op_bmi = op_family_gates["bmi"]
-    op_bvc = op_family_gates["bvc"]
-    op_bvs = op_family_gates["bvs"]
-    op_bcc = op_family_gates["bcc"]
-    op_bcs = op_family_gates["bcs"]
-    op_bne = op_family_gates["bne"]
-    op_beq = op_family_gates["beq"]
-    op_clc = op_family_gates["clc"]
-    op_sec = op_family_gates["sec"]
-    op_cli = op_family_gates["cli"]
-    op_sei = op_family_gates["sei"]
-    op_clv = op_family_gates["clv"]
-    op_cld = op_family_gates["cld"]
-    op_sed = op_family_gates["sed"]
-    op_lax = op_family_gates["lax"]
-    op_sax = op_family_gates["sax"]
-    op_dcp = op_family_gates["dcp"]
-    op_isb = op_family_gates["isb"]
-    op_slo = op_family_gates["slo"]
-    op_rla = op_family_gates["rla"]
-    op_sre = op_family_gates["sre"]
-    op_rra = op_family_gates["rra"]
+    # Operation-family gates, by spec operation name (family["adc"], ...).
+    family = op_family_gates
 
     # ── Addressing / EA / length ────────────────────────────────────
     abs_addr = fetched_operand_lo + 256 * fetched_operand_hi
@@ -665,9 +452,9 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         is_pointer_read,
         pointer_base,
         mux(
-            op_pla + op_plp + op_rts + op_rti,
+            family["pla"] + family["plp"] + family["rts"] + family["rti"],
             stack_pull_addr,
-            mux(op_brk, 0xFFFE, 0),
+            mux(family["brk"], 0xFFFE, 0),
         ),
     )
     # Second pointer byte: zero-page wrap for (zp,X)/(zp),Y; NMOS page-wrap
@@ -681,12 +468,12 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         is_pointer_read,
         pointer_next,
         mux(
-            op_pla + op_plp + op_rts + op_rti,
+            family["pla"] + family["plp"] + family["rts"] + family["rti"],
             stack_pull_addr2,
-            mux(op_brk, 0xFFFF, 0),
+            mux(family["brk"], 0xFFFF, 0),
         ),
     )
-    addrC = mux(op_pla + op_plp + op_rts + op_rti, stack_pull_addr3, 0)
+    addrC = mux(family["pla"] + family["plp"] + family["rts"] + family["rti"], stack_pull_addr3, 0)
     # An interrupt step reads its vector through the same two slots BRK uses
     # for $FFFE/$FFFF; everything else the interrupted instruction would have
     # read is left in place and discarded by the is_int muxes below.
@@ -983,31 +770,31 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     # The A-writing families are a mutually exclusive one-hot, so new_a is a
     # *parallel* gated sum (depth 2) rather than a sixteen-deep mux chain.
     # Shifts write A only in accumulator mode; memory-mode RMW leaves it be.
-    arith_a = (op_adc + op_sbc + op_tya + op_slo + op_rla + op_sre
-               + op_rra + op_isb)
-    writes_a = (op_load_a + op_lax + op_and + op_ora + op_eor + op_pla
-                + op_txa + is_acc + arith_a)
+    arith_a = (family["adc"] + family["sbc"] + family["tya"] + family["slo"] + family["rla"] + family["sre"]
+               + family["rra"] + family["isb"])
+    writes_a = (family["load_a"] + family["lax"] + family["and"] + family["ora"] + family["eor"] + family["pla"]
+                + family["txa"] + is_acc + arith_a)
     shift_acc_result = (
-        multiply(op_asl, asl_result)
-        + multiply(op_lsr, lsr_result)
-        + multiply(op_rol, rol_result)
-        + multiply(op_ror, ror_result)
+        multiply(family["asl"], asl_result)
+        + multiply(family["lsr"], lsr_result)
+        + multiply(family["rol"], rol_result)
+        + multiply(family["ror"], ror_result)
     )
     new_a = (
-        multiply(op_load_a + op_lax, operand)
-        + multiply(op_and, and_result)
-        + multiply(op_ora, ora_result)
-        + multiply(op_eor, eor_result)
-        + multiply(op_adc, decimal_adc)
-        + multiply(op_sbc, decimal_sbc)
-        + multiply(op_pla, stack_pull_byte)
-        + multiply(op_txa, current_x)
-        + multiply(op_tya, current_y)
-        + multiply(op_slo, slo_result)
-        + multiply(op_rla, rla_result)
-        + multiply(op_sre, sre_result)
-        + multiply(op_rra, rra_result)
-        + multiply(op_isb, isb_result)
+        multiply(family["load_a"] + family["lax"], operand)
+        + multiply(family["and"], and_result)
+        + multiply(family["ora"], ora_result)
+        + multiply(family["eor"], eor_result)
+        + multiply(family["adc"], decimal_adc)
+        + multiply(family["sbc"], decimal_sbc)
+        + multiply(family["pla"], stack_pull_byte)
+        + multiply(family["txa"], current_x)
+        + multiply(family["tya"], current_y)
+        + multiply(family["slo"], slo_result)
+        + multiply(family["rla"], rla_result)
+        + multiply(family["sre"], sre_result)
+        + multiply(family["rra"], rra_result)
+        + multiply(family["isb"], isb_result)
         + multiply(is_acc, shift_acc_result)
         + multiply(1 - writes_a, current_a)
     )
@@ -1023,19 +810,19 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         ror_bit_list = [carry_in] + operand_bits[:-1]
         for j in range(8):
             shift_sel = (
-                multiply(op_rol, rla_bits[j]) + multiply(op_ror, ror_bit_list[j])
+                multiply(family["rol"], rla_bits[j]) + multiply(family["ror"], ror_bit_list[j])
             )
             if asl_bits[j] is not None:
-                shift_sel = shift_sel + multiply(op_asl, asl_bits[j])
+                shift_sel = shift_sel + multiply(family["asl"], asl_bits[j])
             if lsr_bits[j] is not None:
-                shift_sel = shift_sel + multiply(op_lsr, lsr_bits[j])
+                shift_sel = shift_sel + multiply(family["lsr"], lsr_bits[j])
             expr = (
-                multiply(op_load_a + op_lax, operand_bits[j])
-                + multiply(op_and, and_bit_list[j])
-                + multiply(op_ora, or_bit_list[j])
-                + multiply(op_eor, xor_bit_list[j])
-                + multiply(op_pla, pull_srv_bits[j])
-                + multiply(op_txa, x_bits[j])
+                multiply(family["load_a"] + family["lax"], operand_bits[j])
+                + multiply(family["and"], and_bit_list[j])
+                + multiply(family["ora"], or_bit_list[j])
+                + multiply(family["eor"], xor_bit_list[j])
+                + multiply(family["pla"], pull_srv_bits[j])
+                + multiply(family["txa"], x_bits[j])
                 + multiply(is_acc, shift_sel)
                 + multiply(arith_a, arith_a_bits[j])
                 + multiply(1 - writes_a, a_bits[j])
@@ -1044,39 +831,39 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
 
     # X, Y and S select the same way: disjoint family gates around an
     # unchanged-register default, so each is one parallel stage.
-    writes_x = op_load_x + op_lax + op_inx + op_dex + op_tax + op_tsx
+    writes_x = family["load_x"] + family["lax"] + family["inx"] + family["dex"] + family["tax"] + family["tsx"]
     new_x = (
-        multiply(op_load_x + op_lax, operand)
-        + multiply(op_inx, inx_result)
-        + multiply(op_dex, dex_result)
-        + multiply(op_tax, current_a)
-        + multiply(op_tsx, current_s)
+        multiply(family["load_x"] + family["lax"], operand)
+        + multiply(family["inx"], inx_result)
+        + multiply(family["dex"], dex_result)
+        + multiply(family["tax"], current_a)
+        + multiply(family["tsx"], current_s)
         + multiply(1 - writes_x, current_x)
     )
     new_x = mux(is_int, current_x, new_x)
     new_x = persist(new_x, name="new_x")
 
-    writes_y = op_load_y + op_iny + op_dey + op_tay
+    writes_y = family["load_y"] + family["iny"] + family["dey"] + family["tay"]
     new_y = (
-        multiply(op_load_y, operand)
-        + multiply(op_iny, iny_result)
-        + multiply(op_dey, dey_result)
-        + multiply(op_tay, current_a)
+        multiply(family["load_y"], operand)
+        + multiply(family["iny"], iny_result)
+        + multiply(family["dey"], dey_result)
+        + multiply(family["tay"], current_a)
         + multiply(1 - writes_y, current_y)
     )
     new_y = mux(is_int, current_y, new_y)
     new_y = persist(new_y, name="new_y")
 
-    writes_s = (op_pha + op_php + op_jsr + op_brk + op_pla + op_plp
-                + op_rts + op_rti + op_txs)
+    writes_s = (family["pha"] + family["php"] + family["jsr"] + family["brk"] + family["pla"] + family["plp"]
+                + family["rts"] + family["rti"] + family["txs"])
     new_s = (
-        multiply(op_pha + op_php, wrap8(current_s - 1))
-        + multiply(op_jsr, wrap8(current_s - 2))
-        + multiply(op_brk, wrap8(current_s - 3))
-        + multiply(op_pla + op_plp, wrap8(current_s + 1))
-        + multiply(op_rts, wrap8(current_s + 2))
-        + multiply(op_rti, wrap8(current_s + 3))
-        + multiply(op_txs, current_x)
+        multiply(family["pha"] + family["php"], wrap8(current_s - 1))
+        + multiply(family["jsr"], wrap8(current_s - 2))
+        + multiply(family["brk"], wrap8(current_s - 3))
+        + multiply(family["pla"] + family["plp"], wrap8(current_s + 1))
+        + multiply(family["rts"], wrap8(current_s + 2))
+        + multiply(family["rti"], wrap8(current_s + 3))
+        + multiply(family["txs"], current_x)
         + multiply(1 - writes_s, current_s)
     )
     # NMI pushes three bytes, exactly like BRK.
@@ -1090,12 +877,12 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     # parallel gated sum rather than a nested select.
     nz_alu = (
         multiply(
-            op_load_a + op_adc + op_sbc + op_pla + op_txa + op_tya
-            + op_lax + op_slo + op_rla + op_sre + op_rra + op_isb,
+            family["load_a"] + family["adc"] + family["sbc"] + family["pla"] + family["txa"] + family["tya"]
+            + family["lax"] + family["slo"] + family["rla"] + family["sre"] + family["rra"] + family["isb"],
             new_a,
         )
-        + multiply(op_load_x + op_inx + op_dex + op_tax + op_tsx, new_x)
-        + multiply(op_load_y + op_iny + op_dey + op_tay, new_y)
+        + multiply(family["load_x"] + family["inx"] + family["dex"] + family["tax"] + family["tsx"], new_x)
+        + multiply(family["load_y"] + family["iny"] + family["dey"] + family["tay"], new_y)
     )
     nz_alu = persist(nz_alu, name="nz_alu")
     n_alu = stepglu(one, nz_alu - 128)
@@ -1103,25 +890,25 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
 
     # For memory-modifying operations (inc/dec/shifts), NZ comes from the result
     nz_mem = mux(
-        op_inc, inc_result,
-        mux(op_dec, dec_result,
-            mux(op_asl, asl_result,
-                mux(op_lsr, lsr_result,
-                    mux(op_rol, rol_result,
-                        mux(op_ror, ror_result, 0))))))
+        family["inc"], inc_result,
+        mux(family["dec"], dec_result,
+            mux(family["asl"], asl_result,
+                mux(family["lsr"], lsr_result,
+                    mux(family["rol"], rol_result,
+                        mux(family["ror"], ror_result, 0))))))
     nz_mem = persist(nz_mem, name="nz_mem")
     n_mem = stepglu(one, nz_mem - 128)
     z_mem = 1 - stepglu(one, nz_mem - 1)
 
     # Branch/flag ops
-    bpl_taken = multiply(1 - current_p_n, op_bpl)
-    bmi_taken = multiply(current_p_n, op_bmi)
-    bvc_taken = multiply(1 - current_p_v, op_bvc)
-    bvs_taken = multiply(current_p_v, op_bvs)
-    bcc_taken = multiply(1 - current_p_c, op_bcc)
-    bcs_taken = multiply(current_p_c, op_bcs)
-    bne_taken = multiply(1 - current_p_z, op_bne)
-    beq_taken = multiply(current_p_z, op_beq)
+    bpl_taken = multiply(1 - current_p_n, family["bpl"])
+    bmi_taken = multiply(current_p_n, family["bmi"])
+    bvc_taken = multiply(1 - current_p_v, family["bvc"])
+    bvs_taken = multiply(current_p_v, family["bvs"])
+    bcc_taken = multiply(1 - current_p_c, family["bcc"])
+    bcs_taken = multiply(current_p_c, family["bcs"])
+    bne_taken = multiply(1 - current_p_z, family["bne"])
+    beq_taken = multiply(current_p_z, family["beq"])
     branch_taken = (
         bpl_taken + bmi_taken + bvc_taken + bvs_taken
         + bcc_taken + bcs_taken + bne_taken + beq_taken
@@ -1130,56 +917,56 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
 
     # Carry flag updates
     carry_op = (
-        op_adc + op_sbc + op_cmp + op_cpx + op_cpy + op_asl + op_lsr + op_rol + op_ror
-        + op_clc + op_sec + op_dcp + op_slo + op_rla + op_sre + op_rra + op_isb
+        family["adc"] + family["sbc"] + family["cmp"] + family["cpx"] + family["cpy"] + family["asl"] + family["lsr"] + family["rol"] + family["ror"]
+        + family["clc"] + family["sec"] + family["dcp"] + family["slo"] + family["rla"] + family["sre"] + family["rra"] + family["isb"]
     )
     new_p_c = (
         multiply(current_p_c, 1 - carry_op)
-        + multiply(op_adc, decimal_adc_carry)
-        + multiply(op_sbc, decimal_sbc_carry)
-        + multiply(op_cmp, cmp_carry)
-        + multiply(op_cpx, cpx_carry)
-        + multiply(op_cpy, cpy_carry)
-        + multiply(op_asl, asl_carry)
-        + multiply(op_lsr, lsr_carry)
-        + multiply(op_rol, rol_carry)
-        + multiply(op_ror, ror_carry)
-        + multiply(op_clc, 0)
-        + multiply(op_sec, 1)
-        + multiply(op_dcp, dcp_carry)
-        + multiply(op_slo, asl_carry)
-        + multiply(op_rla, rol_carry)
-        + multiply(op_sre, lsr_carry)
-        + multiply(op_rra, rra_carry)
-        + multiply(op_isb, isb_carry)
+        + multiply(family["adc"], decimal_adc_carry)
+        + multiply(family["sbc"], decimal_sbc_carry)
+        + multiply(family["cmp"], cmp_carry)
+        + multiply(family["cpx"], cpx_carry)
+        + multiply(family["cpy"], cpy_carry)
+        + multiply(family["asl"], asl_carry)
+        + multiply(family["lsr"], lsr_carry)
+        + multiply(family["rol"], rol_carry)
+        + multiply(family["ror"], ror_carry)
+        + multiply(family["clc"], 0)
+        + multiply(family["sec"], 1)
+        + multiply(family["dcp"], dcp_carry)
+        + multiply(family["slo"], asl_carry)
+        + multiply(family["rla"], rol_carry)
+        + multiply(family["sre"], lsr_carry)
+        + multiply(family["rra"], rra_carry)
+        + multiply(family["isb"], isb_carry)
     )
     new_p_c = persist(new_p_c, name="new_p_c")
 
     # Zero flag updates
     writes_z = (
-        op_load_a + op_load_x + op_load_y + op_adc + op_sbc
-        + op_pla + op_inx + op_iny + op_dex + op_dey + op_tax + op_tay + op_txa + op_tya + op_tsx
-        + op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror
-        + op_lax + op_slo + op_rla + op_sre + op_rra + op_isb
+        family["load_a"] + family["load_x"] + family["load_y"] + family["adc"] + family["sbc"]
+        + family["pla"] + family["inx"] + family["iny"] + family["dex"] + family["dey"] + family["tax"] + family["tay"] + family["txa"] + family["tya"] + family["tsx"]
+        + family["inc"] + family["dec"] + family["asl"] + family["lsr"] + family["rol"] + family["ror"]
+        + family["lax"] + family["slo"] + family["rla"] + family["sre"] + family["rra"] + family["isb"]
     )
     # N and Z share one gate partition: the memory-result families (RMW and
     # both shift modes) report the memory result, the rest of writes_z reports
     # the ALU result, and compares/logic are disjoint from both -- so each flag
-    # is one parallel gated sum instead of a nine-deep select.  op_bit
+    # is one parallel gated sum instead of a nine-deep select.  family["bit"]
     # overrides further down, once bit_z/bit_n exist.
-    nz_from_mem = op_inc + op_dec + op_asl + op_lsr + op_rol + op_ror
-    nz_writers = (writes_z + op_cmp + op_cpx + op_cpy + op_dcp
-                  + op_and + op_ora + op_eor)
+    nz_from_mem = family["inc"] + family["dec"] + family["asl"] + family["lsr"] + family["rol"] + family["ror"]
+    nz_writers = (writes_z + family["cmp"] + family["cpx"] + family["cpy"] + family["dcp"]
+                  + family["and"] + family["ora"] + family["eor"])
     new_p_z = (
         multiply(nz_from_mem, z_mem)
         + multiply(writes_z - nz_from_mem, z_alu)
-        + multiply(op_cmp, cmp_z)
-        + multiply(op_cpx, cpx_z)
-        + multiply(op_cpy, cpy_z)
-        + multiply(op_dcp, dcp_z)
-        + multiply(op_and, and_z)
-        + multiply(op_ora, ora_z)
-        + multiply(op_eor, eor_z)
+        + multiply(family["cmp"], cmp_z)
+        + multiply(family["cpx"], cpx_z)
+        + multiply(family["cpy"], cpy_z)
+        + multiply(family["dcp"], dcp_z)
+        + multiply(family["and"], and_z)
+        + multiply(family["ora"], ora_z)
+        + multiply(family["eor"], eor_z)
         + multiply(1 - nz_writers, current_p_z)
     )
     new_p_z = persist(new_p_z, name="new_p_z")
@@ -1188,56 +975,56 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     new_p_n = (
         multiply(nz_from_mem, n_mem)
         + multiply(writes_z - nz_from_mem, n_alu)
-        + multiply(op_cmp, cmp_n)
-        + multiply(op_cpx, cpx_n)
-        + multiply(op_cpy, cpy_n)
-        + multiply(op_dcp, dcp_n)
-        + multiply(op_and, and_n)
-        + multiply(op_ora, ora_n)
-        + multiply(op_eor, eor_n)
+        + multiply(family["cmp"], cmp_n)
+        + multiply(family["cpx"], cpx_n)
+        + multiply(family["cpy"], cpy_n)
+        + multiply(family["dcp"], dcp_n)
+        + multiply(family["and"], and_n)
+        + multiply(family["ora"], ora_n)
+        + multiply(family["eor"], eor_n)
         + multiply(1 - nz_writers, current_p_n)
     )
     new_p_n = persist(new_p_n, name="new_p_n")
 
     # Overflow flag updates
-    writes_v = op_adc + op_sbc + op_bit + op_clv + op_rra + op_isb
+    writes_v = family["adc"] + family["sbc"] + family["bit"] + family["clv"] + family["rra"] + family["isb"]
     new_p_v = mux(
         writes_v,
-        mux(op_adc, adc_overflow,
-            mux(op_sbc, sbc_overflow,
-                mux(op_bit, bit_v,
-                    mux(op_rra, rra_overflow,
-                        mux(op_isb, isb_overflow,
-                            mux(op_clv, 0, current_p_v)))))),
+        mux(family["adc"], adc_overflow,
+            mux(family["sbc"], sbc_overflow,
+                mux(family["bit"], bit_v,
+                    mux(family["rra"], rra_overflow,
+                        mux(family["isb"], isb_overflow,
+                            mux(family["clv"], 0, current_p_v)))))),
         current_p_v,
     )
     new_p_v = persist(new_p_v, name="new_p_v")
 
     # Decimal flag
-    new_p_d = mux(op_cld, 0, mux(op_sed, 1, current_p_d))
+    new_p_d = mux(family["cld"], 0, mux(family["sed"], 1, current_p_d))
     new_p_d = persist(new_p_d, name="new_p_d")
 
     # Interrupt flag
-    new_p_i = mux(op_cli, 0, mux(op_sei + op_brk, 1, current_p_i))
+    new_p_i = mux(family["cli"], 0, mux(family["sei"] + family["brk"], 1, current_p_i))
     new_p_i = persist(new_p_i, name="new_p_i")
 
     # Break flag (cleared by PLP/RTI; PHP pushes B=1 but does not set live P)
-    new_p_b = mux(op_plp + op_rti, 0, current_p_b)
+    new_p_b = mux(family["plp"] + family["rti"], 0, current_p_b)
     new_p_b = persist(new_p_b, name="new_p_b")
 
     # Unused flag always 1
     new_p_u = one
 
     # BIT special: N and V come from operand, Z from A & operand
-    new_p_n = mux(op_bit, bit_n, new_p_n)
-    new_p_z = mux(op_bit, bit_z, new_p_z)
+    new_p_n = mux(family["bit"], bit_n, new_p_n)
+    new_p_z = mux(family["bit"], bit_z, new_p_z)
     new_p_n = persist(new_p_n, name="new_p_n_bit")
     new_p_z = persist(new_p_z, name="new_p_z_bit")
 
     # PLP/RTI update all flags from the pulled byte (B cleared, U set).
     # wide_bits: the flag bits are the mem_A read's served bits -- the
     # 255-step shared ladder (and its fan-out width) never builds.
-    op_pull_p = op_plp + op_rti
+    op_pull_p = family["plp"] + family["rti"]
     if wide_bits:
         pull_bits = {1 << b: pull_srv_bits[7 - b] for b in range(8)}
     else:
@@ -1280,10 +1067,10 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
 
     # ── PC update ───────────────────────────────────────────────────
     next_pc = pc_after
-    next_pc = mux(op_jmp + op_jsr, ea, next_pc)
-    next_pc = mux(op_rts, wrap16(pulled_word + 1), next_pc)
-    next_pc = mux(op_rti, rti_return, next_pc)
-    next_pc = mux(op_brk, irq_vector, next_pc)
+    next_pc = mux(family["jmp"] + family["jsr"], ea, next_pc)
+    next_pc = mux(family["rts"], wrap16(pulled_word + 1), next_pc)
+    next_pc = mux(family["rti"], rti_return, next_pc)
+    next_pc = mux(family["brk"], irq_vector, next_pc)
     next_pc = mux(branch_taken, branch_target, next_pc)
     # NMI vectors through $FFFA/$FFFB (read into irq_vector above); this mux
     # is last so it overrides whatever the interrupted instruction decoded to.
@@ -1293,20 +1080,20 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     # ── Primary memory write for this instruction ─────────────────────
     # Accumulator mode occurs only on the four shift opcodes, so subtracting
     # is_acc leaves exactly the memory-mode read-modify-write shifts.
-    shifts_mem = op_asl + op_lsr + op_rol + op_ror - is_acc
-    unofficial_store = op_sax + op_dcp + op_isb + op_slo + op_rla + op_sre + op_rra
+    shifts_mem = family["asl"] + family["lsr"] + family["rol"] + family["ror"] - is_acc
+    unofficial_store = family["sax"] + family["dcp"] + family["isb"] + family["slo"] + family["rla"] + family["sre"] + family["rra"]
     is_store = (
-        op_store_a + op_store_x + op_store_y + op_inc + op_dec + shifts_mem
-        + op_pha + op_php + op_jsr + op_brk + unofficial_store
+        family["store_a"] + family["store_x"] + family["store_y"] + family["inc"] + family["dec"] + shifts_mem
+        + family["pha"] + family["php"] + family["jsr"] + family["brk"] + unofficial_store
     )
     is_store = mux(is_int, 1, is_store)
     is_store = persist(is_store, name="is_store")
 
     write_addr = mux(
-        op_store_a + op_store_x + op_store_y + op_inc + op_dec + shifts_mem + unofficial_store,
+        family["store_a"] + family["store_x"] + family["store_y"] + family["inc"] + family["dec"] + shifts_mem + unofficial_store,
         ea,
         mux(
-            op_pha + op_php + op_jsr + op_brk,
+            family["pha"] + family["php"] + family["jsr"] + family["brk"],
             wrap16(0x0100 + current_s),
             0,
         ),
@@ -1323,25 +1110,25 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
 
     php_push_value = current_p + FLAG_B * (1 - current_p_b) + FLAG_U * (1 - current_p_u)
     write_value = mux(
-        op_store_a, current_a,
-        mux(op_store_x, current_x,
-            mux(op_store_y, current_y,
-                mux(op_inc, inc_result,
-                    mux(op_dec, dec_result,
-                        mux(op_asl, asl_result,
-                            mux(op_lsr, lsr_result,
-                                mux(op_rol, rol_result,
-                                    mux(op_ror, ror_result,
-                                        mux(op_pha, current_a,
-                                            mux(op_php, php_push_value,
-                                                mux(op_jsr + op_brk, push_ret_hi, 0))))))))))))
-    write_value = mux(op_sax, sax_result, write_value)
-    write_value = mux(op_dcp, dec_result, write_value)
-    write_value = mux(op_isb, inc_result, write_value)
-    write_value = mux(op_slo, asl_result, write_value)
-    write_value = mux(op_rla, rol_result, write_value)
-    write_value = mux(op_sre, lsr_result, write_value)
-    write_value = mux(op_rra, ror_result, write_value)
+        family["store_a"], current_a,
+        mux(family["store_x"], current_x,
+            mux(family["store_y"], current_y,
+                mux(family["inc"], inc_result,
+                    mux(family["dec"], dec_result,
+                        mux(family["asl"], asl_result,
+                            mux(family["lsr"], lsr_result,
+                                mux(family["rol"], rol_result,
+                                    mux(family["ror"], ror_result,
+                                        mux(family["pha"], current_a,
+                                            mux(family["php"], php_push_value,
+                                                mux(family["jsr"] + family["brk"], push_ret_hi, 0))))))))))))
+    write_value = mux(family["sax"], sax_result, write_value)
+    write_value = mux(family["dcp"], dec_result, write_value)
+    write_value = mux(family["isb"], inc_result, write_value)
+    write_value = mux(family["slo"], asl_result, write_value)
+    write_value = mux(family["rla"], rol_result, write_value)
+    write_value = mux(family["sre"], lsr_result, write_value)
+    write_value = mux(family["rra"], ror_result, write_value)
     # NMI pushes PCH first (the interrupted PC, not PC+2 as BRK pushes).
     write_value = mux(is_int, current_pc_hi, write_value)
     write_value = persist(write_value, name="write_value_out")
@@ -1349,13 +1136,13 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     # Second and third stack pushes (JSR pushes 2 bytes, BRK and NMI push 3).
     # The push addresses are shared: NMI uses the same S-1/S-2 slots as
     # JSR/BRK, so only the gates and pushed values need is_int muxes.
-    persist(mux(is_int, 1, op_jsr + op_brk), name="is_store2")
+    persist(mux(is_int, 1, family["jsr"] + family["brk"]), name="is_store2")
     persist(0x0100 + wrap8(current_s - 1), name="write_addr2_out")
     persist(mux(is_int, current_pc_lo, push_ret_lo), name="write_value2_out")
 
     # NMI/IRQ push P with B clear and U set (BRK/PHP push with B set).
     int_push_p = current_p - FLAG_B * current_p_b + FLAG_U * (1 - current_p_u)
-    persist(mux(is_int, 1, op_brk), name="is_store3")
+    persist(mux(is_int, 1, family["brk"]), name="is_store3")
     persist(0x0100 + wrap8(current_s - 2), name="write_addr3_out")
     persist(mux(is_int, int_push_p, php_push_value), name="write_value3_out")
 
@@ -1374,38 +1161,64 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     # *parallel* gated sum (depth 2), not a mux chain; families with
     # data == 0 are simply absent.
     data_ref = (
-        multiply(op_store_a + op_pha, current_a)
-        + multiply(op_store_x, current_x)
-        + multiply(op_store_y, current_y)
-        + multiply(op_php, current_p)
-        + multiply(op_inc + op_isb, inc_result)
-        + multiply(op_dec + op_dcp, dec_result)
-        + multiply(op_asl + op_slo, asl_result)
-        + multiply(op_lsr + op_sre, lsr_result)
-        + multiply(op_rol + op_rla, rol_result)
-        + multiply(op_ror + op_rra, ror_result)
-        + multiply(op_sax, sax_result)
+        multiply(family["store_a"] + family["pha"], current_a)
+        + multiply(family["store_x"], current_x)
+        + multiply(family["store_y"], current_y)
+        + multiply(family["php"], current_p)
+        + multiply(family["inc"] + family["isb"], inc_result)
+        + multiply(family["dec"] + family["dcp"], dec_result)
+        + multiply(family["asl"] + family["slo"], asl_result)
+        + multiply(family["lsr"] + family["sre"], lsr_result)
+        + multiply(family["rol"] + family["rla"], rol_result)
+        + multiply(family["ror"] + family["rra"], ror_result)
+        + multiply(family["sax"], sax_result)
         + multiply(
-            op_load_a + op_lax + op_adc + op_sbc + op_and + op_ora + op_eor
-            + op_pla + op_txa + op_tya,
+            family["load_a"] + family["lax"] + family["adc"] + family["sbc"] + family["and"] + family["ora"] + family["eor"]
+            + family["pla"] + family["txa"] + family["tya"],
             new_a,
         )
-        + multiply(op_load_x + op_inx + op_dex + op_tax + op_tsx, new_x)
-        + multiply(op_load_y + op_iny + op_dey + op_tay, new_y)
-        + multiply(op_txs, new_s)
-        + multiply(op_plp, new_p)
-        + multiply(op_cmp, cmp_result)
-        + multiply(op_cpx, cpx_result)
-        + multiply(op_cpy, cpy_result)
-        + multiply(op_bit, operand)
+        + multiply(family["load_x"] + family["inx"] + family["dex"] + family["tax"] + family["tsx"], new_x)
+        + multiply(family["load_y"] + family["iny"] + family["dey"] + family["tay"], new_y)
+        + multiply(family["txs"], new_s)
+        + multiply(family["plp"], new_p)
+        + multiply(family["cmp"], cmp_result)
+        + multiply(family["cpx"], cpx_result)
+        + multiply(family["cpy"], cpy_result)
+        + multiply(family["bit"], operand)
     )
     data_out = mux(is_int, 0, data_ref)
     data_out = persist(data_out, name="data_out")
 
+    # ── Timing ──────────────────────────────────────────────────────
+    # The instruction's NMOS cycle count is an output like any other: the
+    # decoded opcode's cycles (2 for an undefined byte, so garbage still
+    # spends the budget), +1 for a taken branch and +1 more when it lands
+    # on another page, +1 when an indexed read carries into the high
+    # address byte.  An interrupt sequence takes 7.
+    cycles = 2
+    for op in OPCODES.values():
+        cycles = cycles + (op.cycles - 2) * opcode_gates[op.byte]
+    landing = current_pc_lo + 2 - 256 * stepglu(one, current_pc_lo - 254) + rel_offset
+    branch_cross = stepglu(one, landing - 256) + stepglu(one, -landing - 1)
+    cycles = cycles + select(branch_taken, 1 + branch_cross, 0)
+    indexed_reads = {
+        MODE_ABSOLUTE_X: fetched_operand_lo + current_x,
+        MODE_ABSOLUTE_Y: fetched_operand_lo + current_y,
+        MODE_INDIRECT_Y: idy_lo + current_y,
+    }
+    for mode, low_sum in indexed_reads.items():
+        reads = sum(
+            (opcode_gates[op.byte] for op in OPCODES.values()
+             if op.mode == mode and op.operation in PAGE_CROSS_READ_OPERATIONS),
+            Expression(),
+        )
+        cycles = cycles + select(reads, stepglu(one, low_sum - 256), 0)
+    cycles = persist(select(is_int, 7, cycles), name="cycles")
+
     # ── Halt ────────────────────────────────────────────────────────
     # BRK halts only if the IRQ vector is 0 (uninitialized memory).  An
     # interrupt never halts, even if the interrupted byte happens to be $00.
-    halted_now = multiply(op_brk, match_byte(irq_vector, 0))
+    halted_now = multiply(family["brk"], match_byte(irq_vector, 0))
     halted_now = multiply(halted_now, 1 - is_int)
     new_halted = current_halted + halted_now
     new_halted = persist(new_halted, name="new_halted")

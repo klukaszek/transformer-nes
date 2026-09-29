@@ -1,7 +1,25 @@
-"""Computation graph primitives for transformer compilation.
+"""Computation-graph primitives that compile to transformer weights.
 
-Proof graphs use Append-Only Lookup Machine (ALM) primitives.  Licensed
-execution graphs may additionally contain engine-served memory reads.
+A program is a graph of dimensions -- named scalars of one token's
+residual stream -- and every kind of dimension is something a transformer
+layer computes exactly:
+
+- InputDimension: a value the token embeds.
+- ReGLUDimension: relu(b) * a, one feed-forward neuron.
+- PersistDimension: a linear combination stored in its own slot.
+- LookUpDimension: hardmax attention over every token so far, latest
+  wins ties -- how a token reads earlier tokens (memory, state).
+
+Expressions are linear combinations of dimensions; the helpers below
+(reglu, stepglu, make_multiply, fetch) build the idioms everything else
+uses (graph/ops.py has the arithmetic and memory ones).
+model/schedule.py assigns dimensions to layers and model/weights.py turns
+them into weights.  Folded experts (graph/fold.py) may also contain a
+MemoryRead: one exact read the engine serves directly, in place of the
+grouped lookups that compute it in the full graph.
+
+Construction state is module-global (graph_dims, the caches); reset_graph
+starts a new graph.
 """
 
 from __future__ import annotations
@@ -24,6 +42,10 @@ def expr_key(expr):
 
 
 class Expression:
+    """A linear combination of dimensions: {dimension: coefficient}, with
+    the constant term as a coefficient on `one`.  Supports +, - and scalar
+    *; zero coefficients are dropped."""
+
     __slots__ = ("terms",)
 
     def __init__(self, terms: dict | None = None):
@@ -111,6 +133,10 @@ class Expression:
             self.terms[dim] = value
 
 class Dimension:
+    """One scalar of a token's residual stream.  Ids are allocated in
+    construction order, which the scheduler and the engines' digests
+    depend on: building the same graph twice gives the same weights."""
+
     counter = 0
 
     def __init__(self, name=None, kind="generic"):
@@ -157,12 +183,13 @@ class Dimension:
 
 
 class InputDimension(Dimension):
+    """A value the token's embedding sets."""
+
     def __init__(self, name):
         super().__init__(name, kind="input")
 
 
-one = InputDimension("one")
-
+one = InputDimension("one")  # the constant 1, set on every token
 
 
 class PersistDimension(Dimension):
@@ -179,6 +206,8 @@ class PersistDimension(Dimension):
 
 
 class ReGLUDimension(Dimension):
+    """relu(b) * a: one feed-forward neuron of an FFN block."""
+
     def __init__(self, a_expr, b_expr, name=None):
         super().__init__(name or f"reglu_{Dimension.counter}", kind="reglu")
         self.a_expr = a_expr
@@ -193,6 +222,12 @@ MEMORY_GROUP_FUSED = -2
 
 
 class LookUp:
+    """One attention head: the 2-D query of this token against the 2-D key
+    of every token so far (itself included); the best score wins, ties to
+    the latest token, and its value expressions become this token's
+    LookUpDimensions.  Keys are built so the intended token scores
+    strictly highest (e.g. a parabola peaked at the queried address)."""
+
     counter = 0
 
     def __init__(self, value_exprs, query_exprs_2d, key_exprs_2d, tie_break="latest"):
@@ -211,6 +246,8 @@ class LookUp:
 
 
 class LookUpDimension(Dimension):
+    """The value_index-th value a LookUp returns."""
+
     def __init__(self, lookup, value_index):
         super().__init__(f"lookup_{lookup.id}_v{value_index}", kind="lookup")
         self.lookup = lookup
@@ -218,6 +255,10 @@ class LookUpDimension(Dimension):
 
 
 class MemoryRead:
+    """An exact memory read the engine serves directly (folded experts
+    only): the latest written value at `address`, that address, and
+    optionally the value's bits."""
+
     counter = 0
 
     def __init__(self, address, *, bits=()):
@@ -234,6 +275,8 @@ class MemoryRead:
 
 
 class MemoryReadDimension(Dimension):
+    """One output of a MemoryRead (value, address, or a bit)."""
+
     def __init__(self, memory_read, value_index, output_kind):
         super().__init__(
             f"memory_read_{memory_read.id}_{output_kind}", kind="memory_read"

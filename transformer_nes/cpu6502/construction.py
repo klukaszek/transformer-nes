@@ -18,6 +18,7 @@ RUNTIME_READ_DIMS = (
     "is_store", "write_addr_out", "write_value_out",
     "is_store2", "write_addr2_out", "write_value2_out",
     "is_store3", "write_addr3_out", "write_value3_out",
+    "cycles",
 )
 
 

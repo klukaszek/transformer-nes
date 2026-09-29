@@ -7,7 +7,7 @@ import logging
 import os
 import time
 
-from transformer_nes.nes.backends import OPCODES_NATIVE, backend_factory
+from transformer_nes.nes.backends import backend_factory
 from transformer_nes.nes.build import load_frontend, load_hardware
 from transformer_nes.nes.debug import DebugBridge
 
@@ -15,8 +15,16 @@ logger = logging.getLogger(__name__)
 
 
 def run_app(
-    console, frontend, *, title: str, scale: int, max_frames: int, record=None, debug=None,
+    console,
+    frontend,
+    *,
+    title: str,
+    scale: int,
+    max_frames: int,
+    record=None,
+    debug=None,
     on_quit=None,
+    overlay=False,
 ):
     elapsed = 0.0
     last_buttons = 0
@@ -66,7 +74,7 @@ def run_app(
         if on_quit is not None:
             on_quit()
 
-    frontend.run(title, scale, frame, quit_cb, debug)
+    frontend.run(title, scale, frame, quit_cb, debug, overlay)
 
 
 def main():
@@ -77,6 +85,13 @@ def main():
         choices=("reference", "weights"),
         default="weights",
     )
+    parser.add_argument(
+        "--ppu",
+        choices=("native", "weights"),
+        default="native",
+        help="run the PPU register file and background rendering as transformer "
+        "weights (transformer_nes/ppu2c02)",
+    )
     parser.add_argument("--scale", type=int, default=3)
     parser.add_argument("--frames", type=int, default=0)
     parser.add_argument("--record")
@@ -85,22 +100,47 @@ def main():
         "--tail", type=int, default=120, help="frames to run after the final tape event"
     )
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--xray",
+        action="store_true",
+        help="open the overlay (~) on its transformer X-ray at startup",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(message)s")
     if args.tape and args.record:
         parser.error("--tape and --record cannot be used together")
     hardware = load_hardware()
     cart = hardware.Cartridge.load(args.rom)
+
+    ppu_engines = []
+
+    def attach_ppu(console):
+        if args.ppu == "weights":
+            from transformer_nes.ppu2c02.machine import register_engine, render_engine
+
+            ppu_engines[:] = [register_engine(), render_engine(console.ppu_graph_chr_full)]
+            console.set_ppu_register_engine(ppu_engines[0])
+            console.set_ppu_render_engine(ppu_engines[1])
+
     if args.tape:
-        console = hardware.Console(cart, backend_factory(args.backend), OPCODES_NATIVE, 44100.0)
+        console = hardware.Console(cart, backend_factory(args.backend), 44100.0)
+        attach_ppu(console)
         result = console.run_tape(args.tape, args.tail, args.frames)
         logger.info("%(frames)d frames in %(seconds).3fs: %(fps).1f fps, %(cycles)d cycles", result)
         return
     frontend = load_frontend()
     rate = frontend.audio_setup()
+    runtimes = []  # the CPU runtime the console drives, for the X-ray
+
+    def build_backend(image, start_pc):
+        runtime, is_engine = backend_factory(args.backend)(image, start_pc)
+        runtimes.append(runtime)
+        return runtime, is_engine
+
     console = hardware.Console(
-        cart, backend_factory(args.backend), OPCODES_NATIVE, float(rate) if rate else 44100.0
+        cart, build_backend, float(rate) if rate else 44100.0
     )
+    attach_ppu(console)
 
     # Battery-backed saves live next to the ROM; loaded before the first
     # frame so the game's boot sees them, written back on quit.  Tape
@@ -118,16 +158,25 @@ def main():
             sav.write(console.prg_ram())
         logger.info("wrote battery save: %s", sav_path)
 
-    debug = DebugBridge(console, args.backend)
+    debug = DebugBridge(
+        console,
+        args.backend,
+        cpu_runtime=runtimes[0] if args.backend == "weights" else None,
+        render_engine=ppu_engines[1] if ppu_engines else None,
+    )
 
     def launch(record=None):
         run_app(
             console,
             frontend,
-            title=f"transformer-nes: {os.path.basename(args.rom)} ({args.backend})",
+            title=(
+                f"transformer-nes: {os.path.basename(args.rom)} ({args.backend}"
+                f"{', PPU as weights' if args.ppu == 'weights' else ''})"
+            ),
             scale=args.scale,
             max_frames=args.frames,
             record=record,
+            overlay=args.xray,
             debug=debug,
             on_quit=save_battery,
         )

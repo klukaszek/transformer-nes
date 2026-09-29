@@ -1,29 +1,17 @@
 """Adapt the CPU runtime backends to the native console's interface.
 
-The console drives one core protocol (pc/x/y, interrupt lines, poke,
-step); each backend gets a thin adapter, and backend_factory returns
-the (runtime, is_engine) pair the Console constructor expects.
-OPCODES_NATIVE is the (cycles, read-mode, dynamic-kind) table the native run loop
-uses for the stepped backends.
+The console drives one core protocol (pc, interrupt lines, poke, peek,
+step); each backend gets a thin adapter, and backend_factory returns the
+(runtime, is_engine) pair the Console constructor expects.
 """
 
 from __future__ import annotations
 
-from transformer_nes.cpu6502.backends.reference import irq_deliverable
-from transformer_nes.cpu6502.spec import (
-    MEMORY_MODES,
-    MODE_ABSOLUTE,
-    MODE_ABSOLUTE_X,
-    MODE_ABSOLUTE_Y,
-    MODE_INDIRECT_X,
-    MODE_INDIRECT_Y,
-    MODE_ZERO_PAGE,
-    MODE_ZERO_PAGE_X,
-    MODE_ZERO_PAGE_Y,
-    OPCODES,
-    READS_MEMORY,
-    dynamic_cycle_table,
+from transformer_nes.cpu6502.backends.reference import (
+    instruction_cycles,
+    irq_deliverable,
 )
+from transformer_nes.cpu6502.spec import MEMORY_MODES, READS_MEMORY, opcode_for
 
 
 class ReferenceCore:
@@ -31,12 +19,7 @@ class ReferenceCore:
         self.cpu = cpu
 
     pc = property(lambda s: s.cpu.pc)
-    x = property(lambda s: s.cpu.x)
-    y = property(lambda s: s.cpu.y)
-    p = property(lambda s: s.cpu.p)
     halted = property(lambda s: s.cpu.halted)
-    nmi_pending = property(lambda s: s.cpu.nmi_pending)
-    irq_ready = property(lambda s: irq_deliverable(s.cpu.p, s.cpu.irq_pending))
 
     def set_nmi(self):
         self.cpu.nmi_pending = True
@@ -49,6 +32,19 @@ class ReferenceCore:
 
     def poke(self, addr, value):
         self.cpu.write_memory(addr, value)
+
+    def peek(self) -> tuple[int, int]:
+        """The next step's cycles and the device read it issues (-1:
+        none): an interrupt sequence reads nothing a device answers."""
+        cpu = self.cpu
+        if cpu.nmi_pending or irq_deliverable(cpu.p, cpu.irq_pending):
+            return 7, -1
+        op = opcode_for(cpu.read_memory(cpu.pc))
+        cycles = instruction_cycles(cpu, op, cpu.pc, cpu.x, cpu.y, cpu.p)
+        if op.operation not in READS_MEMORY or op.mode not in MEMORY_MODES:
+            return cycles, -1
+        lo, hi, _ = cpu.read_operand(op)
+        return cycles, cpu.resolve_ea(op, lo, hi)
 
     def step(self):
         return self.cpu.step()
@@ -72,19 +68,3 @@ def backend_factory(name: str):
 
     return build
 
-
-MODE_CODES = {
-    MODE_ZERO_PAGE: 0,
-    MODE_ZERO_PAGE_X: 1,
-    MODE_ZERO_PAGE_Y: 2,
-    MODE_ABSOLUTE: 3,
-    MODE_ABSOLUTE_X: 4,
-    MODE_ABSOLUTE_Y: 5,
-    MODE_INDIRECT_X: 6,
-    MODE_INDIRECT_Y: 7,
-}
-_DYNAMIC_CYCLES = dynamic_cycle_table()
-OPCODES_NATIVE = [(2, -1, 0)] * 256
-for byte, op in OPCODES.items():
-    mode = MODE_CODES[op.mode] if op.operation in READS_MEMORY and op.mode in MEMORY_MODES else -1
-    OPCODES_NATIVE[byte] = (op.cycles, mode, _DYNAMIC_CYCLES[byte])

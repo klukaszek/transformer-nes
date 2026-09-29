@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -51,16 +52,18 @@ class SteppedRuntime {
 public:
   virtual ~SteppedRuntime() = default;
   virtual int pc() const = 0;
-  virtual int x() const = 0;
-  virtual int y() const = 0;
-  virtual int p() const = 0;
   virtual bool halted() const = 0;
-  virtual bool nmi_pending() const = 0;
-  virtual bool irq_ready() const = 0;
   virtual void set_nmi() = 0;
   virtual void set_irq() = 0;
   virtual void clear_irq() = 0;
   virtual void poke(int addr, int value) = 0;
+  // The next step ahead of running it: its cycles, and the device-visible
+  // memory read it issues (-1: none), which the bus serves first.
+  struct Next {
+    int cycles = 0;
+    int read = -1;
+  };
+  virtual Next peek() const = 0;
   virtual CpuStep step() = 0;
 };
 
@@ -68,14 +71,17 @@ using ReadLease = variant<monostate, int, vector<uint8_t>>;
 class Device {
 public:
   virtual ~Device() = default;
-  virtual int read(int addr) = 0;
-  // cycle: the console-clock stamp the write executed at (known because
-  // watched writes pause the engine, -1 when no stamp exists); devices
-  // that model mid-frame state (the PPU) use it, the rest ignore it.
+  // cycle: the console-clock cycle the accessing instruction ends at
+  // (known because watched accesses pause the engine); devices that
+  // model time (the PPU, mappers watching it) use it, the rest ignore it.
+  virtual int read(int addr, int64_t cycle) = 0;
   virtual void write(int addr, int value, int64_t cycle) = 0;
   virtual void write_rmw(int addr, int value, int64_t cycle) { write(addr, value, cycle); }
   virtual int take_stall() { return 0; }
   virtual ReadLease read_lease(int) { return {}; }
+  // The console cycle from which the lease just granted may be stale;
+  // the machine stops serving it before then.
+  virtual int64_t lease_expiry() const { return std::numeric_limits<int64_t>::max(); }
   virtual void lease_consumed(int, int) {}
 };
 
@@ -109,13 +115,15 @@ public:
   virtual void clear_irq() = 0;
   virtual void clear_read_lease() = 0;
   // cycle_base: the console-clock value at entry, so drained device
-  // writes carry an absolute cycle stamp.  A true return from the
-  // pause callback stops the run early (the console re-plans its
-  // frame events after a mid-frame IRQ-schedule change).
+  // writes carry an absolute cycle stamp.  `pause` is polled where the
+  // run stops between instructions (after every one on the stepped Bus,
+  // after serviced writes on the engine); true ends the run there.
   virtual MachineRun run_cycles(int64_t, function<bool()> = {}, int64_t cycle_base = 0) = 0;
   virtual int read_ram(int) const = 0;
   virtual void poke(int, int) = 0;
   virtual void map_region(int, span<const uint8_t>) = 0;
+  // Withdraw any read lease a device granted (its value may be stale).
+  virtual void drop_leases(Device&) {}
 };
 
 // The shared level-sensitive IRQ line: sources OR onto the machine's
@@ -141,38 +149,15 @@ struct IrqLine {
   }
 };
 
-struct OpcodeInfo {
-  enum class DynamicKind : uint8_t {
-    none = 0,
-    bpl = 1,
-    bmi = 2,
-    bvc = 3,
-    bvs = 4,
-    bcc = 5,
-    bcs = 6,
-    bne = 7,
-    beq = 8,
-    absolute_x = 9,
-    absolute_y = 10,
-    indirect_y = 11,
-  };
-  int cycles = 0;
-  int read_mode = -1;
-  DynamicKind dynamic_kind = DynamicKind::none;
-};
-using OpcodeTable = array<OpcodeInfo, 256>;
-
 class Bus : public ConsoleMachine {
 public:
-  Bus(SteppedRuntime& runtime, span<const uint8_t> image, const OpcodeTable& opcodes);
+  Bus(SteppedRuntime& runtime, span<const uint8_t> image);
   void attach(Device& device, int lo, int hi, bool writes_only = false) override;
   void set_nmi() override { runtime_.set_nmi(); }
   void set_irq() override { runtime_.set_irq(); }
   void clear_irq() override { runtime_.clear_irq(); }
   bool halted() const { return runtime_.halted(); }
   CpuStep step();
-  vector<CpuStep> run(int max_steps, const vector<int>& nmi_at = {},
-                      const vector<int>& irq_at = {});
   void clear_read_lease() override {}
   MachineRun run_cycles(int64_t budget, function<bool()> pause = {},
                         int64_t cycle_base = 0) override;
@@ -183,16 +168,13 @@ public:
   }
   void map_region(int base, span<const uint8_t> data) override;
   void poke_ram(int addr, int value) { ram_[address_index(addr)] = static_cast<uint8_t>(value); }
-  const array<uint8_t, 0x10000>& ram() const { return ram_; }
   int64_t cycles() const { return cycles_; }
 
 private:
   static constexpr size_t address_index(int address) {
     return cpu_ram_index(address);
   }
-  optional<int> read_target(int pc, int x, int y) const;
   SteppedRuntime& runtime_;
-  OpcodeTable opcodes_{};
   array<uint8_t, 0x10000> ram_{};
   DeviceMap devices_;
   int64_t cycles_ = 0;
@@ -202,10 +184,12 @@ private:
 class Controller final : public Device {
 public:
   void set_button(size_t index, bool pressed);
-  int read(int addr) override;
+  int read(int addr, int64_t) override;
   void write(int addr, int value, int64_t) override;
   ReadLease read_lease(int addr) override;
   void lease_consumed(int addr, int count) override;
+
+  int polls = 0; // strobe falling edges: one per game controller read
 
 private:
   array<bool, 8> buttons_{};

@@ -49,7 +49,7 @@ public:
     std::copy_n(cart_.prg.begin() + b[1] * BANK16, BANK16, image.begin() + 0xC000);
     return image;
   }
-  void write(int addr, int value, int) override {
+  void write(int addr, int value) override {
     auto old_prg = prg_banks();
     int old_mirror = control & 3;
     auto old_chr = chr_banks();
@@ -65,11 +65,11 @@ public:
   // Consecutive-cycle writes: the serial port sees only the first, which
   // for an RMW is the original bus byte -- the mapped ROM byte here (the
   // image is repair-maintained); bit 7 of the second still resets.
-  void write_rmw(int addr, int value, int) override {
+  void write_rmw(int addr, int value) override {
     const int original = rom_byte(addr);
-    write(addr, original, -1);
+    write(addr, original);
     if (value & 0x80)
-      write(addr, value, -1);
+      write(addr, value);
   }
 
 private:

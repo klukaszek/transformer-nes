@@ -11,7 +11,7 @@ namespace transformer_nes::nes {
 // multiplier.  The PPU-side substitution state lives in Mmc5Ppu (chr.h).
 class Mmc5 final : public Mapper {
 public:
-  explicit Mmc5(Cartridge cart) : Mapper(std::move(cart)), exram(0x400), prg_ram(0x10000) {
+  explicit Mmc5(Cartridge cart) : Mapper(std::move(cart)), prg_ram(0x10000) {
     if (cart_.prg.empty() || cart_.prg.size() % BANK8 || cart_.chr.size() % 0x400)
       throw std::invalid_argument("MMC5 requires 8 KiB PRG and 1 KiB CHR banks");
     n_prg_ = cart_.prg.size() / BANK8;
@@ -76,10 +76,21 @@ public:
     }
     return image;
   }
-  optional<int> irq_scanline(int) const override {
-    return irq_enabled && irq_target ? optional<int>(irq_target) : std::nullopt;
+  // Scanline detection (the PPU's scanline-start events, dot 3 of each
+  // rendered line): the first line of a frame enters "in frame" with
+  // the counter at 0, each later one increments it; a match with the
+  // $5203 target sets pending.  Idle PPU lines leave the frame.
+  void ppu_event(const PpuEvent& event) override {
+    if (scanline_.step(event) && irq_target) {
+      irq_pending = true;
+      if (irq_enabled)
+        host_.irq->set(IRQ_MAPPER, true);
+    }
   }
-  void notify_scanline_irq() override { irq_pending = true; }
+  std::unique_ptr<IrqProbe> irq_probe() const override {
+    return irq_enabled && irq_target && !irq_pending ? std::make_unique<Probe>(scanline_)
+                                                     : nullptr;
+  }
   bool ram_writable() const { return ram_protect1 == 2 && ram_protect2 == 1; }
   int read(int addr) override {
     if (addr >= 0x6000 && addr <= 0x7FFF)
@@ -87,7 +98,7 @@ public:
     if (addr >= 0x8000)
       return rom_byte(addr);
     if (addr == 0x5204) {
-      int out = (irq_pending ? 0x80 : 0) | 0x40;
+      int out = (irq_pending ? 0x80 : 0) | (scanline_.in_frame ? 0x40 : 0);
       irq_pending = false;
       host_.irq->set(IRQ_MAPPER, false);
       return out;
@@ -97,10 +108,10 @@ public:
     if (addr == 0x5206)
       return (mul_a * mul_b) >> 8;
     if (addr >= 0x5C00 && addr <= 0x5FFF)
-      return exram[addr - 0x5C00];
+      return host_.ppu->mmc5.exram(addr - 0x5C00);
     return 0;
   }
-  void write(int addr, int value, int) override {
+  void write(int addr, int value) override {
     value &= 0xFF;
     auto old = prg_layout();
     if (addr == 0x5100)
@@ -130,16 +141,20 @@ public:
     } else if (addr == 0x5130) {
       chr_upper = value & 3;
       sync_chr();
-    } else if (addr == 0x5203)
+    } else if (addr == 0x5203) {
       irq_target = value;
-    else if (addr == 0x5204)
+      scanline_.target = value;
+      host_.irq->sched_dirty = true;
+    } else if (addr == 0x5204) {
       irq_enabled = value & 0x80;
+      host_.irq->set(IRQ_MAPPER, irq_enabled && irq_pending);
+      host_.irq->sched_dirty = true;
+    }
     else if (addr == 0x5205)
       mul_a = value;
     else if (addr == 0x5206)
       mul_b = value;
     else if (addr >= 0x5C00 && addr <= 0x5FFF) {
-      exram[addr - 0x5C00] = static_cast<uint8_t>(value);
       host_.ppu->set_mmc5_exram(addr - 0x5C00, value);
     } else if (addr >= 0x6000 && addr <= 0x7FFF) {
       // A locked write still landed in the machine image before this
@@ -167,12 +182,42 @@ public:
   }
 
 private:
+  struct Scanline {
+    bool in_frame = false;
+    int counter = 0, target = 0;
+    // True when this event's line matches the target.
+    bool step(const PpuEvent& event) {
+      if (event.kind == PpuEvent::Idle) {
+        in_frame = false;
+        return false;
+      }
+      if (event.kind != PpuEvent::ScanlineStart)
+        return false;
+      if (!in_frame) {
+        in_frame = true;
+        counter = 0;
+      } else {
+        ++counter;
+      }
+      return counter == target;
+    }
+  };
+  struct Probe final : IrqProbe {
+    explicit Probe(Scanline s) : scanline(s) {}
+    void ppu_event(const PpuEvent& event) override {
+      if (scanline.step(event) && fire_dot < 0)
+        fire_dot = event.dot;
+    }
+    Scanline scanline;
+  };
+
+  Scanline scanline_;
   uint8_t prg_mode = 3, chr_mode = 3, chr_upper = 0;
   int irq_target = 0, mul_a = 0xFF, mul_b = 0xFF;
   bool irq_enabled = false, irq_pending = false;
   array<uint8_t, 4> prg_regs{0x80, 0x80, 0x80, 0xFF};
   array<uint8_t, 12> chr_regs{0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3};
-  vector<uint8_t> exram, prg_ram;
+  vector<uint8_t> prg_ram;
   uint8_t prg_ram_bank = 0;
   int ram_protect1 = 0, ram_protect2 = 0;
   int exram_mode = 0, nametable_map = 0, fill_tile = 0, fill_color = 0;

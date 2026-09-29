@@ -28,7 +28,7 @@ from transformer_nes.cpu6502.backends.weights.windows import (
     match_shape_windows,
 )
 from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS, Cpu6502Graph
-from transformer_nes.cpu6502.spec import OPCODES
+from transformer_nes.cpu6502.spec import OPCODES, written_addresses
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_nes.graph.core import ProgramGraph
 from transformer_nes.model.engine_gen import (
@@ -79,6 +79,7 @@ class Cpu6502TransformerMachine:
         self.build_seconds = time.perf_counter() - build_start
         self.n_layers = info.n_layers
         self.slot_of = info.slot_of
+        self.lives = info.lives  # residual live ranges (nes/xray.py)
         self.d_model = info.d_model
         self.state_row = tok_to_idx["STATE"]
         self.halt_row = tok_to_idx["HALT"]
@@ -127,10 +128,10 @@ class Cpu6502TransformerMachine:
             raise RuntimeError("generated 6502 engine is missing machine_step")
         if not self.engine.supports_direct_writes:
             raise RuntimeError("generated 6502 engine is missing direct memory writes")
-        self.step_out = np.empty(21, dtype=np.int64)
+        self.step_out = np.empty(22, dtype=np.int64)
         # Shape matches per injected (base, bank content): a bank switch
         # re-adds its windows from this memo instead of rescanning.
-        self.region_windows: dict[tuple[int, bytes], tuple] = {}
+        self._region_windows: dict[tuple[int, bytes], tuple] = {}
 
         self.pos = 0
         self.trace_len = 0
@@ -256,10 +257,6 @@ class Cpu6502TransformerMachine:
         self.machine_halted = False
         self.populate_shape_windows()
 
-    @property
-    def machine_state(self) -> dict:
-        return dict(self.mstate)
-
     def set_nmi(self):
         """The interrupt sequence itself then runs inside the weights."""
         self.nmi_pending = True
@@ -296,18 +293,26 @@ class Cpu6502TransformerMachine:
         """Replace a mapped cartridge region without creating WRITE tokens
         (the engine's map_write stamps state in place; no sequence advance)."""
         self.engine.map_region(base, data)
-        # Newly banked-in code gets its shape windows immediately instead
-        # of waiting out JIT warmup; matches are memoized per bank content.
+        for sid, head in self.region_windows(base, data):
+            self.engine.add_window(sid, head)
+
+    def region_windows(self, base: int, data: bytes) -> tuple:
+        """Shape windows of newly banked-in code, so it dispatches at once
+        instead of waiting out JIT warmup; memoized per bank content."""
         meta = getattr(self.engine, "shapes_meta", None) or []
-        if meta and self.engine.has_run_loop:
-            key = (base, data)
-            hits = self.region_windows.get(key)
-            if hits is None:
-                hits = self.region_windows[key] = tuple(
-                    match_shape_windows(data, meta, base=base)
-                )
-            for sid, head in hits:
-                self.engine.add_window(sid, head)
+        if not (meta and self.engine.has_run_loop):
+            return ()
+        key = (base, bytes(data))
+        hits = self._region_windows.get(key)
+        if hits is None:
+            hits = self._region_windows[key] = tuple(match_shape_windows(data, meta, base=base))
+        return hits
+
+    def machine_abi(self) -> tuple[int, int, int]:
+        """(version, engine, table) for native callers (run_protocol.py:
+        MachineAbi).  Callers driving it bypass this object's position
+        and state mirrors; this object must outlive them."""
+        return self.engine.machine_abi()
 
     def insert_write(self, addr: int, value: int):
         addr &= 0xFFFF
@@ -317,19 +322,13 @@ class Cpu6502TransformerMachine:
         self.pos += 1
 
     def _set_ram(self, addr: int, value: int) -> None:
-        addr &= 0xFFFF
-        value &= 0xFF
-        if self.mirror_cpu_ram and addr < 0x2000:
-            physical = addr & 0x07FF
-            for mirror in range(physical, 0x2000, 0x0800):
-                self.ram[mirror] = value
-        else:
-            self.ram[addr] = value
+        for target in written_addresses(addr, self.mirror_cpu_ram):
+            self.ram[target] = value & 0xFF
 
     def machine_step(self) -> TraceRow:
         """One instruction entirely in generated C++ (embed, layers,
         readout, direct WRITE inserts, halt logits); Python only unpacks
-        the 21-slot result and keeps the mirrors in sync."""
+        the 22-slot result and keeps the mirrors in sync."""
         st = self.mstate
         nmi = 1 if self.nmi_pending else 0
         self.nmi_pending = False
@@ -341,7 +340,7 @@ class Cpu6502TransformerMachine:
             st["ir"], st["oplo"], st["ophi"], st["ea"], st["data"],
             st["halted"], nmi, irq, self.step_out,
         )
-        o = self.step_out.tolist()  # one C call instead of 21 scalar reads
+        o = self.step_out.tolist()  # one C call instead of 22 scalar reads
         n_writes = o[14]
         writes = []
         for i in range(n_writes):
@@ -454,10 +453,10 @@ class Cpu6502TransformerMachine:
                 break
         self.pull_run_state()
 
-    # ── Machine API (lets the NES console drive the run loop) ────────
-    # The run-protocol machine surface: the native console's
-    # PythonEngineMachine (nes/bindings.cpp) drives the weights engine,
-    # pausing back to Python only for MMIO (run_protocol.py).
+    # ── Machine API (run_protocol.py) ───────────────────────────────
+    # The console sets the machine up here (image, watches) and then
+    # drives the engine through its native ABI (machine_abi); run() is
+    # the same loop for Python callers.
 
     def load_image(self, memory_image, *, start_pc: int) -> None:
         self.boot_image(list(memory_image), start_pc=start_pc)
@@ -479,33 +478,6 @@ class Cpu6502TransformerMachine:
 
     def watch_write(self, lo: int, hi: int) -> None:
         self.engine.watch_write(lo, hi)
-
-    def set_read_lease(self, addr: int, value: int, group: int = 0) -> int:
-        return int(self.engine.set_read_lease(addr, value, group))
-
-    def set_read_lease_seq(self, addr: int, values: bytes, group: int = 0) -> int:
-        return int(self.engine.set_read_lease_seq(addr, bytes(values), group))
-
-    def take_lease_served(self, addr: int) -> int:
-        return int(self.engine.take_lease_served(addr))
-
-    def clear_read_lease(self) -> None:
-        self.engine.clear_read_lease()
-
-    def clear_read_lease_addr(self, addr: int) -> None:
-        self.engine.clear_read_lease_addr(addr)
-
-    def set_mapper_mmc3(self, prg: bytes, bank_select: int, regs: bytes,
-                        cur: bytes) -> None:
-        self.engine.set_mapper_mmc3(bytes(prg), bank_select, bytes(regs),
-                                    bytes(cur))
-
-    def set_mapper_mmc1(self, prg: bytes, shift: int, control: int,
-                        prg_reg: int, lo: int, hi: int) -> None:
-        self.engine.set_mapper_mmc1(bytes(prg), shift, control, prg_reg, lo, hi)
-
-    def clear_mapper(self) -> None:
-        self.engine.clear_mapper()
 
     def read_ram(self, addr: int) -> int:
         return self.engine.read_ram(addr)

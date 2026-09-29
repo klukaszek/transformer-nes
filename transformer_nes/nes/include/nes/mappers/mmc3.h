@@ -42,27 +42,20 @@ public:
       std::copy_n(cart_.prg.begin() + b[i] * BANK8, BANK8, image.begin() + 0x8000 + i * BANK8);
     return image;
   }
-  // The counter reloads from the latch on the line after each expiry
-  // and after a $C001 clear, so the latch is a DELTA from that anchor,
-  // not an absolute line (NESDEV MMC3): SMB3's spade minigame chains
-  // latch=52 handlers to split its strips and HUD at 32/85/138/191.
-  // A vblank reload (anchor -1) fires at the latch's line; latch 0 is
-  // the fire-next-scanline trick and needs a mid-frame anchor.
-  optional<int> irq_scanline(int last_fired) const override {
-    if (!irq_enabled)
-      return std::nullopt;
-    const int anchor = std::max(last_fired, reload_line);
-    if (anchor < 0 && irq_latch <= 0)
-      return std::nullopt;
-    const int line = anchor < 0 ? irq_latch : anchor + 1 + irq_latch;
-    return line < 240 ? optional<int>(line) : std::nullopt;
+  bool wants_a12() const override { return true; }
+  // Each filtered A12 rise clocks the counter (bg=$0000/sprites=$1000:
+  // dot 260 of every rendered line); expiry with IRQs enabled asserts.
+  void ppu_event(const PpuEvent& event) override {
+    if (event.kind == PpuEvent::A12Rise && counter_.clock() && irq_enabled)
+      host_.irq->set(IRQ_MAPPER, true);
   }
-  void notify_scanline_irq() override { irq_pending = true; }
-  void begin_frame() override { reload_line = -1; }
-  void write(int addr, int value, int scanline) override {
+  std::unique_ptr<IrqProbe> irq_probe() const override {
+    return irq_enabled ? std::make_unique<Probe>(counter_) : nullptr;
+  }
+  void write(int addr, int value) override {
     auto old = prg_banks();
     int reg = addr & 0xE001;
-    update(reg, value, scanline);
+    update(reg, value);
     auto now = prg_banks();
     for (size_t i = 0; i < old.size(); ++i)
       if (old[i] != now[i])
@@ -72,13 +65,37 @@ public:
   }
 
 private:
-  bool irq_enabled = false, irq_pending = false;
+  // The scanline counter (NESDEV MMC3, Sharp behavior): a clock
+  // reloads it from the latch when it is 0 or a reload is pending,
+  // otherwise decrements; it fires on reaching 0.
+  struct Counter {
+    int latch = 0, value = 0;
+    bool reload = false;
+    bool clock() {
+      if (value == 0 || reload) {
+        value = latch;
+        reload = false;
+      } else {
+        --value;
+      }
+      return value == 0;
+    }
+  };
+  struct Probe final : IrqProbe {
+    explicit Probe(Counter c) : counter(c) {}
+    void ppu_event(const PpuEvent& event) override {
+      if (event.kind == PpuEvent::A12Rise && counter.clock() && fire_dot < 0)
+        fire_dot = event.dot;
+    }
+    Counter counter;
+  };
+
+  bool irq_enabled = false;
+  Counter counter_;
   uint8_t bank_select = 0;
-  int irq_latch = 0;
-  int reload_line = -1; // scanline of a mid-frame $C001 clear (-1: vblank)
   array<uint8_t, 8> regs{0, 2, 4, 5, 6, 7, 0, 1};
   size_t n_prg_ = 0, n_chr_ = 1;
-  void update(int reg, int value, int scanline) {
+  void update(int reg, int value) {
     if (reg == 0x8000)
       bank_select = value;
     else if (reg == 0x8001)
@@ -86,17 +103,17 @@ private:
     else if (reg == 0xA000)
       host_.ppu->mirroring = value & 1 ? 3 : 2;
     else if (reg == 0xC000)
-      irq_latch = value;
-    else if (reg == 0xC001)
-      reload_line = scanline;
-    else if (reg == 0xE000) {
+      counter_.latch = value;
+    else if (reg == 0xC001) {
+      counter_.value = 0;
+      counter_.reload = true;
+    } else if (reg == 0xE000) {
       irq_enabled = false;
       host_.irq->set(IRQ_MAPPER, false);
     } else if (reg == 0xE001)
       irq_enabled = true;
     // The IRQ schedule may have moved (latch/reload/enable writes): the
-    // console re-evaluates its frame events instead of running past a
-    // mid-frame arm.
+    // console re-plans instead of running past the new expiry.
     if (reg >= 0xC000 && reg != 0xE000)
       host_.irq->sched_dirty = true;
   }

@@ -11,6 +11,10 @@
 #include "nes/ppu.h"
 #include "nes/tape.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <string_view>
 #include <memory>
 #include <stdexcept>
 #include <tuple>
@@ -27,6 +31,7 @@ using std::int64_t;
 using std::size_t;
 using std::span;
 using std::string;
+using std::string_view;
 using std::tuple;
 using std::uint8_t;
 using std::unique_ptr;
@@ -37,20 +42,55 @@ py::bytes to_bytes(span<const uint8_t> data) {
                    static_cast<py::ssize_t>(data.size()));
 }
 
+// A graph engine's token fields in order, which the PPU fills and reads
+// by position: "name" entries, or {"stem", n} for stem0..stem(n-1).
+struct Fields {
+  string name;
+  int count = 0;
+  Fields(const char* n) : name(n) {}
+  Fields(const char* stem, int n) : name(stem), count(n) {}
+};
+vector<string> fields(std::initializer_list<Fields> spec) {
+  vector<string> out;
+  for (const Fields& f : spec)
+    if (f.count == 0)
+      out.push_back(f.name);
+    else
+      for (int i = 0; i < f.count; ++i)
+        out.push_back(f.name + std::to_string(i));
+  return out;
+}
+// ppu2c02/render.py INPUTS, OUTPUTS and ppu2c02/registers.py's token.
+const vector<string> render_inputs = fields(
+    {"is_slot", "slot", "hit_set", "fine_x", "ctrl", "mask", {"nt_page", 4}, "latch_lo",
+     "latch_hi", "wide_low", "ext_mode", "chr_upper", "v_cx", "v_cy", "v_nt", "v_fy", {"bg", 16},
+     {"sprite", 8}});
+const vector<string> render_outputs =
+    fields({{"pixel", 8}, {"tile", 8}, "new_v_cx", "new_v_cy", "new_v_nt", "new_v_fy", "fetched",
+            {"hit", 8}, "new_latch_lo", "new_latch_hi"});
+const vector<string> register_inputs =
+    fields({"is_access", "reg", "value", "is_write", "status", "rendering", {"nt_page", 4},
+            "chr_writable", "t_cx", "t_cy", "t_nt", "t_fy", "v_cx", "v_cy", "v_nt", "v_fy",
+            "fine_x", "w", "ctrl", "mask", "oam_addr", "read_buffer"});
+const vector<string> register_outputs =
+    fields({"new_t_cx", "new_t_cy", "new_t_nt", "new_t_fy", "new_v_cx", "new_v_cy", "new_v_nt",
+            "new_v_fy", "new_fine_x", "new_w", "new_ctrl", "new_mask", "new_oam_addr",
+            "new_read_buffer", "read_value", "mem_write", "mem_write_addr", "mem_write_value",
+            "clear_vblank", "nmi_rise"});
+
 class PythonSteppedRuntime final : public SteppedRuntime {
 public:
   explicit PythonSteppedRuntime(py::object core) : core_(std::move(core)) {}
   int pc() const override { return py::cast<int>(core_.attr("pc")); }
-  int x() const override { return py::cast<int>(core_.attr("x")); }
-  int y() const override { return py::cast<int>(core_.attr("y")); }
-  int p() const override { return py::cast<int>(core_.attr("p")); }
   bool halted() const override { return py::cast<bool>(core_.attr("halted")); }
-  bool nmi_pending() const override { return py::cast<bool>(core_.attr("nmi_pending")); }
-  bool irq_ready() const override { return py::cast<bool>(core_.attr("irq_ready")); }
   void set_nmi() override { core_.attr("set_nmi")(); }
   void set_irq() override { core_.attr("set_irq")(); }
   void clear_irq() override { core_.attr("clear_irq")(); }
   void poke(int a, int v) override { core_.attr("poke")(a, v); }
+  Next peek() const override {
+    const auto [cycles, read] = core_.attr("peek")().cast<std::pair<int, int>>();
+    return {cycles, read};
+  }
   CpuStep step() override {
     py::object row = core_.attr("step")();
     py::object state = row.attr("state");
@@ -71,11 +111,50 @@ private:
   py::object core_;
 };
 
-class PythonEngineMachine final : public ConsoleMachine {
+// The generated CPU engine's native machine ABI
+// (cpu6502/backends/weights/run_protocol.py: MachineRunOut, MachineAbi).
+namespace cpu_engine {
+constexpr int abi_version = 1;
+struct RunOut {
+  const char* reason;
+  long cycles;
+  int read_addr;
+  long read_cycles;
+  int pause_ir;
+  const int* hit_addr;
+  const int* hit_value;
+  long n_hits;
+};
+struct Abi {
+  void (*run)(void*, long max_cycles, RunOut*);
+  int (*read_ram)(void*, int);
+  void (*inject_write)(void*, int, int);
+  void (*map_region)(void*, int, const unsigned char*, long);
+  void (*add_window)(void*, int, int);
+  int (*set_read_lease)(void*, int, int);
+  int (*set_read_lease_seq)(void*, int, const unsigned char*, long);
+  long (*take_lease_served)(void*, int);
+  void (*clear_read_lease)(void*);
+  void (*clear_read_lease_addr)(void*, int);
+  void (*set_nmi)(void*);
+  void (*set_irq)(void*);
+  void (*clear_irq)(void*);
+};
+} // namespace cpu_engine
+
+// The transformer CPU's run loop driven natively: Python sets it up
+// (image, watches) and names the shape windows of newly mapped code;
+// every run, lease, write and interrupt goes straight through the ABI.
+class EngineMachine final : public ConsoleMachine {
 public:
-  PythonEngineMachine(py::object runtime, const vector<uint8_t>& image, int start)
+  EngineMachine(py::object runtime, const vector<uint8_t>& image, int start)
       : rt_(std::move(runtime)) {
     rt_.attr("load_image")(to_bytes(image), py::arg("start_pc") = start);
+    const auto abi = rt_.attr("machine_abi")().cast<py::tuple>();
+    if (abi[0].cast<int>() != cpu_engine::abi_version)
+      throw std::runtime_error("CPU engine machine ABI version mismatch");
+    ctx_ = reinterpret_cast<void*>(abi[1].cast<std::uintptr_t>());
+    abi_ = reinterpret_cast<const cpu_engine::Abi*>(abi[2].cast<std::uintptr_t>());
   }
   void attach(Device& d, int lo, int hi, bool writes_only = false) override {
     devices_.attach(d, lo, hi, writes_only);
@@ -83,35 +162,55 @@ public:
       rt_.attr("watch_read")(lo, hi);
     rt_.attr("watch_write")(lo, hi);
   }
-  void set_nmi() override { rt_.attr("set_nmi")(); }
-  void set_irq() override { rt_.attr("set_irq")(); }
-  void clear_irq() override { rt_.attr("clear_irq")(); }
+  void set_nmi() override { abi_->set_nmi(ctx_); }
+  void set_irq() override { abi_->set_irq(ctx_); }
+  void clear_irq() override { abi_->clear_irq(ctx_); }
   void clear_read_lease() override {
     flush_queues();
     lease_owners_.clear();
     lease_queues_.clear();
-    rt_.attr("clear_read_lease")();
+    lease_deadline_ = NEVER;
+    abi_->clear_read_lease(ctx_);
   }
-  int read_ram(int a) const override { return py::cast<int>(rt_.attr("read_ram")(a)); }
-  void poke(int a, int v) override { rt_.attr("inject_write")(a, v); }
-  void map_region(int a, span<const uint8_t> d) override { rt_.attr("map_region")(a, to_bytes(d)); }
+  int read_ram(int a) const override { return abi_->read_ram(ctx_, a); }
+  void poke(int a, int v) override { abi_->inject_write(ctx_, a, v); }
+  void map_region(int a, span<const uint8_t> d) override {
+    abi_->map_region(ctx_, a, d.data(), static_cast<long>(d.size()));
+    for (auto [shape, head] : region_windows(a, d))
+      abi_->add_window(ctx_, shape, head);
+  }
+  void drop_leases(Device& d) override { drop_device_leases(&d); }
   MachineRun run_cycles(int64_t budget, function<bool()> pause = {},
                         int64_t cycle_base = 0) override {
     int64_t cycles = 0;
     bool halted = false;
     while (cycles < budget && !halted) {
-      py::dict out = rt_.attr("run")(INT64_MAX, py::arg("max_cycles") = budget - cycles,
-                                     py::arg("trace") = false)
-                         .cast<py::dict>();
-      cycles += py::cast<int64_t>(out["cycles"]);
-      drain_mapper(out, cycle_base + cycles);
-      drain_leases(out);
+      // A time-limited lease (the PPU's $2002) expires mid-run: run up
+      // to its deadline, then drop the leases so the device answers.
+      int64_t chunk = budget - cycles;
+      if (lease_deadline_ != NEVER) {
+        const int64_t left = lease_deadline_ - (cycle_base + cycles);
+        if (left <= 0) {
+          clear_read_lease();
+          continue;
+        }
+        chunk = std::min(chunk, left);
+      }
+      cpu_engine::RunOut out;
+      abi_->run(ctx_, static_cast<long>(chunk), &out);
+      cycles += out.cycles;
       // Paused writes are stamped at the end of the returned chunk.
       cycles += service_writes(out, cycle_base + cycles);
-      string reason = py::cast<string>(out["reason"]);
-      if (reason == "watch_read")
-        cycles += service_read(py::cast<int>(out["read_addr"]));
+      const string_view reason = out.reason;
       halted = reason == "halt" || reason == "trap";
+      // The paused instruction has not run yet; its read lands on its
+      // last cycle.  Interrupts the read raised (the PPU catching up
+      // past vblank) must wait until that instruction completes, so the
+      // pause check is skipped until the next chunk runs it.
+      if (reason == "watch_read") {
+        cycles += service_read(out.read_addr, cycle_base + cycles + out.read_cycles);
+        continue;
+      }
       if (pause && pause())
         break;
     }
@@ -120,46 +219,44 @@ public:
 
 private:
   Device* device_at(int a) const { return devices_.find(a); }
-  int service_writes(const py::dict& out, int64_t cycle) {
+  int service_writes(const cpu_engine::RunOut& out, int64_t cycle) {
     int stalls = 0;
-    py::sequence aa = out["hit_addr"], vv = out["hit_value"];
-    if (py::len(aa) != py::len(vv))
-      throw std::runtime_error("CPU engine returned mismatched write arrays");
-    if (py::len(aa) == 0)
-      return 0;
     // Watched writes pause the step that made them, so pause_ir is that
     // step's opcode: RMW writes route through write_rmw (MMC1's quirk).
-    const bool rmw = is_memory_rmw(static_cast<uint8_t>(py::cast<int>(out["pause_ir"])));
-    for (py::size_t i = 0; i < py::len(aa); ++i) {
-      int a = py::cast<int>(aa[i]);
+    const bool rmw = out.n_hits && is_memory_rmw(static_cast<uint8_t>(out.pause_ir));
+    // The hit arrays live until the next run; servicing never runs.
+    for (long i = 0; i < out.n_hits; ++i) {
+      const int a = out.hit_addr[i], v = out.hit_value[i];
       if (auto* d = device_at(a)) {
         drop_device_leases(d);
         if (rmw)
-          d->write_rmw(a, py::cast<int>(vv[i]), cycle);
+          d->write_rmw(a, v, cycle);
         else
-          d->write(a, py::cast<int>(vv[i]), cycle);
+          d->write(a, v, cycle);
         stalls += d->take_stall();
       }
     }
     return stalls;
   }
-  int service_read(int a) {
+  int service_read(int a, int64_t cycle) {
     flush_queues();
     auto* d = device_at(a);
-    int value = d ? d->read(a) & 0xFF : read_ram(a);
+    int value = d ? d->read(a, cycle) & 0xFF : read_ram(a);
     int stalls = d ? d->take_stall() : 0;
     if (d) {
       auto lease = d->read_lease(a);
       int evicted = -1;
       if (auto* v = std::get_if<int>(&lease)) {
-        evicted = py::cast<int>(rt_.attr("set_read_lease")(a, *v, 0));
+        evicted = abi_->set_read_lease(ctx_, a, *v);
         lease_queues_.erase(a);
       } else if (auto* q = std::get_if<vector<uint8_t>>(&lease)) {
-        evicted = py::cast<int>(rt_.attr("set_read_lease_seq")(a, to_bytes(*q), 0));
+        evicted = abi_->set_read_lease_seq(ctx_, a, q->data(), static_cast<long>(q->size()));
         lease_queues_.insert(a);
       }
-      if (!std::holds_alternative<std::monostate>(lease))
+      if (!std::holds_alternative<std::monostate>(lease)) {
         lease_owners_[a] = d;
+        lease_deadline_ = std::min(lease_deadline_, d->lease_expiry());
+      }
       if (evicted >= 0 && evicted != a) {
         lease_owners_.erase(evicted);
         lease_queues_.erase(evicted);
@@ -170,32 +267,9 @@ private:
   }
   void flush_queues() {
     for (int addr : lease_queues_) {
-      int count = py::cast<int>(rt_.attr("take_lease_served")(addr));
+      const long count = abi_->take_lease_served(ctx_, addr);
       if (auto owner = lease_owners_.find(addr); count && owner != lease_owners_.end())
-        owner->second->lease_consumed(addr, count);
-    }
-  }
-  void drain_mapper(const py::dict& out, int64_t cycle) {
-    py::sequence aa = out["mapper_addr"], vv = out["mapper_value"];
-    if (py::len(aa) != py::len(vv))
-      throw std::runtime_error("CPU engine returned mismatched mapper arrays");
-    // Apply natively decoded mapper writes in program order.
-    for (py::size_t i = 0; i < py::len(aa); ++i) {
-      int a = py::cast<int>(aa[i]);
-      if (auto* d = device_at(a))
-        d->write(a, py::cast<int>(vv[i]), cycle);
-    }
-  }
-  void drain_leases(const py::dict& out) {
-    py::sequence addresses = out["ls_addr"], served = out["ls_served"];
-    if (py::len(addresses) != py::len(served))
-      throw std::runtime_error("CPU engine returned mismatched lease arrays");
-    for (py::size_t i = 0; i < py::len(addresses); ++i) {
-      int addr = py::cast<int>(addresses[i]);
-      auto owner = lease_owners_.find(addr);
-      if (lease_queues_.erase(addr) && owner != lease_owners_.end())
-        owner->second->lease_consumed(addr, py::cast<int>(served[i]));
-      lease_owners_.erase(addr);
+        owner->second->lease_consumed(addr, static_cast<int>(count));
     }
   }
   void drop_device_leases(Device* device) {
@@ -205,30 +279,50 @@ private:
         drop.push_back(addr);
     for (int addr : drop) {
       if (lease_queues_.erase(addr)) {
-        int count = py::cast<int>(rt_.attr("take_lease_served")(addr));
+        const long count = abi_->take_lease_served(ctx_, addr);
         if (count)
-          device->lease_consumed(addr, count);
+          device->lease_consumed(addr, static_cast<int>(count));
       }
-      rt_.attr("clear_read_lease_addr")(addr);
+      abi_->clear_read_lease_addr(ctx_, addr);
       lease_owners_.erase(addr);
     }
   }
+  // Shape windows of a mapped region, named by Python once per distinct
+  // (base, content) and replayed natively on every later bank switch.
+  struct Region {
+    int base;
+    vector<uint8_t> data;
+    vector<std::pair<int, int>> windows;
+  };
+  const vector<std::pair<int, int>>& region_windows(int base, span<const uint8_t> d) {
+    uint64_t h = 1469598103934665603ULL ^ static_cast<uint64_t>(base);
+    for (size_t i = 0; i < d.size(); i += 8) {
+      uint64_t word = 0;
+      std::memcpy(&word, d.data() + i, std::min<size_t>(8, d.size() - i));
+      h = (h ^ word) * 1099511628211ULL;
+    }
+    auto& bucket = regions_[h];
+    for (const Region& r : bucket)
+      if (r.base == base && std::ranges::equal(r.data, d))
+        return r.windows;
+    Region r{base, vector<uint8_t>(d.begin(), d.end()), {}};
+    for (py::handle w : rt_.attr("region_windows")(base, to_bytes(d)))
+      r.windows.emplace_back(py::cast<int>(w[py::int_(0)]), py::cast<int>(w[py::int_(1)]));
+    return bucket.emplace_back(std::move(r)).windows;
+  }
   py::object rt_;
+  void* ctx_ = nullptr;
+  const cpu_engine::Abi* abi_ = nullptr;
   DeviceMap devices_;
+  int64_t lease_deadline_ = NEVER;
   std::unordered_map<int, Device*> lease_owners_;
   std::unordered_set<int> lease_queues_;
+  std::unordered_map<uint64_t, vector<Region>> regions_;
 };
 
 class ConsoleHost {
 public:
-  ConsoleHost(Cartridge cart, py::object factory, const vector<tuple<int, int, int>>& opcode_values,
-              double sample_rate) {
-    if (opcode_values.size() != OpcodeTable{}.size())
-      throw std::invalid_argument("opcode table must contain exactly 256 entries");
-    OpcodeTable opcodes{};
-    for (size_t i = 0; i < opcode_values.size(); ++i)
-      opcodes[i] = {std::get<0>(opcode_values[i]), std::get<1>(opcode_values[i]),
-                    static_cast<OpcodeInfo::DynamicKind>(std::get<2>(opcode_values[i]))};
+  ConsoleHost(Cartridge cart, py::object factory, double sample_rate) {
     Ppu ppu(cart.chr.empty() ? vector<uint8_t>(0x2000) : cart.chr, cart.chr.empty(),
             cart.mirroring == Mirroring::Vertical);
     auto mapper = make_mapper(std::move(cart));
@@ -240,10 +334,10 @@ public:
     py::object runtime = backend[0];
     bool engine = py::cast<bool>(backend[1]);
     if (engine)
-      machine_ = std::make_unique<PythonEngineMachine>(runtime, image, start);
+      machine_ = std::make_unique<EngineMachine>(runtime, image, start);
     else {
       stepped_ = std::make_unique<PythonSteppedRuntime>(runtime);
-      machine_ = std::make_unique<Bus>(*stepped_, image, opcodes);
+      machine_ = std::make_unique<Bus>(*stepped_, image);
     }
     console_ =
         std::make_unique<Console>(std::move(mapper), std::move(ppu), Apu(sample_rate), *machine_);
@@ -274,6 +368,122 @@ public:
     machine_->map_region(0x6000, span(reinterpret_cast<const uint8_t*>(s.data()), s.size()));
   }
   void set_sprite_limit(bool enabled) { console_->ppu.sprite_limit = enabled; }
+  // The overlay's X-ray: which render model drew each slot of the last
+  // frame (Ppu::completed_expert_map).
+  py::bytes ppu_expert_map() const {
+    const auto& map = console_->ppu.completed_expert_map();
+    return py::bytes(reinterpret_cast<const char*>(map.data()), map.size());
+  }
+  // Render background slots through a compiled render graph
+  // (ppu2c02/render.py, built by ppu2c02.machine.render_engine); None
+  // restores native rendering.
+  void set_ppu_render_engine(py::object engine) {
+    if (engine.is_none()) {
+      console_->ppu.set_render_engine({});
+      render_engine_ = py::none();
+      return;
+    }
+    if (py::cast<vector<string>>(engine.attr("inputs")) != render_inputs ||
+        py::cast<vector<string>>(engine.attr("outputs")) != render_outputs)
+      throw std::invalid_argument("engine is not the PPU render graph");
+    const auto abi = engine.attr("abi")().cast<py::tuple>();
+    Ppu::RenderEngine api;
+    api.ctx = reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>());
+    api.write = reinterpret_cast<void (*)(void*, int, int)>(abi[1].cast<std::uintptr_t>());
+    api.step =
+        reinterpret_cast<void (*)(void*, int, const int*, int*)>(abi[2].cast<std::uintptr_t>());
+    api.trace =
+        reinterpret_cast<void (*)(void*, const int*, int*)>(abi[3].cast<std::uintptr_t>());
+    api.trace_rows = abi[4].cast<int>();
+    api.trace_width = abi[5].cast<int>();
+    const auto dispatch = engine.attr("dispatch").cast<py::list>();
+    for (size_t latched = 0; latched < 2; ++latched) {
+      const py::dict d = dispatch[latched];
+      auto& out = api.dispatch[latched];
+      const auto inner = d["inner"].cast<vector<vector<int>>>();
+      for (size_t t = 0; t < 2; ++t)
+        std::ranges::copy(inner[t], out.inner[t].begin());
+      out.sprites = static_cast<uint8_t>(d["sprites"].cast<int>());
+      std::ranges::copy(d["first"].cast<vector<int>>(), out.first.begin());
+      std::ranges::copy(d["last"].cast<vector<int>>(), out.last.begin());
+    }
+    render_engine_ = engine;
+    console_->ppu.set_render_engine(api);
+  }
+  // Run the PPU register file through a compiled register graph
+  // (model/graph_engine.py) called natively through its ABI; `engine`
+  // is kept alive here.  Its inputs and outputs must be the register
+  // graph's field order (ppu2c02/registers.py), checked by name.
+  void set_ppu_register_engine(py::object engine) {
+    if (engine.is_none()) {
+      console_->ppu.set_register_step({});
+      register_engine_ = py::none();
+      return;
+    }
+    if (py::cast<vector<string>>(engine.attr("inputs")) != register_inputs ||
+        py::cast<vector<string>>(engine.attr("outputs")) != register_outputs)
+      throw std::invalid_argument("engine is not the PPU register graph");
+    const auto abi = engine.attr("abi")().cast<py::tuple>();
+    void* ctx = reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>());
+    auto write = reinterpret_cast<void (*)(void*, int, int)>(abi[1].cast<std::uintptr_t>());
+    auto step = reinterpret_cast<void (*)(void*, int, const int*, int*)>(
+        abi[2].cast<std::uintptr_t>());
+    register_engine_ = engine;
+    Ppu::RegisterStep api;
+    api.write = [ctx, write](int addr, int value) { write(ctx, addr, value); };
+    api.access = [ctx, step](const Ppu::RegisterAccess& a, int nt_map, bool chr_writable,
+                             const Ppu::RegisterFile& before) {
+      // In the order of register_inputs, loopy registers split into fields.
+      auto loopy = [](int32_t reg, int* out) {
+        out[0] = reg & 0x1F;
+        out[1] = (reg >> 5) & 0x1F;
+        out[2] = (reg >> 10) & 3;
+        out[3] = (reg >> 12) & 7;
+      };
+      int in[25] = {1,
+                    a.reg,
+                    a.value,
+                    a.is_write,
+                    a.status,
+                    a.rendering,
+                    nt_map & 3,
+                    (nt_map >> 2) & 3,
+                    (nt_map >> 4) & 3,
+                    (nt_map >> 6) & 3,
+                    chr_writable};
+      loopy(before.t, in + 11);
+      loopy(before.v, in + 15);
+      const int rest[6] = {before.fine_x, before.w, before.ctrl, before.mask, before.oam_addr,
+                           before.read_buffer};
+      std::copy(std::begin(rest), std::end(rest), in + 19);
+      int out[20];
+      step(ctx, 0, in, out);
+      auto join = [](const int* f) { return f[0] | (f[1] << 5) | (f[2] << 10) | (f[3] << 12); };
+      const Ppu::RegisterFile after{join(out),  join(out + 4), out[8],  out[9],
+                                    out[10],    out[11],       out[12], out[13]};
+      // The engine's own log receives the write through `write`, with the
+      // rest of the view's changes before the next access.
+      const Ppu::RegisterResult result{out[14], out[15] ? out[16] : -1, out[17]};
+      return std::pair{after, result};
+    };
+    console_->ppu.set_register_step(std::move(api));
+  }
+  // The X-ray's pixel dissection (Ppu::request_slot_trace): the model
+  // that drew the slot and the full model's residual stream after the
+  // embedding and each layer; None until the slot is drawn.
+  void request_ppu_slot_trace(int line, int slot) { console_->ppu.request_slot_trace(line, slot); }
+  py::object take_ppu_slot_trace() {
+    auto trace = console_->ppu.take_slot_trace();
+    if (!trace)
+      return py::none();
+    py::dict out;
+    out["line"] = trace->line;
+    out["slot"] = trace->slot;
+    out["model"] = trace->model;
+    out["residual"] = py::array_t<int>(static_cast<py::ssize_t>(trace->residual.size()),
+                                       trace->residual.data());
+    return out;
+  }
   py::dict run_tape(const string& path, int tail_frames, int max_frames) {
     const auto result = replay_tape(*console_, InputTape::load(path), tail_frames, max_frames);
     py::dict out;
@@ -287,6 +497,8 @@ public:
   Console& console() { return *console_; }
 
 private:
+  py::object register_engine_ = py::none();
+  py::object render_engine_ = py::none();
   unique_ptr<PythonSteppedRuntime> stepped_;
   unique_ptr<ConsoleMachine> machine_;
   unique_ptr<Console> console_;
@@ -321,9 +533,8 @@ PYBIND11_MODULE(nes_hardware, m) {
       .def_readonly("mapper", &Cartridge::mapper)
       .def_readonly("battery", &Cartridge::battery);
   py::class_<ConsoleHost>(m, "Console")
-      .def(py::init<Cartridge, py::object, const vector<tuple<int, int, int>>&, double>(),
-           py::arg("cartridge"), py::arg("backend_factory"), py::arg("opcodes"),
-           py::arg("sample_rate") = 44100.0)
+      .def(py::init<Cartridge, py::object, double>(), py::arg("cartridge"),
+           py::arg("backend_factory"), py::arg("sample_rate") = 44100.0)
       .def("run_frame", &ConsoleHost::run_frame)
       .def("set_buttons", &ConsoleHost::set_buttons)
       .def("run_tape", &ConsoleHost::run_tape, py::arg("path"), py::arg("tail_frames") = 120,
@@ -332,9 +543,27 @@ PYBIND11_MODULE(nes_hardware, m) {
       .def("prg_ram", &ConsoleHost::prg_ram)
       .def("load_prg_ram", &ConsoleHost::load_prg_ram, py::arg("data"))
       .def("set_sprite_limit", &ConsoleHost::set_sprite_limit, py::arg("enabled"))
+      .def("ppu_expert_map", &ConsoleHost::ppu_expert_map,
+           "Which render model drew each 8-pixel slot of the last frame "
+           "(240x32 bytes: 0 full graph, k expert k, 255 native)")
+      .def("set_ppu_register_engine", &ConsoleHost::set_ppu_register_engine,
+           py::arg("engine"))
+      .def("set_ppu_render_engine", &ConsoleHost::set_ppu_render_engine, py::arg("engine"))
+      .def("request_ppu_slot_trace", &ConsoleHost::request_ppu_slot_trace, py::arg("line"),
+           py::arg("slot"))
+      .def("take_ppu_slot_trace", &ConsoleHost::take_ppu_slot_trace)
+      .def_property(
+          "ppu_force_full_render",
+          [](ConsoleHost& h) { return h.console().ppu.force_full_render; },
+          [](ConsoleHost& h, bool on) { h.console().ppu.force_full_render = on; },
+          "render every graph slot with the full model (no folded experts)")
+      .def_property_readonly("ppu_graph_chr_full",
+                             [](ConsoleHost& h) { return h.console().ppu.graph_chr_full(); })
       .def_property_readonly("frame_index",
                              [](ConsoleHost& h) { return h.console().frame_index; })
       .def_property_readonly("cycles", [](ConsoleHost& h) { return h.console().cycles; })
+      .def_property_readonly("controller_polls",
+                             [](ConsoleHost& h) { return h.console().controller.polls; })
       .def_property_readonly("halted", [](ConsoleHost& h) { return h.console().halted; })
       .def_property_readonly("last_audio", [](ConsoleHost& h) {
         const auto& a = h.console().last_audio;

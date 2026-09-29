@@ -2,9 +2,9 @@
 
 model/engine_gen.py emits this persistent-machine protocol into the
 generated engine: one exact memory structure, one shadow decoder, one run
-loop (watch/lease/trace/budget), one machine API.  The consumer is the
-native console's PythonEngineMachine (nes/bindings.cpp); keeping the
-blocks here keeps the protocol reviewable in one place.
+loop (watch/lease/trace/budget), one machine API and its native ABI.
+The consumer is the console's EngineMachine (nes/bindings.cpp); keeping
+the blocks here keeps the protocol reviewable in one place.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from transformer_nes.cpu6502.spec import (
     MODE_ZERO_PAGE_Y,
     OPCODES,
     READS_MEMORY,
-    dynamic_cycle_table,
 )
 
 READ_MODE_CODE = {
@@ -45,19 +44,6 @@ def read_mode_table() -> tuple[int, ...]:
     for byte, op in OPCODES.items():
         if op.operation in READS_MEMORY:
             table[byte] = READ_MODE_CODE.get(op.mode, 0)
-    return tuple(table)
-
-
-def cycle_table() -> tuple[int, ...]:
-    """Base opcode cycles. Dynamic penalties are added by ``dynamic_cycles``.
-
-    Unknown bytes cost 2, never 0: a zero-cycle step can never satisfy a
-    cycle budget, so garbage execution (a bad pointer landing between
-    opcodes) would spin the native run loop forever instead of returning
-    at the frame boundary."""
-    table = [2] * 256
-    for byte, op in OPCODES.items():
-        table[byte] = op.cycles
     return tuple(table)
 
 
@@ -148,9 +134,9 @@ MEM_QUERY_TEMPLATE = """\
     // Exact memory-head argmax: nearest address wins; equal-distance
     // ties use the latest write. One structure serves each 4 KiB group,
     // so attention state is O(1) in the token log.
-    int mem_val[16][4096];
-    long long mem_seq[16][4096];
-    unsigned long long mem_bits[16][64];
+    int mem_val[{GROUPS}][4096];
+    long long mem_seq[{GROUPS}][4096];
+    unsigned long long mem_bits[{GROUPS}][64];
 
     void mem_query(const int g_, const long long q, {OUT} out[2]) const {
         const unsigned long long* bits = mem_bits[g_];
@@ -197,9 +183,10 @@ MEM_QUERY_TEMPLATE = """\
     }"""
 
 
-def mem_query_cpp(out_type: str) -> str:
-    """The exact nearest-written-address structure (members + query);
-    ``out_type`` is the caller's output element type."""
+def mem_query_cpp(out_type: str, groups: int = 16) -> str:
+    """The exact nearest-written-address structure (members + query) over
+    ``groups`` 4 KiB groups; ``out_type`` is the caller's output element
+    type."""
     cast = "" if out_type == "long long" else f"({out_type})"
     zero = "0.0" if out_type == "double" else "0"
     return (
@@ -207,6 +194,7 @@ def mem_query_cpp(out_type: str) -> str:
         .replace("{OUT}", out_type)
         .replace("{CAST}", cast)
         .replace("{ZERO}", zero)
+        .replace("{GROUPS}", str(groups))
     )
 
 
@@ -287,15 +275,14 @@ IN_RANGES_CPP = """\
 
 
 def run_state_members_cpp() -> str:
-    """Persistent-machine state shared by both run loops: RAM mirror,
-    architectural registers, pause/lease flags, counters, watch ranges, and
-    the shadow-decode / cycle-accounting tables."""
+    """Persistent-machine state of the run loop: RAM mirror, architectural
+    registers, pause/lease flags, counters, watch ranges, and the
+    shadow-decode / trace tables.  Timing is not among them: every
+    instruction's cycles are an output of the model that executes it."""
     read_mode = ", ".join(str(v) for v in read_mode_table())
-    cycles_tab = ", ".join(str(v) for v in cycle_table())
     trace_mode = ", ".join(str(v) for v in trace_mode_table())
     trace_length = ", ".join(str(v) for v in trace_length_table())
     trace_data = ", ".join(str(v) for v in trace_data_table())
-    dynamic = ", ".join(str(v) for v in dynamic_cycle_table())
     return f"""\
     unsigned char ram[65536];  // mirror of the write log, for shadow decode
     int st_pc = 0, st_a = 0, st_x = 0, st_y = 0, st_s = 0xFD, st_p = 0x24;
@@ -319,7 +306,6 @@ def run_state_members_cpp() -> str:
     int lease_n[NLEASE] = {{0, 0, 0, 0}};
     int lease_i[NLEASE] = {{0, 0, 0, 0}};
     long lease_served[NLEASE] = {{0, 0, 0, 0}};
-    int lease_group[NLEASE] = {{0, 0, 0, 0}};
     long step_index = 0;
     long cycles_total = 0;
     std::vector<std::pair<int,int>> rwatch, wwatch;
@@ -327,60 +313,10 @@ def run_state_members_cpp() -> str:
     // windows dispatch only while this stays >= 0x2000, making a watched
     // write inside a window statically impossible.
     int watch_write_lo = 0x10000;
-    // Native cartridge PRG banking (console silicon, like the PPU):
-    // $8000-$FFFF register writes decode natively -- bank switches copy
-    // from the resident PRG ROM, the clobbered ROM byte is repaired --
-    // and are reported for the Python mapper's CHR/IRQ/mirroring side
-    // effects.
-    int mapper_kind = 0;  // 0 none, 1 MMC1, 3 MMC3
-    std::vector<unsigned char> mapper_prg;
-    int mapper_nbanks = 0;
-    int mapper_cur[4] = {{-1, -1, -1, -1}};  // 8K slot banks (MMC1: 16K pairs)
-    int m3_bank_select = 0;
-    int m3_regs[8] = {{0, 0, 0, 0, 0, 0, 0, 0}};
-    int m1_shift = 0x10, m1_control = 0x0C, m1_prg = 0;
-    std::vector<int> mapper_addr, mapper_value;
-    std::vector<int> ls_addr; std::vector<long> ls_served;  // native lease kills
     static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};
     static constexpr unsigned char TRACE_MODE[256] = {{ {trace_mode} }};
     static constexpr unsigned char TRACE_LENGTH[256] = {{ {trace_length} }};
-    static constexpr unsigned char TRACE_DATA[256] = {{ {trace_data} }};
-    // Base opcode cycles; dynamic penalties are added by dynamic_cycles().
-    static constexpr unsigned char CYCLES[256] = {{ {cycles_tab} }};
-    static constexpr unsigned char DYNAMIC[256] = {{ {dynamic} }};
-
-    int dynamic_cycles(int opcode, int pc, int xr, int yr, int p) const {{
-        int cycles = CYCLES[opcode & 0xFF];
-        const int kind = DYNAMIC[opcode & 0xFF];
-        if (kind >= 1 && kind <= 8) {{
-            const bool taken =
-                (kind == 1 && !(p & 0x80)) || (kind == 2 && (p & 0x80)) ||
-                (kind == 3 && !(p & 0x40)) || (kind == 4 && (p & 0x40)) ||
-                (kind == 5 && !(p & 0x01)) || (kind == 6 && (p & 0x01)) ||
-                (kind == 7 && !(p & 0x02)) || (kind == 8 && (p & 0x02));
-            if (!taken) return cycles;
-            ++cycles;
-            const int next = (pc + 2) & 0xFFFF;
-            const int target = (next + (int)(std::int8_t)ram[(pc + 1) & 0xFFFF]) & 0xFFFF;
-            if ((next & 0xFF00) != (target & 0xFF00)) ++cycles;
-            return cycles;
-        }}
-        if (kind >= 9 && kind <= 11) {{
-            const int lo = ram[(pc + 1) & 0xFFFF];
-            int base;
-            int index;
-            if (kind == 11) {{
-                const int pointer = lo & 0xFF;
-                base = ram[pointer] | (ram[(pointer + 1) & 0xFF] << 8);
-                index = yr;
-            }} else {{
-                base = lo | (ram[(pc + 2) & 0xFFFF] << 8);
-                index = kind == 9 ? xr : yr;
-            }}
-            if ((base & 0xFF00) != (((base + index) & 0xFFFF) & 0xFF00)) ++cycles;
-        }}
-        return cycles;
-    }}"""
+    static constexpr unsigned char TRACE_DATA[256] = {{ {trace_data} }};"""
 
 
 MACHINE_API_CPP = """\
@@ -409,32 +345,28 @@ MACHINE_API_CPP = """\
     }
     // Both setters return the evicted address (or -1) so the bus can drop
     // its device tracking for it.
-    int set_read_lease(int addr, int value, int group) {
+    int set_read_lease(int addr, int value) {
         addr &= 0xFFFF;
         const int s = lease_claim(addr);
         const int evicted = lease_addr[s] == addr ? -1 : lease_addr[s];
         lease_addr[s] = addr; lease_value[s] = value & 0xFF;
         lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
-        lease_group[s] = group;
         return evicted;
     }
-    int set_read_lease_seq(int addr, py::bytes values, int group) {
-        const std::string v = values;
+    int set_read_lease_bytes(int addr, const unsigned char* v, long n) {
         addr &= 0xFFFF;
         const int s = lease_claim(addr);
         const int evicted = lease_addr[s] == addr ? -1 : lease_addr[s];
         lease_addr[s] = addr;
-        lease_n[s] = v.size() < 8 ? (int)v.size() : 8;
+        lease_n[s] = n < 8 ? (int)n : 8;
         lease_i[s] = 0; lease_served[s] = 0;
-        lease_group[s] = group;
-        for (int i = 0; i < lease_n[s]; ++i) lease_vals[s][i] = (unsigned char)v[i];
+        for (int i = 0; i < lease_n[s]; ++i) lease_vals[s][i] = v[i];
         if (lease_n[s] == 0) lease_addr[s] = -1;
         return evicted;
     }
     void clear_read_lease() {
         for (int s = 0; s < NLEASE; ++s) {
             lease_addr[s] = -1; lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
-            lease_group[s] = 0;
         }
     }
     // Targeted invalidation (a write only disturbs its own device's
@@ -443,7 +375,6 @@ MACHINE_API_CPP = """\
         const int s = lease_slot(addr & 0xFFFF);
         if (s >= 0) {
             lease_addr[s] = -1; lease_n[s] = lease_i[s] = 0; lease_served[s] = 0;
-            lease_group[s] = 0;
         }
     }
     long take_lease_served(int addr) {
@@ -459,116 +390,95 @@ MACHINE_API_CPP = """\
     int read_ram(int addr) { return ram[addr & 0xFFFF]; }
     py::bytes dump_ram() { return py::bytes((const char*)ram, 65536); }
 
-    // ── Native PRG banking ───────────────────────────────────────────
-    void mapper_slot(int slot, int bank, int size) {
-        if (mapper_cur[slot] == bank) return;
-        mapper_cur[slot] = bank;
-        const unsigned char* src = mapper_prg.data() + (size_t)bank * size;
-        const int base = 0x8000 + slot * size;
-        for (int i = 0; i < size; ++i) map_write(base + i, src[i]);
-    }
-    void mapper_apply_mmc3() {
-        const int n = mapper_nbanks;
-        const int r6 = m3_regs[6] % n, r7 = m3_regs[7] % n;
-        const int second_last = n - 2, last = n - 1;
-        const bool swap = m3_bank_select & 0x40;
-        mapper_slot(0, swap ? second_last : r6, 0x2000);
-        mapper_slot(1, r7, 0x2000);
-        mapper_slot(2, swap ? r6 : second_last, 0x2000);
-        mapper_slot(3, last, 0x2000);
-    }
-    void mapper_apply_mmc1() {
-        const int n = mapper_nbanks;
-        const int mode = (m1_control >> 2) & 3;
-        const int bank = (m1_prg & 0x0F) % n;
-        int lo, hi;
-        if (mode <= 1) { lo = bank & 0x0E; hi = (bank & 0x0E) | 1; }
-        else if (mode == 2) { lo = 0; hi = bank; }
-        else { lo = bank; hi = n - 1; }
-        mapper_slot(0, lo, 0x4000);
-        mapper_slot(1, hi, 0x4000);
-    }
-    int mapper_rom_byte(int addr) {
-        if (mapper_kind == 1) {
-            const int bank = mapper_cur[(addr >> 14) & 1];
-            return mapper_prg[(size_t)bank * 0x4000 + (addr & 0x3FFF)];
-        }
-        const int bank = mapper_cur[(addr - 0x8000) >> 13];
-        return mapper_prg[(size_t)bank * 0x2000 + (addr & 0x1FFF)];
-    }
-    // Decode a $8000-$FFFF register write, apply any PRG switch, repair
-    // the clobbered ROM byte, and report the mapper side effects.
-    void mapper_write(int addr, int value) {
-        mapper_addr.push_back(addr); mapper_value.push_back(value);
-        if (mapper_kind == 3) {
-            const int reg = addr & 0xE001;
-            if (reg == 0x8000) { m3_bank_select = value; mapper_apply_mmc3(); }
-            else if (reg == 0x8001) {
-                m3_regs[m3_bank_select & 7] = value & 0xFF;
-                mapper_apply_mmc3();
-            } else if (reg == 0xE000) {
-                irq_pending = false;  // $E000 acks the line NOW; the
-            }                         // drain reconciles console sources
-        } else if (value & 0x80) {
-            m1_shift = 0x10; m1_control |= 0x0C;
-            mapper_apply_mmc1();
-        } else {
-            const bool complete = m1_shift & 1;
-            m1_shift = ((m1_shift >> 1) | ((value & 1) << 4)) & 0x1F;
-            if (complete) {
-                const int reg = (addr >> 13) & 3;
-                if (reg == 0) m1_control = m1_shift;
-                else if (reg == 3) m1_prg = m1_shift;
-                m1_shift = 0x10;
-                mapper_apply_mmc1();
-            }
-        }
-        map_write(addr, mapper_rom_byte(addr));
-    }
-    void set_mapper_mmc3(py::bytes prg, int bank_select, py::bytes regs,
-                         py::bytes cur) {
-        const std::string p = prg, r = regs, c = cur;
-        mapper_prg.assign(p.begin(), p.end());
-        mapper_nbanks = (int)(p.size() / 0x2000);
-        m3_bank_select = bank_select;
-        for (int i = 0; i < 8 && i < (int)r.size(); ++i)
-            m3_regs[i] = (unsigned char)r[i];
-        for (int i = 0; i < 4 && i < (int)c.size(); ++i)
-            mapper_cur[i] = (unsigned char)c[i];
-        mapper_kind = 3;
-    }
-    void set_mapper_mmc1(py::bytes prg, int shift, int control, int prgreg,
-                         int lo, int hi) {
-        const std::string p = prg;
-        mapper_prg.assign(p.begin(), p.end());
-        mapper_nbanks = (int)(p.size() / 0x4000);
-        m1_shift = shift; m1_control = control; m1_prg = prgreg;
-        mapper_cur[0] = lo; mapper_cur[1] = hi;
-        mapper_kind = 1;
-    }
-    void clear_mapper() {
-        mapper_kind = 0; mapper_prg.clear();
-        for (int i = 0; i < 4; ++i) mapper_cur[i] = -1;
-        m1_shift = 0x10; m1_control = 0x0C; m1_prg = 0;
-        m3_bank_select = 0;
-        for (int i = 0; i < 8; ++i) m3_regs[i] = 0;
-        mapper_addr.clear(); mapper_value.clear();
-    }"""
+    // The native machine ABI (machine_abi()): the console's bus calls the
+    // run loop and these controls directly, with no Python in between.
+    // Keep in step with nes/bindings.cpp:cpu_engine (MACHINE_ABI_VERSION).
+    struct MachineRunOut {
+        const char* reason;  // "budget", "halt", "trap", "watch_read", "watch_write", "cycles"
+        long cycles;
+        int read_addr;
+        long read_cycles;
+        int pause_ir;  // the opcode a watch_write pause stopped on
+        const int* hit_addr;
+        const int* hit_value;
+        long n_hits;  // valid until the next run
+    };
+    struct MachineAbi {
+        void (*run)(void*, long max_cycles, MachineRunOut*);
+        int (*read_ram)(void*, int);
+        void (*inject_write)(void*, int, int);
+        void (*map_region)(void*, int, const unsigned char*, long);
+        void (*add_window)(void*, int, int);
+        int (*set_read_lease)(void*, int, int);
+        int (*set_read_lease_seq)(void*, int, const unsigned char*, long);
+        long (*take_lease_served)(void*, int);
+        void (*clear_read_lease)(void*);
+        void (*clear_read_lease_addr)(void*, int);
+        void (*set_nmi)(void*);
+        void (*set_irq)(void*);
+        void (*clear_irq)(void*);
+    };
+"""
+
+MACHINE_ABI_VERSION = 1
+
+# The pybind export of the machine ABI: a version, the engine, and a
+# static table of plain function pointers over it.
+PYBIND_MACHINE_ABI = """        .def("machine_abi", [](ENGINE_T& e) {
+            using E = ENGINE_T;
+            static const E::MachineAbi abi = {
+                +[](void* c, long max_cycles, E::MachineRunOut* out) {
+                    auto* e = static_cast<E*>(c);
+                    const auto r = e->run_core(LONG_MAX, false, max_cycles, false);
+                    *out = {r.reason, r.cycles, r.read_addr, r.read_cycles, e->st_ir,
+                            e->hit_addr.data(), e->hit_value.data(), (long)e->hit_addr.size()};
+                },
+                +[](void* c, int a) { return static_cast<E*>(c)->read_ram(a); },
+                +[](void* c, int a, int v) { static_cast<E*>(c)->inject_write(a, v); },
+                +[](void* c, int base, const unsigned char* d, long n) {
+                    static_cast<E*>(c)->map_bytes(base, d, n);
+                },
+                +[](void* c, int shape, int head) { static_cast<E*>(c)->add_window(shape, head); },
+                +[](void* c, int a, int v) { return static_cast<E*>(c)->set_read_lease(a, v); },
+                +[](void* c, int a, const unsigned char* v, long n) {
+                    return static_cast<E*>(c)->set_read_lease_bytes(a, v, n);
+                },
+                +[](void* c, int a) { return static_cast<E*>(c)->take_lease_served(a); },
+                +[](void* c) { static_cast<E*>(c)->clear_read_lease(); },
+                +[](void* c, int a) { static_cast<E*>(c)->clear_read_lease_addr(a); },
+                +[](void* c) { static_cast<E*>(c)->set_nmi(); },
+                +[](void* c) { static_cast<E*>(c)->set_irq(); },
+                +[](void* c) { static_cast<E*>(c)->clear_irq(); },
+            };
+            return py::make_tuple(MACHINE_ABI_VERSION, reinterpret_cast<std::uintptr_t>(&e),
+                                  reinterpret_cast<std::uintptr_t>(&abi));
+        })""".replace("MACHINE_ABI_VERSION", str(MACHINE_ABI_VERSION), 1)
 
 
 RUN_LOOP_TEMPLATE = """\
-    // Run up to max_steps instructions natively, pausing back to
-    // Python only on halt / jump-to-self trap / watched device
-    // access / cycle budget.  One protocol and result dict, consumed
-    // by the native console's PythonEngineMachine (nes/bindings.cpp).
-    // trace=false skips the per-step trace/write arrays (the console's
-    // gameplay path reads only steps/hits/reason/cycles).
-    py::dict run(long max_steps, bool stop_on_trap, long max_cycles, bool trace) {
-        std::vector<int> t_pc, t_a, t_x, t_y, t_s, t_p, t_ir, t_oplo, t_ophi, t_ea, t_data, t_halted;
-        std::vector<long> w_row; std::vector<int> w_addr, w_value;
-        std::vector<int> hit_addr, hit_value;
+    // Run up to max_steps instructions, stopping on halt, a jump-to-self
+    // trap, a watched device access the leases cannot serve, or the cycle
+    // budget.  The console drives run_core through the machine ABI
+    // (nes/bindings.cpp:EngineMachine); run() wraps it as a dict for
+    // Python, with the per-step trace arrays when `trace` is set.  The
+    // per-run outputs are members, reused across runs: the ABI hands out
+    // the hit arrays without copying.
+    std::vector<int> t_pc, t_a, t_x, t_y, t_s, t_p, t_ir, t_oplo, t_ophi, t_ea, t_data, t_halted;
+    std::vector<long> w_row; std::vector<int> w_addr, w_value;
+    std::vector<int> hit_addr, hit_value;
+    struct RunResult {
+        const char* reason;
+        int read_addr;
+        long read_cycles, cycles, steps, forwards;
+    };
+    RunResult run_core(long max_steps, bool stop_on_trap, long max_cycles, bool trace) {
+        for (auto* v : {&t_pc, &t_a, &t_x, &t_y, &t_s, &t_p, &t_ir, &t_oplo, &t_ophi, &t_ea,
+                        &t_data, &t_halted, &w_addr, &w_value, &hit_addr, &hit_value})
+            v->clear();
+        w_row.clear();
         const char* reason = "budget";
         int read_addr = -1;
+        long read_cycles = 0;
         long cycles_this = 0;
         const long steps_entry = step_index;
         long n_forward = 0;
@@ -580,10 +490,10 @@ RUN_LOOP_TEMPLATE = """\
             if (!nmi_pending && !irq_ready() && !skip && !rwatch.empty()) {
                 const int target = shadow_read_target();
                 if (target >= 0 && in_ranges(rwatch, target)) {
-                    // Leased: serve the device read natively, exactly
-                    // what the Python pause path would inject.  An
-                    // exhausted queue keeps its slot (preserving the
-                    // served count for the bus) but pauses.
+                    // Leased: serve the device read here, the value the
+                    // device would return.  An exhausted queue keeps its
+                    // slot (preserving the served count for the bus) but
+                    // pauses.
                     bool served = false;
                     const int ls = lease_slot(target);
                     if (ls >= 0) {
@@ -595,6 +505,9 @@ RUN_LOOP_TEMPLATE = """\
                         }
                     }
                     if (!served) {
+                        // The device access lands on the instruction's
+                        // last cycle: report its length for the stamp.
+                        read_cycles = probe_cycles();
                         resume_read_skip = true; read_addr = target; reason = "watch_read"; break;
                     }
                 }
@@ -602,6 +515,10 @@ RUN_LOOP_TEMPLATE = """\
             ++n_forward;
 {STEP_BODY}
         }
+        return {reason, read_addr, read_cycles, cycles_this, step_index - steps_entry, n_forward};
+    }
+    py::dict run(long max_steps, bool stop_on_trap, long max_cycles, bool trace) {
+        const RunResult r = run_core(max_steps, stop_on_trap, max_cycles, trace);
         py::dict out;
         auto arr = [](const std::vector<int>& src) {
             return py::array_t<int>((py::ssize_t)src.size(), src.data());
@@ -628,17 +545,12 @@ RUN_LOOP_TEMPLATE = """\
         }
         out["hit_addr"] = arr(hit_addr);
         out["hit_value"] = arr(hit_value);
-        out["mapper_addr"] = arr(mapper_addr);
-        out["mapper_value"] = arr(mapper_value);
-        mapper_addr.clear(); mapper_value.clear();
-        out["ls_addr"] = arr(ls_addr);
-        out["ls_served"] = py::array_t<long>((py::ssize_t)ls_served.size(), ls_served.data());
-        ls_addr.clear(); ls_served.clear();
-        out["read_addr"] = read_addr;
-        out["reason"] = reason;
-        out["cycles"] = cycles_this;
-        out["steps"] = step_index - steps_entry;
-        out["forwards"] = n_forward;
+        out["read_addr"] = r.read_addr;
+        out["read_cycles"] = r.read_cycles;
+        out["reason"] = r.reason;
+        out["cycles"] = r.cycles;
+        out["steps"] = r.steps;
+        out["forwards"] = r.forwards;
         return out;
     }"""
 

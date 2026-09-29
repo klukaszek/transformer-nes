@@ -1,9 +1,10 @@
 // Native NES app: a Sokol window over the console frame loop.  The
-// window, input, and one textured quad live here; each display frame
-// calls back into Python (Console.run_frame via app.py) at the NTSC
-// rate and blits the returned 256x240 RGB frame.  Metal on Apple, GL
-// elsewhere (ui/sokol_platform.h); cached by content digest.
+// window, input, audio, and one textured quad live here; display frames
+// call back into Python (Console.run_frame via app.py) at the NTSC rate
+// and blit the returned 256x240 palette indices.  Metal on Apple, GL
+// elsewhere (ui/sokol_platform.h).
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -251,6 +252,23 @@ void app_frame() {
     state->have_frame = true;
   }
 
+  // Where the (possibly cropped) frame lands, letterboxed to its aspect;
+  // the overlay needs it too, in points.
+  const bool crop = state->ui.crop;
+  const int src_w = crop ? view_width : frame_width;
+  const int src_h = crop ? view_height : frame_height;
+  int w = sapp_width(), h = sapp_height();
+  int vw = w, vh = w * src_h / src_w;
+  if (vh > h) {
+    vh = h;
+    vw = h * src_w / src_h;
+  }
+  const float dpi = sapp_dpi_scale();
+  state->ui.game_x = static_cast<float>((w - vw) / 2) / dpi;
+  state->ui.game_y = static_cast<float>((h - vh) / 2) / dpi;
+  state->ui.game_w = static_cast<float>(vw) / dpi;
+  state->ui.game_h = static_cast<float>(vh) / dpi;
+
   // Build the overlay's ImGui frame before the pass (font/texture
   // updates are illegal inside one); submit it inside the pass below.
   try {
@@ -267,16 +285,6 @@ void app_frame() {
   pass.action.colors[0].clear_value = {0.0f, 0.0f, 0.0f, 1.0f};
   sg_begin_pass(&pass);
   if (state->have_frame) {
-    const bool crop = state->ui.crop;
-    const int src_w = crop ? view_width : frame_width;
-    const int src_h = crop ? view_height : frame_height;
-    // Letterbox to the (possibly cropped) frame's aspect.
-    int w = sapp_width(), h = sapp_height();
-    int vw = w, vh = w * src_h / src_w;
-    if (vh > h) {
-      vh = h;
-      vw = h * src_w / src_h;
-    }
     sg_apply_viewport((w - vw) / 2, (h - vh) / 2, vw, vh, true);
     sg_apply_pipeline(state->pipeline);
     sg_bindings bind{};
@@ -295,7 +303,11 @@ void app_frame() {
 
 void app_event(const sapp_event* e) {
   if (transformer_nes::ui::handle_event(e, state->ui)) {
-    state->buttons = 0; // keys released into the overlay must not stick
+    // A key the overlay took (its toggle, Esc, typing into a field) may
+    // have its release land there too: drop held buttons so none stick.
+    // Mouse use over the overlay leaves the game's input alone.
+    if (e->type == SAPP_EVENTTYPE_KEY_DOWN)
+      state->buttons = 0;
     return;
   }
   if (e->type != SAPP_EVENTTYPE_KEY_DOWN && e->type != SAPP_EVENTTYPE_KEY_UP) {
@@ -305,35 +317,15 @@ void app_event(const sapp_event* e) {
     sapp_request_quit();
     return;
   }
-  std::uint32_t bit = 0;
-  switch (e->key_code) {
-  case SAPP_KEYCODE_X:
-    bit = BTN_A;
-    break;
-  case SAPP_KEYCODE_Z:
-    bit = BTN_B;
-    break;
-  case SAPP_KEYCODE_TAB:
-    bit = BTN_SELECT;
-    break;
-  case SAPP_KEYCODE_ENTER:
-    bit = BTN_START;
-    break;
-  case SAPP_KEYCODE_UP:
-    bit = BTN_UP;
-    break;
-  case SAPP_KEYCODE_DOWN:
-    bit = BTN_DOWN;
-    break;
-  case SAPP_KEYCODE_LEFT:
-    bit = BTN_LEFT;
-    break;
-  case SAPP_KEYCODE_RIGHT:
-    bit = BTN_RIGHT;
-    break;
-  default:
+  static constexpr std::pair<sapp_keycode, uint32_t> keys[] = {
+      {SAPP_KEYCODE_X, BTN_A},       {SAPP_KEYCODE_Z, BTN_B},         {SAPP_KEYCODE_TAB, BTN_SELECT},
+      {SAPP_KEYCODE_ENTER, BTN_START}, {SAPP_KEYCODE_UP, BTN_UP},     {SAPP_KEYCODE_DOWN, BTN_DOWN},
+      {SAPP_KEYCODE_LEFT, BTN_LEFT}, {SAPP_KEYCODE_RIGHT, BTN_RIGHT},
+  };
+  const auto key = std::ranges::find(keys, e->key_code, &std::pair<sapp_keycode, uint32_t>::first);
+  if (key == std::end(keys))
     return;
-  }
+  const uint32_t bit = key->second;
   if (e->type == SAPP_EVENTTYPE_KEY_DOWN) {
     state->buttons |= bit;
   } else {
@@ -378,10 +370,23 @@ void app_cleanup() {
   sg_shutdown();
 }
 
-// Wrap the Python debug bridge (app.py DebugBridge) as plain functions;
-// they run inside the frame/event callbacks, GIL already held.
+transformer_nes::ui::Dissection to_dissection(const py::handle& d) {
+  transformer_nes::ui::Dissection out;
+  out.title = py::cast<std::string>(d["title"]);
+  out.layers = py::cast<int>(d["layers"]);
+  out.d_model = py::cast<int>(d["d_model"]);
+  out.steps = py::cast<decltype(out.steps)>(d["steps"]);
+  out.activity = py::cast<std::vector<int>>(d["activity"]);
+  return out;
+}
+
+// Wrap the Python debug bridge (nes/debug.py DebugBridge) as plain
+// functions; they run inside the frame/event callbacks, GIL already
+// held.  The X-ray's CPU and pixel hooks exist when the bridge has the
+// weights CPU and the render graph to read.
 transformer_nes::ui::DebugHooks make_hooks(py::object bridge) {
-  transformer_nes::ui::DebugHooks hooks;
+  using namespace transformer_nes::ui;
+  DebugHooks hooks;
   if (bridge.is_none())
     return hooks;
   hooks.read_mem = [bridge](uint32_t start, uint32_t count) {
@@ -397,13 +402,39 @@ transformer_nes::ui::DebugHooks make_hooks(py::object bridge) {
     bridge.attr("set_option")(name, value);
   };
   hooks.step_frame = [bridge] { bridge.attr("step_frame")(); };
+  hooks.xray_frame = [bridge] {
+    const py::dict x = bridge.attr("xray_frame")();
+    XrayFrame frame;
+    frame.cpu_paths = py::cast<Counts>(x["cpu_paths"]);
+    frame.cpu_singles = py::cast<Counts>(x["cpu_singles"]);
+    frame.ppu_models = py::cast<Counts>(x["ppu_models"]);
+    frame.expert_map = py::cast<std::string>(x["expert_map"]);
+    frame.expert_names = py::cast<std::vector<std::string>>(x["expert_names"]);
+    frame.expert_colors = py::cast<std::vector<uint32_t>>(x["expert_colors"]);
+    frame.read_heat = py::cast<std::string>(x["read_heat"]);
+    frame.hot_pages = py::cast<Counts>(x["hot_pages"]);
+    return frame;
+  };
+  if (!bridge.attr("cpu_xray").is_none())
+    hooks.dissect = [bridge] { return to_dissection(bridge.attr("dissect")()); };
+  if (!bridge.attr("ppu_xray").is_none()) {
+    hooks.trace_pixel = [bridge](int line, int x) { bridge.attr("trace_pixel")(line, x); };
+    hooks.pixel_dissection = [bridge]() -> std::optional<Dissection> {
+      const py::object d = bridge.attr("pixel_dissection")();
+      return d.is_none() ? std::nullopt : std::optional(to_dissection(d));
+    };
+    hooks.knock_out = [bridge](const std::string& name) {
+      return py::cast<std::string>(bridge.attr("knock_out")(name));
+    };
+    hooks.restore = [bridge] { bridge.attr("restore")(); };
+  }
   return hooks;
 }
 
 // Blocks until the window closes.  The callbacks run on this thread
 // inside sapp_run, so the GIL held by this call covers every frame.
 void run(const string& title, int scale, py::object frame_cb, py::object quit_cb,
-         py::object debug) {
+         py::object debug, bool overlay) {
   if (scale <= 0)
     throw std::invalid_argument("window scale must be positive");
   if (!PyCallable_Check(frame_cb.ptr()))
@@ -412,6 +443,7 @@ void run(const string& title, int scale, py::object frame_cb, py::object quit_cb
   st.frame_cb = frame_cb;
   st.quit_cb = quit_cb;
   st.hooks = make_hooks(debug);
+  st.ui.open = st.ui.xray = overlay;
   state = &st;
   sapp_desc desc{};
   desc.init_cb = app_init;
@@ -438,6 +470,7 @@ void run(const string& title, int scale, py::object frame_cb, py::object quit_cb
 PYBIND11_MODULE(nes_app, m) {
   m.def("run", &run, py::arg("title"), py::arg("scale"), py::arg("frame_cb"),
         py::arg("quit_cb") = py::none(), py::arg("debug") = py::none(),
+        py::arg("overlay") = false,
         "Open the window and drive frame_cb(buttons) until quit; on macOS "
         "the process exits inside run, with quit_cb the last Python to run. "
         "debug is the tilde overlay's bridge (read_mem/stats/options/...).");

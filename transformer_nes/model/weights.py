@@ -8,14 +8,16 @@ The persist/output phase is a linear projection. For each output slot:
   delta[slot] = persist_expr evaluated over gate/passthrough outputs
               - old_value (if slot was reused from a dead dim)
 
-The weights live in plain numpy arrays (WeightModel); nothing runs a forward
-here -- inference is entirely in the generated C++ engine.  Torch is used only
+The weights live in plain numpy arrays (WeightModel).  model/inference.py
+runs them as an exact reference forward; the 6502 executes through the
+generated C++ engine (model/engine_gen.py).  Torch is used only
 to compile that engine (torch.utils.cpp_extension), not as a tensor library.
 """
 
 import logging
 import math
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import numpy as np
@@ -43,6 +45,11 @@ class BuildInfo(NamedTuple):
     std_layers: list
     slot_of: dict
     d_model: int
+    # (dim, slot, first, end): the dim holds `slot` in the residual stream
+    # after the embedding (row 0) and each layer L (row L + 1), for rows
+    # first <= row < end -- slots are recycled, so one slot carries
+    # several dims over the stack (the debugger's layer-by-layer labels).
+    lives: list
 
 
 class _Weight:
@@ -70,7 +77,8 @@ class _Attn:
 
 class WeightModel:
     """Numpy weight container the analytic construction populates and the
-    generated C++ engine reads.  Not a torch module -- there is no forward."""
+    generated C++ engine reads.  Not a torch module; the reference forward is
+    model/inference.py."""
 
     # Per-layer classification metadata, attached by build_model: head/FFN
     # kinds (0 unused, 1 lookup, 2 passthrough), tie-breaks, cache/memory
@@ -83,8 +91,6 @@ class WeightModel:
     head_lookup_ids: list[list[int]]
     head_pairs: list[list[int]]
     head_memory_outputs: list[list[tuple[str, ...] | None]]
-    attn_erase: list
-    ffn_erase: list
     one_slot: int
 
     def __init__(self, vocab, d_model, n_heads, n_layers, d_ffn, stop_token_id=0):
@@ -97,123 +103,114 @@ class WeightModel:
         self.head = _Weight((vocab, d_model))
 
 
-def build_model(program_graph=None, schedule=None, recycle_slots=True):
-    """Build transformer weight matrices from a computation graph.
+@dataclass
+class SlotLayout:
+    """Where each dim lives in the residual stream (assign_slots)."""
 
-    Args:
-        program_graph: a ProgramGraph wrapping the input/output tokens.
-        schedule: a precomputed schedule dict (asap_schedule output).
-        recycle_slots: reuse a dead dim's residual slot (interval coloring).
-            Recycling narrows d_model but costs one erase per reuse, because
-            the residual update is additive and the stale value has to be
-            subtracted.  Giving every dim its own slot removes that traffic
-            entirely.  Measured 2026-07-31: on the union the escape is a bad
-            deal (d_model 622 -> 4284 for 15.8% fewer non-zeros), but on the
-            folded experts it is a good one (max d_model 36 -> 56 for 13.6%
-            fewer), and the experts are what execute -- so they build with
-            this off (experts.py:schedule_and_build) and the union keeps
-            recycling.
-    """
-    if program_graph is not None:
-        pg = program_graph
-        input_tokens = pg.input_tokens
-        output_tokens = pg.output_tokens
-        ALL_DIMS = pg.all_dims
-        one = pg.one
-    else:
-        raise ValueError(
-            "build_model requires a program_graph (the default WASM "
-            "machine graph was removed; wrap your interpreter's "
-            "input/output tokens in a ProgramGraph)"
-        )
+    slot_of: dict  # dim -> residual slot
+    d_model: int
+    # (layer, half) -> slots whose dead occupant must be erased there,
+    # half 1 the attention block and 3 the FFN block.
+    erased_at: dict
+    lives: list  # BuildInfo.lives
 
-    # ── Load schedule ─────────────────────────────────────────
-    if schedule is None:
-        raise ValueError(
-            "build_model requires a precomputed schedule "
-            "(asap_schedule output)"
-        )
-    std_layers = schedule["std_layers"]
-    n_layers = schedule["num_layers"]
-    alive_after = schedule.get("alive_after", {})
 
-    # ── Slot assignment (interval coloring) ───────────────────
-    input_dims = [d for d in ALL_DIMS if isinstance(d, InputDimension)]
-    slot_of = {}
-    next_slot = 0
-    for d in input_dims:
-        if d not in slot_of:
-            slot_of[d] = next_slot
-            next_slot += 1
-
-    free_slots = []
-    pending_free = []  # freed this half-layer, available next
-    reused_at = {}  # (L, sp) -> slots written (already 0)
+def assign_slots(input_dims, output_tokens, alive_after, n_layers, recycle_slots) -> SlotLayout:
+    """Interval coloring of the residual stream.  Inputs take the first
+    slots; walking the schedule's half-layer boundaries, a dim born there
+    takes the lowest slot freed before it (or a new one), and dims only the
+    output tokens read come last.  A slot freed at a boundary is reusable
+    from the next one."""
+    slot_of = {d: i for i, d in enumerate(dict.fromkeys(input_dims))}
+    next_slot = len(slot_of)
+    free_slots: list[int] = []
+    pending_free: list[int] = []  # freed at this boundary, usable at the next
     death_of_slot = {}  # slot -> boundary index where its occupant died
     # An erase only stops a stale value from polluting the additive update
     # that reuses the slot, so it is created on reuse, not on death: a dead
     # value nobody reallocates rides the residual unread and costs nothing.
-    erase_events = []  # (death index, reuse index, slot)
-
-    boundaries = [(L, sp) for L in range(n_layers) for sp in (1, 3)]
-    cur = frozenset(input_dims)
-    for i, (L, sp) in enumerate(boundaries):
-        c = 4 * L + sp
-        nxt = alive_after.get(c, cur)
-        dying = cur - nxt
-        born = nxt - cur
-
+    erase_events = []  # (death index, slot)
+    boundaries = [(L, half) for L in range(n_layers) for half in (1, 3)]
+    first_row = {d: 0 for d in input_dims}
+    end_row = {}
+    alive = frozenset(input_dims)
+    for i, (L, half) in enumerate(boundaries):
+        after = alive_after.get(4 * L + half, alive)
         free_slots.extend(pending_free)
         free_slots.sort()
         pending_free = []
-
-        for d in dying:
-            s = slot_of[d]
-            pending_free.append(s)
-            death_of_slot[s] = i
-
+        for d in alive - after:
+            pending_free.append(slot_of[d])
+            death_of_slot[slot_of[d]] = i
+            end_row[d] = L + 1  # still readable after layer L - 1
         if not recycle_slots:
             free_slots.clear()
             pending_free.clear()
-
-        reused = set()
-        for d in sorted(born, key=lambda x: x.id):
+        for d in sorted(after - alive, key=lambda x: x.id):
+            first_row[d] = L + 1
             if free_slots:
-                s = free_slots.pop(0)
-                slot_of[d] = s
-                reused.add(s)
-                erase_events.append((death_of_slot[s], i, s))
+                slot_of[d] = free_slots.pop(0)
+                erase_events.append((death_of_slot[slot_of[d]], slot_of[d]))
             else:
                 slot_of[d] = next_slot
                 next_slot += 1
-
-        reused_at[(L, sp)] = reused
-        cur = nxt
+        alive = after
 
     # An erase may sit at any boundary between death and reuse, but the death
     # boundary is cheapest on non-zeros; concentrating them wastes the spare V
     # slots and shared Q/K rows the genuine passthroughs already pay for.
     erased_at = {b: set() for b in boundaries}
-    for death_i, _reuse_i, s in erase_events:
-        erased_at[boundaries[death_i]].add(s)
+    for death_i, slot in erase_events:
+        erased_at[boundaries[death_i]].add(slot)
 
-    # Assign slots to output-referenced dims not yet covered
-    output_dims_need = set()
-    for expr in output_tokens.values():
-        if isinstance(expr, Expression):
-            for d in expr.terms:
-                if d not in slot_of and d not in input_dims:
-                    output_dims_need.add(d)
-    for d in sorted(output_dims_need, key=lambda x: x.id):
+    output_only = {
+        d
+        for expr in output_tokens.values() if isinstance(expr, Expression)
+        for d in expr.terms
+        if d not in slot_of and d not in input_dims
+    }
+    for d in sorted(output_only, key=lambda x: x.id):
         if free_slots:
-            s = free_slots.pop(0)
-            slot_of[d] = s
+            slot_of[d] = free_slots.pop(0)
         else:
             slot_of[d] = next_slot
             next_slot += 1
+    return SlotLayout(
+        slot_of=slot_of,
+        d_model=next_slot + next_slot % 2,  # even, for the 2-wide head projections
+        erased_at=erased_at,
+        lives=[(d, slot_of[d], first, end_row.get(d, n_layers + 1))
+               for d, first in first_row.items()],
+    )
 
-    D = next_slot
-    D += D % 2
+
+def build_model(program_graph, schedule, recycle_slots=True):
+    """Build transformer weight matrices from a computation graph.
+
+    Args:
+        program_graph: a ProgramGraph wrapping the input/output tokens.
+        schedule: its schedule (model/schedule.py:asap_schedule).
+        recycle_slots: reuse a dead dim's residual slot (interval coloring).
+            Recycling narrows d_model but costs one erase per reuse, because
+            the residual update is additive and the stale value has to be
+            subtracted.  On the union, recycling wins (d_model 622 instead
+            of 4284 for 15.8% fewer non-zeros); on the folded experts, which
+            are what execute, a slot per dim wins (max d_model 36 -> 56 for
+            13.6% fewer non-zeros), so they build without it
+            (experts.py:schedule_and_build).
+    """
+    pg = program_graph
+    input_tokens = pg.input_tokens
+    output_tokens = pg.output_tokens
+    ALL_DIMS = pg.all_dims
+    one = pg.one
+    std_layers = schedule["std_layers"]
+    n_layers = schedule["num_layers"]
+    alive_after = schedule.get("alive_after", {})
+
+    input_dims = [d for d in ALL_DIMS if isinstance(d, InputDimension)]
+    layout = assign_slots(input_dims, output_tokens, alive_after, n_layers, recycle_slots)
+    slot_of, erased_at, D = layout.slot_of, layout.erased_at, layout.d_model
 
     # ── Internal dims (never in any alive set) ────────────────
     all_ever_alive = set()
@@ -255,17 +252,13 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
 
     # ── Count resources per layer ─────────────────────────────
     # Layers are RAGGED: each gets exactly the heads and FFN units its phase
-    # needs.  Residual width is set by liveness and is unrelated to head
-    # count, which used to be pinned at d_model // 2.
+    # needs.  Residual width is set by liveness, independent of head count.
     heads_per_layer = []
     ffn_per_layer = []
 
-    cur = frozenset(input_dims)
     for L in range(n_layers):
         attn, persist1, ffn, persist2 = std_layers[L]
 
-        c1 = 4 * L + 1
-        nxt1 = alive_after.get(c1, cur)
         erased1 = erased_at[(L, 1)]
 
         lookup_dims_set = set()
@@ -285,10 +278,7 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
                     pt_srcs.add(slot_of[d])
 
         heads_per_layer.append(n_lu_heads + (len(pt_srcs) + 1) // 2)
-        cur = nxt1
 
-        c3 = 4 * L + 3
-        nxt3 = alive_after.get(c3, cur)
         erased3 = erased_at[(L, 3)]
 
         same_rg = set(ffn)
@@ -301,7 +291,6 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
                     pt_srcs_ffn.add(slot_of[d])
 
         ffn_per_layer.append(max(1, len(ffn) + len(pt_srcs_ffn)))
-        cur = nxt3
 
     # ── Vocabulary ────────────────────────────────────────────
     all_tokens = sorted(set(input_tokens.keys()) | set(output_tokens.keys()))
@@ -337,7 +326,6 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
         model.head.weight[idx] = expr_to_tensor(expr)
 
     # ── Per-layer weights ─────────────────────────────────────
-    cur = frozenset(input_dims)
     all_tiebreak = []
     all_ffn_kinds = []
 
@@ -356,8 +344,6 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
         d_ffn = model.ff_out[layer_idx].weight.shape[1]
 
         # ── ATTENTION HALF-LAYER ──────────────────────────────
-        c1 = 4 * layer_idx + 1
-        nxt1 = alive_after.get(c1, cur)
         head_idx = 0
         lookup_dim_to_head = {}
         layer_tiebreak = []
@@ -492,11 +478,8 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
             layer_tiebreak.append(1)
         all_tiebreak.append(layer_tiebreak)
 
-        cur = nxt1
 
         # ── FFN HALF-LAYER ────────────────────────────────────
-        c3 = 4 * layer_idx + 3
-        nxt3 = alive_after.get(c3, cur)
         reglu_to_gate = {}
         layer_ffn_kinds = [0] * d_ffn
         j = 0
@@ -539,10 +522,7 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
         assert j <= d_ffn, f"L{layer_idx} ffn: {j} neurons > {d_ffn}"
         all_ffn_kinds.append(layer_ffn_kinds)
 
-        cur = nxt3
 
-    model.attn_erase = [sorted(erased_at[(li, 1)]) for li in range(n_layers)]
-    model.ffn_erase = [sorted(erased_at[(li, 3)]) for li in range(n_layers)]
     model.head_tiebreak = all_tiebreak
     # FFN neuron classification per layer: 0 unused, 1 ReGLU, 2 linear
     # passthrough/erase neuron.  Fast engines can fuse kind-2 neurons into a
@@ -594,7 +574,7 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
         model.head_memory_outputs.append(memory_outputs)
 
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
-    logger.info(
+    logger.debug(
         "Built model: d_model=%d, n_layers=%d, heads/layer max=%d mean=%.1f, "
         "d_ffn/layer max=%d mean=%.1f",
         D,
@@ -604,7 +584,7 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
         max(ffn_per_layer, default=0),
         sum(ffn_per_layer) / max(len(ffn_per_layer), 1),
     )
-    logger.info(
+    logger.debug(
         "  vocab=%d, lookups=%d, persist=%d, pt_h=%d, pt_g=%d",
         vocab_size,
         sum(sum(kind == 1 for kind in kinds) for kinds in model.head_kinds),
@@ -614,5 +594,5 @@ def build_model(program_graph=None, schedule=None, recycle_slots=True):
     )
 
     info = BuildInfo(n_layers=n_layers, std_layers=std_layers,
-                     slot_of=slot_of, d_model=D)
+                     slot_of=slot_of, d_model=D, lives=layout.lives)
     return model, all_tokens, tok_to_idx_map, info

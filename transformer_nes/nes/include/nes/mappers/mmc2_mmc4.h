@@ -42,7 +42,7 @@ public:
                   image.begin() + 0x8000 + i * unit_);
     return image;
   }
-  void write(int addr, int value, int) override {
+  void write(int addr, int value) override {
     int reg = addr & 0xF000;
     if (reg == 0xA000) {
       const size_t old = prg_bank(0);

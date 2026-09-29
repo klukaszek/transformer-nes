@@ -9,6 +9,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -33,38 +34,36 @@ constexpr size_t CHR_RAM_BANKS = 0x2000 / CHR_BANK1;
 // Everything a mapper drives outside its own cartridge state: the PPU
 // (mirroring, CHR banks, MMC5 substitution state), the machine image
 // (repair pokes, bank region maps), and the shared IRQ line (acks +
-// the sched_dirty re-plan signal).
+// the sched_dirty re-plan signal).  The console catches the PPU up to
+// each mapper access before the mapper sees it.
 struct MapperHost {
   Ppu* ppu = nullptr;
   ConsoleMachine* machine = nullptr;
   IrqLine* irq = nullptr;
 };
 
-class Mapper {
+// A mapper also watches the PPU bus (PpuWatcher): scanline-IRQ mappers
+// clock their counters from the PPU's A12 rises or scanline starts.
+class Mapper : public PpuWatcher {
 public:
   explicit Mapper(Cartridge cart) : cart_(std::move(cart)) {}
-  virtual ~Mapper() = default;
+  ~Mapper() override = default;
   virtual bool banked() const { return false; }
   virtual vector<uint8_t> cpu_image() const = 0;
   virtual int read(int) { throw std::runtime_error("mapper range is write-only"); }
-  // scanline: the visible-span row the write executed on (-1 outside
-  // or unknown); MMC3 anchors mid-frame $C001 reloads to it.
-  virtual void write(int, int, int) { throw std::runtime_error("mapper is not writable"); }
-  virtual void write_rmw(int addr, int value, int scanline) { write(addr, value, scanline); }
-  // Next IRQ scanline given the line of the frame's previous IRQ (-1 at
-  // frame start): MMC3-class counters chain in latch-sized deltas from
-  // the previous expiry, MMC5 compares against an absolute line.
-  virtual optional<int> irq_scanline(int) const { return std::nullopt; }
+  virtual void write(int, int) { throw std::runtime_error("mapper is not writable"); }
+  virtual void write_rmw(int addr, int value) { write(addr, value); }
   virtual vector<pair<int, int>> register_ranges() const { return {}; }
-  virtual void notify_scanline_irq() {}
-  virtual void begin_frame() {}
+  // Whether the PPU should report A12 rises (costs a little per fetch).
+  virtual bool wants_a12() const { return false; }
+  // A copy of the IRQ counter that predicts, over a PPU dry run, when
+  // the IRQ fires; null when no IRQ can fire.
+  virtual std::unique_ptr<IrqProbe> irq_probe() const { return nullptr; }
 
   void connect(MapperHost host) {
     host_ = host;
     on_connected();
   }
-
-  const Cartridge& cartridge() const { return cart_; }
 
 protected:
   Cartridge cart_;

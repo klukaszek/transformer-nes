@@ -48,6 +48,19 @@ inline constexpr array<uint16_t, 16> dmc_periods = {
 inline constexpr array<int, 4> four_step_cycles = {7457, 14913, 22371, 29829};
 inline constexpr array<int, 4> five_step_cycles = {7457, 14913, 22371, 37281};
 
+// How many times a down-counter at `counter` with reload `period` expires
+// over n clocks (an expiry when it is clocked at 0), leaving `counter` as
+// n single clocks would.
+inline int timer_expiries(int& counter, int period, int n) {
+  if (n <= counter) {
+    counter -= n;
+    return 0;
+  }
+  const int rest = n - counter - 1, span = period + 1;
+  counter = period - rest % span;
+  return 1 + rest / span;
+}
+
 // A 4-bit-output envelope generator shared by pulse and noise.
 struct Envelope {
   bool start = false;
@@ -107,6 +120,9 @@ struct Pulse {
       seq_pos = (seq_pos + 1) & 7;
     }
   }
+  void advance(int ticks) { // `ticks` clock_timer calls
+    seq_pos = static_cast<uint8_t>((seq_pos + timer_expiries(timer_counter, timer, ticks)) & 7);
+  }
   void clock_length() {
     if (length > 0 && !length_halt)
       length--;
@@ -149,6 +165,11 @@ struct Triangle {
         seq_pos = (seq_pos + 1) & 31;
     }
   }
+  void advance(int cycles) { // `cycles` clock_timer calls
+    const int steps = timer_expiries(timer_counter, timer, cycles);
+    if (length > 0 && linear_counter > 0)
+      seq_pos = static_cast<uint8_t>((seq_pos + steps) & 31);
+  }
   void clock_length() {
     if (length > 0 && !length_halt)
       length--;
@@ -185,10 +206,17 @@ struct Noise {
   void clock_timer() { // called at APU rate
     if (timer_counter-- == 0) {
       timer_counter = period;
-      const int bit = mode ? 6 : 1;
-      const uint16_t fb = (lfsr & 1) ^ ((lfsr >> bit) & 1);
-      lfsr = static_cast<uint16_t>((lfsr >> 1) | (fb << 14));
+      step_lfsr();
     }
+  }
+  void advance(int ticks) { // `ticks` clock_timer calls
+    for (int k = timer_expiries(timer_counter, period, ticks); k > 0; --k)
+      step_lfsr();
+  }
+  void step_lfsr() {
+    const int bit = mode ? 6 : 1;
+    const uint16_t fb = (lfsr & 1) ^ ((lfsr >> bit) & 1);
+    lfsr = static_cast<uint16_t>((lfsr >> 1) | (fb << 14));
   }
   void clock_length() {
     if (length > 0 && !length_halt)
@@ -239,10 +267,8 @@ public:
   int read(int address);
   void write(int address, int value);
   // Advance state to a stamped CPU cycle before applying an MMIO write.
-  void advance_to(int64_t cpu_cycle, MemoryReader reader = {});
+  void advance_to(int64_t cpu_cycle);
   [[nodiscard]] vector<float> take_samples();
-  // Compatibility wrapper for callers that advance in frame-sized chunks.
-  [[nodiscard]] vector<float> end_frame(int cpu_cycles, MemoryReader reader = {});
   [[nodiscard]] int take_dma_stall() {
     const int stall = dma_stall;
     dma_stall = 0;
@@ -272,16 +298,18 @@ public:
   int dma_stall = 0;
   int64_t clocked_cycles = 0;
   vector<float> pending_samples;
+  // CPU memory as the DMC's sample DMA reads it (empty: no fetches).
+  MemoryReader memory;
 
 private:
-  void fill_dmc_buffer(const MemoryReader& reader);
-  void clock_dmc(const MemoryReader& reader);
+  void fill_dmc_buffer();
+  void clock_dmc();
   void clock_quarter();
   void clock_half();
   void clock_frame_sequencer();
   double mix_level() const;
   float sample();
-  void clock_cycle(const MemoryReader& reader);
+  void clock_cycle();
 };
 
 } // namespace transformer_nes::nes

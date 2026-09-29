@@ -7,7 +7,7 @@ import os
 import numpy as np
 import pytest
 
-from transformer_nes.nes.backends import OPCODES_NATIVE, backend_factory
+from transformer_nes.nes.backends import backend_factory
 from transformer_nes.nes.build import load_hardware
 
 EXAMPLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
@@ -19,7 +19,7 @@ FRAMES = 90
 
 
 def run_console(hardware, cart, backend, frames, script=SCRIPT):
-    console = hardware.Console(cart, backend_factory(backend), OPCODES_NATIVE, 44100.0)
+    console = hardware.Console(cart, backend_factory(backend), 44100.0)
     frames_out = []
     mask = 0
     for i in range(frames):

@@ -49,19 +49,6 @@ class ControlFlow:
 
 
 @dataclass(frozen=True)
-class RecurrenceSummary:
-    kind: Literal["identity", "affine_until", "invariant_poll"]
-    steps_per_iteration: int
-    cycles_per_iteration: int
-    cycles_prefix: int
-    register: Literal["x", "y"] | None = None
-    delta: int = 0
-    fallthrough_offset: int = 0
-    closure_operand_offset: int | None = None
-    closure_operand_value: int | None = None
-
-
-@dataclass(frozen=True)
 class ExecutionGraph:
     program_graph: ProgramGraph
     n_steps: int
@@ -71,8 +58,16 @@ class ExecutionGraph:
     outputs: tuple[ArchitecturalOutput, ...]
     control: ControlFlow
     halt_dimension: Dimension | None
-    recurrence: RecurrenceSummary | None
+    # Each step's cycle count: folded to a constant, or a model output.
+    cycles: tuple[int | Dimension, ...]
     dim_of_name: dict[str, Dimension]
 
     def output(self, name: str) -> ArchitecturalOutput:
         return next(output for output in self.outputs if output.name == name)
+
+    @property
+    def cycles_prefix(self) -> int | None:
+        """The cycles before the last step, which the run loop's budget
+        guard needs ahead of dispatch; None unless they all folded."""
+        prefix = self.cycles[:-1]
+        return sum(prefix) if all(isinstance(c, int) for c in prefix) else None

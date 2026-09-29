@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import partial
 
 from transformer_nes.cpu6502.spec import (
     BRANCH_CONDITIONS,
@@ -35,11 +36,33 @@ from transformer_nes.cpu6502.spec import (
     MODE_ZERO_PAGE_X,
     MODE_ZERO_PAGE_Y,
     OPCODES,
+    PAGE_CROSS_READ_OPERATIONS,
     Opcode,
-    dynamic_cycle_kind,
     opcode_for,
+    written_addresses,
 )
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
+
+# What an operation handler returns: (the trace row's data value, the next
+# PC, the memory writes).
+Result = tuple[int, int, tuple[MemWrite, ...]]
+
+
+# The four shifts as (value, carry in) -> (result, bit shifted out).
+def ASL(v: int, c: int) -> tuple[int, int]:
+    return (v << 1) & 0xFF, v & 0x80
+
+
+def LSR(v: int, c: int) -> tuple[int, int]:
+    return v >> 1, v & 0x01
+
+
+def ROL(v: int, c: int) -> tuple[int, int]:
+    return ((v << 1) | (1 if c else 0)) & 0xFF, v & 0x80
+
+
+def ROR(v: int, c: int) -> tuple[int, int]:
+    return (v >> 1) | (0x80 if c else 0), v & 0x01
 
 
 def irq_deliverable(p: int, irq_pending: bool | int,
@@ -52,32 +75,23 @@ def irq_deliverable(p: int, irq_pending: bool | int,
 
 def instruction_cycles(cpu: Cpu6502, opcode: Opcode, pc: int,
                        x: int, y: int, p: int) -> int:
-    """Return one instruction's NMOS cycle count, including live penalties."""
+    """One instruction's NMOS cycle count: the opcode's, +1 for a taken
+    branch and +1 more when it lands on another page, +1 when an indexed
+    read carries into the high address byte."""
     cycles = opcode.cycles
-    kind = dynamic_cycle_kind(opcode)
-    if kind <= 8 and opcode.operation in BRANCH_CONDITIONS:
+    lo = cpu.read_memory(pc + 1)
+    if opcode.operation in BRANCH_CONDITIONS:
         mask, expected = BRANCH_CONDITIONS[opcode.operation]
         if (p & mask) == expected:
-            cycles += 1
-            next_pc = (pc + 2) & 0xFFFF
-            offset = cpu.read_memory(pc + 1)
-            offset = offset if offset < 0x80 else offset - 0x100
-            target = (next_pc + offset) & 0xFFFF
-            cycles += int((next_pc ^ target) & 0xFF00 != 0)
-        return cycles
-
-    if not kind:
-        return cycles
-    if opcode.mode == MODE_ABSOLUTE_X:
-        base = cpu.read_memory(pc + 1) | (cpu.read_memory(pc + 2) << 8)
-        cycles += int((base & 0xFF00) != ((base + x) & 0xFFFF & 0xFF00))
-    elif opcode.mode == MODE_ABSOLUTE_Y:
-        base = cpu.read_memory(pc + 1) | (cpu.read_memory(pc + 2) << 8)
-        cycles += int((base & 0xFF00) != ((base + y) & 0xFFFF & 0xFF00))
-    elif opcode.mode == MODE_INDIRECT_Y:
-        pointer = cpu.read_memory(pc + 1)
-        base = cpu.read_memory(pointer) | (cpu.read_memory((pointer + 1) & 0xFF) << 8)
-        cycles += int((base & 0xFF00) != ((base + y) & 0xFFFF & 0xFF00))
+            landing = (pc + 2) % 0x100 + lo - (0x100 if lo >= 0x80 else 0)
+            cycles += 1 + (not 0 <= landing <= 0xFF)
+    elif opcode.operation in PAGE_CROSS_READ_OPERATIONS:
+        low = {
+            MODE_ABSOLUTE_X: lo + x,
+            MODE_ABSOLUTE_Y: lo + y,
+            MODE_INDIRECT_Y: cpu.read_memory(lo) + y,
+        }.get(opcode.mode, 0)
+        cycles += low > 0xFF
     return cycles
 
 
@@ -119,72 +133,7 @@ class Cpu6502:
         if self.mirror_cpu_ram:
             for addr in range(0x0800, 0x2000):
                 self.memory[addr] = self.memory[addr & 0x07FF]
-        self._ops = {
-            "load_a": self.op_load_a,
-            "load_x": self.op_load_x,
-            "load_y": self.op_load_y,
-            "store_a": self.op_store_a,
-            "store_x": self.op_store_x,
-            "store_y": self.op_store_y,
-            "adc": self.op_adc,
-            "sbc": self.op_sbc,
-            "cmp": self.op_cmp,
-            "cpx": self.op_cpx,
-            "cpy": self.op_cpy,
-            "and": self.op_and,
-            "ora": self.op_ora,
-            "eor": self.op_eor,
-            "bit": self.op_bit,
-            "asl": self.op_asl,
-            "lsr": self.op_lsr,
-            "rol": self.op_rol,
-            "ror": self.op_ror,
-            "inc": self.op_inc,
-            "dec": self.op_dec,
-            "inx": self.op_inx,
-            "iny": self.op_iny,
-            "dex": self.op_dex,
-            "dey": self.op_dey,
-            "tax": self.op_tax,
-            "tay": self.op_tay,
-            "txa": self.op_txa,
-            "tya": self.op_tya,
-            "tsx": self.op_tsx,
-            "txs": self.op_txs,
-            "pha": self.op_pha,
-            "php": self.op_php,
-            "pla": self.op_pla,
-            "plp": self.op_plp,
-            "jmp": self.op_jmp,
-            "jsr": self.op_jsr,
-            "rts": self.op_rts,
-            "rti": self.op_rti,
-            "brk": self.op_brk,
-            "bpl": self.op_bpl,
-            "bmi": self.op_bmi,
-            "bvc": self.op_bvc,
-            "bvs": self.op_bvs,
-            "bcc": self.op_bcc,
-            "bcs": self.op_bcs,
-            "bne": self.op_bne,
-            "beq": self.op_beq,
-            "clc": self.op_clc,
-            "sec": self.op_sec,
-            "cli": self.op_cli,
-            "sei": self.op_sei,
-            "clv": self.op_clv,
-            "cld": self.op_cld,
-            "sed": self.op_sed,
-            "nop": self.op_nop,
-            "lax": self.op_lax,
-            "sax": self.op_sax,
-            "dcp": self.op_dcp,
-            "isb": self.op_isb,
-            "slo": self.op_slo,
-            "rla": self.op_rla,
-            "sre": self.op_sre,
-            "rra": self.op_rra,
-        }
+        self._ops = self.operations()
         # 256-entry dispatch table: (opcode, handler) or None for
         # unsupported bytes.  Avoids two dict lookups per instruction.
         self.dispatch = [None] * 256
@@ -226,14 +175,8 @@ class Cpu6502:
         return self.memory[self.memory_address(addr)]
 
     def write_memory(self, addr: int, value: int) -> None:
-        addr &= 0xFFFF
-        value &= 0xFF
-        if self.mirror_cpu_ram and addr < 0x2000:
-            physical = addr & 0x07FF
-            for mirror in range(physical, 0x2000, 0x0800):
-                self.memory[mirror] = value
-        else:
-            self.memory[addr] = value
+        for target in written_addresses(addr, self.mirror_cpu_ram):
+            self.memory[target] = value & 0xFF
 
     # ── Flag helpers ────────────────────────────────────────────────
 
@@ -317,21 +260,6 @@ class Cpu6502:
             return (base + self.y) & 0xFFFF
         return 0
 
-    def read_mem(self, opcode: Opcode, lo: int, hi: int, ea: int) -> int:
-        mode = opcode.mode
-        if mode == MODE_IMMEDIATE:
-            return lo
-        if mode == MODE_ACCUMULATOR:
-            return self.a
-        return self.fetch_byte(ea)
-
-    def branch(self, opcode: Opcode, lo: int, taken: bool) -> tuple[int, int, tuple[MemWrite, ...]]:
-        if taken:
-            offset = lo if lo < 0x80 else lo - 0x100
-            target = (self.pc + opcode.length + offset) & 0xFFFF
-            return 0, target, ()
-        return 0, self.pc + opcode.length, ()
-
     def step(self) -> TraceRow:
         """Execute one instruction (or a pending NMI) and return a trace row."""
         if self.halted:
@@ -348,13 +276,9 @@ class Cpu6502:
 
         ir = self.fetch_byte(self.pc)
         opcode = opcode_for(ir)
-        lo, hi, fetch_end = self.read_operand(opcode)
+        lo, hi, _ = self.read_operand(opcode)
         ea = self.resolve_ea(opcode, lo, hi)
-        data = self.read_mem(opcode, lo, hi, ea)
-
-        handler = self._ops[opcode.operation]
-        writes: tuple[MemWrite, ...]
-        data, new_pc, writes = handler(opcode, lo, hi, ea)
+        data, new_pc, writes = self._ops[opcode.operation](opcode, lo, hi, ea)
 
         row = TraceRow(
             step=self.step_count,
@@ -473,542 +397,252 @@ class Cpu6502:
                 break
         return steps
 
-    # ── Operation implementations ───────────────────────────────────
+    # ── Operations ──────────────────────────────────────────────────
+    # A handler takes (opcode, operand lo, operand hi, effective address)
+    # and returns (the trace row's data value, the next PC, the memory
+    # writes).  Most operations are one of a few families, bound to a
+    # register, a flag or a shift by operations().
 
-    def op_load_a(self, opcode: Opcode, lo: int, hi: int, ea: int
-                    ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        self.a = value & 0xFF
-        self.set_nz(self.a)
-        return self.a, self.pc + opcode.length, ()
+    def operations(self) -> dict[str, Callable[[Opcode, int, int, int], Result]]:
+        """The handler for every spec operation name."""
+        ops = {
+            **{f"load_{r}": partial(self.load, r) for r in "axy"},
+            **{f"store_{r}": partial(self.store, r) for r in "axy"},
+            "cmp": partial(self.compare, "a"),
+            "cpx": partial(self.compare, "x"),
+            "cpy": partial(self.compare, "y"),
+            "and": partial(self.logic, lambda a, v: a & v),
+            "ora": partial(self.logic, lambda a, v: a | v),
+            "eor": partial(self.logic, lambda a, v: a ^ v),
+            "asl": partial(self.shift, ASL),
+            "lsr": partial(self.shift, LSR),
+            "rol": partial(self.shift, ROL),
+            "ror": partial(self.shift, ROR),
+            "inc": partial(self.step_memory, 1),
+            "dec": partial(self.step_memory, -1),
+            "inx": partial(self.transfer, "x", "x", 1),
+            "iny": partial(self.transfer, "y", "y", 1),
+            "dex": partial(self.transfer, "x", "x", -1),
+            "dey": partial(self.transfer, "y", "y", -1),
+            "tax": partial(self.transfer, "x", "a", 0),
+            "tay": partial(self.transfer, "y", "a", 0),
+            "txa": partial(self.transfer, "a", "x", 0),
+            "tya": partial(self.transfer, "a", "y", 0),
+            "tsx": partial(self.transfer, "x", "s", 0),
+            **{op: partial(self.branch, mask, expected)
+               for op, (mask, expected) in BRANCH_CONDITIONS.items()},
+            **{op: partial(self.flag, flag, value) for op, (flag, value) in (
+                ("clc", ("C", False)), ("sec", ("C", True)), ("cli", ("I", False)),
+                ("sei", ("I", True)), ("clv", ("V", False)), ("cld", ("D", False)),
+                ("sed", ("D", True)))},
+        }
+        for name in ("adc", "sbc", "bit", "txs", "pha", "pla", "php", "plp", "jmp", "jsr", "rts",
+                     "rti", "brk", "nop", "lax", "sax", "dcp", "isb", "slo", "rla", "sre", "rra"):
+            ops[name] = getattr(self, f"op_{name}")
+        return ops
 
-    def op_load_x(self, opcode: Opcode, lo: int, hi: int, ea: int
-                    ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        self.x = value & 0xFF
-        self.set_nz(self.x)
-        return self.x, self.pc + opcode.length, ()
+    def write(self, ea: int, value: int) -> MemWrite:
+        self.write_memory(ea, value)
+        return MemWrite(self.step_count, ea, value & 0xFF)
 
-    def op_load_y(self, opcode: Opcode, lo: int, hi: int, ea: int
-                    ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        self.y = value & 0xFF
-        self.set_nz(self.y)
-        return self.y, self.pc + opcode.length, ()
+    def push_writes(self, *values: int) -> tuple[MemWrite, ...]:
+        """The stack writes of pushing `values` in order (before pushing)."""
+        return tuple(
+            MemWrite(self.step_count, 0x0100 + ((self.s - i) & 0xFF), v & 0xFF)
+            for i, v in enumerate(values)
+        )
 
-    def op_store_a(self, opcode: Opcode, lo: int, hi: int, ea: int
-                     ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.write_memory(ea, self.a)
-        write = MemWrite(self.step_count, ea, self.a & 0xFF)
-        return self.a, self.pc + opcode.length, (write,)
+    def set_register(self, register: str, value: int, opcode: Opcode) -> Result:
+        """register = value & 0xFF, setting N and Z."""
+        value &= 0xFF
+        setattr(self, register, value)
+        self.set_nz(value)
+        return value, self.pc + opcode.length, ()
 
-    def op_store_x(self, opcode: Opcode, lo: int, hi: int, ea: int
-                     ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.write_memory(ea, self.x)
-        write = MemWrite(self.step_count, ea, self.x & 0xFF)
-        return self.x, self.pc + opcode.length, (write,)
+    def load(self, register: str, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        return self.set_register(register, (lo if opcode.mode == MODE_IMMEDIATE else self.read_memory(ea)), opcode)
 
-    def op_store_y(self, opcode: Opcode, lo: int, hi: int, ea: int
-                     ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.write_memory(ea, self.y)
-        write = MemWrite(self.step_count, ea, self.y & 0xFF)
-        return self.y, self.pc + opcode.length, (write,)
+    def store(self, register: str, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        value = getattr(self, register)
+        return value, self.pc + opcode.length, (self.write(ea, value),)
 
-    def adc_apply(self, value: int) -> None:
+    def transfer(self, register: str, source: str, delta: int, opcode: Opcode, lo: int, hi: int,
+                 ea: int) -> Result:
+        """register = source + delta: the transfers, INX/INY/DEX/DEY."""
+        return self.set_register(register, getattr(self, source) + delta, opcode)
+
+    def compare(self, register: str, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        result = getattr(self, register) - (lo if opcode.mode == MODE_IMMEDIATE else self.read_memory(ea))
+        self.set_flag("C", result >= 0)
+        self.set_nz(result & 0xFF)
+        return result & 0xFF, self.pc + opcode.length, ()
+
+    def logic(self, combine, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        return self.set_register("a", combine(self.a, (lo if opcode.mode == MODE_IMMEDIATE else self.read_memory(ea))), opcode)
+
+    def shift(self, rule, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        """ASL/LSR/ROL/ROR on A or on memory: rule(value, carry) gives the
+        result and the bit shifted out into C."""
+        on_a = opcode.mode == MODE_ACCUMULATOR
+        value, carry = rule(self.a if on_a else self.fetch_byte(ea), self.p & FLAG_C)
+        self.set_flag("C", carry)
+        self.set_nz(value)
+        if on_a:
+            self.a = value
+            return value, self.pc + opcode.length, ()
+        return value, self.pc + opcode.length, (self.write(ea, value),)
+
+    def step_memory(self, delta: int, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        value = (self.fetch_byte(ea) + delta) & 0xFF
+        self.set_nz(value)
+        return value, self.pc + opcode.length, (self.write(ea, value),)
+
+    def branch(self, mask: int, expected: int, opcode: Opcode, lo: int, hi: int, ea: int
+               ) -> Result:
+        if (self.p & mask) != expected:
+            return 0, self.pc + opcode.length, ()
+        offset = lo if lo < 0x80 else lo - 0x100
+        return 0, (self.pc + opcode.length + offset) & 0xFFFF, ()
+
+    def flag(self, name: str, value: bool, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        self.set_flag(name, value)
+        return 0, self.pc + opcode.length, ()
+
+    # ADC and SBC: V always reflects the binary result, as on NMOS hardware;
+    # with D set (and BCD enabled) A and C take the decimal result.
+
+    def add(self, value: int, *, subtract: bool = False) -> None:
         carry = 1 if self.p & FLAG_C else 0
-        raw = self.a + value + carry
-        bin_result = raw & 0xFF
+        addend = (~value) & 0xFF if subtract else value
+        raw = self.a + addend + carry
+        binary = raw & 0xFF
         if self.p & FLAG_D and self.bcd_enabled:
-            result, new_c = self.adc_decimal(value)
+            result, new_c = (self.sbc_decimal if subtract else self.adc_decimal)(value)
         else:
-            result = bin_result
-            new_c = raw > 0xFF
-        # V always reflects the binary sum, as on NMOS hardware.
-        a_sign = self.a & 0x80
-        v_sign = value & 0x80
-        r_sign = bin_result & 0x80
+            result, new_c = binary, raw > 0xFF
         self.set_flag("C", new_c)
-        self.set_flag("V", (a_sign == v_sign) and (a_sign != r_sign))
+        self.set_flag("V", (self.a ^ binary) & (addend ^ binary) & 0x80)
         self.a = result
         self.set_nz(self.a)
-
-    def op_adc(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        self.adc_apply(value)
-        return self.a, self.pc + opcode.length, ()
 
     def adc_decimal(self, value: int) -> tuple[int, bool]:
         carry = 1 if self.p & FLAG_C else 0
         al = (self.a & 0x0F) + (value & 0x0F) + carry
-        if al >= 10:
-            al = (al - 10) & 0x0F
-            ah_carry = 1
-        else:
-            ah_carry = 0
-        ah = (self.a >> 4) + (value >> 4) + ah_carry
-        if ah >= 10:
-            ah = (ah - 10) & 0x0F
-            final_c = True
-        else:
-            final_c = False
-        return (ah << 4) | al, final_c
-
-    def sbc_apply(self, value: int) -> None:
-        carry = 1 if self.p & FLAG_C else 0
-        raw = self.a + ((~value) & 0xFF) + carry
-        bin_result = raw & 0xFF
-        if self.p & FLAG_D and self.bcd_enabled:
-            result, new_c = self.sbc_decimal(value)
-        else:
-            result = bin_result
-            new_c = raw > 0xFF
-        # V always reflects the binary difference, as on NMOS hardware.
-        a_sign = self.a & 0x80
-        v_sign = (~value) & 0x80
-        r_sign = bin_result & 0x80
-        self.set_flag("C", new_c)
-        self.set_flag("V", (a_sign == v_sign) and (a_sign != r_sign))
-        self.a = result
-        self.set_nz(self.a)
-
-    def op_sbc(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        self.sbc_apply(value)
-        return self.a, self.pc + opcode.length, ()
+        ah = (self.a >> 4) + (value >> 4) + (al >= 10)
+        return ((ah - 10 if ah >= 10 else ah) & 0x0F) << 4 | ((al - 10 if al >= 10 else al) & 0x0F), ah >= 10
 
     def sbc_decimal(self, value: int) -> tuple[int, bool]:
         carry = 1 if self.p & FLAG_C else 0
-        # A - M - (1-C) = A + (99-M) + C  in decimal, but adjust result
-        # Standard BCD subtraction algorithm
         al = (self.a & 0x0F) - (value & 0x0F) - (1 - carry)
-        borrow = 0
-        if al < 0:
-            al = (al + 10) & 0x0F
-            borrow = 1
-        ah = (self.a >> 4) - (value >> 4) - borrow
-        if ah < 0:
-            ah = (ah + 10) & 0x0F
-            final_c = False
-        else:
-            final_c = True
-        return (ah << 4) | al, final_c
+        ah = (self.a >> 4) - (value >> 4) - (al < 0)
+        return ((ah + 10 if ah < 0 else ah) & 0x0F) << 4 | ((al + 10 if al < 0 else al) & 0x0F), ah >= 0
 
-    def op_cmp(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        result = self.a - value
-        self.set_flag("C", result >= 0)
-        self.set_nz(result & 0xFF)
-        return result & 0xFF, self.pc + opcode.length, ()
-
-    def op_cpx(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        result = self.x - value
-        self.set_flag("C", result >= 0)
-        self.set_nz(result & 0xFF)
-        return result & 0xFF, self.pc + opcode.length, ()
-
-    def op_cpy(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        result = self.y - value
-        self.set_flag("C", result >= 0)
-        self.set_nz(result & 0xFF)
-        return result & 0xFF, self.pc + opcode.length, ()
-
-    def op_and(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        self.a = (self.a & value) & 0xFF
-        self.set_nz(self.a)
+    def op_adc(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        self.add(lo if opcode.mode == MODE_IMMEDIATE else self.read_memory(ea))
         return self.a, self.pc + opcode.length, ()
 
-    def op_ora(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        self.a = (self.a | value) & 0xFF
-        self.set_nz(self.a)
+    def op_sbc(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        self.add((lo if opcode.mode == MODE_IMMEDIATE else self.read_memory(ea)), subtract=True)
         return self.a, self.pc + opcode.length, ()
 
-    def op_eor(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        self.a = (self.a ^ value) & 0xFF
-        self.set_nz(self.a)
-        return self.a, self.pc + opcode.length, ()
-
-    def op_bit(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
+    def op_bit(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
         value = self.fetch_byte(ea)
         self.p = (self.p & ~(FLAG_N | FLAG_V | FLAG_Z)) | (value & (FLAG_N | FLAG_V))
         self.set_flag("Z", (self.a & value) == 0)
         return value, self.pc + opcode.length, ()
 
-    def op_asl(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        if opcode.mode == MODE_ACCUMULATOR:
-            value = self.a
-            new_value = (value << 1) & 0xFF
-            self.a = new_value
-            self.set_flag("C", value & 0x80)
-            self.set_nz(new_value)
-            return self.a, self.pc + opcode.length, ()
-        value = self.fetch_byte(ea)
-        new_value = (value << 1) & 0xFF
-        self.write_memory(ea, new_value)
-        self.set_flag("C", value & 0x80)
-        self.set_nz(new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_lsr(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        if opcode.mode == MODE_ACCUMULATOR:
-            value = self.a
-            new_value = (value >> 1) & 0xFF
-            self.a = new_value
-            self.set_flag("C", value & 0x01)
-            self.set_nz(new_value)
-            return self.a, self.pc + opcode.length, ()
-        value = self.fetch_byte(ea)
-        new_value = (value >> 1) & 0xFF
-        self.write_memory(ea, new_value)
-        self.set_flag("C", value & 0x01)
-        self.set_nz(new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_rol(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        carry = 1 if self.p & FLAG_C else 0
-        if opcode.mode == MODE_ACCUMULATOR:
-            value = self.a
-            new_value = ((value << 1) | carry) & 0xFF
-            self.a = new_value
-            self.set_flag("C", value & 0x80)
-            self.set_nz(new_value)
-            return self.a, self.pc + opcode.length, ()
-        value = self.fetch_byte(ea)
-        new_value = ((value << 1) | carry) & 0xFF
-        self.write_memory(ea, new_value)
-        self.set_flag("C", value & 0x80)
-        self.set_nz(new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_ror(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        carry = 1 if self.p & FLAG_C else 0
-        if opcode.mode == MODE_ACCUMULATOR:
-            value = self.a
-            new_value = ((value >> 1) | (carry << 7)) & 0xFF
-            self.a = new_value
-            self.set_flag("C", value & 0x01)
-            self.set_nz(new_value)
-            return self.a, self.pc + opcode.length, ()
-        value = self.fetch_byte(ea)
-        new_value = ((value >> 1) | (carry << 7)) & 0xFF
-        self.write_memory(ea, new_value)
-        self.set_flag("C", value & 0x01)
-        self.set_nz(new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_inc(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        new_value = (self.fetch_byte(ea) + 1) & 0xFF
-        self.write_memory(ea, new_value)
-        self.set_nz(new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_dec(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        new_value = (self.fetch_byte(ea) - 1) & 0xFF
-        self.write_memory(ea, new_value)
-        self.set_nz(new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_inx(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.x = (self.x + 1) & 0xFF
-        self.set_nz(self.x)
-        return self.x, self.pc + opcode.length, ()
-
-    def op_iny(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.y = (self.y + 1) & 0xFF
-        self.set_nz(self.y)
-        return self.y, self.pc + opcode.length, ()
-
-    def op_dex(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.x = (self.x - 1) & 0xFF
-        self.set_nz(self.x)
-        return self.x, self.pc + opcode.length, ()
-
-    def op_dey(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.y = (self.y - 1) & 0xFF
-        self.set_nz(self.y)
-        return self.y, self.pc + opcode.length, ()
-
-    def op_tax(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.x = self.a & 0xFF
-        self.set_nz(self.x)
-        return self.x, self.pc + opcode.length, ()
-
-    def op_tay(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.y = self.a & 0xFF
-        self.set_nz(self.y)
-        return self.y, self.pc + opcode.length, ()
-
-    def op_txa(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.a = self.x & 0xFF
-        self.set_nz(self.a)
-        return self.a, self.pc + opcode.length, ()
-
-    def op_tya(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.a = self.y & 0xFF
-        self.set_nz(self.a)
-        return self.a, self.pc + opcode.length, ()
-
-    def op_tsx(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.x = self.s & 0xFF
-        self.set_nz(self.x)
-        return self.x, self.pc + opcode.length, ()
-
-    def op_txs(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.s = self.x & 0xFF
+    def op_txs(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        self.s = self.x  # the one transfer that sets no flags
         return self.s, self.pc + opcode.length, ()
 
-    def op_pha(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        write = MemWrite(self.step_count, 0x0100 + self.s, self.a & 0xFF)
+    def op_pha(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        writes = self.push_writes(self.a)
         self.push_byte(self.a)
-        return self.a, self.pc + opcode.length, (write,)
+        return self.a, self.pc + opcode.length, writes
 
-    def op_php(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        # PHP always pushes with B and U set.
-        value = (self.p | FLAG_B | FLAG_U) & 0xFF
-        write = MemWrite(self.step_count, 0x0100 + self.s, value)
+    def op_php(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        value = (self.p | FLAG_B | FLAG_U) & 0xFF  # pushed with B and U set
+        writes = self.push_writes(value)
         self.push_byte(value)
-        return self.p, self.pc + opcode.length, (write,)
+        return self.p, self.pc + opcode.length, writes
 
-    def op_pla(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.a = self.pull_byte()
-        self.set_nz(self.a)
-        return self.a, self.pc + opcode.length, ()
+    def op_pla(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        return self.set_register("a", self.pull_byte(), opcode)
 
-    def op_plp(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
+    def op_plp(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
         self.p = (self.pull_byte() & ~FLAG_B) | FLAG_U
         return self.p, self.pc + opcode.length, ()
 
-    def op_jmp(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
+    def op_jmp(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
         return 0, ea, ()
 
-    def op_jsr(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
+    def op_jsr(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
         return_addr = (self.pc + opcode.length - 1) & 0xFFFF
-        writes = (
-            MemWrite(self.step_count, 0x0100 + self.s, (return_addr >> 8) & 0xFF),
-            MemWrite(self.step_count, 0x0100 + ((self.s - 1) & 0xFF), return_addr & 0xFF),
-        )
+        writes = self.push_writes(return_addr >> 8, return_addr)
         self.push_word(return_addr)
         return 0, ea, writes
 
-    def op_rts(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return_addr = (self.pull_word() + 1) & 0xFFFF
-        return 0, return_addr, ()
+    def op_rts(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        return 0, (self.pull_word() + 1) & 0xFFFF, ()
 
-    def op_rti(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
+    def op_rti(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
         self.p = (self.pull_byte() & ~FLAG_B) | FLAG_U
         return 0, self.pull_word(), ()
 
-    def op_brk(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        # BRK pushes PC+2, then P with B set, then loads IRQ vector at $FFFE.
+    def op_brk(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        """Push PC+2 and P (B set), set I, jump through $FFFE; a zero vector
+        halts (the harnesses' end-of-program convention)."""
         return_addr = (self.pc + 2) & 0xFFFF
         pushed_p = (self.p | FLAG_B | FLAG_U) & 0xFF
-        writes = (
-            MemWrite(self.step_count, 0x0100 + self.s, (return_addr >> 8) & 0xFF),
-            MemWrite(self.step_count, 0x0100 + ((self.s - 1) & 0xFF), return_addr & 0xFF),
-            MemWrite(self.step_count, 0x0100 + ((self.s - 2) & 0xFF), pushed_p),
-        )
+        writes = self.push_writes(return_addr >> 8, return_addr, pushed_p)
         self.push_word(return_addr)
         self.push_byte(pushed_p)
         self.set_flag("I", True)
         vector = self.fetch_byte(0xFFFE) | (self.fetch_byte(0xFFFF) << 8)
-        if vector == 0x0000:
-            self.halted = True
+        self.halted = vector == 0x0000
         return 0, vector, writes
 
-    def op_bpl(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return self.branch(opcode, lo, not (self.p & FLAG_N))
-
-    def op_bmi(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return self.branch(opcode, lo, bool(self.p & FLAG_N))
-
-    def op_bvc(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return self.branch(opcode, lo, not (self.p & FLAG_V))
-
-    def op_bvs(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return self.branch(opcode, lo, bool(self.p & FLAG_V))
-
-    def op_bcc(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return self.branch(opcode, lo, not (self.p & FLAG_C))
-
-    def op_bcs(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return self.branch(opcode, lo, bool(self.p & FLAG_C))
-
-    def op_bne(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return self.branch(opcode, lo, not (self.p & FLAG_Z))
-
-    def op_beq(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return self.branch(opcode, lo, bool(self.p & FLAG_Z))
-
-    def op_clc(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.set_flag("C", False)
+    def op_nop(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
         return 0, self.pc + opcode.length, ()
 
-    def op_sec(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.set_flag("C", True)
-        return 0, self.pc + opcode.length, ()
+    # ── Unofficial opcodes: compositions of the official ones ───────
 
-    def op_cli(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.set_flag("I", False)
-        return 0, self.pc + opcode.length, ()
+    def op_lax(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        self.x = (lo if opcode.mode == MODE_IMMEDIATE else self.read_memory(ea)) & 0xFF
+        return self.set_register("a", self.x, opcode)
 
-    def op_sei(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.set_flag("I", True)
-        return 0, self.pc + opcode.length, ()
+    def op_sax(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
+        value = self.a & self.x
+        return value, self.pc + opcode.length, (self.write(ea, value),)
 
-    def op_clv(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.set_flag("V", False)
-        return 0, self.pc + opcode.length, ()
+    def op_dcp(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:  # DEC, CMP
+        value, next_pc, writes = self.step_memory(-1, opcode, lo, hi, ea)
+        self.compare("a", opcode, value, hi, ea)
+        return value, next_pc, writes
 
-    def op_cld(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.set_flag("D", False)
-        return 0, self.pc + opcode.length, ()
+    def op_isb(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:  # INC, SBC
+        value, next_pc, writes = self.step_memory(1, opcode, lo, hi, ea)
+        self.add(value, subtract=True)
+        return value, next_pc, writes
 
-    def op_sed(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        self.set_flag("D", True)
-        return 0, self.pc + opcode.length, ()
+    def shift_then(self, rule, then, opcode: Opcode, ea: int) -> Result:
+        """A memory shift whose result then feeds A (the RMW unofficials)."""
+        value, next_pc, writes = self.shift(rule, opcode, 0, 0, ea)
+        then(value)
+        return value, next_pc, writes
 
-    def op_nop(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        return 0, self.pc + opcode.length, ()
+    def op_slo(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:  # ASL, ORA
+        return self.shift_then(ASL, lambda v: self.set_register("a", self.a | v, opcode), opcode, ea)
 
-    # ── Unofficial opcodes ──────────────────────────────────────────
+    def op_rla(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:  # ROL, AND
+        return self.shift_then(ROL, lambda v: self.set_register("a", self.a & v, opcode), opcode, ea)
 
-    def op_lax(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = lo if opcode.mode == MODE_IMMEDIATE else self.fetch_byte(ea)
-        self.a = self.x = value & 0xFF
-        self.set_nz(self.a)
-        return self.a, self.pc + opcode.length, ()
+    def op_sre(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:  # LSR, EOR
+        return self.shift_then(LSR, lambda v: self.set_register("a", self.a ^ v, opcode), opcode, ea)
 
-    def op_sax(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = self.a & self.x & 0xFF
-        self.write_memory(ea, value)
-        write = MemWrite(self.step_count, ea, value)
-        return value, self.pc + opcode.length, (write,)
+    def op_rra(self, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:  # ROR, ADC
+        return self.shift_then(ROR, self.add, opcode, ea)
 
-    def op_dcp(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        new_value = (self.fetch_byte(ea) - 1) & 0xFF
-        self.write_memory(ea, new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        result = self.a - new_value
-        self.set_flag("C", result >= 0)
-        self.set_nz(result & 0xFF)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_isb(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        new_value = (self.fetch_byte(ea) + 1) & 0xFF
-        self.write_memory(ea, new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        self.sbc_apply(new_value)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_slo(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = self.fetch_byte(ea)
-        new_value = (value << 1) & 0xFF
-        self.write_memory(ea, new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        self.set_flag("C", value & 0x80)
-        self.a = (self.a | new_value) & 0xFF
-        self.set_nz(self.a)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_rla(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = self.fetch_byte(ea)
-        carry = 1 if self.p & FLAG_C else 0
-        new_value = ((value << 1) | carry) & 0xFF
-        self.write_memory(ea, new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        self.set_flag("C", value & 0x80)
-        self.a = (self.a & new_value) & 0xFF
-        self.set_nz(self.a)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_sre(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = self.fetch_byte(ea)
-        new_value = (value >> 1) & 0xFF
-        self.write_memory(ea, new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        self.set_flag("C", value & 0x01)
-        self.a = (self.a ^ new_value) & 0xFF
-        self.set_nz(self.a)
-        return new_value, self.pc + opcode.length, (write,)
-
-    def op_rra(self, opcode: Opcode, lo: int, hi: int, ea: int
-                ) -> tuple[int, int, tuple[MemWrite, ...]]:
-        value = self.fetch_byte(ea)
-        carry = 1 if self.p & FLAG_C else 0
-        new_value = ((value >> 1) | (carry << 7)) & 0xFF
-        self.write_memory(ea, new_value)
-        write = MemWrite(self.step_count, ea, new_value)
-        # ADC consumes the carry that ROR just produced.
-        self.set_flag("C", value & 0x01)
-        self.adc_apply(new_value)
-        return new_value, self.pc + opcode.length, (write,)
 
 
 # ── Convenience entry point ─────────────────────────────────────────

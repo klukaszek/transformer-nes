@@ -152,10 +152,10 @@ void Apu::write(int addr, int value) {
   }
 }
 
-void Apu::fill_dmc_buffer(const MemoryReader& reader) {
-  if (!dmc.buffer_empty || dmc.bytes_remaining == 0 || !reader)
+void Apu::fill_dmc_buffer() {
+  if (!dmc.buffer_empty || dmc.bytes_remaining == 0 || !memory)
     return;
-  dmc.sample_buffer = reader(dmc.current_address) & 0xFF;
+  dmc.sample_buffer = memory(dmc.current_address) & 0xFF;
   dmc.buffer_empty = false;
   dma_stall += 4;
   dmc.current_address = dmc.current_address == 0xFFFF ? 0x8000 : uint16_t(dmc.current_address + 1);
@@ -176,8 +176,8 @@ int64_t Apu::cycles_until_dmc_dma() const {
          static_cast<int64_t>(dmc.bits_remaining - 1) * dmc.period;
 }
 
-void Apu::clock_dmc(const MemoryReader& reader) {
-  fill_dmc_buffer(reader);
+void Apu::clock_dmc() {
+  fill_dmc_buffer();
   if (dmc.timer_counter-- > 0)
     return;
   dmc.timer_counter = dmc.period - 1;
@@ -271,9 +271,9 @@ float Apu::sample() {
 
 // Advance every channel by one CPU cycle (triangle each cycle; the
 // others at APU rate, every other cycle).
-void Apu::clock_cycle(const MemoryReader& reader) {
+void Apu::clock_cycle() {
   triangle.clock_timer();
-  clock_dmc(reader);
+  clock_dmc();
   apu_tick = !apu_tick;
   if (apu_tick) {
     pulse[0].clock_timer();
@@ -283,18 +283,41 @@ void Apu::clock_cycle(const MemoryReader& reader) {
   clock_frame_sequencer();
 }
 
-void Apu::advance_to(int64_t cpu_cycle, MemoryReader reader) {
-  if (cpu_cycle <= clocked_cycles)
-    return;
-  const int64_t delta = cpu_cycle - clocked_cycles;
-  for (int64_t i = 0; i < delta; ++i) {
-    clock_cycle(reader);
-    if (++sample_accum >= cycles_per_sample) {
-      sample_accum -= cycles_per_sample;
-      pending_samples.push_back(sample());
+// Runs to `cpu_cycle` in spans with nothing but counting in them: each
+// ends before the next sample, frame-sequencer step, DMC timer expiry or
+// DMC fetch, and those cycles run one at a time through clock_cycle.  A
+// span's timers advance arithmetically, exactly as cycle-by-cycle.
+void Apu::advance_to(int64_t cpu_cycle) {
+  while (clocked_cycles < cpu_cycle) {
+    const auto& events = five_step ? five_step_cycles : four_step_cycles;
+    int64_t span = cpu_cycle - clocked_cycles;
+    span = std::min<int64_t>(span, events[seq_step] - seq_cycle - 1);
+    span = std::min<int64_t>(span, dmc.timer_counter);
+    // The cycle whose count reaches a sample runs singly.
+    span = std::min<int64_t>(span, static_cast<int64_t>(cycles_per_sample - sample_accum - 1.0));
+    if (dmc.buffer_empty && dmc.bytes_remaining > 0)
+      span = 0; // a fetch is due this cycle
+    if (span <= 0) {
+      clock_cycle();
+      if (++sample_accum >= cycles_per_sample) {
+        sample_accum -= cycles_per_sample;
+        pending_samples.push_back(sample());
+      }
+      ++clocked_cycles;
+      continue;
     }
+    const int n = static_cast<int>(span);
+    triangle.advance(n);
+    dmc.timer_counter -= n;
+    const int apu_ticks = apu_tick ? n / 2 : (n + 1) / 2;
+    apu_tick = apu_tick != ((n & 1) != 0);
+    pulse[0].advance(apu_ticks);
+    pulse[1].advance(apu_ticks);
+    noise.advance(apu_ticks);
+    seq_cycle += n;
+    sample_accum += n;
+    clocked_cycles += n;
   }
-  clocked_cycles = cpu_cycle;
 }
 
 vector<float> Apu::take_samples() {
@@ -303,9 +326,5 @@ vector<float> Apu::take_samples() {
   return out;
 }
 
-vector<float> Apu::end_frame(int cpu_cycles, MemoryReader reader) {
-  advance_to(clocked_cycles + cpu_cycles, std::move(reader));
-  return take_samples();
-}
 
 } // namespace transformer_nes::nes

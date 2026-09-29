@@ -5,86 +5,6 @@
 
 namespace transformer_nes::nes {
 
-namespace {
-
-using DynamicKind = OpcodeInfo::DynamicKind;
-
-bool is_branch_kind(DynamicKind kind) {
-  switch (kind) {
-  case DynamicKind::bpl:
-  case DynamicKind::bmi:
-  case DynamicKind::bvc:
-  case DynamicKind::bvs:
-  case DynamicKind::bcc:
-  case DynamicKind::bcs:
-  case DynamicKind::bne:
-  case DynamicKind::beq:
-    return true;
-  default:
-    return false;
-  }
-}
-
-bool branch_taken(DynamicKind kind, int p) {
-  switch (kind) {
-  case DynamicKind::bpl:
-    return !(p & 0x80);
-  case DynamicKind::bmi:
-    return p & 0x80;
-  case DynamicKind::bvc:
-    return !(p & 0x40);
-  case DynamicKind::bvs:
-    return p & 0x40;
-  case DynamicKind::bcc:
-    return !(p & 0x01);
-  case DynamicKind::bcs:
-    return p & 0x01;
-  case DynamicKind::bne:
-    return !(p & 0x02);
-  case DynamicKind::beq:
-    return p & 0x02;
-  default:
-    return false;
-  }
-}
-
-int dynamic_cycles(uint8_t opcode, int pc, int x, int y, int p,
-                   const array<uint8_t, 0x10000>& ram,
-                   const OpcodeTable& opcodes) {
-  int cycles = opcodes[opcode].cycles;
-  const DynamicKind kind = opcodes[opcode].dynamic_kind;
-  if (is_branch_kind(kind)) {
-    if (!branch_taken(kind, p))
-      return cycles;
-    ++cycles;
-    const int next = (pc + 2) & 0xFFFF;
-    const int target = (next + static_cast<int8_t>(ram[cpu_ram_index(pc + 1)])) & 0xFFFF;
-    if ((next & 0xFF00) != (target & 0xFF00)) ++cycles;
-    return cycles;
-  }
-  if (kind == OpcodeInfo::DynamicKind::none)
-    return cycles;
-
-  int base = 0;
-  int index = 0;
-  const int lo = ram[cpu_ram_index(pc + 1)];
-  if (kind == OpcodeInfo::DynamicKind::absolute_x ||
-      kind == OpcodeInfo::DynamicKind::absolute_y) {
-    base = lo | (ram[cpu_ram_index(pc + 2)] << 8);
-    index = kind == OpcodeInfo::DynamicKind::absolute_x ? x : y;
-  } else if (kind == OpcodeInfo::DynamicKind::indirect_y) {
-    const int pointer = lo & 0xFF;
-    base = ram[cpu_ram_index(pointer)] | (ram[cpu_ram_index((pointer + 1) & 0xFF)] << 8);
-    index = y;
-  } else {
-    return cycles;
-  }
-  if ((base & 0xFF00) != (((base + index) & 0xFFFF) & 0xFF00)) ++cycles;
-  return cycles;
-}
-
-} // namespace
-
 void DeviceMap::attach(Device& device, int first, int last, bool writes_only) {
   if (first < 0 || last > 0xFFFF || first > last)
     throw std::invalid_argument("invalid device address range");
@@ -98,8 +18,7 @@ Device* DeviceMap::find(int address, bool for_read) const {
   return nullptr;
 }
 
-Bus::Bus(SteppedRuntime& runtime, span<const uint8_t> image, const OpcodeTable& opcodes)
-    : runtime_(runtime), opcodes_(opcodes) {
+Bus::Bus(SteppedRuntime& runtime, span<const uint8_t> image) : runtime_(runtime) {
   if (image.size() != ram_.size())
     throw std::invalid_argument("memory image must be 64 KiB");
   std::copy(image.begin(), image.end(), ram_.begin());
@@ -107,52 +26,17 @@ Bus::Bus(SteppedRuntime& runtime, span<const uint8_t> image, const OpcodeTable& 
 void Bus::attach(Device& device, int lo, int hi, bool writes_only) {
   devices_.attach(device, lo, hi, writes_only);
 }
-optional<int> Bus::read_target(int pc, int x, int y) const {
-  const auto pc_index = address_index(pc);
-  int mode = opcodes_[ram_[pc_index]].read_mode;
-  if (mode < 0)
-    return std::nullopt;
-  int lo = ram_[address_index(pc + 1)];
-  if (mode == 0)
-    return lo;
-  if (mode == 1)
-    return (lo + x) & 0xFF;
-  if (mode == 2)
-    return (lo + y) & 0xFF;
-  int hi = ram_[address_index(pc + 2)];
-  if (mode == 3)
-    return lo | (hi << 8);
-  if (mode == 4)
-    return ((lo | (hi << 8)) + x) & 0xFFFF;
-  if (mode == 5)
-    return ((lo | (hi << 8)) + y) & 0xFFFF;
-  if (mode == 6) {
-    int zp = (lo + x) & 0xFF;
-    return ram_[address_index(zp)] | (ram_[address_index((zp + 1) & 0xFF)] << 8);
-  }
-  if (mode == 7) {
-    int base = ram_[address_index(lo)] | (ram_[address_index((lo + 1) & 0xFF)] << 8);
-    return (base + y) & 0xFFFF;
-  }
-  return std::nullopt;
-}
 CpuStep Bus::step() {
   const uint8_t opcode = ram_[address_index(runtime_.pc())];
-  if (runtime_.nmi_pending() || runtime_.irq_ready())
-    cycles_ += 7;
-  else {
-    int pc = runtime_.pc();
-    cycles_ += dynamic_cycles(opcode, pc, runtime_.x(), runtime_.y(), runtime_.p(),
-                              ram_, opcodes_);
-    auto target = read_target(pc, runtime_.x(), runtime_.y());
-    if (target)
-      if (auto* d = devices_.find(*target, true)) {
-        int value = d->read(*target) & 0xFF;
-        runtime_.poke(*target, value);
-        ram_[address_index(*target)] = static_cast<uint8_t>(value);
-        cycles_ += d->take_stall();
-      }
-  }
+  const auto next = runtime_.peek();
+  cycles_ += next.cycles;
+  if (next.read >= 0)
+    if (auto* d = devices_.find(next.read, true)) {
+      const int value = d->read(next.read, stamp_base_ + cycles_) & 0xFF;
+      runtime_.poke(next.read, value);
+      ram_[address_index(next.read)] = static_cast<uint8_t>(value);
+      cycles_ += d->take_stall();
+    }
   CpuStep row = runtime_.step();
   for (const auto& write : row.writes) {
     ram_[address_index(write.addr)] = static_cast<uint8_t>(write.value);
@@ -165,17 +49,6 @@ CpuStep Bus::step() {
     }
   }
   return row;
-}
-vector<CpuStep> Bus::run(int max_steps, const vector<int>& nmi_at, const vector<int>& irq_at) {
-  vector<CpuStep> out;
-  for (int i = 0; i < max_steps && !halted(); ++i) {
-    if (std::find(nmi_at.begin(), nmi_at.end(), i) != nmi_at.end())
-      set_nmi();
-    if (std::find(irq_at.begin(), irq_at.end(), i) != irq_at.end())
-      set_irq();
-    out.push_back(step());
-  }
-  return out;
 }
 MachineRun Bus::run_cycles(int64_t budget, function<bool()> pause, int64_t cycle_base) {
   const int64_t start = cycles_;
@@ -196,7 +69,7 @@ void Controller::set_button(size_t index, bool pressed) {
     throw std::out_of_range("controller button");
   buttons_[index] = pressed;
 }
-int Controller::read(int addr) {
+int Controller::read(int addr, int64_t) {
   if (addr != 0x4016)
     return 0x40;
   if (strobe_)
@@ -209,6 +82,8 @@ void Controller::write(int addr, int value, int64_t) {
   if (addr != 0x4016)
     return;
   bool next = (value & 1) != 0;
+  if (strobe_ && !next)
+    ++polls;
   if ((strobe_ && !next) || next)
     index_ = 0;
   strobe_ = next;

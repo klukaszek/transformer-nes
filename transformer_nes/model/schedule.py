@@ -252,7 +252,7 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
     re-places every op at the least-loaded legal phase within its
     dependency window (ties -> latest, which also shortens lifetimes).
     """
-    log = log or logger.info
+    log = log or logger.debug
 
     if program_graph is not None:
         pg = program_graph

@@ -38,10 +38,13 @@ class Opcode:
     byte: int
     mnemonic: str
     mode: str
-    length: int
     cycles: int
     operation: str  # dispatch key used by the reference core and graph
-    flags: tuple[str, ...]  # flags that the operation may update
+
+    @property
+    def length(self) -> int:
+        """Instruction bytes: the opcode and its mode's operand."""
+        return MODE_LENGTH[self.mode]
 
 
 # Addressing mode names used in the table.
@@ -58,6 +61,12 @@ MODE_INDIRECT_Y = "idy"
 MODE_RELATIVE = "rel"
 MODE_IMPLIED = "imp"
 MODE_ACCUMULATOR = "acc"
+MODE_LENGTH = {
+    MODE_IMPLIED: 1, MODE_ACCUMULATOR: 1,
+    MODE_IMMEDIATE: 2, MODE_ZERO_PAGE: 2, MODE_ZERO_PAGE_X: 2, MODE_ZERO_PAGE_Y: 2,
+    MODE_RELATIVE: 2, MODE_INDIRECT_X: 2, MODE_INDIRECT_Y: 2,
+    MODE_ABSOLUTE: 3, MODE_ABSOLUTE_X: 3, MODE_ABSOLUTE_Y: 3, MODE_INDIRECT: 3,
+}
 
 # Read operations with conditional indexed page-cross penalties.
 PAGE_CROSS_READ_OPERATIONS = frozenset({
@@ -71,275 +80,110 @@ BRANCH_CONDITIONS = {
     "bne": (FLAG_Z, 0), "beq": (FLAG_Z, FLAG_Z),
 }
 BRANCH_OPERATIONS = frozenset(BRANCH_CONDITIONS)
-BRANCH_CYCLE_CODES = {
-    "bpl": 1, "bmi": 2, "bvc": 3, "bvs": 4,
-    "bcc": 5, "bcs": 6, "bne": 7, "beq": 8,
-}
-INDEXED_READ_CYCLE_CODES = {
-    MODE_ABSOLUTE_X: 9,
-    MODE_ABSOLUTE_Y: 10,
-    MODE_INDIRECT_Y: 11,
-}
 
 
-# Full official NMOS 6502 opcode set (151 opcodes). ``cycles`` is the base
-# timing; branch and indexed-read penalties are computed by the execution
-# backends from the live operands and flags.
-OPCODES: dict[int, Opcode] = {
-    0xA9: Opcode(0xA9, "LDA", MODE_IMMEDIATE, 2, 2, "load_a", ("N", "Z")),
-    0xA5: Opcode(0xA5, "LDA", MODE_ZERO_PAGE, 2, 3, "load_a", ("N", "Z")),
-    0xB5: Opcode(0xB5, "LDA", MODE_ZERO_PAGE_X, 2, 4, "load_a", ("N", "Z")),
-    0xAD: Opcode(0xAD, "LDA", MODE_ABSOLUTE, 3, 4, "load_a", ("N", "Z")),
-    0xBD: Opcode(0xBD, "LDA", MODE_ABSOLUTE_X, 3, 4, "load_a", ("N", "Z")),
-    0xB9: Opcode(0xB9, "LDA", MODE_ABSOLUTE_Y, 3, 4, "load_a", ("N", "Z")),
-    0xA1: Opcode(0xA1, "LDA", MODE_INDIRECT_X, 2, 6, "load_a", ("N", "Z")),
-    0xB1: Opcode(0xB1, "LDA", MODE_INDIRECT_Y, 2, 5, "load_a", ("N", "Z")),
-    0xA2: Opcode(0xA2, "LDX", MODE_IMMEDIATE, 2, 2, "load_x", ("N", "Z")),
-    0xA6: Opcode(0xA6, "LDX", MODE_ZERO_PAGE, 2, 3, "load_x", ("N", "Z")),
-    0xB6: Opcode(0xB6, "LDX", MODE_ZERO_PAGE_Y, 2, 4, "load_x", ("N", "Z")),
-    0xAE: Opcode(0xAE, "LDX", MODE_ABSOLUTE, 3, 4, "load_x", ("N", "Z")),
-    0xBE: Opcode(0xBE, "LDX", MODE_ABSOLUTE_Y, 3, 4, "load_x", ("N", "Z")),
-    0xA0: Opcode(0xA0, "LDY", MODE_IMMEDIATE, 2, 2, "load_y", ("N", "Z")),
-    0xA4: Opcode(0xA4, "LDY", MODE_ZERO_PAGE, 2, 3, "load_y", ("N", "Z")),
-    0xB4: Opcode(0xB4, "LDY", MODE_ZERO_PAGE_X, 2, 4, "load_y", ("N", "Z")),
-    0xAC: Opcode(0xAC, "LDY", MODE_ABSOLUTE, 3, 4, "load_y", ("N", "Z")),
-    0xBC: Opcode(0xBC, "LDY", MODE_ABSOLUTE_X, 3, 4, "load_y", ("N", "Z")),
-    0x85: Opcode(0x85, "STA", MODE_ZERO_PAGE, 2, 3, "store_a", ()),
-    0x95: Opcode(0x95, "STA", MODE_ZERO_PAGE_X, 2, 4, "store_a", ()),
-    0x8D: Opcode(0x8D, "STA", MODE_ABSOLUTE, 3, 4, "store_a", ()),
-    0x9D: Opcode(0x9D, "STA", MODE_ABSOLUTE_X, 3, 5, "store_a", ()),
-    0x99: Opcode(0x99, "STA", MODE_ABSOLUTE_Y, 3, 5, "store_a", ()),
-    0x81: Opcode(0x81, "STA", MODE_INDIRECT_X, 2, 6, "store_a", ()),
-    0x91: Opcode(0x91, "STA", MODE_INDIRECT_Y, 2, 6, "store_a", ()),
-    0x86: Opcode(0x86, "STX", MODE_ZERO_PAGE, 2, 3, "store_x", ()),
-    0x96: Opcode(0x96, "STX", MODE_ZERO_PAGE_Y, 2, 4, "store_x", ()),
-    0x8E: Opcode(0x8E, "STX", MODE_ABSOLUTE, 3, 4, "store_x", ()),
-    0x84: Opcode(0x84, "STY", MODE_ZERO_PAGE, 2, 3, "store_y", ()),
-    0x94: Opcode(0x94, "STY", MODE_ZERO_PAGE_X, 2, 4, "store_y", ()),
-    0x8C: Opcode(0x8C, "STY", MODE_ABSOLUTE, 3, 4, "store_y", ()),
-    0xAA: Opcode(0xAA, "TAX", MODE_IMPLIED, 1, 2, "tax", ("N", "Z")),
-    0xA8: Opcode(0xA8, "TAY", MODE_IMPLIED, 1, 2, "tay", ("N", "Z")),
-    0x8A: Opcode(0x8A, "TXA", MODE_IMPLIED, 1, 2, "txa", ("N", "Z")),
-    0x98: Opcode(0x98, "TYA", MODE_IMPLIED, 1, 2, "tya", ("N", "Z")),
-    0xBA: Opcode(0xBA, "TSX", MODE_IMPLIED, 1, 2, "tsx", ("N", "Z")),
-    0x9A: Opcode(0x9A, "TXS", MODE_IMPLIED, 1, 2, "txs", ()),
-    0x48: Opcode(0x48, "PHA", MODE_IMPLIED, 1, 3, "pha", ()),
-    0x08: Opcode(0x08, "PHP", MODE_IMPLIED, 1, 3, "php", ()),
-    0x68: Opcode(0x68, "PLA", MODE_IMPLIED, 1, 4, "pla", ("N", "Z")),
-    0x28: Opcode(0x28, "PLP", MODE_IMPLIED, 1, 4, "plp", ("N", "V", "B", "D", "I", "Z", "C")),
-    0x69: Opcode(0x69, "ADC", MODE_IMMEDIATE, 2, 2, "adc", ("N", "V", "Z", "C")),
-    0x65: Opcode(0x65, "ADC", MODE_ZERO_PAGE, 2, 3, "adc", ("N", "V", "Z", "C")),
-    0x75: Opcode(0x75, "ADC", MODE_ZERO_PAGE_X, 2, 4, "adc", ("N", "V", "Z", "C")),
-    0x6D: Opcode(0x6D, "ADC", MODE_ABSOLUTE, 3, 4, "adc", ("N", "V", "Z", "C")),
-    0x7D: Opcode(0x7D, "ADC", MODE_ABSOLUTE_X, 3, 4, "adc", ("N", "V", "Z", "C")),
-    0x79: Opcode(0x79, "ADC", MODE_ABSOLUTE_Y, 3, 4, "adc", ("N", "V", "Z", "C")),
-    0x61: Opcode(0x61, "ADC", MODE_INDIRECT_X, 2, 6, "adc", ("N", "V", "Z", "C")),
-    0x71: Opcode(0x71, "ADC", MODE_INDIRECT_Y, 2, 5, "adc", ("N", "V", "Z", "C")),
-    0xE9: Opcode(0xE9, "SBC", MODE_IMMEDIATE, 2, 2, "sbc", ("N", "V", "Z", "C")),
-    0xE5: Opcode(0xE5, "SBC", MODE_ZERO_PAGE, 2, 3, "sbc", ("N", "V", "Z", "C")),
-    0xF5: Opcode(0xF5, "SBC", MODE_ZERO_PAGE_X, 2, 4, "sbc", ("N", "V", "Z", "C")),
-    0xED: Opcode(0xED, "SBC", MODE_ABSOLUTE, 3, 4, "sbc", ("N", "V", "Z", "C")),
-    0xFD: Opcode(0xFD, "SBC", MODE_ABSOLUTE_X, 3, 4, "sbc", ("N", "V", "Z", "C")),
-    0xF9: Opcode(0xF9, "SBC", MODE_ABSOLUTE_Y, 3, 4, "sbc", ("N", "V", "Z", "C")),
-    0xE1: Opcode(0xE1, "SBC", MODE_INDIRECT_X, 2, 6, "sbc", ("N", "V", "Z", "C")),
-    0xF1: Opcode(0xF1, "SBC", MODE_INDIRECT_Y, 2, 5, "sbc", ("N", "V", "Z", "C")),
-    0xC9: Opcode(0xC9, "CMP", MODE_IMMEDIATE, 2, 2, "cmp", ("N", "Z", "C")),
-    0xC5: Opcode(0xC5, "CMP", MODE_ZERO_PAGE, 2, 3, "cmp", ("N", "Z", "C")),
-    0xD5: Opcode(0xD5, "CMP", MODE_ZERO_PAGE_X, 2, 4, "cmp", ("N", "Z", "C")),
-    0xCD: Opcode(0xCD, "CMP", MODE_ABSOLUTE, 3, 4, "cmp", ("N", "Z", "C")),
-    0xDD: Opcode(0xDD, "CMP", MODE_ABSOLUTE_X, 3, 4, "cmp", ("N", "Z", "C")),
-    0xD9: Opcode(0xD9, "CMP", MODE_ABSOLUTE_Y, 3, 4, "cmp", ("N", "Z", "C")),
-    0xC1: Opcode(0xC1, "CMP", MODE_INDIRECT_X, 2, 6, "cmp", ("N", "Z", "C")),
-    0xD1: Opcode(0xD1, "CMP", MODE_INDIRECT_Y, 2, 5, "cmp", ("N", "Z", "C")),
-    0xE0: Opcode(0xE0, "CPX", MODE_IMMEDIATE, 2, 2, "cpx", ("N", "Z", "C")),
-    0xE4: Opcode(0xE4, "CPX", MODE_ZERO_PAGE, 2, 3, "cpx", ("N", "Z", "C")),
-    0xEC: Opcode(0xEC, "CPX", MODE_ABSOLUTE, 3, 4, "cpx", ("N", "Z", "C")),
-    0xC0: Opcode(0xC0, "CPY", MODE_IMMEDIATE, 2, 2, "cpy", ("N", "Z", "C")),
-    0xC4: Opcode(0xC4, "CPY", MODE_ZERO_PAGE, 2, 3, "cpy", ("N", "Z", "C")),
-    0xCC: Opcode(0xCC, "CPY", MODE_ABSOLUTE, 3, 4, "cpy", ("N", "Z", "C")),
-    0x29: Opcode(0x29, "AND", MODE_IMMEDIATE, 2, 2, "and", ("N", "Z")),
-    0x25: Opcode(0x25, "AND", MODE_ZERO_PAGE, 2, 3, "and", ("N", "Z")),
-    0x35: Opcode(0x35, "AND", MODE_ZERO_PAGE_X, 2, 4, "and", ("N", "Z")),
-    0x2D: Opcode(0x2D, "AND", MODE_ABSOLUTE, 3, 4, "and", ("N", "Z")),
-    0x3D: Opcode(0x3D, "AND", MODE_ABSOLUTE_X, 3, 4, "and", ("N", "Z")),
-    0x39: Opcode(0x39, "AND", MODE_ABSOLUTE_Y, 3, 4, "and", ("N", "Z")),
-    0x21: Opcode(0x21, "AND", MODE_INDIRECT_X, 2, 6, "and", ("N", "Z")),
-    0x31: Opcode(0x31, "AND", MODE_INDIRECT_Y, 2, 5, "and", ("N", "Z")),
-    0x09: Opcode(0x09, "ORA", MODE_IMMEDIATE, 2, 2, "ora", ("N", "Z")),
-    0x05: Opcode(0x05, "ORA", MODE_ZERO_PAGE, 2, 3, "ora", ("N", "Z")),
-    0x15: Opcode(0x15, "ORA", MODE_ZERO_PAGE_X, 2, 4, "ora", ("N", "Z")),
-    0x0D: Opcode(0x0D, "ORA", MODE_ABSOLUTE, 3, 4, "ora", ("N", "Z")),
-    0x1D: Opcode(0x1D, "ORA", MODE_ABSOLUTE_X, 3, 4, "ora", ("N", "Z")),
-    0x19: Opcode(0x19, "ORA", MODE_ABSOLUTE_Y, 3, 4, "ora", ("N", "Z")),
-    0x01: Opcode(0x01, "ORA", MODE_INDIRECT_X, 2, 6, "ora", ("N", "Z")),
-    0x11: Opcode(0x11, "ORA", MODE_INDIRECT_Y, 2, 5, "ora", ("N", "Z")),
-    0x49: Opcode(0x49, "EOR", MODE_IMMEDIATE, 2, 2, "eor", ("N", "Z")),
-    0x45: Opcode(0x45, "EOR", MODE_ZERO_PAGE, 2, 3, "eor", ("N", "Z")),
-    0x55: Opcode(0x55, "EOR", MODE_ZERO_PAGE_X, 2, 4, "eor", ("N", "Z")),
-    0x4D: Opcode(0x4D, "EOR", MODE_ABSOLUTE, 3, 4, "eor", ("N", "Z")),
-    0x5D: Opcode(0x5D, "EOR", MODE_ABSOLUTE_X, 3, 4, "eor", ("N", "Z")),
-    0x59: Opcode(0x59, "EOR", MODE_ABSOLUTE_Y, 3, 4, "eor", ("N", "Z")),
-    0x41: Opcode(0x41, "EOR", MODE_INDIRECT_X, 2, 6, "eor", ("N", "Z")),
-    0x51: Opcode(0x51, "EOR", MODE_INDIRECT_Y, 2, 5, "eor", ("N", "Z")),
-    0x24: Opcode(0x24, "BIT", MODE_ZERO_PAGE, 2, 3, "bit", ("N", "V", "Z")),
-    0x2C: Opcode(0x2C, "BIT", MODE_ABSOLUTE, 3, 4, "bit", ("N", "V", "Z")),
-    0x0A: Opcode(0x0A, "ASL", MODE_ACCUMULATOR, 1, 2, "asl", ("N", "Z", "C")),
-    0x06: Opcode(0x06, "ASL", MODE_ZERO_PAGE, 2, 5, "asl", ("N", "Z", "C")),
-    0x16: Opcode(0x16, "ASL", MODE_ZERO_PAGE_X, 2, 6, "asl", ("N", "Z", "C")),
-    0x0E: Opcode(0x0E, "ASL", MODE_ABSOLUTE, 3, 6, "asl", ("N", "Z", "C")),
-    0x1E: Opcode(0x1E, "ASL", MODE_ABSOLUTE_X, 3, 7, "asl", ("N", "Z", "C")),
-    0x4A: Opcode(0x4A, "LSR", MODE_ACCUMULATOR, 1, 2, "lsr", ("N", "Z", "C")),
-    0x46: Opcode(0x46, "LSR", MODE_ZERO_PAGE, 2, 5, "lsr", ("N", "Z", "C")),
-    0x56: Opcode(0x56, "LSR", MODE_ZERO_PAGE_X, 2, 6, "lsr", ("N", "Z", "C")),
-    0x4E: Opcode(0x4E, "LSR", MODE_ABSOLUTE, 3, 6, "lsr", ("N", "Z", "C")),
-    0x5E: Opcode(0x5E, "LSR", MODE_ABSOLUTE_X, 3, 7, "lsr", ("N", "Z", "C")),
-    0x2A: Opcode(0x2A, "ROL", MODE_ACCUMULATOR, 1, 2, "rol", ("N", "Z", "C")),
-    0x26: Opcode(0x26, "ROL", MODE_ZERO_PAGE, 2, 5, "rol", ("N", "Z", "C")),
-    0x36: Opcode(0x36, "ROL", MODE_ZERO_PAGE_X, 2, 6, "rol", ("N", "Z", "C")),
-    0x2E: Opcode(0x2E, "ROL", MODE_ABSOLUTE, 3, 6, "rol", ("N", "Z", "C")),
-    0x3E: Opcode(0x3E, "ROL", MODE_ABSOLUTE_X, 3, 7, "rol", ("N", "Z", "C")),
-    0x6A: Opcode(0x6A, "ROR", MODE_ACCUMULATOR, 1, 2, "ror", ("N", "Z", "C")),
-    0x66: Opcode(0x66, "ROR", MODE_ZERO_PAGE, 2, 5, "ror", ("N", "Z", "C")),
-    0x76: Opcode(0x76, "ROR", MODE_ZERO_PAGE_X, 2, 6, "ror", ("N", "Z", "C")),
-    0x6E: Opcode(0x6E, "ROR", MODE_ABSOLUTE, 3, 6, "ror", ("N", "Z", "C")),
-    0x7E: Opcode(0x7E, "ROR", MODE_ABSOLUTE_X, 3, 7, "ror", ("N", "Z", "C")),
-    0xE6: Opcode(0xE6, "INC", MODE_ZERO_PAGE, 2, 5, "inc", ("N", "Z")),
-    0xF6: Opcode(0xF6, "INC", MODE_ZERO_PAGE_X, 2, 6, "inc", ("N", "Z")),
-    0xEE: Opcode(0xEE, "INC", MODE_ABSOLUTE, 3, 6, "inc", ("N", "Z")),
-    0xFE: Opcode(0xFE, "INC", MODE_ABSOLUTE_X, 3, 7, "inc", ("N", "Z")),
-    0xC6: Opcode(0xC6, "DEC", MODE_ZERO_PAGE, 2, 5, "dec", ("N", "Z")),
-    0xD6: Opcode(0xD6, "DEC", MODE_ZERO_PAGE_X, 2, 6, "dec", ("N", "Z")),
-    0xCE: Opcode(0xCE, "DEC", MODE_ABSOLUTE, 3, 6, "dec", ("N", "Z")),
-    0xDE: Opcode(0xDE, "DEC", MODE_ABSOLUTE_X, 3, 7, "dec", ("N", "Z")),
-    0xE8: Opcode(0xE8, "INX", MODE_IMPLIED, 1, 2, "inx", ("N", "Z")),
-    0xC8: Opcode(0xC8, "INY", MODE_IMPLIED, 1, 2, "iny", ("N", "Z")),
-    0xCA: Opcode(0xCA, "DEX", MODE_IMPLIED, 1, 2, "dex", ("N", "Z")),
-    0x88: Opcode(0x88, "DEY", MODE_IMPLIED, 1, 2, "dey", ("N", "Z")),
-    0x4C: Opcode(0x4C, "JMP", MODE_ABSOLUTE, 3, 3, "jmp", ()),
-    0x6C: Opcode(0x6C, "JMP", MODE_INDIRECT, 3, 5, "jmp", ()),
-    0x20: Opcode(0x20, "JSR", MODE_ABSOLUTE, 3, 6, "jsr", ()),
-    0x60: Opcode(0x60, "RTS", MODE_IMPLIED, 1, 6, "rts", ()),
-    0x40: Opcode(0x40, "RTI", MODE_IMPLIED, 1, 6, "rti", ()),
-    0x00: Opcode(0x00, "BRK", MODE_IMPLIED, 1, 7, "brk", ("B",)),
-    0x10: Opcode(0x10, "BPL", MODE_RELATIVE, 2, 2, "bpl", ()),
-    0x30: Opcode(0x30, "BMI", MODE_RELATIVE, 2, 2, "bmi", ()),
-    0x50: Opcode(0x50, "BVC", MODE_RELATIVE, 2, 2, "bvc", ()),
-    0x70: Opcode(0x70, "BVS", MODE_RELATIVE, 2, 2, "bvs", ()),
-    0x90: Opcode(0x90, "BCC", MODE_RELATIVE, 2, 2, "bcc", ()),
-    0xB0: Opcode(0xB0, "BCS", MODE_RELATIVE, 2, 2, "bcs", ()),
-    0xD0: Opcode(0xD0, "BNE", MODE_RELATIVE, 2, 2, "bne", ()),
-    0xF0: Opcode(0xF0, "BEQ", MODE_RELATIVE, 2, 2, "beq", ()),
-    0x18: Opcode(0x18, "CLC", MODE_IMPLIED, 1, 2, "clc", ("C",)),
-    0x38: Opcode(0x38, "SEC", MODE_IMPLIED, 1, 2, "sec", ("C",)),
-    0x58: Opcode(0x58, "CLI", MODE_IMPLIED, 1, 2, "cli", ("I",)),
-    0x78: Opcode(0x78, "SEI", MODE_IMPLIED, 1, 2, "sei", ("I",)),
-    0xB8: Opcode(0xB8, "CLV", MODE_IMPLIED, 1, 2, "clv", ("V",)),
-    0xD8: Opcode(0xD8, "CLD", MODE_IMPLIED, 1, 2, "cld", ("D",)),
-    0xF8: Opcode(0xF8, "SED", MODE_IMPLIED, 1, 2, "sed", ("D",)),
-    0xEA: Opcode(0xEA, "NOP", MODE_IMPLIED, 1, 2, "nop", ()),
-    # ── Unofficial (stable) NMOS opcodes, as exercised by nestest ──────
-    # NOP variants that fetch (and discard) an operand.
-    0x1A: Opcode(0x1A, "NOP", MODE_IMPLIED, 1, 2, "nop", ()),
-    0x3A: Opcode(0x3A, "NOP", MODE_IMPLIED, 1, 2, "nop", ()),
-    0x5A: Opcode(0x5A, "NOP", MODE_IMPLIED, 1, 2, "nop", ()),
-    0x7A: Opcode(0x7A, "NOP", MODE_IMPLIED, 1, 2, "nop", ()),
-    0xDA: Opcode(0xDA, "NOP", MODE_IMPLIED, 1, 2, "nop", ()),
-    0xFA: Opcode(0xFA, "NOP", MODE_IMPLIED, 1, 2, "nop", ()),
-    0x80: Opcode(0x80, "NOP", MODE_IMMEDIATE, 2, 2, "nop", ()),
-    0x04: Opcode(0x04, "NOP", MODE_ZERO_PAGE, 2, 3, "nop", ()),
-    0x44: Opcode(0x44, "NOP", MODE_ZERO_PAGE, 2, 3, "nop", ()),
-    0x64: Opcode(0x64, "NOP", MODE_ZERO_PAGE, 2, 3, "nop", ()),
-    0x14: Opcode(0x14, "NOP", MODE_ZERO_PAGE_X, 2, 4, "nop", ()),
-    0x34: Opcode(0x34, "NOP", MODE_ZERO_PAGE_X, 2, 4, "nop", ()),
-    0x54: Opcode(0x54, "NOP", MODE_ZERO_PAGE_X, 2, 4, "nop", ()),
-    0x74: Opcode(0x74, "NOP", MODE_ZERO_PAGE_X, 2, 4, "nop", ()),
-    0xD4: Opcode(0xD4, "NOP", MODE_ZERO_PAGE_X, 2, 4, "nop", ()),
-    0xF4: Opcode(0xF4, "NOP", MODE_ZERO_PAGE_X, 2, 4, "nop", ()),
-    0x0C: Opcode(0x0C, "NOP", MODE_ABSOLUTE, 3, 4, "nop", ()),
-    0x1C: Opcode(0x1C, "NOP", MODE_ABSOLUTE_X, 3, 4, "nop", ()),
-    0x3C: Opcode(0x3C, "NOP", MODE_ABSOLUTE_X, 3, 4, "nop", ()),
-    0x5C: Opcode(0x5C, "NOP", MODE_ABSOLUTE_X, 3, 4, "nop", ()),
-    0x7C: Opcode(0x7C, "NOP", MODE_ABSOLUTE_X, 3, 4, "nop", ()),
-    0xDC: Opcode(0xDC, "NOP", MODE_ABSOLUTE_X, 3, 4, "nop", ()),
-    0xFC: Opcode(0xFC, "NOP", MODE_ABSOLUTE_X, 3, 4, "nop", ()),
-    # LAX: load A and X together.
-    0xA7: Opcode(0xA7, "LAX", MODE_ZERO_PAGE, 2, 3, "lax", ("N", "Z")),
-    0xB7: Opcode(0xB7, "LAX", MODE_ZERO_PAGE_Y, 2, 4, "lax", ("N", "Z")),
-    0xAF: Opcode(0xAF, "LAX", MODE_ABSOLUTE, 3, 4, "lax", ("N", "Z")),
-    0xBF: Opcode(0xBF, "LAX", MODE_ABSOLUTE_Y, 3, 4, "lax", ("N", "Z")),
-    0xA3: Opcode(0xA3, "LAX", MODE_INDIRECT_X, 2, 6, "lax", ("N", "Z")),
-    0xB3: Opcode(0xB3, "LAX", MODE_INDIRECT_Y, 2, 5, "lax", ("N", "Z")),
-    # SAX: store A & X.
-    0x87: Opcode(0x87, "SAX", MODE_ZERO_PAGE, 2, 3, "sax", ()),
-    0x97: Opcode(0x97, "SAX", MODE_ZERO_PAGE_Y, 2, 4, "sax", ()),
-    0x8F: Opcode(0x8F, "SAX", MODE_ABSOLUTE, 3, 4, "sax", ()),
-    0x83: Opcode(0x83, "SAX", MODE_INDIRECT_X, 2, 6, "sax", ()),
-    # SBC $EB: identical to official SBC immediate.
-    0xEB: Opcode(0xEB, "SBC", MODE_IMMEDIATE, 2, 2, "sbc", ("N", "V", "Z", "C")),
-    # DCP: DEC memory then CMP.
-    0xC7: Opcode(0xC7, "DCP", MODE_ZERO_PAGE, 2, 5, "dcp", ("N", "Z", "C")),
-    0xD7: Opcode(0xD7, "DCP", MODE_ZERO_PAGE_X, 2, 6, "dcp", ("N", "Z", "C")),
-    0xCF: Opcode(0xCF, "DCP", MODE_ABSOLUTE, 3, 6, "dcp", ("N", "Z", "C")),
-    0xDF: Opcode(0xDF, "DCP", MODE_ABSOLUTE_X, 3, 7, "dcp", ("N", "Z", "C")),
-    0xDB: Opcode(0xDB, "DCP", MODE_ABSOLUTE_Y, 3, 7, "dcp", ("N", "Z", "C")),
-    0xC3: Opcode(0xC3, "DCP", MODE_INDIRECT_X, 2, 8, "dcp", ("N", "Z", "C")),
-    0xD3: Opcode(0xD3, "DCP", MODE_INDIRECT_Y, 2, 8, "dcp", ("N", "Z", "C")),
-    # ISB (aka ISC): INC memory then SBC.
-    0xE7: Opcode(0xE7, "ISB", MODE_ZERO_PAGE, 2, 5, "isb", ("N", "V", "Z", "C")),
-    0xF7: Opcode(0xF7, "ISB", MODE_ZERO_PAGE_X, 2, 6, "isb", ("N", "V", "Z", "C")),
-    0xEF: Opcode(0xEF, "ISB", MODE_ABSOLUTE, 3, 6, "isb", ("N", "V", "Z", "C")),
-    0xFF: Opcode(0xFF, "ISB", MODE_ABSOLUTE_X, 3, 7, "isb", ("N", "V", "Z", "C")),
-    0xFB: Opcode(0xFB, "ISB", MODE_ABSOLUTE_Y, 3, 7, "isb", ("N", "V", "Z", "C")),
-    0xE3: Opcode(0xE3, "ISB", MODE_INDIRECT_X, 2, 8, "isb", ("N", "V", "Z", "C")),
-    0xF3: Opcode(0xF3, "ISB", MODE_INDIRECT_Y, 2, 8, "isb", ("N", "V", "Z", "C")),
-    # SLO: ASL memory then ORA.
-    0x07: Opcode(0x07, "SLO", MODE_ZERO_PAGE, 2, 5, "slo", ("N", "Z", "C")),
-    0x17: Opcode(0x17, "SLO", MODE_ZERO_PAGE_X, 2, 6, "slo", ("N", "Z", "C")),
-    0x0F: Opcode(0x0F, "SLO", MODE_ABSOLUTE, 3, 6, "slo", ("N", "Z", "C")),
-    0x1F: Opcode(0x1F, "SLO", MODE_ABSOLUTE_X, 3, 7, "slo", ("N", "Z", "C")),
-    0x1B: Opcode(0x1B, "SLO", MODE_ABSOLUTE_Y, 3, 7, "slo", ("N", "Z", "C")),
-    0x03: Opcode(0x03, "SLO", MODE_INDIRECT_X, 2, 8, "slo", ("N", "Z", "C")),
-    0x13: Opcode(0x13, "SLO", MODE_INDIRECT_Y, 2, 8, "slo", ("N", "Z", "C")),
-    # RLA: ROL memory then AND.
-    0x27: Opcode(0x27, "RLA", MODE_ZERO_PAGE, 2, 5, "rla", ("N", "Z", "C")),
-    0x37: Opcode(0x37, "RLA", MODE_ZERO_PAGE_X, 2, 6, "rla", ("N", "Z", "C")),
-    0x2F: Opcode(0x2F, "RLA", MODE_ABSOLUTE, 3, 6, "rla", ("N", "Z", "C")),
-    0x3F: Opcode(0x3F, "RLA", MODE_ABSOLUTE_X, 3, 7, "rla", ("N", "Z", "C")),
-    0x3B: Opcode(0x3B, "RLA", MODE_ABSOLUTE_Y, 3, 7, "rla", ("N", "Z", "C")),
-    0x23: Opcode(0x23, "RLA", MODE_INDIRECT_X, 2, 8, "rla", ("N", "Z", "C")),
-    0x33: Opcode(0x33, "RLA", MODE_INDIRECT_Y, 2, 8, "rla", ("N", "Z", "C")),
-    # SRE: LSR memory then EOR.
-    0x47: Opcode(0x47, "SRE", MODE_ZERO_PAGE, 2, 5, "sre", ("N", "Z", "C")),
-    0x57: Opcode(0x57, "SRE", MODE_ZERO_PAGE_X, 2, 6, "sre", ("N", "Z", "C")),
-    0x4F: Opcode(0x4F, "SRE", MODE_ABSOLUTE, 3, 6, "sre", ("N", "Z", "C")),
-    0x5F: Opcode(0x5F, "SRE", MODE_ABSOLUTE_X, 3, 7, "sre", ("N", "Z", "C")),
-    0x5B: Opcode(0x5B, "SRE", MODE_ABSOLUTE_Y, 3, 7, "sre", ("N", "Z", "C")),
-    0x43: Opcode(0x43, "SRE", MODE_INDIRECT_X, 2, 8, "sre", ("N", "Z", "C")),
-    0x53: Opcode(0x53, "SRE", MODE_INDIRECT_Y, 2, 8, "sre", ("N", "Z", "C")),
-    # RRA: ROR memory then ADC.
-    0x67: Opcode(0x67, "RRA", MODE_ZERO_PAGE, 2, 5, "rra", ("N", "V", "Z", "C")),
-    0x77: Opcode(0x77, "RRA", MODE_ZERO_PAGE_X, 2, 6, "rra", ("N", "V", "Z", "C")),
-    0x6F: Opcode(0x6F, "RRA", MODE_ABSOLUTE, 3, 6, "rra", ("N", "V", "Z", "C")),
-    0x7F: Opcode(0x7F, "RRA", MODE_ABSOLUTE_X, 3, 7, "rra", ("N", "V", "Z", "C")),
-    0x7B: Opcode(0x7B, "RRA", MODE_ABSOLUTE_Y, 3, 7, "rra", ("N", "V", "Z", "C")),
-    0x63: Opcode(0x63, "RRA", MODE_INDIRECT_X, 2, 8, "rra", ("N", "V", "Z", "C")),
-    0x73: Opcode(0x73, "RRA", MODE_INDIRECT_Y, 2, 8, "rra", ("N", "V", "Z", "C")),
-}
+# Every opcode the cores execute: the official NMOS set plus the stable
+# unofficial ones nestest exercises.  A row is an instruction -- mnemonic
+# and operation -- then each encoding as "mode opcode cycles"; the length
+# follows from the mode.  ``cycles`` is the base timing; branch and
+# indexed-read penalties are computed by the execution backends from the
+# live operands and flags.  Order matters: the graph builds its decode
+# gates in this order.
+_OPCODE_TABLE = """
+LDA load_a   imm A9 2  zpg A5 3  zpx B5 4  abs AD 4  abx BD 4  aby B9 4  idx A1 6  idy B1 5
+LDX load_x   imm A2 2  zpg A6 3  zpy B6 4  abs AE 4  aby BE 4
+LDY load_y   imm A0 2  zpg A4 3  zpx B4 4  abs AC 4  abx BC 4
+STA store_a  zpg 85 3  zpx 95 4  abs 8D 4  abx 9D 5  aby 99 5  idx 81 6  idy 91 6
+STX store_x  zpg 86 3  zpy 96 4  abs 8E 4
+STY store_y  zpg 84 3  zpx 94 4  abs 8C 4
+TAX tax      imp AA 2
+TAY tay      imp A8 2
+TXA txa      imp 8A 2
+TYA tya      imp 98 2
+TSX tsx      imp BA 2
+TXS txs      imp 9A 2
+PHA pha      imp 48 3
+PHP php      imp 08 3
+PLA pla      imp 68 4
+PLP plp      imp 28 4
+ADC adc      imm 69 2  zpg 65 3  zpx 75 4  abs 6D 4  abx 7D 4  aby 79 4  idx 61 6  idy 71 5
+SBC sbc      imm E9 2  zpg E5 3  zpx F5 4  abs ED 4  abx FD 4  aby F9 4  idx E1 6  idy F1 5
+CMP cmp      imm C9 2  zpg C5 3  zpx D5 4  abs CD 4  abx DD 4  aby D9 4  idx C1 6  idy D1 5
+CPX cpx      imm E0 2  zpg E4 3  abs EC 4
+CPY cpy      imm C0 2  zpg C4 3  abs CC 4
+AND and      imm 29 2  zpg 25 3  zpx 35 4  abs 2D 4  abx 3D 4  aby 39 4  idx 21 6  idy 31 5
+ORA ora      imm 09 2  zpg 05 3  zpx 15 4  abs 0D 4  abx 1D 4  aby 19 4  idx 01 6  idy 11 5
+EOR eor      imm 49 2  zpg 45 3  zpx 55 4  abs 4D 4  abx 5D 4  aby 59 4  idx 41 6  idy 51 5
+BIT bit      zpg 24 3  abs 2C 4
+ASL asl      acc 0A 2  zpg 06 5  zpx 16 6  abs 0E 6  abx 1E 7
+LSR lsr      acc 4A 2  zpg 46 5  zpx 56 6  abs 4E 6  abx 5E 7
+ROL rol      acc 2A 2  zpg 26 5  zpx 36 6  abs 2E 6  abx 3E 7
+ROR ror      acc 6A 2  zpg 66 5  zpx 76 6  abs 6E 6  abx 7E 7
+INC inc      zpg E6 5  zpx F6 6  abs EE 6  abx FE 7
+DEC dec      zpg C6 5  zpx D6 6  abs CE 6  abx DE 7
+INX inx      imp E8 2
+INY iny      imp C8 2
+DEX dex      imp CA 2
+DEY dey      imp 88 2
+JMP jmp      abs 4C 3  ind 6C 5
+JSR jsr      abs 20 6
+RTS rts      imp 60 6
+RTI rti      imp 40 6
+BRK brk      imp 00 7
+BPL bpl      rel 10 2
+BMI bmi      rel 30 2
+BVC bvc      rel 50 2
+BVS bvs      rel 70 2
+BCC bcc      rel 90 2
+BCS bcs      rel B0 2
+BNE bne      rel D0 2
+BEQ beq      rel F0 2
+CLC clc      imp 18 2
+SEC sec      imp 38 2
+CLI cli      imp 58 2
+SEI sei      imp 78 2
+CLV clv      imp B8 2
+CLD cld      imp D8 2
+SED sed      imp F8 2
+NOP nop      imp EA 2
+# ── Unofficial (stable) NMOS opcodes, as exercised by nestest ──────
+# NOP variants that fetch (and discard) an operand.
+NOP nop      imp 1A 2  imp 3A 2  imp 5A 2  imp 7A 2  imp DA 2  imp FA 2  imm 80 2  zpg 04 3
+NOP nop      zpg 44 3  zpg 64 3  zpx 14 4  zpx 34 4  zpx 54 4  zpx 74 4  zpx D4 4  zpx F4 4
+NOP nop      abs 0C 4  abx 1C 4  abx 3C 4  abx 5C 4  abx 7C 4  abx DC 4  abx FC 4
+# LAX: load A and X together.
+LAX lax      zpg A7 3  zpy B7 4  abs AF 4  aby BF 4  idx A3 6  idy B3 5
+# SAX: store A & X.
+SAX sax      zpg 87 3  zpy 97 4  abs 8F 4  idx 83 6
+# SBC $EB: identical to official SBC immediate.
+SBC sbc      imm EB 2
+# DCP: DEC memory then CMP.
+DCP dcp      zpg C7 5  zpx D7 6  abs CF 6  abx DF 7  aby DB 7  idx C3 8  idy D3 8
+# ISB (aka ISC): INC memory then SBC.
+ISB isb      zpg E7 5  zpx F7 6  abs EF 6  abx FF 7  aby FB 7  idx E3 8  idy F3 8
+# SLO: ASL memory then ORA.
+SLO slo      zpg 07 5  zpx 17 6  abs 0F 6  abx 1F 7  aby 1B 7  idx 03 8  idy 13 8
+# RLA: ROL memory then AND.
+RLA rla      zpg 27 5  zpx 37 6  abs 2F 6  abx 3F 7  aby 3B 7  idx 23 8  idy 33 8
+# SRE: LSR memory then EOR.
+SRE sre      zpg 47 5  zpx 57 6  abs 4F 6  abx 5F 7  aby 5B 7  idx 43 8  idy 53 8
+# RRA: ROR memory then ADC.
+RRA rra      zpg 67 5  zpx 77 6  abs 6F 6  abx 7F 7  aby 7B 7  idx 63 8  idy 73 8
+"""
 
 
-def dynamic_cycle_kind(opcode: Opcode) -> int:
-    if opcode.operation in BRANCH_CYCLE_CODES:
-        return BRANCH_CYCLE_CODES[opcode.operation]
-    if opcode.operation in PAGE_CROSS_READ_OPERATIONS:
-        return INDEXED_READ_CYCLE_CODES.get(opcode.mode, 0)
-    return 0
+def _parse_opcodes(table: str) -> dict[int, Opcode]:
+    opcodes = {}
+    for line in table.strip().splitlines():
+        if line.startswith("#"):
+            continue
+        mnemonic, operation, *cells = line.split()
+        for mode, byte, cycles in zip(*[iter(cells)] * 3, strict=True):
+            opcodes[int(byte, 16)] = Opcode(int(byte, 16), mnemonic, mode, int(cycles), operation)
+    return opcodes
 
 
-def dynamic_cycle_table() -> tuple[int, ...]:
-    return tuple(
-        dynamic_cycle_kind(OPCODES[byte]) if byte in OPCODES else 0
-        for byte in range(256)
-    )
+OPCODES: dict[int, Opcode] = _parse_opcodes(_OPCODE_TABLE)
 
 
 def opcode_for(byte: int) -> Opcode:
@@ -455,3 +299,12 @@ class Asm:
 def asm() -> Asm:
     """Return a fresh assembler builder."""
     return Asm()
+
+
+def written_addresses(addr: int, mirror_cpu_ram: bool) -> range:
+    """The bytes a CPU write to `addr` lands in: with the NES's RAM
+    mirroring, a write below $2000 reaches all four 2 KiB copies."""
+    addr &= 0xFFFF
+    if mirror_cpu_ram and addr < 0x2000:
+        return range(addr & 0x07FF, 0x2000, 0x0800)
+    return range(addr, addr + 1)

@@ -18,7 +18,6 @@ from transformer_nes.cpu6502.backends.weights.experts import (
     pinned_sequence_control,
     project_sequence_execution,
     schedule_and_build,
-    semantic_recurrence,
     sparse_forward_work,
 )
 from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS
@@ -318,7 +317,8 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
     experts, _meta = build_shape_experts(union_pg, [shape])
     spec = experts[0]["step_spec"]
 
-    assert set(spec["inputs"]) == {"x"}
+    # The pc enters only to time the closing branch (its page cross).
+    assert set(spec["inputs"]) == {"x", "pc_lo", "pc_hi"}
     assert spec["p_flags"] == []
     assert {"p_z", "p_n"} <= set(spec["sequence_final"]["model"])
     assert spec["sequence_control"] == {
@@ -332,11 +332,11 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
         "flag_mask": reference.FLAG_Z,
         "flag_value": False,
     }
-    recurrence = experts[0]["recurrence"]
-    assert (
-        recurrence.kind, recurrence.register, recurrence.delta,
-        recurrence.closure_operand_offset, recurrence.closure_operand_value,
-    ) == ("affine_until", "x", -1, 2, 0xFD)
+    # DEX's 2 cycles fold; the closing BNE's are the model's (taken or
+    # not, across a page or not), read out after the forward.
+    assert experts[0]["cycles_prefix"] == 2 and experts[0]["spin"] == 0
+    assert spec["sequence_cycles"]["constant"] == 2
+    assert len(spec["sequence_cycles"]["model"]) == 1
 
 
 def test_compact_opcode_experts_cover_stack_and_control(union_pg):
@@ -369,35 +369,6 @@ def test_compact_opcode_experts_cover_stack_and_control(union_pg):
         generate_source(
             experts[0]["model"], experts[0]["step_spec"], experts=[legacy],
         )
-
-
-@pytest.mark.parametrize(
-    ("code", "register", "delta"),
-    (("cad0fd", "x", -1), ("e8d0fd", "x", 1),
-     ("88d0fd", "y", -1), ("c8d0fd", "y", 1)),
-)
-def test_affine_recurrences_are_isa_semantic(code, register, delta):
-    ops = decode_ops(bytes.fromhex(code))
-    recurrence = semantic_recurrence(ops, [0, 1])
-
-    assert recurrence.kind == "affine_until"
-    assert (recurrence.register, recurrence.delta) == (register, delta)
-    assert recurrence.steps_per_iteration == 2
-    assert recurrence.cycles_per_iteration == 4
-    assert recurrence.cycles_prefix == 2
-    assert recurrence.fallthrough_offset == 3
-
-
-def test_poll_recurrence_is_isa_semantic():
-    ops = decode_ops(bytes.fromhex("ad00072940f0f9"))
-    recurrence = semantic_recurrence(ops, [0, 3, 5])
-
-    assert recurrence.kind == "invariant_poll"
-    assert recurrence.steps_per_iteration == 3
-    assert recurrence.cycles_per_iteration == 8
-    assert recurrence.cycles_prefix == 6
-    assert recurrence.closure_operand_offset == 6
-    assert recurrence.closure_operand_value == 0xF9
 
 
 def test_shape_interior_branch_is_rejected(union_pg):

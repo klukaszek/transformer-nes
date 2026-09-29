@@ -167,6 +167,12 @@ class GraphMaterializer:
     def materialize(self, all_dims, live, val, folded, lookup_exprs, sub, tr,
                     *, name_of=lambda n: n, is_leaf=None,
                     hazards=frozenset(), resolve_read=None) -> None:
+        """Rebuild every live, not-constant dim of `all_dims` in the current
+        graph context, in order: ReGLUs and persists from their `folded`
+        operands, lookups from `lookup_exprs`, each translated by `tr` and
+        recorded in `sub` (old dim -> new expression).  Annotated memory
+        reads come back as one fused read (or a forwarded store when
+        `resolve_read` finds one); `is_leaf` dims stay as they are."""
         made = set()
         fused_reads: dict = {}
         for d in all_dims:
@@ -201,16 +207,22 @@ class GraphMaterializer:
                         j for j, bit in enumerate(getattr(d, "read_bit_dims", ()))
                         if self.structural_reads and bit in live
                     )
+                    # Translate the site's ingredients as liveness walked
+                    # them -- after substitution -- so a term that cancels
+                    # under the pins never reaches a dead dimension.
+                    def ingredient(key, site=site):
+                        return tr(subst(site[key], val))
+
                     if self.structural_reads:
                         expr = masked_exact_read(
-                            tr(site["address"]), Expression(), Expression(),
+                            ingredient("address"), Expression(), Expression(),
                             Expression(), structural=True,
                             bit_indices=wanted_bits,
                         )
                     else:
                         expr = masked_exact_read(
-                            tr(site["address"]), tr(site["byte_value"]),
-                            tr(site["write_addr"]), tr(site["is_write"]),
+                            ingredient("address"), ingredient("byte_value"),
+                            ingredient("write_addr"), ingredient("is_write"),
                         )
                     if wanted_bits:
                         read = next(iter(expr.terms)).memory_read
@@ -272,7 +284,7 @@ class GraphMaterializer:
 
 
 EXECUTION_INTERIOR_ROOTS = frozenset({
-    "ea", "next_pc", "new_halted",
+    "ea", "next_pc", "new_halted", "cycles",
     "is_store", "write_addr_out", "write_value_out",
     "is_store2", "write_addr2_out", "write_value2_out",
     "is_store3", "write_addr3_out", "write_value3_out",
@@ -377,6 +389,9 @@ class GraphFolder:
         self.dependency_cache: dict[frozenset[Dimension], frozenset[Dimension]] = {}
 
     def dependency_closure(self, seeds) -> frozenset[Dimension]:
+        """Every dim `seeds` read, transitively (memoized).  With
+        structural reads, a memory read depends on its address only, and a
+        served bit on its read."""
         key = frozenset(seeds)
         if key in self.dependency_cache:
             return self.dependency_cache[key]
@@ -421,6 +436,17 @@ class GraphFolder:
                      preserve: frozenset = frozenset(),
                      resolve_site=None, inline_budget: int | None = None,
                      required: frozenset[Dimension] | None = None):
+        """Evaluate the graph as far as `pins` allow, in construction order.
+
+        Returns (val, folded, lookup_exprs): `val` maps every dim that
+        became a constant or a linear map of others to that expression;
+        `folded` holds the rest with their substituted operands (a ReGLU's
+        (a, b), a persist's (expr,)); `lookup_exprs` gives each lookup's
+        substituted query, key and value expressions.  `frozen` persists
+        stay opaque leaves, `required` limits the walk to those dims, and
+        `inline_linear` substitutes linear persists into their consumers
+        (within `inline_budget` terms, never `preserve`d or annotated
+        reads)."""
         pg = self.pg
         one = pg.one
         val: dict = {one: Expression({one: 1.0})}
@@ -553,6 +579,9 @@ class GraphFolder:
 
     def fold(self, pins: dict[str, float], label: str = "", *,
              inline_linear: bool = False) -> FoldResult:
+        """The graph with `pins` (persist name -> constant) held: partial
+        evaluation, liveness from the output tokens and the roots, then
+        the live remainder materialized as a new ProgramGraph."""
         pg = self.pg
         pins = dict(pins)
         val, folded, lookup_exprs = self.partial_eval(

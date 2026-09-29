@@ -1,7 +1,7 @@
 """Battery-backed PRG RAM: loaded image is CPU-visible before the first
 frame and the shutdown dump matches the live $6000-$7FFF contents."""
 
-from transformer_nes.nes.backends import OPCODES_NATIVE, backend_factory
+from transformer_nes.nes.backends import backend_factory
 from transformer_nes.nes.build import load_hardware
 
 
@@ -19,7 +19,7 @@ def test_battery_prg_ram_round_trip():
     hardware = load_hardware()
     cart = battery_cart(hardware)
     assert cart.battery
-    console = hardware.Console(cart, backend_factory("reference"), OPCODES_NATIVE, 44100.0)
+    console = hardware.Console(cart, backend_factory("reference"), 44100.0)
     image = bytes((i * 7 + 3) & 0xFF for i in range(0x2000))
     console.load_prg_ram(image)
     assert console.read_ram(0x6000, 0x2000) == image
