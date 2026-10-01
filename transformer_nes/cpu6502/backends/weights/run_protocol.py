@@ -9,6 +9,7 @@ the blocks here keeps the protocol reviewable in one place.
 
 from __future__ import annotations
 
+from transformer_nes.cpu6502.backends.weights.windows import WINDOW_EXCLUDED, ends_window
 from transformer_nes.cpu6502.spec import (
     MODE_ABSOLUTE,
     MODE_ABSOLUTE_X,
@@ -73,6 +74,20 @@ def trace_length_table() -> tuple[int, ...]:
     table = [1] * 256
     for byte, op in OPCODES.items():
         table[byte] = op.length
+    return tuple(table)
+
+
+def ends_window_table() -> tuple[int, ...]:
+    """Opcodes after which the next instruction starts a new block: what
+    ends a learned window (branches, returns), what none holds
+    (windows.py WINDOW_EXCLUDED, indirect JMP), and undefined bytes -- 2
+    for a conditional branch, whose outcomes the profile also counts."""
+    table = [1] * 256
+    for byte, op in OPCODES.items():
+        table[byte] = 2 if op.mode == "rel" else int(
+            ends_window(op) or op.operation in WINDOW_EXCLUDED
+            or (op.operation == "jmp" and op.mode != "abs")
+        )
     return tuple(table)
 
 
@@ -283,6 +298,7 @@ def run_state_members_cpp() -> str:
     trace_mode = ", ".join(str(v) for v in trace_mode_table())
     trace_length = ", ".join(str(v) for v in trace_length_table())
     trace_data = ", ".join(str(v) for v in trace_data_table())
+    ends_window = ", ".join(str(v) for v in ends_window_table())
     return f"""\
     unsigned char ram[65536];  // mirror of the write log, for shadow decode
     int st_pc = 0, st_a = 0, st_x = 0, st_y = 0, st_s = 0xFD, st_p = 0x24;
@@ -316,7 +332,14 @@ def run_state_members_cpp() -> str:
     static constexpr unsigned char READ_MODE[256] = {{ {read_mode} }};
     static constexpr unsigned char TRACE_MODE[256] = {{ {trace_mode} }};
     static constexpr unsigned char TRACE_LENGTH[256] = {{ {trace_length} }};
-    static constexpr unsigned char TRACE_DATA[256] = {{ {trace_data} }};"""
+    static constexpr unsigned char TRACE_DATA[256] = {{ {trace_data} }};
+    // Block entries: single-instruction dispatches not reached by falling
+    // through from the previous one (after a control transfer, a window,
+    // an interrupt or a pause) -- the heads per-ROM windows grow from.
+    static constexpr unsigned char ENDS_WINDOW[256] = {{ {ends_window} }};
+    long block_entries[65536] = {{}};
+    long branch_runs[65536] = {{}}, branch_taken[65536] = {{}};
+    int fallthrough_pc = -1;"""
 
 
 MACHINE_API_CPP = """\
@@ -483,6 +506,7 @@ RUN_LOOP_TEMPLATE = """\
         const long steps_entry = step_index;
         long n_forward = 0;
 {EXTRA_LOCALS}
+        fallthrough_pc = -1;  // after a pause, the next instruction starts a block
         for (long i = 0; i < max_steps; ++i) {
             if (st_halted) { reason = "halt"; break; }
             const bool skip = resume_read_skip;

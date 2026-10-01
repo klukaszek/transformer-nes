@@ -131,7 +131,7 @@ class CpuXray:
     def take_paths(self) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
         """Instructions per path since the last call, and the opcodes that
         ran singly (opcode experts or the full model), busiest first."""
-        paths, opcodes = self.engine.xray_take()
+        paths, opcodes, _dispatches = self.engine.xray_take()
         busiest = np.argsort(opcodes)[::-1][:8]
         top = [
             (f"{OPCODES[int(b)].mnemonic} {OPCODES[int(b)].mode}" if int(b) in OPCODES
@@ -181,9 +181,9 @@ class PpuXray:
     """X-ray of the render graph (ppu2c02/render.py): one tile slot traced
     through its full model on a copy of the running engine."""
 
-    def __init__(self, render_engine):
-        self.engine = render_engine
-        self.named = _named(render_engine.lives)
+    def __init__(self, ppu_engine):
+        self.engine = ppu_engine  # its model 0 is the full render graph
+        self.named = _named(ppu_engine.lives)
         self.life_of = {life[0].name: life for life in self.named}
 
     def knock_out(self, console, name: str, value: int = 0) -> str:

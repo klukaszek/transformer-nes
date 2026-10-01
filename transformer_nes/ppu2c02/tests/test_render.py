@@ -10,7 +10,7 @@ from carts import console_frames, latch_cart, mmc5_cart, register_cart
 from transformer_nes.nes.backends import backend_factory
 from transformer_nes.nes.build import load_hardware
 from transformer_nes.ppu2c02 import render
-from transformer_nes.ppu2c02.machine import register_engine, render_engine
+from transformer_nes.ppu2c02.machine import ppu_engine
 
 EXAMPLES = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -56,7 +56,7 @@ def random_slot(rng, pins: dict) -> list[int]:
 
 
 def test_experts_agree_with_the_full_graph():
-    engine = render_engine()
+    engine = ppu_engine()
     rng = np.random.default_rng(7)
     for lo, hi in ((0, 0x3000), (0x5000, 0x7000)):
         for addr in range(lo, hi):
@@ -73,34 +73,29 @@ def test_experts_agree_with_the_full_graph():
 
 
 
-@pytest.mark.parametrize("mask_bits", [0x18, 0x1F])
-def test_graph_renders_the_synthetic_cart(mask_bits):
-    """Rendering toggles, scroll and address writes mid-frame, sprites;
-    with 0x1F also greyscale and left-edge clipping (the full graph)."""
-    hardware = load_hardware()
-    cart = register_cart(hardware, vertical=False, mask_bits=mask_bits)
-    engine = render_engine()
-    native = console_frames(hardware, cart, 6)
-    graph = console_frames(hardware, cart, 6, lambda c: c.set_ppu_render_engine(engine))
-    assert np.array_equal(native, graph)
-
-
 def whole_ppu(hardware, cart, count):
-    """Frames with the register file and rendering as weights."""
+    """Frames with the PPU as one transformer: register file, rendering,
+    sprite unit."""
     probe = hardware.Console(cart, backend_factory("weights"), 44100.0)
-    renderer, registers = render_engine(probe.ppu_graph_chr_full), register_engine()
+    engine = ppu_engine(probe.ppu_graph_chr_full)
+    return console_frames(hardware, cart, count, lambda c: c.set_ppu_engine(engine))
 
-    def attach(console):
-        console.set_ppu_render_engine(renderer)
-        console.set_ppu_register_engine(registers)
 
-    return console_frames(hardware, cart, count, attach)
+@pytest.mark.parametrize(("mask_bits", "vertical"), [(0x18, False), (0x18, True), (0x1F, False)])
+def test_graph_renders_the_synthetic_cart(mask_bits, vertical):
+    """Every register: rendering toggles, scroll and address writes
+    mid-frame, $2007 across CHR, nametables and palette, OAM, sprites,
+    both mirrorings; with 0x1F also greyscale and left-edge clipping
+    (the full render graph)."""
+    hardware = load_hardware()
+    cart = register_cart(hardware, vertical=vertical, mask_bits=mask_bits)
+    assert np.array_equal(console_frames(hardware, cart, 6), whole_ppu(hardware, cart, 6))
 
 
 @pytest.mark.parametrize("mapper", [9, 10])
 def test_graph_renders_latch_mappers(mapper):
     """MMC2/MMC4: the render graph switches CHR through the latches its
-    own fetches set (and the native sprite fetches between slots)."""
+    own fetches set (and the sprite fetches between lines)."""
     hardware = load_hardware()
     cart = latch_cart(hardware, mapper=mapper)
     assert np.array_equal(console_frames(hardware, cart, 6), whole_ppu(hardware, cart, 6))
@@ -147,8 +142,8 @@ def test_slot_trace_explains_the_frame():
     console = hardware.Console(
         latch_cart(hardware, mapper=9), backend_factory("weights"), 44100.0
     )
-    engine = render_engine()
-    console.set_ppu_render_engine(engine)
+    engine = ppu_engine()
+    console.set_ppu_engine(engine)
     xray = PpuXray(engine)
     for _ in range(3):
         console.run_frame()
@@ -172,8 +167,8 @@ def test_knock_out_breaks_rendering_until_restored():
     cart = latch_cart(hardware, mapper=9)
     native = console_frames(hardware, cart, 8)
     console = hardware.Console(cart, backend_factory("weights"), 44100.0)
-    engine = render_engine()
-    console.set_ppu_render_engine(engine)
+    engine = ppu_engine()
+    console.set_ppu_engine(engine)
     xray = PpuXray(engine)
     out = []
     for i in range(8):

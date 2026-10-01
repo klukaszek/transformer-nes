@@ -388,15 +388,16 @@ class GraphFolder:
         self.hazard_cache: dict[frozenset[str], set] = {}
         self.dependency_cache: dict[frozenset[Dimension], frozenset[Dimension]] = {}
 
-    def dependency_closure(self, seeds) -> frozenset[Dimension]:
+    def dependency_closure(self, seeds, *, served_bits: bool = True) -> frozenset[Dimension]:
         """Every dim `seeds` read, transitively (memoized).  With
         structural reads, a memory read depends on its address only, and a
-        served bit on its read."""
-        key = frozenset(seeds)
+        served bit on its read -- and, unless `served_bits` (a read that
+        store forwarding replaces is not served), on its own ladder too."""
+        key = (frozenset(seeds), served_bits)
         if key in self.dependency_cache:
             return self.dependency_cache[key]
-        live = set(key)
-        pending = list(key)
+        live = set(key[0])
+        pending = list(key[0])
         while pending:
             dim = pending.pop()
             deps = set()
@@ -407,6 +408,8 @@ class GraphFolder:
                     deps.update(site["address"].terms)
                 elif read_bit is not None and self.structural_reads:
                     deps.add(read_bit[0])
+                    if not served_bits:
+                        deps.update(dim.expr.terms)
                 else:
                     deps.update(dim.expr.terms)
             elif isinstance(dim, ReGLUDimension):
@@ -784,13 +787,17 @@ class GraphFolder:
         pc_names = ("current_pc_lo", "current_pc_hi")
         pc_exprs = None  # step-0 (head) pc byte expressions, new-graph space
 
+        # A step before a pinned branch keeps its state outputs: the flag
+        # the branch tests is its prediction's guard.
+        state_outs = {o[0] if isinstance(o, tuple) else o for o in feedback.values()}
         for k in range(n_steps):
+            guarded = k + 1 < n_steps and "branch_taken" in pin_list[k + 1]
             step_root_dims = (
                 root_dims
                 if not _execution or k + 1 == n_steps
                 else [
                     self.by_name[name] for name in self.root_names
-                    if name in EXECUTION_INTERIOR_ROOTS
+                    if name in EXECUTION_INTERIOR_ROOTS or (guarded and name in state_outs)
                 ]
             )
             seed_bits = bit_feedback_until is None or k < bit_feedback_until
@@ -861,7 +868,8 @@ class GraphFolder:
                 resolve_site=resolve_site if forward_stores else None,
                 inline_budget=inline_budget,
                 required=(
-                    self.dependency_closure(step_root_dims + fb_dims)
+                    self.dependency_closure(
+                        step_root_dims + fb_dims, served_bits=not forward_stores)
                     if _execution else None
                 ),
             )
@@ -1150,8 +1158,13 @@ def sequence_shape_pins(code: bytes, opcodes) -> tuple[list[dict[str, float]], l
     return pin_list, offsets
 
 
-def sequence_pins(head_pc: int, code: bytes, opcodes) -> list[dict[str, float]]:
-    """Per-step pins for a K-instruction window: the bytes at head_pc.
+def sequence_pins(head_pc: int, code: bytes, opcodes,
+                  taken: tuple[bool, ...] = ()) -> list[dict[str, float]]:
+    """Per-step pins for a K-instruction window: the bytes at head_pc, in
+    execution order (an absolute JMP or JSR before the last step continues
+    the window at its target; a conditional branch there goes the way
+    `taken` predicts, in order, with its branch_taken pinned to match --
+    the window's guards check the prediction at run time).
 
     Each step gets its opcode pins plus its pc and every in-window operand
     byte pinned (the router verifies pc == head_pc and the whole window's
@@ -1160,6 +1173,7 @@ def sequence_pins(head_pc: int, code: bytes, opcodes) -> list[dict[str, float]]:
     each step's folded new_halted is constant 0.
     """
     pin_list = []
+    predictions = iter(taken)
     pc = head_pc
     off = 0
     while off < len(code):
@@ -1175,8 +1189,23 @@ def sequence_pins(head_pc: int, code: bytes, opcodes) -> list[dict[str, float]]:
         if off + 2 < len(code):
             pins["fetched_operand_hi_all"] = float(code[off + 2])
         pin_list.append(pins)
-        pc += op.length
+        interior = off + op.length < len(code)
+        if interior and op.operation in ("jmp", "jsr") and op.mode == "abs":
+            pc = code[off + 1] | (code[off + 2] << 8)
+        elif interior and op.mode == "rel":
+            predicted = next(predictions, None)
+            if predicted is None:
+                raise ValueError(f"interior branch at +{off} has no predicted direction")
+            pins["branch_taken"] = float(predicted)
+            pc += op.length
+            if pins["branch_taken"]:
+                pc += code[off + 1] - (256 if code[off + 1] & 0x80 else 0)
+        else:
+            pc += op.length
+        pc &= 0xFFFF
         off += op.length
     if off != len(code):
         raise ValueError("window does not end on an instruction boundary")
+    if next(predictions, None) is not None:
+        raise ValueError("more branch predictions than interior branches")
     return pin_list

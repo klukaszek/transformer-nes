@@ -6,14 +6,15 @@ Slots 0-31 are the visible slots (the last also steps v vertically);
 slots 32-33 are the next line's two prefetches.  A SLOT token carries
 the loopy v fields, fine x, ctrl, mask, the nametable arrangement, the
 16 fetched background pixels under the slot (as palette indices), the 8
-sprite-line pixels (as the native sprite unit leaves them: palette index,
-behind-background bit, sprite-0 bit), and whether sprite 0 already hit.
+sprite-line pixels (as the sprite fetch leaves them, ppu2c02/sprites.py:
+palette index, behind-background bit, sprite-0 bit), and whether sprite 0
+already hit.
 
 The step reads nametable, attribute, pattern and palette bytes from the
 WRITE-token log (ppu2c02/space.py) and outputs the 8 pixel colors, the
 fetched tile as 8 palette indices, v after the slot, the sprite-0 hits,
-and the MMC2/MMC4 latches after the fetch.  Sprite evaluation and
-fetch stay native; the priority rules they feed are here.
+and the MMC2/MMC4 latches after the fetch.  The sprite rows come from
+the sprite graphs; the priority rules they feed are here.
 
 Nearly every product here has a 0/1 factor, so the graph uses the
 one-unit gated forms (graph/ops.py: gate/both/either/select/equals).

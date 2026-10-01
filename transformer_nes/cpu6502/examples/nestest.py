@@ -16,7 +16,9 @@ import logging
 import os
 import time
 
+from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.reference import Cpu6502
+from transformer_nes.cpu6502.spec import opcode_for
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,7 @@ NESTEST_DIR = os.path.normpath(
 NESTEST_ROM = os.path.join(NESTEST_DIR, "nestest.nes")
 NESTEST_LOG = os.path.join(NESTEST_DIR, "nestest.log")
 START_PC = 0xC000
+RESET_CYCLES = 7  # the golden log's count at the first instruction
 
 
 def load_image(rom_path: str = NESTEST_ROM) -> bytearray:
@@ -45,8 +48,9 @@ def load_image(rom_path: str = NESTEST_ROM) -> bytearray:
     return image
 
 
-def load_log(log_path: str = NESTEST_LOG) -> list[tuple[int, int, int, int, int, int]]:
-    """Parse the golden log into (pc, a, x, y, p, s) tuples."""
+def load_log(log_path: str = NESTEST_LOG) -> list[tuple[int, int, int, int, int, int, int]]:
+    """Parse the golden log into (pc, a, x, y, p, s, cycles) tuples, the
+    cycle count being the CPU's before the instruction."""
     rows = []
     with open(log_path) as f:
         for line in f:
@@ -56,7 +60,8 @@ def load_log(log_path: str = NESTEST_LOG) -> list[tuple[int, int, int, int, int,
             y = int(line[line.index("Y:") + 2 :][:2], 16)
             p = int(line[line.index("P:") + 2 :][:2], 16)
             s = int(line[line.index("SP:") + 3 :][:2], 16)
-            rows.append((pc, a, x, y, p, s))
+            cycles = int(line[line.index("CYC:") + 4 :].split()[0])
+            rows.append((pc, a, x, y, p, s, cycles))
     return rows
 
 
@@ -66,28 +71,33 @@ def new_cpu(image: bytearray) -> Cpu6502:
     return cpu
 
 
+def instruction_cycles(cpu: Cpu6502) -> int:
+    return reference.instruction_cycles(
+        cpu, opcode_for(cpu.read_memory(cpu.pc)), cpu.pc, cpu.x, cpu.y, cpu.p
+    )
+
+
 def run_reference(image: bytearray, log_rows) -> tuple[bool, int, float]:
-    """Step the reference core against the golden log.
+    """Step the reference core against the golden log: registers and the
+    cycle count before every instruction.
 
     Returns (passed, lines_matched, elapsed_seconds).
     """
     cpu = new_cpu(image)
+    cycles = RESET_CYCLES
     start = time.perf_counter()
-    for i, (pc, a, x, y, p, s) in enumerate(log_rows):
-        got = (cpu.pc, cpu.a, cpu.x, cpu.y, cpu.p, cpu.s)
-        if got != (pc, a, x, y, p, s):
+    for i, want in enumerate(log_rows):
+        got = (cpu.pc, cpu.a, cpu.x, cpu.y, cpu.p, cpu.s, cycles)
+        if got != want:
             logger.error(
-                "mismatch at log line %d:\nexpected PC=%04X A=%02X X=%02X Y=%02X P=%02X SP=%02X\ngot      PC=%04X A=%02X X=%02X Y=%02X P=%02X SP=%02X",
+                "mismatch at log line %d:\nexpected PC=%04X A=%02X X=%02X Y=%02X P=%02X SP=%02X CYC:%d"
+                "\ngot      PC=%04X A=%02X X=%02X Y=%02X P=%02X SP=%02X CYC:%d",
                 i + 1,
-                pc,
-                a,
-                x,
-                y,
-                p,
-                s,
+                *want,
                 *got,
             )
             return False, i, time.perf_counter() - start
+        cycles += instruction_cycles(cpu)
         cpu.step()
     elapsed = time.perf_counter() - start
 
@@ -118,6 +128,15 @@ def run_weights(
 
     ref = new_cpu(image)
     matched, n = lockstep_arrays_vs_reference(ref, out)
+    # The model's cycles against the reference's, which run_reference
+    # checks line by line against the golden log.
+    ref, cycles = new_cpu(image), 0
+    for _ in range(n):
+        cycles += instruction_cycles(ref)
+        ref.step()
+    if matched and int(out["cycles"]) != cycles:
+        logger.error("weights cycles %d, reference %d", int(out["cycles"]), cycles)
+        matched = False
     return matched, n, build_elapsed, run_elapsed, mode
 
 

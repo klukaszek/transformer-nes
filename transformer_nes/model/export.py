@@ -240,8 +240,9 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
             "never to be exact, so it is lifted into `clear_gates` as "
             "(row, col) pairs.  Token t is masked for the head owning that "
             "row when input col is non-zero at insert time.  That removes "
-            "the last unbounded magnitude, so scores need no headroom "
-            "argument -- accumulate in int64.  This artifact is "
+            "the last unbounded magnitude: the residual is int32, and "
+            "a score (an address times a temperature, against another) "
+            "accumulates in int64.  This artifact is "
             "the SELF-CONTAINED construction: it derives each byte's bits "
             "inside the graph, so input_slots is the whole token contract.  "
             "The repo's generated C++ engine executes a different build of "
@@ -251,7 +252,8 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
         ),
         "dtype": "int32",
         "scale_bits": SCALE_BITS,
-        "accumulator": "int64",
+        "accumulator": "int32",
+        "score_accumulator": "int64",
         "clear_gates": n_clear,
         "bcd": bcd,
         "d_model": int(info.d_model),
@@ -305,6 +307,27 @@ def _expert_metadata(expert: dict, index: int) -> dict:
     }
 
 
+def expert_artifact(expert: dict, index: int) -> tuple[dict[str, np.ndarray], dict]:
+    """One folded expert as checkpoint tensors (``E<index>.L<li>.*``: exact
+    int32 CSR, queries rescaled, clear gates lifted) and its metadata."""
+    tensors: dict[str, np.ndarray] = {}
+    model = expert["model"]
+    for li, (attn, ff_in, ff_out) in enumerate(
+        zip(model.attn, model.ff_in, model.ff_out, strict=True)
+    ):
+        stem = f"E{index}.L{li}"
+        ip, clear_rows, clear_cols = split_clear_gates(
+            rescale_head_queries(attn.in_proj_weight.copy(), attn.num_heads)
+        )
+        csr_tensors(f"{stem}.in_proj", ip, tensors)
+        tensors[f"{stem}.clear_rows"] = clear_rows
+        tensors[f"{stem}.clear_cols"] = clear_cols
+        csr_tensors(f"{stem}.out_proj", attn.out_proj.weight, tensors)
+        csr_tensors(f"{stem}.ff_in", ff_in.weight, tensors)
+        csr_tensors(f"{stem}.ff_out", ff_out.weight, tensors)
+    return tensors, _expert_metadata(expert, index)
+
+
 def export_experts(
     out_dir: str, *, bcd: bool = False, opcodes=None,
 ) -> dict:
@@ -328,29 +351,16 @@ def export_experts(
     experts.extend(build_interrupt_experts(pg))
     tensors: dict[str, np.ndarray] = {}
     metadata = []
-
     for ei, expert in enumerate(experts):
-        model = expert["model"]
-        metadata.append(_expert_metadata(expert, ei))
-        for li, (attn, ff_in, ff_out) in enumerate(
-            zip(model.attn, model.ff_in, model.ff_out, strict=True)
-        ):
-            heads = attn.num_heads
-            ip, clear_rows, clear_cols = split_clear_gates(
-                rescale_head_queries(attn.in_proj_weight.copy(), heads)
-            )
-            csr_tensors(f"E{ei}.L{li}.in_proj", ip, tensors)
-            tensors[f"E{ei}.L{li}.clear_rows"] = clear_rows
-            tensors[f"E{ei}.L{li}.clear_cols"] = clear_cols
-            csr_tensors(f"E{ei}.L{li}.out_proj", attn.out_proj.weight, tensors)
-            csr_tensors(f"E{ei}.L{li}.ff_in", ff_in.weight, tensors)
-            csr_tensors(f"E{ei}.L{li}.ff_out", ff_out.weight, tensors)
+        expert_tensors, meta = expert_artifact(expert, ei)
+        tensors.update(expert_tensors)
+        metadata.append(meta)
 
     meta = {
         "format": "6502 folded opcode execution experts",
         "dtype": "int32",
         "scale_bits": SCALE_BITS,
-        "accumulator": "int64",
+        "accumulator": "int32",  # memory reads are structural: no scores
         "bcd": bcd,
         "n_experts": len(metadata),
         "experts": metadata,

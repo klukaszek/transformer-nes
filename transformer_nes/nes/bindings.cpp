@@ -60,7 +60,8 @@ vector<string> fields(std::initializer_list<Fields> spec) {
         out.push_back(f.name + std::to_string(i));
   return out;
 }
-// ppu2c02/render.py INPUTS, OUTPUTS and ppu2c02/registers.py's token.
+// ppu2c02/render.py INPUTS, OUTPUTS, ppu2c02/sprites.py's two tokens and
+// ppu2c02/registers.py's.
 const vector<string> render_inputs = fields(
     {"is_slot", "slot", "hit_set", "fine_x", "ctrl", "mask", {"nt_page", 4}, "latch_lo",
      "latch_hi", "wide_low", "ext_mode", "chr_upper", "v_cx", "v_cy", "v_nt", "v_fy", {"bg", 16},
@@ -68,9 +69,25 @@ const vector<string> render_inputs = fields(
 const vector<string> render_outputs =
     fields({{"pixel", 8}, {"tile", 8}, "new_v_cx", "new_v_cy", "new_v_nt", "new_v_fy", "fetched",
             {"hit", 8}, "new_latch_lo", "new_latch_hi"});
+const vector<string> evaluate_inputs = fields({"is_evaluate", "line", "ctrl"});
+const vector<string> evaluate_outputs = fields({"count", {"index", 8}});
+const vector<string> fetch_inputs =
+    fields({"is_fetch", "line", "ctrl", "count", {"index", 8}, "latch_lo", "latch_hi", "wide_low",
+            {"bank", 8}});
+const vector<string> fetch_outputs = [] {
+  vector<string> out;
+  for (int k = 0; k < 8; ++k)
+    for (int c = 0; c < 8; ++c)
+      out.push_back("sprite" + std::to_string(k) + "_pixel" + std::to_string(c));
+  for (const char* field : {"_x", "_fetch", "_a12"})
+    for (int k = 0; k < 8; ++k)
+      out.push_back("sprite" + std::to_string(k) + field);
+  out.insert(out.end(), {"new_latch_lo", "new_latch_hi"});
+  return out;
+}();
 const vector<string> register_inputs =
     fields({"is_access", "reg", "value", "is_write", "status", "rendering", {"nt_page", 4},
-            "chr_writable", "t_cx", "t_cy", "t_nt", "t_fy", "v_cx", "v_cy", "v_nt", "v_fy",
+            "chr_writable", "latch_lo", "latch_hi", {"bank", 8}, "t_cx", "t_cy", "t_nt", "t_fy", "v_cx", "v_cy", "v_nt", "v_fy",
             "fine_x", "w", "ctrl", "mask", "oam_addr", "read_buffer"});
 const vector<string> register_outputs =
     fields({"new_t_cx", "new_t_cy", "new_t_nt", "new_t_fy", "new_v_cx", "new_v_cy", "new_v_nt",
@@ -374,20 +391,31 @@ public:
     const auto& map = console_->ppu.completed_expert_map();
     return py::bytes(reinterpret_cast<const char*>(map.data()), map.size());
   }
-  // Render background slots through a compiled render graph
-  // (ppu2c02/render.py, built by ppu2c02.machine.render_engine); None
-  // restores native rendering.
-  void set_ppu_render_engine(py::object engine) {
+  // Run the PPU as the compiled transformer built by
+  // ppu2c02.machine.ppu_engine (register accesses, tile slots, the sprite
+  // unit), kept alive here; None restores the native PPU.  Its token
+  // graphs must be the PPU's, checked field by field.
+  void set_ppu_engine(py::object engine) {
     if (engine.is_none()) {
-      console_->ppu.set_render_engine({});
-      render_engine_ = py::none();
+      console_->ppu.set_engine({});
+      ppu_engine_ = py::none();
       return;
     }
-    if (py::cast<vector<string>>(engine.attr("inputs")) != render_inputs ||
-        py::cast<vector<string>>(engine.attr("outputs")) != render_outputs)
-      throw std::invalid_argument("engine is not the PPU render graph");
+    const py::dict graphs = engine.attr("graphs");
+    auto token_is = [&](const char* name, const vector<string>& in, const vector<string>& out) {
+      if (!graphs.contains(name))
+        return false;
+      const py::object g = graphs[name];
+      return py::cast<vector<string>>(g.attr("inputs")) == in &&
+             py::cast<vector<string>>(g.attr("outputs")) == out;
+    };
+    if (!token_is("render", render_inputs, render_outputs) ||
+        !token_is("evaluate", evaluate_inputs, evaluate_outputs) ||
+        !token_is("fetch", fetch_inputs, fetch_outputs) ||
+        !token_is("access", register_inputs, register_outputs))
+      throw std::invalid_argument("engine is not the PPU graphs");
     const auto abi = engine.attr("abi")().cast<py::tuple>();
-    Ppu::RenderEngine api;
+    Ppu::PpuEngine api;
     api.ctx = reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>());
     api.write = reinterpret_cast<void (*)(void*, int, int)>(abi[1].cast<std::uintptr_t>());
     api.step =
@@ -407,66 +435,14 @@ public:
       std::ranges::copy(d["first"].cast<vector<int>>(), out.first.begin());
       std::ranges::copy(d["last"].cast<vector<int>>(), out.last.begin());
     }
-    render_engine_ = engine;
-    console_->ppu.set_render_engine(api);
-  }
-  // Run the PPU register file through a compiled register graph
-  // (model/graph_engine.py) called natively through its ABI; `engine`
-  // is kept alive here.  Its inputs and outputs must be the register
-  // graph's field order (ppu2c02/registers.py), checked by name.
-  void set_ppu_register_engine(py::object engine) {
-    if (engine.is_none()) {
-      console_->ppu.set_register_step({});
-      register_engine_ = py::none();
-      return;
-    }
-    if (py::cast<vector<string>>(engine.attr("inputs")) != register_inputs ||
-        py::cast<vector<string>>(engine.attr("outputs")) != register_outputs)
-      throw std::invalid_argument("engine is not the PPU register graph");
-    const auto abi = engine.attr("abi")().cast<py::tuple>();
-    void* ctx = reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>());
-    auto write = reinterpret_cast<void (*)(void*, int, int)>(abi[1].cast<std::uintptr_t>());
-    auto step = reinterpret_cast<void (*)(void*, int, const int*, int*)>(
-        abi[2].cast<std::uintptr_t>());
-    register_engine_ = engine;
-    Ppu::RegisterStep api;
-    api.write = [ctx, write](int addr, int value) { write(ctx, addr, value); };
-    api.access = [ctx, step](const Ppu::RegisterAccess& a, int nt_map, bool chr_writable,
-                             const Ppu::RegisterFile& before) {
-      // In the order of register_inputs, loopy registers split into fields.
-      auto loopy = [](int32_t reg, int* out) {
-        out[0] = reg & 0x1F;
-        out[1] = (reg >> 5) & 0x1F;
-        out[2] = (reg >> 10) & 3;
-        out[3] = (reg >> 12) & 7;
-      };
-      int in[25] = {1,
-                    a.reg,
-                    a.value,
-                    a.is_write,
-                    a.status,
-                    a.rendering,
-                    nt_map & 3,
-                    (nt_map >> 2) & 3,
-                    (nt_map >> 4) & 3,
-                    (nt_map >> 6) & 3,
-                    chr_writable};
-      loopy(before.t, in + 11);
-      loopy(before.v, in + 15);
-      const int rest[6] = {before.fine_x, before.w, before.ctrl, before.mask, before.oam_addr,
-                           before.read_buffer};
-      std::copy(std::begin(rest), std::end(rest), in + 19);
-      int out[20];
-      step(ctx, 0, in, out);
-      auto join = [](const int* f) { return f[0] | (f[1] << 5) | (f[2] << 10) | (f[3] << 12); };
-      const Ppu::RegisterFile after{join(out),  join(out + 4), out[8],  out[9],
-                                    out[10],    out[11],       out[12], out[13]};
-      // The engine's own log receives the write through `write`, with the
-      // rest of the view's changes before the next access.
-      const Ppu::RegisterResult result{out[14], out[15] ? out[16] : -1, out[17]};
-      return std::pair{after, result};
-    };
-    console_->ppu.set_register_step(std::move(api));
+    const py::dict sprites = engine.attr("sprite_dispatch");
+    std::ranges::copy(sprites["evaluate"].cast<vector<int>>(), api.sprites.evaluate.begin());
+    std::ranges::copy(sprites["fetch"].cast<vector<int>>(), api.sprites.fetch.begin());
+    const auto registers = engine.attr("register_dispatch").cast<vector<vector<int>>>();
+    for (size_t w = 0; w < 2; ++w)
+      std::ranges::copy(registers[w], api.registers[w].begin());
+    ppu_engine_ = engine;
+    console_->ppu.set_engine(api);
   }
   // The X-ray's pixel dissection (Ppu::request_slot_trace): the model
   // that drew the slot and the full model's residual stream after the
@@ -497,8 +473,7 @@ public:
   Console& console() { return *console_; }
 
 private:
-  py::object register_engine_ = py::none();
-  py::object render_engine_ = py::none();
+  py::object ppu_engine_ = py::none();
   unique_ptr<PythonSteppedRuntime> stepped_;
   unique_ptr<ConsoleMachine> machine_;
   unique_ptr<Console> console_;
@@ -546,9 +521,7 @@ PYBIND11_MODULE(nes_hardware, m) {
       .def("ppu_expert_map", &ConsoleHost::ppu_expert_map,
            "Which render model drew each 8-pixel slot of the last frame "
            "(240x32 bytes: 0 full graph, k expert k, 255 native)")
-      .def("set_ppu_register_engine", &ConsoleHost::set_ppu_register_engine,
-           py::arg("engine"))
-      .def("set_ppu_render_engine", &ConsoleHost::set_ppu_render_engine, py::arg("engine"))
+      .def("set_ppu_engine", &ConsoleHost::set_ppu_engine, py::arg("engine"))
       .def("request_ppu_slot_trace", &ConsoleHost::request_ppu_slot_trace, py::arg("line"),
            py::arg("slot"))
       .def("take_ppu_slot_trace", &ConsoleHost::take_ppu_slot_trace)

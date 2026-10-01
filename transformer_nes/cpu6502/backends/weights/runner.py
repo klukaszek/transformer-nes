@@ -8,46 +8,125 @@ the native engine owns instruction execution and attention state.
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
 import logging
+import os
+import pickle
+import shutil
 import time
 
 import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.weights.experts import (
-    UNION_FALLBACK_OPERATIONS,
-    build_interrupt_experts,
-    build_opcode_execution_experts,
+    WindowLicenseError,
+    build_core_experts,
     build_sequence_expert,
-    build_shape_experts,
+    decode_ops,
     head_row,
     step_spec_base,
+    window_layout,
 )
 from transformer_nes.cpu6502.backends.weights.windows import (
-    SHAPE_LIBRARY,
+    block_code,
     match_shape_windows,
+    static_window_limit,
 )
 from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS, Cpu6502Graph
 from transformer_nes.cpu6502.spec import OPCODES, written_addresses
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
-from transformer_nes.graph.core import ProgramGraph
+from transformer_nes.files import write_atomic
 from transformer_nes.model.engine_gen import (
+    CACHE_DIR,
     GeneratedWeightsEngine,
     SequenceModule,
     engine_config_key,
     seqmod_config_key,
 )
 from transformer_nes.model.schedule import asap_schedule
+from transformer_nes.model.sources import source_digest
 from transformer_nes.model.weights import build_model
 
 logger = logging.getLogger(__name__)
+
+
+def window_key(window) -> tuple:
+    """A window as (head, code, repeat, forward, taken): store forwarding
+    and branch predictions default off."""
+    head, code, repeat, forward, taken = (*window, *(False, ())[len(window) - 3:])
+    return (int(head) & 0xFFFF, bytes(code), int(repeat), bool(forward),
+            tuple(bool(t) for t in taken))
+
+
+# Folds (minutes for a ROM's windows) are cached per expert, keyed by the
+# code that makes them: the expert construction and the CPU graph, with
+# their imports (model/sources.py).
+FOLD_SOURCES = ("transformer_nes.cpu6502.backends.weights.experts", "transformer_nes.cpu6502.construction")
+
+
+@functools.cache
+def fold_dir() -> str:
+    """This code's folds; any other code's are deleted on first use."""
+    root = os.path.join(CACHE_DIR, "folds")
+    digest = source_digest(*FOLD_SOURCES)[:16]
+    if os.path.isdir(root):
+        for stale in set(os.listdir(root)) - {digest}:
+            shutil.rmtree(os.path.join(root, stale), ignore_errors=True)
+    os.makedirs(os.path.join(root, digest), exist_ok=True)
+    return os.path.join(root, digest)
+
+
+def fold_cached(name: str) -> bool:
+    return os.path.exists(os.path.join(fold_dir(), name + ".pkl"))
+
+
+def cached_fold(name: str, build):
+    """`build()`, pickled under `name` in this code's folds."""
+    path = os.path.join(fold_dir(), name + ".pkl")
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    value = build()
+    write_atomic(path, pickle.dumps(value))
+    return value
+
+
+def window_fold_name(window: tuple, bcd: bool) -> str:
+    return "window_" + hashlib.sha256(repr((window_key(window), bcd)).encode()).hexdigest()[:24]
+
+
+def window_folds(pg, windows, bcd: bool, *, build: bool = True) -> list[dict] | None:
+    """The windows' experts, in order (a window the fold's licenses refuse
+    only loses its fast path).  Each fold is cached on its own as soon as
+    it is made, so an interrupted build keeps what it did; with `build`
+    False, None unless all are cached."""
+    names = [window_fold_name(w, bcd) for w in windows]
+    if not build and not all(map(fold_cached, names)):
+        return None
+    experts = (cached_fold(name, lambda w=w: fold_window(pg, w))
+               for name, w in zip(names, windows, strict=True))
+    return [e for e in experts if e is not None]
+
+
+def fold_window(pg, window: tuple) -> dict | None:
+    """A window's expert, or None where the fold's licenses refuse it."""
+    try:
+        return build_sequence_expert(pg, *window)
+    except RuntimeError as e:
+        logger.info("sequence window skipped: %s", e)
+        return None
 
 
 class Cpu6502TransformerMachine:
     """The 6502 as actual transformer weights, stepped position by position."""
 
     def __init__(self, *, bcd: bool = False, union_only: bool = False,
-                 mirror_cpu_ram: bool = False):
+                 mirror_cpu_ram: bool = False, forward_hook: bool = False):
+        # forward_hook: build the engine whose expert steps can hand their
+        # layers to an outside runtime (torch_forward.py); a separate build,
+        # since the hook's branch slows the native forwards.
+        self.forward_hook = bool(forward_hook)
         self.bcd = bool(bcd)
         self.union_only = bool(union_only)
         self.mirror_cpu_ram = bool(mirror_cpu_ram)
@@ -59,17 +138,7 @@ class Cpu6502TransformerMachine:
             name: dim_by_id[dim_id] for name, dim_id in self.graph.dim_id_by_name.items()
         }
 
-        # The run loop reads the machine outputs from the residual stream,
-        # so they must survive to the final layer: a synthetic output token
-        # marks them as outputs for the scheduler.  Its head row is ignored
-        # at prediction time (only STATE vs HALT compete).
-        output_tokens = dict(self.graph.output_tokens)
-        readout = 0
-        for name in RUNTIME_READ_DIMS:
-            readout = readout + 1e-6 * self.dim_by_name[name]
-        output_tokens["READOUT"] = readout
-
-        pg = ProgramGraph(self.graph.input_tokens, output_tokens)
+        pg = self.graph.program_graph()
         self.pg = pg  # kept for the expert folds (graph/fold.py)
         build_start = time.perf_counter()
         sched = asap_schedule(pg.input_tokens, pg.output_tokens, program_graph=pg)
@@ -95,35 +164,28 @@ class Cpu6502TransformerMachine:
         # rather than a configuration vocabulary.
         cache_key = engine_config_key(
             bcd=bcd, union_only=union_only, mirror_cpu_ram=self.mirror_cpu_ram,
+            forward_hook=self.forward_hook,
         )
         engine = GeneratedWeightsEngine.from_cache(cache_key)
         if engine is not None:
             logger.info("engine cache hit (%d experts)", engine.n_experts)
         if engine is None:
-            experts: list[dict] = []
-            shapes_meta: list[dict] = []
             # Without experts every opcode misses dispatch and falls to
             # step_core, so the union alone executes the whole ISA.
-            if not union_only:
-                opcode_bytes = tuple(
-                    byte for byte in sorted(OPCODES)
-                    if OPCODES[byte].operation not in UNION_FALLBACK_OPERATIONS
-                )
-                experts = build_opcode_execution_experts(self.pg, opcode_bytes)
-                experts.extend(build_interrupt_experts(self.pg))
-                shape_experts, shapes_meta = build_shape_experts(
-                    self.pg, SHAPE_LIBRARY,
-                )
-                experts.extend(shape_experts)
+            experts, shapes_meta = ([], []) if union_only else self.core_experts()
             engine = GeneratedWeightsEngine(
                 self.model, step_spec=self.step_spec(),
                 experts=experts, cache_key=cache_key,
                 shapes_meta=shapes_meta, mirror_cpu_ram=self.mirror_cpu_ram,
+                forward_hook=self.forward_hook,
             )
         self.engine = engine
         # The ROM's windows land in a tiny per-ROM module attached through
         # the core's function-pointer hook (no core recompile per ROM).
         self.seq_module = None
+        self.seq_windows: tuple = ()
+        self.seq_key: str | None = None
+        self._window_experts: list[dict] | None = None
         if not self.engine.has_machine_step:
             raise RuntimeError("generated 6502 engine is missing machine_step")
         if not self.engine.supports_direct_writes:
@@ -162,45 +224,185 @@ class Cpu6502TransformerMachine:
         self.engine.forward(x)  # in place, whole stack
         return x
 
-    def attach_sequence_module(self, windows) -> None:
+    def core_experts(self) -> tuple[list[dict], list[dict]]:
+        """The core engine's experts in its build order (the forward hook's
+        ids 0..), and the shapes' metadata (experts.py:build_core_experts;
+        folds cached)."""
+        return cached_fold(f"core_bcd{int(self.bcd)}", lambda: build_core_experts(self.pg))
+
+    def window_experts(self, *, build: bool = True) -> list[dict] | None:
+        """The attached windows' experts, in module order (the forward
+        hook's ids SEQ_HOOK_IDS..; window_folds)."""
+        if self._window_experts is None:
+            self._window_experts = window_folds(self.pg, self.seq_windows, self.bcd, build=build)
+        return self._window_experts
+
+    def windows_folded(self) -> bool:
+        """Whether every attached window's fold is cached (nothing loaded)."""
+        return all(fold_cached(window_fold_name(w, self.bcd)) for w in self.seq_windows)
+
+    def attach_sequence_module(self, windows, *, build: bool = True) -> bool:
         """Compile-or-load the per-ROM sequence module and attach its window
-        dispatch to the core engine.  A new ROM's window set costs one small
-        TU (cached by digest); the 43 MB core is never re-emitted for it."""
-        windows = tuple(
-            (int(head) & 0xFFFF, bytes(code), int(repeat))
-            for head, code, repeat in windows
-        )
+        dispatch to the core engine; whether it attached.  A new ROM's
+        window set costs one small TU (cached by digest; folding its
+        windows takes longer), which `build` False leaves to someone else:
+        the windows then attach only from the cache.  The 43 MB core is
+        never re-emitted for it."""
+        windows = tuple(map(window_key, windows))
         self.engine.detach_seq()
         self.seq_module = None
+        self.seq_windows, self.seq_key, self._window_experts = (), None, None
         if not windows:
-            return
+            return False
         key = seqmod_config_key(
             core_digest=self.engine.digest, bcd=self.bcd, windows=windows
         )
         mod = SequenceModule.from_cache(key, core_digest=self.engine.digest)
+        if mod is None and not build:
+            return False
+        self.seq_windows = windows
         if mod is None:
-            experts = []
-            for w in windows:
-                # The scanner proposes shapes; the fold's license checks
-                # arbitrate.  A rejected window only loses its fast path.
-                try:
-                    experts.append(build_sequence_expert(self.pg, *w))
-                except RuntimeError as e:
-                    logger.info("sequence window skipped: %s", e)
+            experts = self.window_experts()
             if not experts:
-                return
+                return False
             mod = SequenceModule(
                 self.model, self.step_spec(), experts,
                 core_digest=self.engine.digest, cache_key=key,
             )
         else:
             logger.info("sequence module cache hit (max window %d steps)", mod.max_k)
-        self.seq_module = mod
+        self.seq_module, self.seq_key = mod, key
         heads = b"".join(
             head.to_bytes(2, "little")
-            for head in sorted({head for head, _code, _repeat in windows})
+            for head in sorted({head for head, *_ in windows})
         )
         self.engine.attach_seq(mod.fn_ptr, mod.ctx_ptr, heads)
+        return True
+
+    def longest_window(self, pc: int, code: bytes, ops, *, forward: bool = False,
+                       taken: tuple[bool, ...] = ()) -> tuple[int, bool]:
+        """How many leading instructions of `code` fold into one licensed
+        window (0 if fewer than two), and whether a read of the window's own
+        store is what stopped it longer (`forward` folds take such reads).
+        `taken` predicts the code's branches in order; a prefix keeps the
+        predictions of the branches still inside it.  A search that jumps
+        to a license's own cut point when it names one, and bisects when it
+        does not."""
+        good, bad = 1, len(ops) + 1  # prefixes known to fold / not to
+        n = len(ops)
+        aliasing = False
+        while good + 1 < bad:
+            interior = sum(op.mode == "rel" for op in ops[: n - 1])
+            try:
+                build_sequence_expert(
+                    self.pg, pc, code[: sum(op.length for op in ops[:n])], 1, forward,
+                    taken[:interior])
+                good = n
+            except WindowLicenseError as e:
+                aliasing |= e.aliasing
+                # Every longer prefix holds the step the license refused.
+                bad = min(n, e.keep + 1)
+                if good < e.keep < n - 1:
+                    n = e.keep  # the license names its cut: try it next
+                    continue
+            except RuntimeError as e:
+                logger.info("window @%04X skipped: %s", pc, e)
+                return 0, False
+            n = (good + bad) // 2
+        return (good if good >= 2 else 0), aliasing
+
+    def fold_window(self, pc: int, code: bytes, taken: tuple[bool, ...] = ()) -> tuple | None:
+        """The longest licensed window from `pc` along `code`, as
+        (n instructions, window tuple), store forwarding tried when a read
+        of the window's own store cut it; None below two instructions."""
+        ops = decode_ops(code)[: static_window_limit(code)]
+        if len(ops) < 2:
+            return None
+        n, aliasing = self.longest_window(pc, code, ops, taken=taken)
+        forward = False
+        if aliasing:
+            longer, _ = self.longest_window(pc, code, ops, forward=True, taken=taken)
+            if longer > n:
+                n, forward = longer, True
+        if n < 2:
+            return None
+        interior = sum(op.mode == "rel" for op in ops[: n - 1])
+        return n, (pc, code[: sum(op.length for op in ops[:n])], 1, forward, taken[:interior])
+
+    def superblock(self, read, pc: int, code: bytes, runs, taken_runs, *,
+                   bias: float = 0.9, least: int = 8, limit: int = 32) -> tuple | None:
+        """A window from `pc` through the conditional branches ending
+        `code`'s blocks, each the way the profile says it almost always
+        goes (`bias` of at least `least` runs): the blocks chained along
+        those predictions, then folded as one guarded window.  None unless
+        the fold reaches past the first prediction."""
+        taken: tuple[bool, ...] = ()
+        visited = {at for at, _length in window_layout(pc, code)}
+        while code and len(decode_ops(code)) < limit:
+            at, length = window_layout(pc, code, taken)[-1]  # the block's last
+            last = OPCODES[code[-length]]
+            if last.mode != "rel" or runs[at] < least:
+                break
+            rate = taken_runs[at] / runs[at]
+            if max(rate, 1 - rate) < bias:
+                break
+            way = bool(rate >= 0.5)
+            offset = code[-1] - (256 if code[-1] & 0x80 else 0)
+            successor = (at + 2 + (offset if way else 0)) & 0xFFFF
+            rest = block_code(read, successor, limit=limit - len(decode_ops(code)))
+            if not rest or successor in visited:
+                break  # (a loop's back edge: loop windows take those)
+            visited |= {a for a, _l in window_layout(successor, rest)}
+            code, taken = code + rest, taken + (way,)
+        if not taken:
+            return None
+        folded = self.fold_window(pc, code, taken)
+        return folded[1] if folded and folded[1][4] else None
+
+    def learn_windows(self, *, coverage: float = 0.98, limit: int = 384,
+                      profile=None, memory: bytes | None = None) -> list[tuple]:
+        """Per-ROM windows for the blocks this run entered most (the
+        engine's profile since the last call), covering `coverage` of all
+        entries in at most `limit` heads.  Each block becomes as few windows
+        as the fold's licenses allow: a window is cut just before the step
+        a license refuses, and the rest of the block starts the next.  A
+        block a read of its own store cuts short also tries store
+        forwarding.  Where a block's last window ends at a branch the
+        profile finds biased, a superblock from the same head runs on
+        through it (dispatch tries it first; a failed prediction declines
+        to the shorter window).  Returns (head, code, 1, forward, taken)
+        for attach_sequence_module.  `profile` and `memory` default to the
+        engine's (a background learner passes a running engine's).
+        """
+        counts, runs, taken_runs = (
+            self.engine.engine.take_profile() if profile is None else profile)
+        read = self.read_ram if memory is None else (lambda address: memory[address & 0xFFFF])
+        order = np.argsort(counts)[::-1]
+        total, covered = int(counts.sum()), 0
+        windows: list[tuple] = []
+        seen: set[int] = set()
+        for head in order[:limit].tolist():
+            if not counts[head] or covered >= coverage * total:
+                break
+            covered += int(counts[head])
+            pc = head
+            while pc not in seen:
+                seen.add(pc)
+                code = block_code(read, pc)
+                layout = window_layout(pc, code)
+                folded = self.fold_window(pc, code)
+                if folded:
+                    windows.append(folded[1])
+                n = folded[0] if folded else 1  # an instruction no window holds runs alone
+                if n >= len(layout):
+                    superblock = self.superblock(read, pc, code, runs, taken_runs)
+                    if superblock:
+                        windows.append(superblock)
+                    break  # the block is covered
+                pc = layout[n][0]
+        logger.info("learned %d windows (%d superblocks) from %d block heads",
+                    len(windows), sum(bool(w[4]) for w in windows), len(seen))
+        return windows
 
     def populate_shape_windows(self) -> None:
         """Fill the engine's runtime window table from the current RAM image

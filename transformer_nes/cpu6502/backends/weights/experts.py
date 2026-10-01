@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 from dataclasses import replace
 from typing import Literal
 
@@ -17,10 +18,11 @@ import numpy as np
 
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.weights.windows import (
-    MEMORY_WRITE_OPERATIONS,
     SEQUENCE_WRITERS,
+    SHAPE_LIBRARY,
 )
 from transformer_nes.cpu6502.spec import (
+    BRANCH_CONDITIONS,
     BRANCH_OPERATIONS,
     OPCODES,
     READS_MEMORY,
@@ -44,6 +46,7 @@ from transformer_nes.graph.execution import (
 from transformer_nes.graph.fold import (
     SEQUENCE_FEEDBACK,
     GraphFolder,
+    SequenceRejection,
     sequence_pins,
     sequence_shape_pins,
 )
@@ -184,9 +187,43 @@ def classify_sequence_state(fold_result, final_names) -> dict:
     return result
 
 
+def branch_guards(fold_result, pin_list, ops, label: str) -> list[tuple]:
+    """What a superblock's predictions need: for each interior branch the
+    fold pinned (sequence_pins), the flag it tests must read the predicted
+    way -- the flag entering its step, which is the state's own flag
+    ("state", mask, expected) or the model's output of the step before
+    ("model", dimension, expected).  A flag the fold proves constant
+    needs no guard, or contradicts the prediction (refused)."""
+    by_name = fold_result.dim_of_name
+    one = fold_result.program_graph.one
+    guards = []
+    for k, pins in enumerate(pin_list):
+        if "branch_taken" not in pins:
+            continue
+        mask, value = BRANCH_CONDITIONS[ops[k].operation]
+        expected = bool(value) == bool(pins["branch_taken"])
+        if k == 0:
+            guards.append(("state", mask, expected))
+            continue
+        dim_name, input_name = next(
+            (dim_name, input_name)
+            for _name, dim_name, flag, input_name in SEQUENCE_FLAG_DIMS if flag == mask)
+        dim = by_name[f"{dim_name}__s{k - 1}"]
+        form = linear_input_form(Expression({dim: 1.0}))
+        if all(source is one for source in form):
+            if bool(round(form.get(one, 0.0))) != expected:
+                raise WindowLicenseError(
+                    f"{label} step {k}: the branch never goes the predicted way", k)
+        elif form == {by_name[input_name]: 1.0}:
+            guards.append(("state", mask, expected))
+        else:
+            guards.append(("model", dim, expected))
+    return guards
+
+
 def project_sequence_execution(
     fold_result, n_steps: int, control: ControlFlow,
-    halt_dimension: Dimension | None = None,
+    halt_dimension: Dimension | None = None, guards: list[tuple] = (),
 ) -> ExecutionGraph:
     """Replace the proof graph's per-step trace ABI with its execution ABI.
 
@@ -237,17 +274,28 @@ def project_sequence_execution(
 
     # Each step's cycles: folded to a constant where the pins decide them
     # (most opcodes), else a model output (taken branches, page crosses).
+    # The bound: the folded value's interval, or for cycles that depend on
+    # memory (an indirect read's page cross) the most an instruction
+    # costs, 7 + the penalties.
     one = fold_result.program_graph.one
-    cycles = []
+    cycles, bounds = [], []
     for k in range(n_steps):
         dim = fold_result.dim_of_name[f"cycles__s{k}"]
         form = linear_input_form(Expression({dim: 1.0}))
         if all(source is one for source in form):
             cycles.append(int(round(form.get(one, 0.0))))
-        else:
-            cycles.append(dim)
-            output_tokens[f"cycles:{k}"] = Expression({dim: 1})
+            bounds.append(cycles[-1])
+            continue
+        cycles.append(dim)
+        output_tokens[f"cycles:{k}"] = Expression({dim: 1})
+        try:
+            bounds.append(int(math.floor(interval_of(fold_result, dim)[1])))
+        except RuntimeError:
+            bounds.append(9)
 
+    for n, (source, dim, _expected) in enumerate(guards):
+        if source == "model":
+            output_tokens[f"guard:{n}"] = Expression({dim: 1})
     if control.predicate is not None and not control.flag_mask:
         output_tokens["control:branch"] = Expression({control.predicate: 1})
     if control.target_dimension is not None:
@@ -281,7 +329,9 @@ def project_sequence_execution(
         control=execution_control,
         halt_dimension=halt_dimension,
         cycles=tuple(cycles),
+        cycle_bounds=tuple(bounds),
         dim_of_name=dim_of_name,
+        guards=tuple(guards),
     )
 
 
@@ -336,6 +386,10 @@ def sequence_step_spec(execution: ExecutionGraph, info) -> dict:
         None if execution.halt_dimension is None
         else info.slot_of[execution.halt_dimension]
     )
+    spec["sequence_guards"] = [
+        (source, info.slot_of[what] if source == "model" else what, expected)
+        for source, what, expected in execution.guards
+    ]
     return spec
 
 
@@ -415,18 +469,6 @@ def decode_ops(code: bytes) -> list:
     return ops
 
 
-BRANCH_FLAG = {
-    "bcc": (reference.FLAG_C, False),
-    "bcs": (reference.FLAG_C, True),
-    "beq": (reference.FLAG_Z, True),
-    "bmi": (reference.FLAG_N, True),
-    "bne": (reference.FLAG_Z, False),
-    "bpl": (reference.FLAG_N, False),
-    "bvc": (reference.FLAG_V, False),
-    "bvs": (reference.FLAG_V, True),
-}
-
-
 def pinned_sequence_control(fold_result, pin_list, ops) -> ControlFlow:
     k = len(pin_list) - 1
     op = ops[k]
@@ -451,15 +493,18 @@ def pinned_sequence_control(fold_result, pin_list, ops) -> ControlFlow:
             predicate=predicate,
             fallthrough=fallthrough,
             target=(fallthrough + signed) & 0xFFFF,
-            flag_mask=BRANCH_FLAG[op.operation][0],
-            flag_value=BRANCH_FLAG[op.operation][1],
+            flag_mask=BRANCH_CONDITIONS[op.operation][0],
+            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
         )
-    if op.operation == "jmp" and op.mode == "abs":
+    if op.operation in ("jmp", "jsr") and op.mode == "abs":
         target = int(pins["fetched_operand_lo_all"]) | (
             int(pins["fetched_operand_hi_all"]) << 8
         )
         return ControlFlow(predicate=None, fallthrough=target, target=target)
-    if op.operation in STACK_CONTROL_OPERATIONS or op.operation == "jmp":
+    if op.operation in ("rts", "rti"):  # the return address is the model's
+        target = fold_result.dim_of_name[f"next_pc__s{k}"]
+        return ControlFlow(predicate=None, fallthrough=0, target=0, target_dimension=target)
+    if op.operation == "brk" or op.operation == "jmp":
         raise RuntimeError(
             f"sequence final control {op.mnemonic} is not host-resolvable"
         )
@@ -483,8 +528,8 @@ def shape_sequence_control(
             target=0,
             relative_to_head=True,
             relative_operand_offset=offsets[-1] + 1,
-            flag_mask=BRANCH_FLAG[op.operation][0],
-            flag_value=BRANCH_FLAG[op.operation][1],
+            flag_mask=BRANCH_CONDITIONS[op.operation][0],
+            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
         )
     if op.operation in STACK_CONTROL_OPERATIONS or op.operation == "jmp":
         raise RuntimeError(
@@ -505,8 +550,8 @@ def opcode_execution_control(fold_result, op) -> ControlFlow:
             target=0,
             relative_to_head=True,
             relative_operand_offset=1,
-            flag_mask=BRANCH_FLAG[op.operation][0],
-            flag_value=BRANCH_FLAG[op.operation][1],
+            flag_mask=BRANCH_CONDITIONS[op.operation][0],
+            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
         )
     if op.operation in {"jmp", "jsr"} and op.mode == "abs":
         return ControlFlow(
@@ -530,43 +575,153 @@ def opcode_execution_control(fold_result, op) -> ControlFlow:
     )
 
 
-def window_timing(execution: ExecutionGraph, spin: bool) -> dict:
-    """How the run loop times a window.  Its budget guard needs the cycles
-    before the last step up front (`cycles_prefix`; None when the pins left
-    any to the model, and the window never dispatches); the last step's may
-    stay a model output (a closing branch).  A `JMP *` spin changes nothing
+POLL_PREFIXES = {("load_a",), ("bit",), ("load_a", "and")}
+COUNTERS = {"dex": ("x", -1), "inx": ("x", 1), "dey": ("y", -1), "iny": ("y", 1)}
+
+
+def loop_recurrence(ops, offsets) -> dict | None:
+    """A window that is one iteration of a loop the run loop can retire
+    many iterations of at once, when its closing branch points back at
+    its head (checked at dispatch: the operand byte at `closure_offset`
+    must be `closure_value`).
+
+    - poll: a read (of memory nothing in the loop writes) and a test; once
+      one iteration loops, every later one is identical.
+    - count: DEX/INX/DEY/INY then BNE; each iteration steps the register
+      until it wraps to 0.
+
+    The iterations' cycles are the model's: the run loop times one real
+    iteration and leaves the final, falling-through one to a forward."""
+    length = offsets[-1] + ops[-1].length
+    closure = {"closure_offset": offsets[-1] + 1, "closure_value": (-length) & 0xFF}
+    names = tuple(op.operation for op in ops)
+    if len(ops) == 2 and names[0] in COUNTERS and names[1] == "bne":
+        register, delta = COUNTERS[names[0]]
+        return {"kind": "count", "register": register, "delta": delta, **closure}
+    if (
+        names[:-1] in POLL_PREFIXES
+        and names[-1] in BRANCH_OPERATIONS
+        and ops[0].mode not in ("imp", "acc", "imm")
+    ):
+        return {"kind": "poll", **closure}
+    return None
+
+
+def exactly_emittable(model) -> bool:
+    """Whether a model's residual-writing weights (FFN, attention output
+    and values) are whole or half integers, all the exact int32 emission
+    represents (model/engine_gen.py).  Inlining a fold can compose two
+    halves into a quarter."""
+    def fine(matrix) -> bool:
+        doubled = np.asarray(matrix, dtype=np.float64) * 2.0
+        return not np.array_equal(doubled, np.round(doubled))
+
+    for li, attn in enumerate(model.attn):
+        heads = attn.num_heads
+        if fine(attn.in_proj_weight[4 * heads :]) or fine(attn.out_proj.weight):
+            return False
+        if fine(model.ff_in[li].weight) or fine(model.ff_out[li].weight):
+            return False
+    return True
+
+
+def window_timing(execution: ExecutionGraph, spin: bool, loop: dict | None = None) -> dict:
+    """How the run loop times a window.  Its budget guard needs a bound on
+    the cycles before the last step up front (`cycles_prefix`); every
+    step's exact cycles may stay a model output (a page cross, a closing
+    branch).  A `JMP *` spin changes nothing
     per iteration, so the loop retires as many as the budget allows at
-    `spin` cycles each; 0 for any other window."""
+    `spin` cycles each (0 for any other window); `loop` is the window's
+    loop_recurrence, if any."""
     if spin and not isinstance(execution.cycles[0], int):
         raise RuntimeError("a JMP spin's cycles did not fold")
     return {
         "cycles_prefix": execution.cycles_prefix,
         "spin": execution.cycles[0] if spin else 0,
+        "loop": None if spin else loop,
     }
 
 
-def check_reads_licensed(fold_result, ops, label: str) -> None:
+class WindowLicenseError(RuntimeError):
+    """A window the fold cannot license; `keep` is how many of its leading
+    steps still can be one, so a window builder knows where to cut.
+    `aliasing`: the cut is a read of an earlier step's store, which a fold
+    with store forwarding may take instead."""
+
+    def __init__(self, message: str, keep: int, *, aliasing: bool = False):
+        super().__init__(message)
+        self.keep = keep
+        self.aliasing = aliasing
+
+
+def window_layout(head: int, code: bytes, taken: tuple[bool, ...] = ()) -> list[tuple[int, int]]:
+    """Each instruction's (pc, length) in a window's code, in execution
+    order: the walk graph/fold.py:sequence_pins pins."""
+    return [
+        (int(pins["current_pc_lo"]) | int(pins["current_pc_hi"]) << 8, op.length)
+        for pins, op in zip(sequence_pins(head, code, OPCODES, taken), decode_ops(code),
+                            strict=True)
+    ]
+
+
+def may_alias(a: tuple[float, float], b: tuple[float, float]) -> bool:
+    """Whether two address intervals can name one byte, the NES's RAM
+    mirrors included ($0000-$07FF repeats through $1FFF)."""
+    if not all(map(math.isfinite, (*a, *b))):
+        return True
+    if a[1] < b[0] or b[1] < a[0]:
+        if not (a[1] < 0x2000 and b[1] < 0x2000):
+            return False
+    else:
+        return True
+    if a[1] - a[0] >= 0x7FF or b[1] - b[0] >= 0x7FF:
+        return True
+
+    def spans(lo, hi):
+        lo, hi = int(lo) & 0x7FF, int(hi) & 0x7FF
+        return [(lo, hi)] if lo <= hi else [(lo, 0x7FF), (0, hi)]
+
+    return any(x0 <= y1 and y0 <= x1 for x0, x1 in spans(*a) for y0, y1 in spans(*b))
+
+
+def check_reads_licensed(fold_result, ops, label: str, *, forwarded: bool = False) -> None:
     """The run loop shadow-checks only the first instruction.  A later
     memory read is nevertheless safe when folding proves its effective
     address stays in native RAM (< $2000) or cartridge ROM (>= $8000),
-    outside every NES device/read-watch range."""
-    wrote_memory = ops[0].operation in MEMORY_WRITE_OPERATIONS
-    for k, op in enumerate(ops[1:], 1):
-        if op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm"):
-            if wrote_memory:
-                raise RuntimeError(
-                    f"{label}: {op.mnemonic} step {k} reads after an earlier "
-                    "write that is not fed back inside one forward"
-                )
-            dim = fold_result.dim_of_name[f"ea__s{k}"]
-            lo, hi = interval_of(fold_result, dim)
-            if hi < 0x2000 or lo >= 0x8000:
-                continue
-            raise RuntimeError(
-                f"{label}: {op.mnemonic} step {k} read target bound "
-                f"[{lo:.0f}, {hi:.0f}] may reach a watched device"
-            )
-        wrote_memory |= op.operation in MEMORY_WRITE_OPERATIONS
+    outside every NES device/read-watch range -- and, since one forward
+    reads memory as it stood at the window's head, disjoint from every
+    earlier step's store (unless the fold `forwarded` stores, arbitrating
+    every in-window read itself: graph/fold.py forward_stores)."""
+    stores: list[tuple[float, float]] = []
+    for k, op in enumerate(ops):
+        # A pull reads the stack page: not what an earlier push wrote.
+        if k and not forwarded and op.operation in ("pla", "plp", "rts", "rti") and any(
+            may_alias((0x100, 0x1FF), store) for store in stores
+        ):
+            raise WindowLicenseError(
+                f"{label}: {op.mnemonic} step {k} may pull what an earlier step "
+                "pushed, which one forward does not feed back", k, aliasing=True)
+        if k and op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm"):
+            try:
+                read = interval_of(fold_result, fold_result.dim_of_name[f"ea__s{k}"])
+            except RuntimeError as e:
+                raise WindowLicenseError(f"{label}: {op.mnemonic} step {k} read {e}", k) from e
+            if not (read[1] < 0x2000 or read[0] >= 0x8000):
+                raise WindowLicenseError(
+                    f"{label}: {op.mnemonic} step {k} read target bound "
+                    f"[{read[0]:.0f}, {read[1]:.0f}] may reach a watched device", k)
+            if not forwarded and any(may_alias(read, store) for store in stores):
+                raise WindowLicenseError(
+                    f"{label}: {op.mnemonic} step {k} may read an earlier step's "
+                    "store, which one forward does not feed back", k, aliasing=True)
+        if k + 1 < len(ops):  # this step's stores, pushes included
+            for store, addr in STORE_SLOTS:
+                if const_root(fold_result, store, k, label):
+                    try:
+                        stores.append(interval_of(
+                            fold_result, fold_result.dim_of_name[f"{addr}__s{k}"]))
+                    except RuntimeError:  # unbounded: no later read is disjoint
+                        stores.append((float("-inf"), float("inf")))
 
 
 def const_root(fold_result, root: str, k: int, label: str) -> int:
@@ -649,15 +804,15 @@ STORE_SLOTS = (
 
 
 def check_writes_licensed(fold_result, n_steps: int, label: str, *,
-                          window_range: tuple[int, int] | None = None,
+                          window_ranges: list[tuple[int, int]] = (),
                           return_bounds: bool = False):
     """Stores are licensed when the folded write address provably stays
     below $2000 -- the console only ever watches registers at or above it,
     and dispatch additionally requires no watch range below $2000, so a
     licensed store can never swallow a watch_write pause.  window_range
     (pinned windows) additionally forbids overlap with the window's own
-    code bytes: the fold pinned them, so a self-modifying store would
-    execute stale semantics.  Every step must still be non-halting.
+    code bytes (window_ranges): the fold pinned them, so a self-modifying
+    store would execute stale semantics.  Every step must still be non-halting.
     Returns whether any step stores, or ``(has_stores, bounds)`` when
     ``return_bounds`` is requested."""
     has_stores = False
@@ -671,22 +826,19 @@ def check_writes_licensed(fold_result, n_steps: int, label: str, *,
             try:
                 lo, hi = interval_of(fold_result, dim)
             except RuntimeError as e:
-                raise RuntimeError(f"{label} step {k}: store target {e}") from e
+                raise WindowLicenseError(f"{label} step {k}: store target {e}", k) from e
             if lo < 0.0 or hi >= 0x2000:
-                raise RuntimeError(
+                raise WindowLicenseError(
                     f"{label} step {k}: store target bound [{lo:.0f}, {hi:.0f}]"
-                    " is not provably below $2000"
-                )
+                    " is not provably below $2000", k)
             store_lo, store_hi = min(store_lo, lo), max(store_hi, hi)
-            if window_range is not None:
-                w_lo, w_hi = window_range
+            for w_lo, w_hi in window_ranges:
                 if hi >= w_lo and lo < w_hi:
-                    raise RuntimeError(
+                    raise WindowLicenseError(
                         f"{label} step {k}: store bound [{lo:.0f}, {hi:.0f}] "
-                        "may modify the window's own pinned bytes"
-                    )
+                        "may modify the window's own pinned bytes", k)
         if const_root(fold_result, "new_halted", k, label) != 0:
-            raise RuntimeError(f"{label} step {k}: may halt")
+            raise WindowLicenseError(f"{label} step {k}: may halt", k)
     if return_bounds:
         bounds = None if not has_stores else (int(store_lo), int(store_hi))
         return has_stores, bounds
@@ -803,7 +955,8 @@ def build_interrupt_experts(pg) -> list[dict]:
     return experts
 
 
-def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
+def build_sequence_expert(pg, head: int, code: bytes, repeat: int,
+                          forward: bool = False, taken: tuple[bool, ...] = ()) -> dict:
     """One sequence expert: a K-instruction window folded as ONE forward.
 
     The router guarantees pc == head, the window's bytes, no pending NMI,
@@ -812,20 +965,35 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
     bounded below $2000 (check_writes_licensed), control flow
     straight-line inside the window (folded next_pc == the next step's
     pinned pc), and later reads proven outside watched device ranges.
+    With `forward`, a later read of an earlier step's constant-address
+    store takes the stored value (graph/fold.py forward_stores).  With
+    `taken`, the window runs through its interior conditional branches the
+    predicted ways (a superblock): the fold pins each one's direction, and
+    the flag it tests becomes a guard the run loop checks before the
+    window commits anything (branch_guards).
     """
     label = f"sequence @{head:04X}"
-    pin_list = sequence_pins(head, code, OPCODES) * repeat
+    taken = tuple(bool(t) for t in taken)
+    pin_list = sequence_pins(head, code, OPCODES, taken) * repeat
     n_steps = len(pin_list)
     base_ops = decode_ops(code)
     ops = base_ops * repeat
+    offsets = [0]
+    for op in base_ops[:-1]:
+        offsets.append(offsets[-1] + op.length)
+    loop = loop_recurrence(base_ops, offsets) if repeat == 1 and not taken else None
     folder = GraphFolder(pg, root_names=SEQUENCE_ROOT_DIMS,
                          structural_reads=True)
 
     def fold_candidate(inline):
-        return folder.fold_execution_sequence(
-            pin_list, SEQUENCE_FEEDBACK, label=f"seq_{head:04X}",
-            inline_linear=inline, bit_feedback_until=last_a_bit_step(ops),
-        )
+        try:
+            return folder.fold_execution_sequence(
+                pin_list, SEQUENCE_FEEDBACK, label=f"seq_{head:04X}",
+                inline_linear=inline, bit_feedback_until=last_a_bit_step(ops),
+                forward_stores=forward,
+            )
+        except SequenceRejection as e:
+            raise WindowLicenseError(str(e), e.step or 0) from e
 
     r = fold_candidate(False)
     if r.insert_side_hazards:
@@ -833,19 +1001,19 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
             f"{label}: pins reach insert-side expressions "
             f"of {r.insert_side_hazards}"
         )
-    check_reads_licensed(r, ops, label)
+    check_reads_licensed(r, ops, label, forwarded=forward)
     has_stores = check_writes_licensed(
-        r, n_steps, label, window_range=(head, head + len(code)),
+        r, n_steps, label,
+        window_ranges=[(pc, pc + length) for pc, length in window_layout(head, code, taken)],
     )
     for k in range(n_steps - 1):
         nxt = int(pin_list[k + 1]["current_pc_lo"]) | (
             int(pin_list[k + 1]["current_pc_hi"]) << 8
         )
         if const_root(r, "next_pc", k, label) != nxt:
-            raise RuntimeError(
+            raise WindowLicenseError(
                 f"{label} step {k}: control flow leaves the window "
-                "(next_pc != the next step's pc)"
-            )
+                "(next_pc != the next step's pc)", k + 1)
 
     control = pinned_sequence_control(r, pin_list, ops)
     spin = (
@@ -854,7 +1022,8 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
         and base_ops[0].mode == "abs"
         and control.target == head
     )
-    execution = project_sequence_execution(r, n_steps, control)
+    guards = branch_guards(r, pin_list, ops, label)
+    execution = project_sequence_execution(r, n_steps, control, guards=guards)
     materialized = schedule_and_build(execution)
     inlined_r = fold_candidate(True)
     if inlined_r.insert_side_hazards:
@@ -864,23 +1033,41 @@ def build_sequence_expert(pg, head: int, code: bytes, repeat: int) -> dict:
         )
     inlined_execution = project_sequence_execution(
         inlined_r, n_steps, pinned_sequence_control(inlined_r, pin_list, ops),
+        guards=branch_guards(inlined_r, pin_list, ops, label),
     )
     inlined = schedule_and_build(inlined_execution)
-    if prefer_inlined(
+    emittable = exactly_emittable(materialized[0]), exactly_emittable(inlined[0])
+    if not any(emittable):
+        raise WindowLicenseError(
+            f"{label}: weights finer than the exact emission's halves", n_steps - 1)
+    if emittable[1] and (not emittable[0] or prefer_inlined(
         (materialized[0], materialized[3]),
         (inlined[0], inlined[3]), label,
-    ):
+    )):
         r, execution, materialized = inlined_r, inlined_execution, inlined
     model, _tokens, _tok_to_idx, info = materialized
     # Window bytes join the name: different banks may carry different
     # windows at one head, and each needs its own step_core symbol.
     return {
-        "kind": "seq", "name": f"seq_{head:04X}_{bytes(code).hex()}",
-        "head": head, "has_stores": has_stores,
+        "kind": "seq",
+        "name": f"seq_{head:04X}_{bytes(code).hex()}"
+                + ("_" + "".join("TF"[not t] for t in taken) if taken else ""),
+        "head": head, "has_stores": has_stores, "taken": taken,
         "window": bytes(code), "n_steps": n_steps, "model": model,
+        # The bytes dispatch re-verifies in live memory: each instruction
+        # at its own pc (an interior JMP moves on to its target).
+        "match": [
+            ((pc + j) & 0xFFFF, code[off + j])
+            for (pc, length), off in zip(
+                window_layout(head, code, taken),
+                (sum(op.length for op in base_ops[:i]) for i in range(len(base_ops))),
+                strict=True,
+            )
+            for j in range(length)
+        ],
         "step_spec": sequence_step_spec(execution, info),
         "union_lookup_of": r.union_lookup_of,
-        **window_timing(execution, spin),
+        **window_timing(execution, spin, loop),
         "layers": info.n_layers, "_d": info.d_model,
     }
 
@@ -1016,7 +1203,7 @@ def _build_symbolic_execution_experts(
             "opcode_checks": checks, "length": len(template),
             "n_steps": n_steps, "model": model,
             "step_spec": sequence_step_spec(execution, info),
-            **window_timing(execution, self_target),
+            **window_timing(execution, self_target, loop_recurrence(ops, offs)),
             "union_lookup_of": r.union_lookup_of,
             "layers": info.n_layers, "_d": info.d_model,
         })
@@ -1043,3 +1230,17 @@ def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
     return _build_symbolic_execution_experts(
         pg, shapes, expert_kind="shape",
     )
+
+
+def build_core_experts(pg) -> tuple[list[dict], list[dict]]:
+    """The core engine's experts in its build order (the forward hook's ids
+    0..): per opcode, the interrupts, the canonical shapes; and the shapes'
+    metadata."""
+    opcode_bytes = tuple(
+        byte for byte in sorted(OPCODES)
+        if OPCODES[byte].operation not in UNION_FALLBACK_OPERATIONS
+    )
+    experts = build_opcode_execution_experts(pg, opcode_bytes)
+    experts.extend(build_interrupt_experts(pg))
+    shape_experts, shapes_meta = build_shape_experts(pg, SHAPE_LIBRARY)
+    return experts + shape_experts, shapes_meta

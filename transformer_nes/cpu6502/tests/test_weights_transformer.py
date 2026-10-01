@@ -493,3 +493,164 @@ def test_store_window_license_rejections():
     m = Cpu6502TransformerMachine(bcd=False)
     m.attach_sequence_module((mmio_store, self_modify))
     assert m.seq_module is None  # both rejected by the license
+
+
+@pytest.mark.slow
+def test_loop_recurrences_are_single_steps_exactly():
+    """Counting and polling loops retire many iterations per dispatch at
+    the model's own per-iteration cycles; under every budget the machine
+    stops exactly where single steps would, in the same state."""
+    code = bytes([
+        0xA2, 0xC8,        # $8000 LDX #200
+        0xCA, 0xD0, 0xFD,  # $8002 DEX; BNE $8002   (count loop)
+        0xA0, 0x07,        # $8005 LDY #7
+        0x88, 0xD0, 0xFD,  # $8007 DEY; BNE $8007
+        0xA5, 0x10,        # $800A LDA $10           (poll: $10 never changes)
+        0x10, 0xFC,        # $800C BPL $800A
+    ])
+    image = bytearray(0x10000)
+    image[0x8000 : 0x8000 + len(code)] = code
+    for budget in (1, 2, 3, 5, 100, 401, 402, 403, 604, 605, 1000, 1001, 1002, 7777):
+        m = Cpu6502TransformerMachine(bcd=False)
+        m.load_image(bytes(image), start_pc=0x8000)
+        m.map_region(0x8000, code)  # registers the ROM's shape windows
+        m.engine.engine.xray_take()
+        out = m.run(100_000, max_cycles=budget, trace=False)
+        _paths, _ops, dispatches = m.engine.engine.xray_take()
+
+        ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+        ref.pc = 0x8000
+        steps = cycles = 0
+        while cycles < budget:
+            op = reference.opcode_for(ref.read_memory(ref.pc))
+            cycles += reference.instruction_cycles(ref, op, ref.pc, ref.x, ref.y, ref.p)
+            ref.step()
+            steps += 1
+        state = m.get_state()
+        assert (int(out["steps"]), int(out["cycles"])) == (steps, cycles), budget
+        assert (state["pc"], state["a"], state["x"], state["y"], state["p"]) == (
+            ref.pc, ref.a, ref.x, ref.y, ref.p
+        ), budget
+        if budget >= 1000:  # the loops ran as recurrences, not step by step
+            assert sum(dispatches) < steps / 10, (budget, steps, dispatches)
+
+
+@pytest.mark.slow
+def test_store_forwarding_windows_are_single_steps_exactly():
+    """A window whose later steps read its own earlier stores (an RNG
+    churn loop, unrolled three times through its JMP) folds them in
+    (graph/fold.py forward_stores); under every budget it leaves the
+    registers, RAM and cycles single steps would."""
+    loop = bytes([
+        0xE6, 0x20,        # $8000 INC $20
+        0x18,              # $8002 CLC
+        0xA5, 0x20,        # $8003 LDA $20   (reads the INC's store)
+        0x65, 0x21,        # $8005 ADC $21
+        0x85, 0x20,        # $8007 STA $20
+        0x4C, 0x00, 0x80,  # $8009 JMP $8000
+    ])
+    image = bytearray(0x10000)
+    image[0x8000 : 0x8000 + len(loop)] = loop
+    image[0x21] = 0x35
+    for budget in (1, 7, 20, 41, 42, 43, 60, 123, 1000, 1001):
+        m = Cpu6502TransformerMachine(bcd=False)
+        m.load_image(bytes(image), start_pc=0x8000)
+        m.attach_sequence_module([(0x8000, loop * 3, 1, True)])
+        m.engine.engine.xray_take()
+        out = m.run(100_000, max_cycles=budget, trace=False)
+        paths, _ops, _dispatches = m.engine.engine.xray_take()
+
+        ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+        ref.pc = 0x8000
+        steps = cycles = 0
+        while cycles < budget:
+            op = reference.opcode_for(ref.read_memory(ref.pc))
+            cycles += reference.instruction_cycles(ref, op, ref.pc, ref.x, ref.y, ref.p)
+            ref.step()
+            steps += 1
+        state = m.get_state()
+        assert (int(out["steps"]), int(out["cycles"])) == (steps, cycles), budget
+        assert (state["pc"], state["a"], state["p"]) == (ref.pc, ref.a, ref.p), budget
+        assert (m.read_ram(0x20), m.read_ram(0x21)) == (ref.memory[0x20], ref.memory[0x21]), budget
+        if budget >= 1000:
+            assert paths[0] > steps // 2, paths  # the window ran
+
+
+def test_superblocks_are_single_steps_exactly():
+    """Windows through predicted branches (superblocks): the model's own
+    flag (BNE after AND) or the state's (a window headed by the branch)
+    guards each prediction, a wrong one declines to the shorter window,
+    and under every budget the run leaves what single steps would."""
+    loop = bytes([
+        0xE8,              # $8000 INX
+        0x8A,              # $8001 TXA
+        0x29, 0x07,        # $8002 AND #$07
+        0xD0, 0x04,        # $8004 BNE $800A   (taken 7 times in 8)
+        0xE6, 0x20,        # $8006 INC $20
+        0xA4, 0x20,        # $8008 LDY $20
+        0x86, 0x21,        # $800A STX $21
+        0x18,              # $800C CLC
+        0x65, 0x21,        # $800D ADC $21
+        0x85, 0x22,        # $800F STA $22
+        0x4C, 0x00, 0x80,  # $8011 JMP $8000
+    ])
+    image = bytearray(0x10000)
+    image[0x8000 : 0x8000 + len(loop)] = loop
+    head, skip, join = loop[:6], loop[6:10], loop[10:]
+    windows = [
+        (0x8000, head, 1),                         # the prefix: ends at the branch
+        (0x8000, head + join, 1, True, (True,)),  # model-flag guard
+        (0x8000, head + skip + join, 1, True, (False,)),
+        (0x8004, loop[4:6] + join, 1, True, (True,)),  # state-flag guard
+    ]
+    for budget in (1, 9, 30, 77, 78, 79, 200, 401, 1000, 1001):
+        m = Cpu6502TransformerMachine(bcd=False)
+        m.load_image(bytes(image), start_pc=0x8000)
+        m.attach_sequence_module(windows)
+        assert len(m.window_experts()) == len(windows)
+        m.engine.engine.xray_take()
+        out = m.run(100_000, max_cycles=budget, trace=False)
+        paths, _ops, _dispatches = m.engine.engine.xray_take()
+
+        ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+        ref.pc = 0x8000
+        steps = cycles = 0
+        while cycles < budget:
+            op = reference.opcode_for(ref.read_memory(ref.pc))
+            cycles += reference.instruction_cycles(ref, op, ref.pc, ref.x, ref.y, ref.p)
+            ref.step()
+            steps += 1
+        state = m.get_state()
+        assert (int(out["steps"]), int(out["cycles"])) == (steps, cycles), budget
+        assert ((state["pc"], state["a"], state["x"], state["y"], state["p"])
+                == (ref.pc, ref.a, ref.x, ref.y, ref.p)), budget
+        assert m.dump_ram()[0x20:0x23] == bytes(ref.memory[0x20:0x23]), budget
+        if budget >= 1000:
+            assert paths[0] > steps * 3 // 4, paths  # the superblocks ran
+
+
+@pytest.mark.slow
+def test_pytorch_runs_every_expert_forward_exactly():
+    """With the forward hook set, PyTorch runs every expert's layers
+    (cpu6502/backends/weights/torch_forward.py: AOTInductor-compiled) from
+    the native run loop: nestest ends in the state, cycles and RAM the
+    generated engine's own forwards reach, and the X-ray counts the same
+    memory reads."""
+    from transformer_nes.cpu6502.backends.weights.torch_forward import TorchForwards
+    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
+
+    image = bytes(load_image())
+    runs = []
+    for hook in (False, True):
+        m = Cpu6502TransformerMachine(bcd=False, forward_hook=hook)
+        m.load_image(image, start_pc=START_PC)
+        torch_forwards = TorchForwards(m, wait=True) if hook else None
+        m.engine.engine.xray_reads(True)
+        out = m.run(5000, max_cycles=0, trace=False)
+        reads = m.engine.engine.xray_reads(False)
+        runs.append((m.get_state(), int(out["cycles"]), m.dump_ram(), reads))
+        if hook:
+            calls, declined = torch_forwards.counts
+            assert calls > 1000 and declined == 0
+    assert runs[0][:3] == runs[1][:3]
+    assert abs(int(runs[0][3].sum()) - int(runs[1][3].sum())) <= runs[0][3].sum() // 100

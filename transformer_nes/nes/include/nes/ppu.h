@@ -127,9 +127,9 @@ public:
   // the nametable source pages $2000 + page * $400 (CIRAM 0, CIRAM 1,
   // MMC5 ExRAM as the PPU sees it, MMC5 fill mode), palette $3F00, OAM
   // $4000, the FE-latch CHR window $5000, and for MMC5 the whole CHR ROM
-  // at $10000.  Each consumer syncs from the view and receives only the
-  // bytes that changed since its last sync, so every byte it can read
-  // has been written (the graphs' dense reads rely on that).
+  // at $10000.  The engine receives only the bytes that changed since its
+  // last sync, and every byte it can read has been written (the graphs'
+  // dense reads rely on that).
   struct GraphMemorySync {
     array<int16_t, 0x1000 + 0x20 + 0x100> shadow; // pages, palette, OAM; -1 unsent
     array<size_t, 16> chr_source;                 // per 1 KiB CHR slot: source offset
@@ -151,74 +151,50 @@ public:
     }
   };
   void mark_page(size_t offset) { // offset within the four source pages
-    for (GraphMemorySync* sync : {&register_sync_, &render_sync_})
-      sync->pages_dirty |= 1ULL << ((offset >> 6) & 63);
+    graph_sync_.pages_dirty |= 1ULL << ((offset >> 6) & 63);
     ++memory_epoch_;
   }
   void mark_pages() {
-    register_sync_.pages_dirty = render_sync_.pages_dirty = ~0ULL;
+    graph_sync_.pages_dirty = ~0ULL;
     ++memory_epoch_;
   }
   void mark_chr(size_t source) {
-    for (GraphMemorySync* sync : {&register_sync_, &render_sync_}) {
-      sync->chr_dirty.resize((chr.size() >> 6) / 64 + 1);
-      sync->chr_dirty[source >> 12] |= 1ULL << ((source >> 6) & 63);
-      sync->chr_any = true;
-    }
+    graph_sync_.chr_dirty.resize((chr.size() >> 6) / 64 + 1);
+    graph_sync_.chr_dirty[source >> 12] |= 1ULL << ((source >> 6) & 63);
+    graph_sync_.chr_any = true;
     ++memory_epoch_;
   }
   // The source page (0-3) each logical nametable reads, packed 2 bits
   // per table (MMC5's $5105 layout; plain mirroring is its special cases).
   [[nodiscard]] int nt_map() const;
-  // Whole-CHR bytes the render graph needs mapped (MMC5), else 0.
+  // Whole-CHR bytes the PPU graphs need mapped (MMC5), else 0.
   [[nodiscard]] size_t graph_chr_full() const { return mmc5.active() ? chr.size() : 0; }
 
-  // ── The register file as an external step ──
-
-  struct RegisterFile {
-    int32_t t, v, fine_x, w, ctrl, mask, oam_addr, read_buffer;
-  };
-
-  // One register access, as the register graph sees it.
-  struct RegisterAccess {
-    int reg, value;
-    bool is_write;
-    int status;
-    bool rendering;
-  };
-  struct RegisterResult {
-    int read_value = 0;
-    int mem_addr = -1; // a graph-memory write the access made, or -1
-    int mem_value = 0;
-  };
-  // Replace the native register-file transition with an external one
-  // (the register graph, ppu2c02/registers.py): `write` receives every
-  // graph-memory byte that changed since the previous access, then
-  // `access` maps the access, the nametable map, CHR writability and the
-  // register file before to the file after and the result.  An empty
-  // `access` restores the native transition.
-  struct RegisterStep {
-    std::function<void(int addr, int value)> write;
-    std::function<std::pair<RegisterFile, RegisterResult>(
-        const RegisterAccess&, int nt_map, bool chr_writable, const RegisterFile& before)>
-        access;
-  };
-  void set_register_step(RegisterStep step);
-
-  // Render background slots through a compiled render graph
-  // (ppu2c02/render.py) called through its ABI (model/graph_engine.py):
-  // each visible or prefetch slot is one step, and the engine's WRITE
-  // log follows the graph-memory view with render CHR mapping.  Sprite
-  // evaluation and fetch, bus side effects (A12), and dry-run previews
-  // stay native.  Model 0 is the full graph; a slot whose state meets a
-  // folded expert's pins runs that expert instead, by `dispatch`
-  // (ppu2c02/render.py:dispatch).  Null ctx restores native rendering.
+  // Run the PPU as one compiled transformer called through its ABI
+  // (model/graph_engine.py, built by ppu2c02/machine.py): a token per
+  // register access (ppu2c02/registers.py), per visible or prefetch tile
+  // slot (render.py), and per visible line's sprite evaluation and fetch
+  // (sprites.py), all over one WRITE log that follows the graph-memory
+  // view.  What depends on the dot stays native: the status races, bus
+  // side effects (A12), the overflow search, dry-run previews -- and the
+  // whole sprite unit with the 8-sprite limit off.  Each token runs the
+  // folded expert whose pins its state meets, by the dispatch tables; a
+  // slot without one runs model 0, the full render graph.  Null ctx
+  // restores the native PPU.
   struct RenderDispatch {
     array<array<uint8_t, 8>, 2> inner{}; // per background table, fine x
     uint8_t sprites = 0;
     array<uint8_t, 2> first{}, last{}; // slots 0 and 31, per table
   };
-  struct RenderEngine {
+  // The sprite unit's models (ppu2c02/machine.py:sprite_dispatch):
+  // evaluation's full model, then its experts for 8x8 and 8x16 sprites;
+  // fetch's full model, then its experts per size and count 0-8 (only
+  // without CHR latches).
+  struct SpriteDispatch {
+    array<uint8_t, 3> evaluate{};
+    array<uint8_t, 19> fetch{};
+  };
+  struct PpuEngine {
     void* ctx = nullptr;
     void (*write)(void*, int, int) = nullptr;
     void (*step)(void*, int, const int*, int*) = nullptr;
@@ -227,12 +203,23 @@ public:
     void (*trace)(void*, const int*, int*) = nullptr;
     int trace_rows = 0, trace_width = 0;
     array<RenderDispatch, 2> dispatch{}; // [CHR latches active]
+    SpriteDispatch sprites{};
+    array<array<uint8_t, 8>, 2> registers{}; // [is_write][register]
   };
   // The render graph's token layout (ppu2c02/render.py INPUTS, OUTPUTS).
   static constexpr int render_inputs = 43, render_outputs = 31;
   static constexpr int in_bg = 19, in_sprites = 35;
   static constexpr int out_tile = 8, out_v = 16, out_fetched = 20, out_hit = 21, out_latch = 29;
-  void set_render_engine(RenderEngine engine);
+  // The register graph's (ppu2c02/registers.py INPUTS, OUTPUTS).
+  static constexpr int access_inputs = 35, access_outputs = 20;
+  static constexpr int in_access_banks = 13, in_access_state = 21;
+  // The sprite graphs' (ppu2c02/sprites.py EVALUATE_*, FETCH_*).
+  static constexpr int evaluate_inputs = 3, evaluate_outputs = 9;
+  static constexpr int fetch_inputs = 23, fetch_outputs = 90;
+  static constexpr int in_index = 4, in_latch = 12, in_banks = 15;
+  static constexpr int out_sprite_x = 64, out_sprite_fetch = 72, out_sprite_a12 = 80,
+                       out_sprite_latch = 88;
+  void set_engine(PpuEngine engine);
   // The X-ray's pixel dissection: the next time the render graph draws
   // `slot` of `line`, also trace that slot through the full model.
   struct SlotTrace {
@@ -366,9 +353,23 @@ private:
     const vector<EventAt>* events = nullptr; // the current line's timeline
   };
 
+  struct RegisterFile {
+    int32_t t, v, fine_x, w, ctrl, mask, oam_addr, read_buffer;
+  };
+  struct RegisterAccess {
+    int reg, value;
+    bool is_write;
+    int status;
+    bool rendering;
+  };
+  struct RegisterResult {
+    int read_value = 0;
+    int mem_addr = -1; // a graph-memory write the access made, or -1
+    int mem_value = 0;
+  };
   int access(int reg, int value, bool is_write, int64_t dot);
   RegisterResult transition(const RegisterAccess& request);
-  RegisterResult external_transition(const RegisterAccess& request, const RegisterFile& before);
+  RegisterResult graph_transition(const RegisterAccess& request, const RegisterFile& before);
   void access_effects(const RegisterAccess& request, const RegisterFile& before, int64_t dot);
   void write_physical(int addr, int value);
   int increment() const { return (ctrl & 0x04) ? 32 : 1; }
@@ -411,6 +412,13 @@ private:
   void output_pixels(int slot, int64_t dot);
   void evaluate_sprites(int64_t dot);
   void load_sprites(int64_t dot);
+  bool start_sprite_line();
+  void search_overflow(int n, int64_t at);
+  void draw_sprite_row(int x, span<const uint8_t, 8> row);
+  // The sprite unit as graph steps (engine_.sprites).
+  bool sprites_as_graph() const { return engine_.ctx && !dry_ && sprite_limit; }
+  void evaluate_sprites_graph(int64_t dot);
+  void load_sprites_graph(int64_t dot);
   void step_vram_address(bool rendering);
   void increment_x();
   void increment_y();
@@ -428,9 +436,8 @@ private:
   PpuWatcher* watcher_ = nullptr;
   bool wants_a12_ = false;
   int64_t lease_expiry_ = NEVER;
-  // register_sync_ feeds the register view to the step.
-  GraphMemorySync register_sync_, render_sync_;
-  RenderEngine render_;
+  GraphMemorySync graph_sync_;
+  PpuEngine engine_;
   std::pair<int, int> slot_trace_request_{-1, -1};
   std::optional<SlotTrace> slot_trace_;
   // Change counts of the graph-memory view's regions.
@@ -451,16 +458,12 @@ private:
     ++chr_map_epoch_;
     ++memory_epoch_;
   }
-  enum class ChrView { registers, render };
-  template <class Write>
-  void sync_graph_memory(GraphMemorySync& sync, ChrView view, bool chr_window, bool chr_full,
-                         Write&& write);
+  void sync_graph_memory();
   int page_byte(int page, int offset) const;
+  void graph_step(int model, const int* in, int* out);
   void render_slot(int slot, int64_t dot);
   RegisterFile register_file() const;
   int32_t graph_address(int addr) const;
-  void deliver_memory_changes(bool chr_window);
-  RegisterStep register_step_;
   bool schedule_changed_ = false;
   // In-range sprites per line, OAM order, derived from OAM and the
   // sprite size; rebuilt after OAM or size changes and every pre-render

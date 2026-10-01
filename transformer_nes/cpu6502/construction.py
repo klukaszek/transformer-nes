@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from transformer_nes.cpu6502.interpreter import build as build_6502_graph
 from transformer_nes.graph import core as graph_core
-from transformer_nes.graph.core import InputDimension, reset_graph
+from transformer_nes.graph.core import InputDimension, ProgramGraph, reset_graph
 
 RUNTIME_READ_DIMS = (
     "current_pc", "new_a", "new_x", "new_y", "new_s", "new_p", "new_halted",
@@ -47,3 +47,17 @@ class Cpu6502Graph:
         self.is_start = _find_input_dim("is_start")
         self.start_pc_lo = _find_input_dim("start_pc_lo")
         self.start_pc_hi = _find_input_dim("start_pc_hi")
+
+    def program_graph(self) -> ProgramGraph:
+        """The graph the engine runs.  The run loop reads the machine's
+        outputs (RUNTIME_READ_DIMS) from the residual stream, so they must
+        survive to the last layer: a synthetic READOUT token marks them as
+        outputs for the scheduler (its head row is ignored: only STATE vs
+        HALT compete)."""
+        dims = {dim.id: dim for dim in self.all_dims}
+        output_tokens = dict(self.output_tokens)
+        readout = 0
+        for name in RUNTIME_READ_DIMS:
+            readout = readout + 1e-6 * dims[self.dim_id_by_name[name]]
+        output_tokens["READOUT"] = readout
+        return ProgramGraph(self.input_tokens, output_tokens)

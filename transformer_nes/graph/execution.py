@@ -58,16 +58,21 @@ class ExecutionGraph:
     outputs: tuple[ArchitecturalOutput, ...]
     control: ControlFlow
     halt_dimension: Dimension | None
-    # Each step's cycle count: folded to a constant, or a model output.
+    # Each step's cycle count: folded to a constant, or a model output;
+    # and an upper bound on each.
     cycles: tuple[int | Dimension, ...]
+    cycle_bounds: tuple[int, ...]
     dim_of_name: dict[str, Dimension]
+    # Branch predictions to check before committing (a superblock's):
+    # ("state", flag mask, expected) or ("model", dimension, expected).
+    guards: tuple[tuple, ...] = ()
 
     def output(self, name: str) -> ArchitecturalOutput:
         return next(output for output in self.outputs if output.name == name)
 
     @property
-    def cycles_prefix(self) -> int | None:
-        """The cycles before the last step, which the run loop's budget
-        guard needs ahead of dispatch; None unless they all folded."""
-        prefix = self.cycles[:-1]
-        return sum(prefix) if all(isinstance(c, int) for c in prefix) else None
+    def cycles_prefix(self) -> int:
+        """At most the cycles before the last step, which the run loop's
+        budget guard needs ahead of dispatch: a window that fits even at
+        this bound contains only instructions single steps would run."""
+        return sum(self.cycle_bounds[:-1])

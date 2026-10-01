@@ -68,10 +68,11 @@ MODE_LENGTH = {
     MODE_ABSOLUTE: 3, MODE_ABSOLUTE_X: 3, MODE_ABSOLUTE_Y: 3, MODE_INDIRECT: 3,
 }
 
-# Read operations with conditional indexed page-cross penalties.
+# Reads that take a cycle more when an indexed address carries into the
+# high byte; the unofficial absolute,X NOPs read too (nestest's CYC column).
 PAGE_CROSS_READ_OPERATIONS = frozenset({
     "load_a", "load_x", "load_y", "adc", "sbc", "cmp",
-    "and", "ora", "eor", "lax",
+    "and", "ora", "eor", "lax", "nop",
 })
 BRANCH_CONDITIONS = {
     "bpl": (FLAG_N, 0), "bmi": (FLAG_N, FLAG_N),
@@ -279,11 +280,6 @@ class Asm:
     def jmp_abs(self, addr: int) -> Asm:
         return self.append(0x4C, addr & 0xFF, (addr >> 8) & 0xFF)
 
-    def bne(self, offset: int) -> Asm:
-        if not -128 <= offset <= 127:
-            raise ValueError(f"branch offset out of range: {offset}")
-        return self.append(0xD0, offset & 0xFF)
-
     def beq(self, offset: int) -> Asm:
         if not -128 <= offset <= 127:
             raise ValueError(f"branch offset out of range: {offset}")
@@ -291,9 +287,6 @@ class Asm:
 
     def brk(self) -> Asm:
         return self.append(0x00)
-
-    def raw(self, *values: int) -> Asm:
-        return self.append(*values)
 
 
 def asm() -> Asm:

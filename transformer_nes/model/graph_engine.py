@@ -7,12 +7,15 @@ Memory heads -- grouped exact-address reads over WRITE tokens -- are
 served by the nearest-written-address structure, so a WRITE token is one
 structure insert and the attention state stays O(1) in the log.
 
-An engine hosts model 0, the full graph, plus optional folded experts
-(graph/fold.py): the graph partially evaluated under pinned conditions,
-rebuilt with its memory reads served structurally (one exact read in
-place of the grouped attention fabric), scheduled and constructed as
-its own smaller weights.  All models share one memory; the caller picks
-the model per token and must only pick an expert whose pins hold.
+An engine hosts one or more token graphs over one memory (the PPU's:
+the tile slot, and the sprite unit's evaluation and fetch).  Each comes
+as its full model plus optional folded experts (graph/fold.py): the
+graph partially evaluated under pinned conditions, rebuilt with its
+memory reads served structurally (one exact read in place of the
+grouped attention fabric), scheduled and constructed as its own smaller
+weights.  Model 0 is the primary graph's full model and its experts
+follow; then each further graph's.  The caller picks the model per
+token and must only pick an expert whose pins hold.
 
 The engine exposes per-token calls to Python (``write``, ``step``) and
 the same calls as raw C function pointers (``abi``) so native code can
@@ -22,8 +25,8 @@ run the transformer with no Python in the loop:
     void step(void* engine, int model, const int* inputs, int* outputs);
     void trace(void* engine, const int* inputs, int* residual);
 
-``inputs``/``outputs`` follow the caller's named order (an input a model
-folded away is ignored).  ``trace`` runs model 0 on a copy of the engine
+``inputs``/``outputs`` follow the model's graph's named order (an input a
+model folded away is ignored).  ``trace`` runs model 0 on a copy of the engine
 and writes its residual stream after the embedding and after each layer
 (the X-ray, nes/xray.py); ``ablate`` forces one of model 0's residual
 slots to a constant after the layer that computes it.
@@ -34,6 +37,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -90,8 +95,8 @@ def _generate(models: list[dict], memory_size: int, *, f_bits: int) -> str:
         for k, m in enumerate(models)
     ]
     n_regs = max(1, len(ctx.reg_of))
-    n_in = len(models[0]["input_slots"])
-    n_out = len(models[0]["output_slots"])
+    n_in = ", ".join(str(len(m["input_slots"])) for m in models)
+    n_out = ", ".join(str(len(m["output_slots"])) for m in models)
     lines = [INCLUDES, "", "struct ENGINE_T {"]
     emit = lines.append
     emit(f"    static constexpr int F = {f_bits};")
@@ -106,7 +111,8 @@ def _generate(models: list[dict], memory_size: int, *, f_bits: int) -> str:
     emit(f"    long long reg_s[{n_regs}] = {{}};")
     emit(f"    int reg_v0[{n_regs}] = {{}}, reg_v1[{n_regs}] = {{}};")
     emit("    long long seq = -1;")
-    emit(f"    static constexpr int N_MODELS = {len(models)}, N_IN = {n_in}, N_OUT = {n_out};")
+    emit(f"    static constexpr int N_MODELS = {len(models)};")
+    emit(f"    static constexpr int N_IN[N_MODELS] = {{{n_in}}}, N_OUT[N_MODELS] = {{{n_out}}};")
     emit("")
     # Each model's layers inline into its step: one straight-line body the
     # compiler can keep in registers across layer boundaries.
@@ -130,6 +136,7 @@ def _generate(models: list[dict], memory_size: int, *, f_bits: int) -> str:
     # Ablation (the X-ray): model 0 forces one residual slot to a value
     # right after the layer that computes it.  ablate_row -1 = off.
     emit("    int ablate_slot = 0, ablate_row = -1, ablate_value = 0;")
+
     def forward(k: int, indent: str, snap: bool) -> None:
         """Model k's embedding and layer stack; model 0 also applies the
         ablation, and with `snap` records the stream after each row."""
@@ -162,8 +169,10 @@ def _generate(models: list[dict], memory_size: int, *, f_bits: int) -> str:
     emit("        }")
     emit('        throw std::out_of_range("no such model");')
     emit("    }")
-    emit(f"    static constexpr int TRACE_ROWS = {len(plans[0]) + 1}, "
-         f"TRACE_D = {models[0]['d_model']};")
+    emit(
+        f"    static constexpr int TRACE_ROWS = {len(plans[0]) + 1}, "
+        f"TRACE_D = {models[0]['d_model']};"
+    )
     emit("    // Model 0, the residual stream after each row written to snap.")
     emit("    void trace(const int* in, int* snap) {")
     emit("        ++seq;")
@@ -190,9 +199,11 @@ def _generate(models: list[dict], memory_size: int, *, f_bits: int) -> str:
         '        .def("step", [](ENGINE_T& e, int model, py::array_t<int, '
         "py::array::c_style | py::array::forcecast> in) {"
     )
-    emit("            if (in.size() != ENGINE_T::N_IN)")
+    emit("            if (model < 0 || model >= ENGINE_T::N_MODELS)")
+    emit('                throw std::out_of_range("no such model");')
+    emit("            if (in.size() != ENGINE_T::N_IN[model])")
     emit('                throw std::invalid_argument("wrong input count");')
-    emit("            py::array_t<int> out(ENGINE_T::N_OUT);")
+    emit("            py::array_t<int> out(ENGINE_T::N_OUT[model]);")
     emit("            e.step(model, in.data(), out.mutable_data());")
     emit("            return out;")
     emit("        })")
@@ -200,7 +211,7 @@ def _generate(models: list[dict], memory_size: int, *, f_bits: int) -> str:
     emit("            e.ablate_slot = slot;")
     emit("            e.ablate_row = row;")
     emit("            e.ablate_value = value * ENGINE_T::SCALE;")
-    emit("        }, py::arg(\"slot\") = 0, py::arg(\"row\") = -1, py::arg(\"value\") = 0)")
+    emit('        }, py::arg("slot") = 0, py::arg("row") = -1, py::arg("value") = 0)')
     emit('        .def("abi", [](ENGINE_T& e) {')
     emit("            return py::make_tuple(reinterpret_cast<std::uintptr_t>(&e),")
     emit("                                  reinterpret_cast<std::uintptr_t>(&abi_write),")
@@ -212,42 +223,55 @@ def _generate(models: list[dict], memory_size: int, *, f_bits: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-class CompiledGraph:
-    """A graph (and folded experts of it) compiled to weights and then to
-    a native engine.  ``experts`` maps a name to its pins (persist dim
-    name -> constant); their model indices follow in order after 0."""
+@dataclass(frozen=True)
+class TokenGraph:
+    """A token type an engine runs: its graph, the caller's input and
+    output order for it, and its folded experts (name -> pins: persist
+    dim name -> constant)."""
 
-    def __init__(
-        self,
-        program_graph: ProgramGraph,
-        inputs: list[str],
-        outputs: list[str],
-        *,
-        tag: str,
-        experts: dict[str, dict[str, float]] | None = None,
-        memory_size: int = 0x10000,
-    ):
-        self.inputs, self.outputs = list(inputs), list(outputs)
-        self.expert_names = list(experts or {})
-        models = [self._compile(program_graph, program_graph.all_dims, None)]
-        # The full model's residual layout: the X-ray labels its stream.
-        self.slot_of, self.lives = models[0]["info"].slot_of, models[0]["info"].lives
-        if experts:
-            # Structural folds: each memory read becomes one engine-served
-            # read (graph/fold.py), its annotated bits served with it.
-            folder = GraphFolder(program_graph, root_names=outputs, structural_reads=True)
-            for name, pins in experts.items():
-                fold = folder.fold(pins, label=name)
-                models.append(
-                    self._compile(
-                        fold.program_graph,
-                        list(fold.dim_of_name.values()),
-                        fold.union_lookup_of,
-                    )
+    program_graph: ProgramGraph
+    inputs: Sequence[str]
+    outputs: Sequence[str]
+    experts: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+
+
+class CompiledGraph:
+    """Token graphs (and folded experts of them) compiled to weights and
+    then to one native engine over one memory.  The first graph is the
+    primary: its full model is model 0 (the one ``trace`` and ``ablate``
+    see, described by ``slot_of``/``lives``) and its experts, named by
+    ``expert_names``, are models 1..n; ``model_id`` finds any model."""
+
+    def __init__(self, graphs: Mapping[str, TokenGraph], *, tag: str, memory_size: int = 0x10000):
+        self.graphs = dict(graphs)
+        self.expert_names = list(next(iter(self.graphs.values())).experts)
+        self.model_ids: dict[tuple[str, str | None], int] = {}
+        models = []
+        for name, token in self.graphs.items():
+            self.model_ids[name, None] = len(models)
+            models.append(
+                self._compile(token, token.program_graph, token.program_graph.all_dims, None)
+            )
+            if token.experts:
+                # Structural folds: each memory read becomes one engine-served
+                # read (graph/fold.py), its annotated bits served with it.
+                folder = GraphFolder(
+                    token.program_graph, root_names=list(token.outputs), structural_reads=True
                 )
-        self.layers = [m["n_layers"] for m in models]
-        self.widths = [m["d_model"] for m in models]
-        self.n_layers, self.d_model = self.layers[0], self.widths[0]
+                for expert, pins in token.experts.items():
+                    fold = folder.fold(dict(pins), label=expert)
+                    self.model_ids[name, expert] = len(models)
+                    models.append(
+                        self._compile(
+                            token,
+                            fold.program_graph,
+                            list(fold.dim_of_name.values()),
+                            fold.union_lookup_of,
+                        )
+                    )
+        # The full primary model's residual layout: the X-ray labels its stream.
+        self.slot_of, self.lives = models[0]["info"].slot_of, models[0]["info"].lives
+        self.n_layers, self.d_model = models[0]["n_layers"], models[0]["d_model"]
         source, self.f_bits = generate_graph_source(models, memory_size)
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         self.digest = digest
@@ -263,7 +287,11 @@ class CompiledGraph:
             manifest_put(key, {"kind": "graph", "digest": digest})
         self.engine = module.Engine()
 
-    def _compile(self, program_graph, dims, union_lookup_of) -> dict:
+    def model_id(self, graph: str, expert: str | None = None) -> int:
+        return self.model_ids[graph, expert]
+
+    @staticmethod
+    def _compile(token: TokenGraph, program_graph, dims, union_lookup_of) -> dict:
         model, _tokens, _idx, info = construct(program_graph)
         by_name = {}
         for d in dims:
@@ -276,9 +304,9 @@ class CompiledGraph:
             "d_model": info.d_model,
             "one_slot": info.slot_of[program_graph.one],
             "input_slots": [
-                info.slot_of.get(inputs[n], -1) if n in inputs else -1 for n in self.inputs
+                info.slot_of.get(inputs[n], -1) if n in inputs else -1 for n in token.inputs
             ],
-            "output_slots": [info.slot_of[by_name[n]] for n in self.outputs],
+            "output_slots": [info.slot_of[by_name[n]] for n in token.outputs],
             "union_lookup_of": union_lookup_of,
         }
 

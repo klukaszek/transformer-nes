@@ -12,7 +12,7 @@ dependencies = [
     "safetensors>=0.8.0",
     "scipy>=1.17.1",
     "setuptools>=82.0.0",
-    "torch>=2.10.0",
+    "torch>=2.14.1",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +28,9 @@ dev = [
 6502-klaus = "transformer_nes.cpu6502.examples.klaus.harness:main"
 6502-nestest = "transformer_nes.cpu6502.examples.nestest:main"
 6502-transformer = "transformer_nes.cpu6502.backends.weights.runner:main"
+6502-export = "transformer_nes.model.export:main"
+6502-checkpoint = "transformer_nes.model.checkpoint_runner:main"
+6502-experts = "transformer_nes.model.expert_runner:main"
 nes-run = "transformer_nes.nes.app:main"
 
 [build-system]

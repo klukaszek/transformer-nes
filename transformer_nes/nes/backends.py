@@ -50,12 +50,15 @@ class ReferenceCore:
         return self.cpu.step()
 
 
-def backend_factory(name: str):
+def backend_factory(name: str, *, forward_hook: bool = False):
     def build(image: bytes, start_pc: int):
         if name == "weights":
             from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 
-            return Cpu6502TransformerMachine(bcd=False, mirror_cpu_ram=True), True
+            machine = Cpu6502TransformerMachine(
+                bcd=False, mirror_cpu_ram=True, forward_hook=forward_hook,
+            )
+            return machine, True
         if name == "reference":
             from transformer_nes.cpu6502.backends.reference import Cpu6502
 

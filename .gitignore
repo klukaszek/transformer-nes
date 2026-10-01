@@ -43,3 +43,8 @@ experiments/*/artifact/
 
 # Editor state
 .obsidian/
+checkpoint/
+experts/
+
+# Learned windows (per-ROM profiles of play)
+windows/

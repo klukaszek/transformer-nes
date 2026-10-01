@@ -151,20 +151,15 @@ void Ppu::write(int addr, int value, int64_t dot) {
 }
 
 // One register access in two parts: the register-file transition --
-// natively, or through an attached external step (the register graph,
-// ppu2c02/registers.py, which computes exactly this) -- and then the
+// natively, or as a token through the PPU engine's register graph
+// (ppu2c02/registers.py, which computes exactly this) -- and then the
 // effects that depend on the dot rather than on the access.
 int Ppu::access(int reg, int value, bool is_write, int64_t dot) {
   const RegisterFile before = register_file();
   const RegisterAccess request{reg, value, is_write, status(dot),
                                rendering_enabled() && rendering_line()};
-  RegisterResult result;
-  if (register_step_.access) {
-    deliver_memory_changes(!is_write && reg == 7 && (r_.v & 0x3FFF) < 0x2000);
-    result = external_transition(request, before);
-  } else {
-    result = transition(request);
-  }
+  const RegisterResult result =
+      engine_.ctx ? graph_transition(request, before) : transition(request);
   access_effects(request, before, dot);
   return result.read_value;
 }
@@ -307,22 +302,52 @@ void Ppu::access_effects(const RegisterAccess& request, const RegisterFile& befo
     sprites_indexed_ = false;
 }
 
-// The transition through the attached step (its memory is already up
-// to date): load the register file it returns and apply its write.
-Ppu::RegisterResult Ppu::external_transition(const RegisterAccess& request,
-                                             const RegisterFile& before) {
-  const auto [after, result] = register_step_.access(request, nt_map(), chr_writable, before);
-  t = static_cast<uint16_t>(after.t);
-  r_.v = static_cast<uint16_t>(after.v);
-  fine_x = after.fine_x;
-  write_latch = after.w != 0;
-  ctrl = after.ctrl;
-  mask = after.mask;
-  oam_addr = static_cast<uint8_t>(after.oam_addr);
-  read_buffer = after.read_buffer;
-  if (result.mem_addr >= 0)
-    write_physical(result.mem_addr, result.mem_value);
-  return result;
+// The transition as an ACCESS token through the register expert for
+// this register and direction (ppu2c02/registers.py): load the register
+// file it returns and apply its memory write.
+Ppu::RegisterResult Ppu::graph_transition(const RegisterAccess& request,
+                                          const RegisterFile& before) {
+  const int map = nt_map();
+  int in[access_inputs] = {1,
+                           request.reg,
+                           request.value,
+                           request.is_write,
+                           request.status,
+                           request.rendering,
+                           map & 3,
+                           (map >> 2) & 3,
+                           (map >> 4) & 3,
+                           (map >> 6) & 3,
+                           chr_writable,
+                           chr_latch_active && chr_latch.latch_fe[0],
+                           chr_latch_active && chr_latch.latch_fe[1]};
+  if (mmc5.active())
+    for (int s = 0; s < 8; ++s)
+      in[in_access_banks + s] = static_cast<int>(chr_bank[static_cast<size_t>(s)] >> 10);
+  int* field = in + in_access_state;
+  for (const int32_t loopy : {before.t, before.v}) {
+    *field++ = loopy & 0x1F;
+    *field++ = (loopy >> 5) & 0x1F;
+    *field++ = (loopy >> 10) & 3;
+    *field++ = (loopy >> 12) & 7;
+  }
+  for (const int32_t value :
+       {before.fine_x, before.w, before.ctrl, before.mask, before.oam_addr, before.read_buffer})
+    *field++ = value;
+  int out[access_outputs];
+  graph_step(engine_.registers[request.is_write][request.reg], in, out);
+  auto join = [](const int* f) { return f[0] | (f[1] << 5) | (f[2] << 10) | (f[3] << 12); };
+  t = static_cast<uint16_t>(join(out));
+  r_.v = static_cast<uint16_t>(join(out + 4));
+  fine_x = out[8];
+  write_latch = out[9] != 0;
+  ctrl = out[10];
+  mask = out[11];
+  oam_addr = static_cast<uint8_t>(out[12]);
+  read_buffer = out[13];
+  if (out[15])
+    write_physical(out[16], out[17]);
+  return {out[14], out[15] ? out[16] : -1, out[17]};
 }
 
 // A graph-memory write (the physical space of ppu2c02/space.py) into
@@ -351,14 +376,9 @@ void Ppu::write_physical(int addr, int value) {
   }
 }
 
-void Ppu::set_register_step(RegisterStep step) {
-  register_step_ = std::move(step);
-  register_sync_.reset(); // the new step's memory starts empty
-}
-
-void Ppu::set_render_engine(RenderEngine engine) {
-  render_ = engine;
-  render_sync_.reset();
+void Ppu::set_engine(PpuEngine engine) {
+  engine_ = engine;
+  graph_sync_.reset(); // the new engine's memory starts empty
 }
 
 int Ppu::nt_map() const {
@@ -375,17 +395,18 @@ int Ppu::page_byte(int page, int offset) const {
   return mmc5.active() ? mmc5.page_view(page, offset) : 0;
 }
 
-// Deliver the graph-memory view's changes since `sync` last saw it.
-// Nametable pages go by written 64-byte chunk, palette and OAM by change
-// count; CHR goes by 1 KiB slot, resent when the slot's source moves and
-// otherwise by written chunk.  The register view maps CHR as $2007 reads
-// see it (current banks and latches); the render view maps the
-// background banks, both latch windows, and for MMC5 the whole CHR ROM.
-template <class Write>
-void Ppu::sync_graph_memory(GraphMemorySync& sync, ChrView view, bool chr_window, bool chr_full,
-                            Write&& write) {
-  if (chr_window && sync.seen == memory_epoch_)
+// Deliver the graph-memory view's changes since the engine last saw
+// it.  Nametable pages go by written 64-byte chunk, palette and OAM by
+// change count; CHR goes by 1 KiB slot, resent when the slot's source
+// moves and otherwise by written chunk.  CHR is mapped as the background
+// fetches see it (with both latch windows under MMC2/MMC4), and for
+// MMC5 the whole CHR ROM, which its sprite and $2007 reads bank into.
+void Ppu::sync_graph_memory() {
+  GraphMemorySync& sync = graph_sync_;
+  if (sync.seen == memory_epoch_)
     return;
+  auto write = [this](int addr, int value) { engine_.write(engine_.ctx, addr, value); };
+  const bool chr_full = mmc5.active();
   auto deliver = [&](size_t index, int addr, uint8_t value) {
     if (sync.shadow[index] == value)
       return;
@@ -405,20 +426,16 @@ void Ppu::sync_graph_memory(GraphMemorySync& sync, ChrView view, bool chr_window
     for (int a = 0; a < 0x100; ++a)
       deliver(static_cast<size_t>(0x1020 + a), 0x4000 + a, oam[static_cast<size_t>(a)]);
   }
-  if (!chr_window)
-    return; // CHR changes wait for the next delivery that wants the window
   auto dirty = [&](size_t source) {
     return (sync.chr_dirty[source >> 12] >> ((source >> 6) & 63)) & 1;
   };
   if (sync.chr_any || sync.chr_map != chr_map_epoch_) {
     sync.chr_map = chr_map_epoch_;
-    const bool latches = view == ChrView::render && chr_latch_active;
+    const bool latches = chr_latch_active;
     for (int s = 0; s < (latches ? 16 : 8); ++s) {
       const int slot = s & 7;
       size_t source;
-      if (view == ChrView::registers)
-        source = chr_index(chr_bank.data(), static_cast<size_t>(slot) * 0x400);
-      else if (latches)
+      if (latches)
         source = chr_latch.banks[(slot >> 2) * 2 + (s >> 3)] + (slot & 3) * 0x400;
       else
         source = bg_banks()[slot];
@@ -445,9 +462,14 @@ void Ppu::sync_graph_memory(GraphMemorySync& sync, ChrView view, bool chr_window
 
 // One tile slot through the render graph: slots 0-31 output pixels and
 // fetch tile slot+2; 32-33 are the next line's prefetches.
+// One token through the PPU engine, its memory first brought up to
+// date with the render view.
+void Ppu::graph_step(int model, const int* in, int* out) {
+  sync_graph_memory();
+  engine_.step(engine_.ctx, model, in, out);
+}
+
 void Ppu::render_slot(int slot, int64_t dot) {
-  sync_graph_memory(render_sync_, ChrView::render, true, mmc5.active(),
-                    [this](int addr, int value) { render_.write(render_.ctx, addr, value); });
   const bool visible = slot < 32;
   const bool extended = mmc5.active() && mmc5.extended_attributes();
   const int map = nt_map();
@@ -481,7 +503,7 @@ void Ppu::render_slot(int slot, int64_t dot) {
   // slots with sprites have none.
   int model = 0;
   if ((mask & 0x08) && !(mask & 0x01) && !extended && !force_full_render) {
-    const RenderDispatch& d = render_.dispatch[chr_latch_active ? 1 : 0];
+    const RenderDispatch& d = engine_.dispatch[chr_latch_active ? 1 : 0];
     const int table = (ctrl & 0x10) ? 1 : 0;
     if (slot == 0 || slot == 31)
       model = sprites ? 0 : slot == 0 ? d.first[table] : d.last[table];
@@ -489,11 +511,11 @@ void Ppu::render_slot(int slot, int64_t dot) {
       model = sprites ? d.sprites : d.inner[table][fine_x];
   }
   int out[render_outputs];
-  render_.step(render_.ctx, model, in, out);
-  if (render_.trace && !dry_ && slot_trace_request_ == std::pair{r_.line, slot}) {
+  graph_step(model, in, out);
+  if (engine_.trace && !dry_ && slot_trace_request_ == std::pair{r_.line, slot}) {
     SlotTrace trace{r_.line, slot, model,
-                    vector<int>(static_cast<size_t>(render_.trace_rows * render_.trace_width))};
-    render_.trace(render_.ctx, in, trace.residual.data());
+                    vector<int>(static_cast<size_t>(engine_.trace_rows * engine_.trace_width))};
+    engine_.trace(engine_.ctx, in, trace.residual.data());
     slot_trace_ = std::move(trace);
     slot_trace_request_ = {-1, -1};
   }
@@ -555,7 +577,7 @@ void Ppu::oam_dma(span<const uint8_t, 256> page, int64_t dot) {
     schedule_changed_ = true;
 }
 
-// ── The register file as an external step ──
+// ── The register file ──
 
 Ppu::RegisterFile Ppu::register_file() const {
   return {t, r_.v, fine_x, write_latch, ctrl, mask, oam_addr, read_buffer};
@@ -571,15 +593,6 @@ int32_t Ppu::graph_address(int addr) const {
     return 0x2000 + 0x400 * ((nt_map() >> (2 * table)) & 3) + (addr & 0x3FF);
   }
   return static_cast<int32_t>(0x3F00 + palette_index(addr));
-}
-
-// Deliver the register view's changes since the last access to the
-// step.  The CHR window is only read through a $2007 read below $2000,
-// so bank switches (several a frame under MMC3) are delivered just
-// before one.
-void Ppu::deliver_memory_changes(bool chr_window) {
-  sync_graph_memory(register_sync_, ChrView::registers, chr_window, false,
-                    [this](int addr, int value) { register_step_.write(addr, value); });
 }
 
 // ── Clock ──
@@ -669,7 +682,7 @@ void Ppu::process(const EventAt& e) {
   const int64_t dot = r_.pos;
   switch (e.ev) {
   case Ev::Slot:
-    if (render_.ctx && !dry_) {
+    if (engine_.ctx && !dry_) {
       render_slot(e.slot, dot);
       break;
     }
@@ -687,14 +700,21 @@ void Ppu::process(const EventAt& e) {
     break;
   case Ev::Evaluate:
     r_.selected_count = 0;
-    if (rendering_enabled())
-      evaluate_sprites(dot);
+    if (rendering_enabled()) {
+      if (sprites_as_graph())
+        evaluate_sprites_graph(dot);
+      else
+        evaluate_sprites(dot);
+    }
     break;
   case Ev::Sprites:
-    load_sprites(dot);
+    if (sprites_as_graph())
+      load_sprites_graph(dot);
+    else
+      load_sprites(dot);
     break;
   case Ev::Prefetch:
-    if (render_.ctx && !dry_) {
+    if (engine_.ctx && !dry_) {
       if (rendering_enabled()) {
         render_slot(32, dot);
         render_slot(33, dot + 8);
@@ -857,15 +877,38 @@ void Ppu::output_pixels(int slot, int64_t dot) {
 // next line and run the eight sprite-slot fetches (empty slots fetch
 // tile $FF, which still drives A12).  Sprites claim pixels lowest index
 // first; only the claiming sprite's priority bit decides front/behind.
-void Ppu::load_sprites(int64_t dot) {
+// Dot 257: the next line's sprite buffer starts empty, v takes t's
+// horizontal bits and OAMADDR resets; false when not rendering.
+bool Ppu::start_sprite_line() {
   if (r_.any_sprites)
     r_.sprites.fill(0);
   r_.any_sprites = r_.sprite0_on_line = false;
   r_.sprite_slots = 0;
   if (!rendering_enabled())
-    return;
+    return false;
   r_.v = static_cast<uint16_t>((r_.v & ~0x041F) | (t & 0x041F));
   oam_addr = 0;
+  return true;
+}
+
+// A sprite row's 8 screen-ordered pixels (0 transparent) into the next
+// line's buffer at x: rows arrive in OAM order, and the first opaque
+// pixel at a position wins.
+void Ppu::draw_sprite_row(int x, span<const uint8_t, 8> row) {
+  for (int c = 0; c < 8 && x + c < 256; ++c) {
+    auto& pixel = r_.sprites[static_cast<size_t>(x + c)];
+    if (!row[c] || pixel)
+      continue;
+    pixel = row[c];
+    r_.any_sprites = true;
+    r_.sprite_slots |= 1U << ((x + c) >> 3);
+    r_.sprite0_on_line |= (row[c] & 0x80) != 0;
+  }
+}
+
+void Ppu::load_sprites(int64_t dot) {
+  if (!start_sprite_line())
+    return;
   const int h = (ctrl & 0x20) ? 16 : 8;
   const bool draw = r_.line < 239; // the next line is visible
   const int count = r_.line < 240 ? r_.selected_count : 0;
@@ -895,17 +938,13 @@ void Ppu::load_sprites(int64_t dot) {
       continue;
     const uint8_t meta = static_cast<uint8_t>(0x10 | ((attr & 3) << 2) |
                                               ((attr & 0x20) ? 0x40 : 0) | (i == 0 ? 0x80 : 0));
-    for (int c = 0; c < 8 && x + c < 256; ++c) {
+    array<uint8_t, 8> pixels{};
+    for (int c = 0; c < 8; ++c) {
       const int bit = (attr & 0x40) ? c : 7 - c;
       const int value = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
-      auto& pixel = r_.sprites[static_cast<size_t>(x + c)];
-      if (!value || pixel)
-        continue;
-      pixel = static_cast<uint8_t>(meta | value);
-      r_.any_sprites = true;
-      r_.sprite_slots |= 1U << ((x + c) >> 3);
-      r_.sprite0_on_line |= i == 0;
+      pixels[static_cast<size_t>(c)] = value ? static_cast<uint8_t>(meta | value) : 0;
     }
+    draw_sprite_row(x, pixels);
   }
   const int dummy = (h == 16 || (ctrl & 0x08)) ? 0x1000 : 0;
   for (int slot = std::min(count, 8); slot < 8; ++slot) {
@@ -960,14 +999,78 @@ void Ppu::evaluate_sprites(int64_t dot) {
     for (int i = n; i < 64; ++i)
       if (in_range(oam[static_cast<size_t>(i) * 4]))
         r_.selected[static_cast<size_t>(r_.selected_count++)] = static_cast<uint8_t>(i);
-  if (r_.overflow_dot != NEVER)
-    return;
+  if (r_.overflow_dot == NEVER)
+    search_overflow(n, at);
+}
+
+// The overflow search once eight sprites are found, from OAM index n at
+// `at`: it checks byte m of each sprite as its Y, bumping m along with n
+// on a miss (the diagonal scan), 2 dots per sprite.
+void Ppu::search_overflow(int n, int64_t at) {
+  const int h = (ctrl & 0x20) ? 16 : 8;
   for (int m = 0; n < 64; ++n, m = (m + 1) & 3, at += 2) {
-    if (in_range(oam[static_cast<size_t>(n) * 4 + m])) {
+    if (static_cast<unsigned>(r_.line - oam[static_cast<size_t>(n) * 4 + m]) <
+        static_cast<unsigned>(h)) {
       r_.overflow_dot = at;
       mark_status_change(at);
       return;
     }
+  }
+}
+
+// Sprite evaluation through the evaluation graph: the line's first
+// eight in-range sprites; with eight, the native overflow search goes on
+// from the sprite after the eighth (8 dots per sprite copied, 2 per
+// sprite skipped so far).
+void Ppu::evaluate_sprites_graph(int64_t dot) {
+  const int in[evaluate_inputs] = {1, r_.line, ctrl};
+  int out[evaluate_outputs];
+  graph_step(engine_.sprites.evaluate[(ctrl & 0x20) ? 2 : 1], in, out);
+  r_.selected_count = out[0];
+  for (int k = 0; k < out[0]; ++k)
+    r_.selected[static_cast<size_t>(k)] = static_cast<uint8_t>(out[1 + k]);
+  if (out[0] == 8 && r_.overflow_dot == NEVER) {
+    const int n = out[8] + 1;
+    search_overflow(n, dot + 8 * 8 + 2 * (n - 8));
+  }
+}
+
+// The sprite fetch through the fetch graph: the selected sprites' rows
+// and where they go, the latches the fetches flip, and the pattern table
+// every fetch reads, for its A12 edge.
+void Ppu::load_sprites_graph(int64_t dot) {
+  if (!start_sprite_line())
+    return;
+  const int count = r_.line < 240 ? r_.selected_count : 0;
+  int in[fetch_inputs] = {1, r_.line, ctrl, count};
+  for (int k = 0; k < count; ++k)
+    in[in_index + k] = r_.selected[static_cast<size_t>(k)];
+  in[in_latch] = chr_latch_active && chr_latch.latch_fe[0];
+  in[in_latch + 1] = chr_latch_active && chr_latch.latch_fe[1];
+  in[in_latch + 2] = chr_latch.wide_low;
+  if (mmc5.active())
+    for (int s = 0; s < 8; ++s)
+      in[in_banks + s] = static_cast<int>(sprite_banks()[s] >> 10);
+  const auto& models = engine_.sprites.fetch;
+  int out[fetch_outputs];
+  graph_step(chr_latch_active ? models[0] : models[1 + ((ctrl & 0x20) ? 9 : 0) + count], in, out);
+  for (int k = 0; k < 8; ++k)
+    if (out[out_sprite_fetch + k]) {
+      a12(false, dot + 8 * k);
+      a12(out[out_sprite_a12 + k] != 0, dot + 8 * k + 4);
+    }
+  const bool latch_lo = out[out_sprite_latch] != 0, latch_hi = out[out_sprite_latch + 1] != 0;
+  if (chr_latch_active &&
+      (chr_latch.latch_fe[0] != latch_lo || chr_latch.latch_fe[1] != latch_hi)) {
+    chr_latch.latch_fe[0] = latch_lo;
+    chr_latch.latch_fe[1] = latch_hi;
+    chr_map_changed();
+  }
+  for (int k = 0; k < count; ++k) {
+    array<uint8_t, 8> row;
+    for (int c = 0; c < 8; ++c)
+      row[static_cast<size_t>(c)] = static_cast<uint8_t>(out[k * 8 + c]);
+    draw_sprite_row(out[out_sprite_x + k], row);
   }
 }
 

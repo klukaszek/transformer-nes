@@ -135,6 +135,7 @@ struct AppState {
 AppState* state = nullptr;
 
 void app_init() {
+  py::gil_scoped_acquire gil;
   sg_desc desc{};
   desc.environment = sglue_environment();
   desc.logger.func = slog_func;
@@ -216,6 +217,7 @@ bool emulate_frame() {
 }
 
 void app_frame() {
+  py::gil_scoped_acquire gil;
   state->acc += sapp_frame_duration();
   // A stall (window drag, machine handoff) must not queue a burst.
   if (state->acc > 4 * nes_frame_seconds) {
@@ -302,6 +304,7 @@ void app_frame() {
 }
 
 void app_event(const sapp_event* e) {
+  py::gil_scoped_acquire gil;
   if (transformer_nes::ui::handle_event(e, state->ui)) {
     // A key the overlay took (its toggle, Esc, typing into a field) may
     // have its release land there too: drop held buttons so none stick.
@@ -355,9 +358,10 @@ void push_audio(py::array_t<float, py::array::c_style | py::array::forcecast> sa
 
 // On macOS quitting goes through [NSApp terminate:], which exits the
 // process inside sapp_run -- the caller of run() never resumes.  The
-// quit callback, invoked here (GIL still held, same thread), is the
-// last Python to execute on every quit path.
+// quit callback, invoked here (same thread), is the last Python to
+// execute on every quit path.
 void app_cleanup() {
+  py::gil_scoped_acquire gil;
   if (state && !state->quit_cb.is_none()) {
     try {
       state->quit_cb();
@@ -381,8 +385,8 @@ transformer_nes::ui::Dissection to_dissection(const py::handle& d) {
 }
 
 // Wrap the Python debug bridge (nes/debug.py DebugBridge) as plain
-// functions; they run inside the frame/event callbacks, GIL already
-// held.  The X-ray's CPU and pixel hooks exist when the bridge has the
+// functions; they run inside the frame/event callbacks, which hold the
+// GIL.  The X-ray's CPU and pixel hooks exist when the bridge has the
 // weights CPU and the render graph to read.
 transformer_nes::ui::DebugHooks make_hooks(py::object bridge) {
   using namespace transformer_nes::ui;
@@ -432,7 +436,9 @@ transformer_nes::ui::DebugHooks make_hooks(py::object bridge) {
 }
 
 // Blocks until the window closes.  The callbacks run on this thread
-// inside sapp_run, so the GIL held by this call covers every frame.
+// inside sapp_run, each taking the GIL for itself: between them, while
+// sapp_run waits for the display, Python's other threads run (the
+// PyTorch forwards load and compile in the background, for one).
 void run(const string& title, int scale, py::object frame_cb, py::object quit_cb,
          py::object debug, bool overlay) {
   if (scale <= 0)
@@ -456,7 +462,10 @@ void run(const string& title, int scale, py::object frame_cb, py::object quit_cb
   desc.high_dpi = true;
   desc.swap_interval = 1;
   desc.logger.func = slog_func;
-  sapp_run(&desc);
+  {
+    py::gil_scoped_release unlocked;
+    sapp_run(&desc);
+  }
   state = nullptr;
   st.frame_cb = py::object();
   st.hooks = {};

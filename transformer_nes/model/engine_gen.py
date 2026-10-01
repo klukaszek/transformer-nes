@@ -32,12 +32,14 @@ from transformer_nes.cpu6502.backends.weights.run_protocol import (
     run_loop_cpp,
     run_state_members_cpp,
 )
+from transformer_nes.files import write_atomic
 from transformer_nes.graph.core import MEMORY_GROUP_FUSED
 from transformer_nes.model.classify import (
     integer_score_terms,
     memory_query,
     register_query,
 )
+from transformer_nes.model.sources import source_digest
 
 logger = logging.getLogger(__name__)
 
@@ -67,52 +69,22 @@ def positive_env_int(name: str, default: int) -> int:
 def compile_shards() -> int:
     return positive_env_int("TRANSFORMER_NES_COMPILE_SHARDS", DEFAULT_COMPILE_SHARDS)
 
-# Everything whose content can change the emitted engine, hashed into the
-# config key so any edit is a cache miss (over-inclusion is safe).
-CODE_DIRS = ("graph", "model")
-CODE_FILES = (
-    "cpu6502/spec.py",
-    "cpu6502/interpreter.py",
-    "cpu6502/construction.py",
-    "cpu6502/backends/reference.py",
-    "cpu6502/backends/weights/run_protocol.py",
-    "cpu6502/backends/weights/windows.py",
-    "cpu6502/backends/weights/experts.py",
-    "cpu6502/backends/weights/runner.py",
-)
-code_digest_cache: str | None = None
+# What shapes the emitted engines (core and window modules): the runner
+# that builds them and everything it imports (model/sources.py).
+ENGINE_SOURCES = ("transformer_nes.cpu6502.backends.weights.runner",)
 
 
-def code_digest() -> str:
-    global code_digest_cache
-    if code_digest_cache is not None:
-        return code_digest_cache
-    pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    paths = []
-    for d in CODE_DIRS:
-        for root, dirs, files in os.walk(os.path.join(pkg, d)):
-            dirs[:] = [x for x in dirs if x not in ("__pycache__", "_engine_cache")]
-            paths.extend(
-                os.path.join(root, f) for f in files
-                if f.endswith((".py", ".h", ".hpp", ".cpp"))
-            )
-    paths.extend(os.path.join(pkg, *f.split("/")) for f in CODE_FILES)
-    h = hashlib.sha256()
-    for p in sorted(paths, key=lambda p: os.path.relpath(p, pkg)):
-        h.update(os.path.relpath(p, pkg).encode())
-        with open(p, "rb") as fh:
-            h.update(fh.read())
-    code_digest_cache = h.hexdigest()
-    return code_digest_cache
+def engine_code_digest() -> str:
+    return source_digest(*ENGINE_SOURCES)
 
 
 def engine_config_key(*, bcd: bool, union_only: bool = False,
-                      mirror_cpu_ram: bool = False) -> str:
+                      mirror_cpu_ram: bool = False, forward_hook: bool = False) -> str:
     """Cache key for a built engine, computable without folding or emitting:
     decimal mode plus every source file that shapes the fixed production core.
     A union-only engine holds no experts, so it keys separately."""
-    raw = (f"{code_digest()}|bcd={int(bcd)}|union_only={int(union_only)}"
-           f"|mirror_cpu_ram={int(mirror_cpu_ram)}")
+    raw = (f"{engine_code_digest()}|bcd={int(bcd)}|union_only={int(union_only)}"
+           f"|mirror_cpu_ram={int(mirror_cpu_ram)}|forward_hook={int(forward_hook)}")
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -125,20 +97,17 @@ def manifest_read() -> dict:
 
 
 def manifest_put(key: str, entry: dict) -> None:
-    """Record a built artifact and prune every artifact an older code
-    digest built: their keys can never be looked up again, so without
-    this the cache grows by a full engine per edit."""
+    """Record a built artifact and prune every engine and window module
+    built from older engine code: their keys can never be looked up again,
+    so without this the cache grows by a full engine per edit.  (A PPU
+    graph build is keyed by its own source and replaced under its key.)"""
     manifest = manifest_read()
-    code = code_digest()
-    manifest[key] = {**entry, "code": code}
-    live = {e["digest"] for e in manifest.values() if e.get("code") == code}
-    manifest = {k: e for k, e in manifest.items() if e.get("code") == code}
-    prune_cache(live)
+    code = engine_code_digest()
+    manifest[key] = {**entry, "code": None if entry.get("kind") == "graph" else code}
+    manifest = {k: e for k, e in manifest.items() if e.get("code") in (None, code)}
+    prune_cache({e["digest"] for e in manifest.values()})
     os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = MANIFEST_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(manifest, f, indent=1, sort_keys=True)
-    os.replace(tmp, MANIFEST_PATH)
+    write_atomic(MANIFEST_PATH, json.dumps(manifest, indent=1, sort_keys=True).encode())
 
 
 ARTIFACT_RE = re.compile(r"^(?:engine|seqmod|graph|build)_([0-9a-f]{16})(?:[_.].*)?$")
@@ -276,8 +245,13 @@ def seqmod_config_key(*, core_digest: str, bcd: bool, windows) -> str:
     """Cache key for a per-ROM sequence module.  The core digest covers the
     header the module compiles against; the code digest covers fold/emission
     changes that alter the module without altering the core's source."""
-    tag = ",".join(f"{h:04X}:{bytes(c).hex()}x{r}" for h, c, r in windows)
-    raw = f"{code_digest()}|core={core_digest}|bcd={int(bcd)}|seq={tag}"
+    # Store forwarding and branch predictions fold differently: they key apart.
+    tag = ",".join(
+        f"{h:04X}:{bytes(c).hex()}x{r}{'f' if forward else ''}"
+        + "".join("TF"[not t] for t in taken)
+        for h, c, r, forward, taken in windows
+    )
+    raw = f"{engine_code_digest()}|core={core_digest}|bcd={int(bcd)}|seq={tag}"
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
@@ -471,14 +445,32 @@ SEQ_HOOK = """\
     static constexpr int SEQ_MAX_K = 32;
     // The cycles the last expert forward retired: its model's output.
     long seq_cycles = 0;
+    // The forward hook: when set, each expert's layers run outside, on
+    // its embedded residual stream (ids: SEQ_HOOK_IDS in engine_gen.py);
+    // it returns false for an expert it cannot run, which then runs here.
+    bool (*forward_hook)(void*, int, int*) = nullptr;
+    void* forward_hook_ctx = nullptr;
+    void set_forward_hook(std::uintptr_t fn, std::uintptr_t ctx) {
+        forward_hook = (bool (*)(void*, int, int*))fn;
+        forward_hook_ctx = (void*)ctx;
+    }
+    std::uintptr_t ram_address() { return (std::uintptr_t)ram; }
+    // Where the X-ray's read counting lives, for a hook that runs the
+    // layers (and so the reads) itself: (&xray_on, xray_reads).
+    std::pair<std::uintptr_t, std::uintptr_t> xray_address() {
+        return {(std::uintptr_t)&xray_on, (std::uintptr_t)xray_reads};
+    }
     // Module window heads: dispatch misses cost one array load instead
     // of a cross-module call into the module's head switch.
     unsigned char seq_head[65536] = {};
 
     // Instructions retired per execution path since the last xray_take():
     // sequence-module windows, shape experts, interrupt experts, opcode
-    // experts, the union model; and per opcode, those that ran singly.
+    // experts, the union model; the dispatches (forwards, or a whole
+    // spin or loop) that retired them; and per opcode, those that ran
+    // singly.
     long xray_paths[5] = {};
+    long xray_dispatches[5] = {};
     long xray_opcodes[256] = {};
 
     int seq_dispatch(long i, long max_steps, long cycles_this,
@@ -488,12 +480,14 @@ SEQ_HOOK = """\
                                  max_cycles, stop_on_trap ? 1 : 0);
             if (k) {
                 xray_paths[0] += k;
+                ++xray_dispatches[0];
                 return k;
             }
         }
         const int k = shape_dispatch(i, max_steps, cycles_this, max_cycles,
                                      stop_on_trap);
         xray_paths[1] += k;
+        xray_dispatches[1] += k > 0;
         return k;
     }
 
@@ -550,6 +544,7 @@ ENGINE_STEP_BODY = """\
                 const int k_seq = seq_dispatch(i, max_steps, cycles_this,
                                                max_cycles, stop_on_trap);
                 if (k_seq > 0) {
+                    fallthrough_pc = -1;
                     step_index += k_seq;
                     cycles_this += seq_cycles;
                     cycles_total += seq_cycles;
@@ -560,6 +555,7 @@ ENGINE_STEP_BODY = """\
                 }
             }
             const bool was_int = nmi_pending || irq_ready();
+            if (!was_int && st_pc != fallthrough_pc) ++block_entries[st_pc];
             const int prev_pc = st_pc;
             const unsigned char exec_opcode = ram[prev_pc];
             int pre_a = st_a, pre_x = st_x, pre_y = st_y, pre_p = st_p;
@@ -577,6 +573,7 @@ ENGINE_STEP_BODY = """\
             }
             if (was_int ? interrupt_step(nmi_pending) : execution_step(exec_opcode)) {
                 ++xray_paths[was_int ? 2 : 3];
+                ++xray_dispatches[was_int ? 2 : 3];
                 if (!was_int) ++xray_opcodes[exec_opcode];
                 const int tr_data = trace && !was_int
                     ? trace_data(exec_opcode, pre_a, pre_x, pre_y, pre_p, tr_operand)
@@ -589,6 +586,12 @@ ENGINE_STEP_BODY = """\
                     st_ea = tr_ea; st_data = tr_data;
                 }
                 if (was_int) nmi_pending = false;
+                fallthrough_pc = was_int || ENDS_WINDOW[exec_opcode]
+                    ? -1 : (prev_pc + TRACE_LENGTH[exec_opcode]) & 0xFFFF;
+                if (!was_int && ENDS_WINDOW[exec_opcode] == 2) {
+                    ++branch_runs[prev_pc];
+                    branch_taken[prev_pc] += st_pc != ((prev_pc + 2) & 0xFFFF);
+                }
                 ++step_index;
                 const long step_cycles = seq_cycles;
                 cycles_this += step_cycles; cycles_total += step_cycles;
@@ -605,6 +608,9 @@ ENGINE_STEP_BODY = """\
             // its receipt o[] carries the state, writes and stop flags.
             step_core(o);
             ++xray_paths[4];
+            ++xray_dispatches[4];
+            fallthrough_pc = was_int || ENDS_WINDOW[exec_opcode]
+                ? -1 : (prev_pc + TRACE_LENGTH[exec_opcode]) & 0xFFFF;
             ++xray_opcodes[exec_opcode];
             const bool halted = o[11] != 0;
             if (trace)
@@ -731,11 +737,18 @@ PYBIND_STEP_METHODS = """\
         .def("set_run_state", &ENGINE_T::set_run_state)
         .def("get_run_state", &ENGINE_T::get_run_state)
         .def("attach_seq", &ENGINE_T::attach_seq)
+        .def("set_forward_hook", &ENGINE_T::set_forward_hook)
+        .def("ram_address", &ENGINE_T::ram_address)
+        .def("xray_address", &ENGINE_T::xray_address)
         .def("detach_seq", &ENGINE_T::detach_seq)
         .def("add_window", &ENGINE_T::add_window)
         .def("clear_windows", &ENGINE_T::clear_windows)
 """ + PYBIND_MACHINE_ABI
 
+
+# Forward-hook ids: the core's experts are 0.., the attached sequence
+# module's windows SEQ_HOOK_IDS.. (both in their build order).
+SEQ_HOOK_IDS = 1000
 
 # Maximum instructions retired by one execution model; keep in sync with
 # SEQ_MAX_K in SEQ_HOOK.
@@ -745,26 +758,71 @@ SEQ_MAX_K = 32
 def emit_window_dispatch(emit, exp, E: str, match: str, step_call: str) -> None:
     """Emit one window's dispatch case: the step and cycle budget guards,
     the byte match, then the forward, whose step_core leaves the window's
-    cycles in seq_cycles.  The cycle guard needs the cycles before the last
-    step up front, so a window whose pins left them to the model never
-    dispatches.  A `JMP *` spin changes nothing per iteration: it retires
+    cycles in seq_cycles.  The cycle guard uses a bound on the cycles
+    before the last step, so a dispatched window holds only instructions
+    single steps would have run.  A `JMP *` spin changes nothing per iteration: it retires
     as many as the budgets allow without a forward, overshooting the cycle
-    budget by at most the last, as single steps would."""
+    budget by at most the last, as single steps would.  A loop window
+    (experts.py:loop_recurrence) runs one iteration as a forward; if that
+    looped back to the head, the following iterations cost the same
+    model-computed cycles, and it retires as many as the budgets allow
+    (a count loop all but its falling-through last)."""
     prefix = exp["cycles_prefix"]
-    if prefix is None:
-        return
     spin = exp["spin"]
+    guards = exp.get("step_spec", {}).get("sequence_guards", ())
+    for source, mask, expected in guards:
+        if source == "state":
+            match += f" && ({E}st_p & 0x{mask:02X}) == {mask if expected else 0}"
     steps = 1 if spin else exp["n_steps"]
     pad = "                "
     emit(f"            if (i + {steps} <= max_steps")
     emit(f"                && (max_cycles <= 0 || cycles_this + {0 if spin else prefix} < max_cycles)")
     emit(f"                && {match}) {{")
+    loop = exp.get("loop")
     if spin:
         emit(f"{pad}long n = max_steps - i;")
         emit(f"{pad}if (max_cycles > 0 && n > (max_cycles - cycles_this - 1) / {spin} + 1)")
         emit(f"{pad}    n = (max_cycles - cycles_this - 1) / {spin} + 1;")
         emit(f"{pad}{E}seq_cycles = n * {spin};")
         emit(f"{pad}return (int)n;")
+    elif loop:
+        emit(f"{pad}const int head = {E}st_pc;")
+        emit(f"{pad}{step_call}")
+        closure = (f"{E}ram[(head + {loop['closure_offset']}) & 0xFFFF] == "
+                   f"0x{loop['closure_value']:02X}")
+        stable = "true"
+        if loop["kind"] == "poll":
+            # The polled value holds: plain memory, or a device read the
+            # lease serves one fixed value.
+            emit(f"{pad}const int polled = {E}shadow_read_target();")
+            emit(f"{pad}const int lease = {E}lease_slot(polled);")
+            stable = (f"(!{E}in_ranges({E}rwatch, polled) || "
+                      f"(lease >= 0 && {E}lease_n[lease] == 0))")
+        emit(f"{pad}long extra = 0;")
+        emit(f"{pad}if ({E}st_pc == head && {closure} && {stable}) {{")
+        emit(f"{pad}    const long per = {E}seq_cycles;  // one looping iteration")
+        emit(f"{pad}    extra = (max_steps - i) / {steps} - 1;")
+        emit(f"{pad}    if (max_cycles > 0) {{")
+        emit(f"{pad}        const long room = max_cycles - cycles_this - {prefix} - 1;")
+        emit(f"{pad}        if (extra > (room >= 0 ? room / per : 0)) extra = room >= 0 ? room / per : 0;")
+        emit(f"{pad}    }}")
+        if loop["kind"] == "count":
+            reg = f"{E}st_{loop['register']}"
+            delta = loop["delta"]
+            left = reg if delta < 0 else f"256 - {reg}"
+            emit(f"{pad}    if (extra > {left} - 1) extra = {left} - 1;  // the last falls through")
+            emit(f"{pad}    if (extra > 0) {{")
+            emit(f"{pad}        {reg} = ({reg} + {delta} * extra) & 0xFF;")
+            emit(f"{pad}        {E}st_p = ({E}st_p & ~0x82) | ({reg} & 0x80) | ({reg} ? 0 : 0x02);")
+            emit(f"{pad}    }}")
+        emit(f"{pad}    if (extra < 0) extra = 0;")
+        emit(f"{pad}    {E}seq_cycles = per * (1 + extra);")
+        emit(f"{pad}}}")
+        emit(f"{pad}return (int)((1 + extra) * {steps});")
+    elif any(source == "model" for source, *_ in guards):
+        # A superblock whose prediction failed declines: the next window
+        # at this head (a shorter one) or single steps take over.
+        emit(f"{pad}if ({step_call.rstrip(';')}) return {steps};")
     else:
         emit(f"{pad}{step_call}")
         emit(f"{pad}return {steps};")
@@ -802,14 +860,16 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
     emit(f"    {elem} xbuf[{mod_xbuf}];")
     emit("")
     lines.extend(body)
-    for exp in experts:
+    for j, exp in enumerate(experts):
         emit("")
         emit_step_core(f"step_core__{exp['name']}", f"__{exp['name']}",
-                       exp["model"], exp["step_spec"])
+                       exp["model"], exp["step_spec"], hook_id=SEQ_HOOK_IDS + j)
     # Window dispatch checks the head PC, bytes, interrupts, and budget.
     by_head: dict[int, list] = {}
     for exp in experts:
         by_head.setdefault(exp["head"], []).append(exp)
+    for exps in by_head.values():  # longest first: a superblock before its prefix
+        exps.sort(key=lambda exp: -exp["n_steps"])
     emit("")
     emit("    int dispatch(Eng& E, long i, long max_steps, long cycles_this,")
     emit("                 long max_cycles, bool stop_on_trap) {")
@@ -819,8 +879,7 @@ def assemble_seq_module(lines, body, experts, core_digest, elem,
         emit(f"        case 0x{head:04X}:")
         for exp in by_head[head]:
             match = " && ".join(
-                f"E.ram[0x{(head + j) & 0xFFFF:04X}] == 0x{b:02X}"
-                for j, b in enumerate(exp["window"])
+                f"E.ram[0x{addr:04X}] == 0x{b:02X}" for addr, b in exp["match"]
             )
             if exp.get("has_stores"):
                 # Licensed store targets stay below $2000; refuse
@@ -1209,7 +1268,8 @@ def emit_layer(plan, suffix: str, signature: str) -> list[str]:
 
 def generate_source(model, step_spec: dict | None = None, experts=None,
                     seq_module_core: str | None = None,
-                    mirror_cpu_ram: bool = False) -> tuple[str, int, bool]:
+                    mirror_cpu_ram: bool = False,
+                    forward_hook: bool = False) -> tuple[str, int, bool]:
     """Return ``(source, memory_head_count, has_machine_step)``.
 
     ``step_spec`` enables the native machine protocol. Core ``experts`` are
@@ -1291,7 +1351,7 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         return f"shr2(x[{slot}])"
 
     def emit_step_core(fn_name, layer_suffix, mdl, spec, *, stage_writes=False,
-                       trace=False, probe=False):
+                       trace=False, probe=False, hook_id=None):
         # One model forward over persistent st_* state. The union emits one
         # diagnostic receipt; execution models emit only final state, control
         # and ordered effects.  trace=True emits the same embedding and
@@ -1321,11 +1381,13 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             raise RuntimeError("zero-work execution model retained live inputs")
 
         args = "Eng& E" if seq_mode else ""
+        guards = [g for g in spec.get("sequence_guards", ()) if g[0] == "model"]
         if trace:
             args = f"{elem}* snap"
         elif not sequence_final and not probe:
             args += (", " if args else "") + "long long* out"
-        emit(f"    {'long long' if probe else 'void'} {fn_name}({args}) {{")
+        returns = "long long" if probe else "bool" if guards else "void"
+        emit(f"    {returns} {fn_name}({args}) {{")
         if needs_x:
             emit(f"        {elem}* x = xbuf;")
             emit(f"        for (int i = 0; i < {dm}; ++i) x[i] = 0;")
@@ -1363,11 +1425,20 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit(f"        ++{E}seq;")
         if trace:
             emit(f"        std::memcpy(snap, x, sizeof({elem}) * {dm});")
+        # The forward hook (set_forward_hook): an outside runtime runs this
+        # expert's layers on the same residual stream, `hook_id` naming it.
+        hooked = hook_id is not None and needs_x
+        if hooked:
+            flag = "Eng::FORWARD_HOOK" if seq_mode else "FORWARD_HOOK"
+            emit(f"        if (!({flag} && {E}forward_hook && "
+                 f"{E}forward_hook({E}forward_hook_ctx, {hook_id}, x))) {{")
         for li in range(len(mdl.attn)):
             emit(f"        layer_{li}{layer_suffix}("
                  f"{'E, ' if seq_mode else ''}x);")
             if trace:
                 emit(f"        std::memcpy(snap + {(li + 1) * dm}, x, sizeof({elem}) * {dm});")
+        if hooked:
+            emit("        }")
         if trace:
             emit("    }")
             return
@@ -1377,6 +1448,13 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             emit("    }")
             return
         if sequence_final:
+            if guards:
+                # A superblock's predicted branches: unless the model's
+                # flags agree, nothing commits and the dispatch declines.
+                held = " && ".join(
+                    f"(({rdv(slot)} & 1) != 0) == {'true' if expected else 'false'}"
+                    for _source, slot, expected in guards)
+                emit(f"        if (!({held})) {{ --{E}seq; return false; }}")
             outs = sequence_final["model"]
             constants = sequence_final["constant"]
             fields = {
@@ -1463,6 +1541,8 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
                     else:
                         emit(f"        {E}insert_write((int)({rdv(addr_slot)} & 0xFFFF), "
                              f"(int)({rdv(value_slot)} & 0xFF), {E}seq + 1);")
+            if guards:
+                emit("        return true;")
             emit("    }")
             return
         outs = spec["outputs"]
@@ -1523,6 +1603,10 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
     emit("")
     emit("struct ENGINE_T {")
     emit(f"    static constexpr bool MIRROR_CPU_RAM = {'true' if mirror_cpu_ram else 'false'};")
+    # Built for an outside forward runtime (set_forward_hook): only then do
+    # expert steps branch on the hook -- an opaque call there costs the
+    # compiled engine its register-resident state.
+    emit(f"    static constexpr bool FORWARD_HOOK = {'true' if forward_hook else 'false'};")
     emit(f"    static constexpr int D = {d_model};")
     emit("    long seq = -1;")
     emit(f"    static constexpr int F = {f_bits};")
@@ -1613,12 +1697,13 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         emit_step_core("trace_core", "", model, step_spec, trace=True)
         emit("")
         emit_step_core("union_cycles", "", model, step_spec, probe=True)
-        for exp in experts:
+        for j, exp in enumerate(experts):
             emit("")
             emit_step_core(f"step_core__{exp['name']}", f"__{exp['name']}",
                            exp["model"], exp["step_spec"],
                            stage_writes=exp.get("kind")
-                           in ("exec_opcode", "exec_int"))
+                           in ("exec_opcode", "exec_int"),
+                           hook_id=j)
 
         # Compact opcode execution is selected by the byte at st_pc. Pending
         # interrupts and tracing bypass it through step_core's union receipt.
@@ -1694,8 +1779,6 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
             emit("        if (!sid || nmi_pending || irq_ready() || stop_on_trap) return 0;")
             emit("        switch (sid) {")
             for j, exp in enumerate(shape_experts):
-                if exp["cycles_prefix"] is None:
-                    continue
                 # add_window guarantees head + length <= 0x10000: no wrap.
                 checks = " && ".join(
                     f"ram[st_pc + {off}] == 0x{b:02X}" if off
@@ -1750,12 +1833,26 @@ def generate_source(model, step_spec: dict | None = None, experts=None,
         # The dissection: one union forward from the current machine state
         # on a copy of the engine, every layer's residual stream returned
         # as fixed-point ints (rows: embedding, then each layer).
+        # The run's profile since the last call: block entries, and each
+        # conditional branch's runs and taken runs (rows 0, 1, 2).
+        emit("        .def(\"take_profile\", [](ENGINE_T& e) {")
+        emit("            py::array_t<long> out({3, 65536});")
+        emit("            long* o = out.mutable_data();")
+        emit("            for (int i = 0; i < 65536; ++i) {")
+        emit("                o[i] = std::exchange(e.block_entries[i], 0);")
+        emit("                o[65536 + i] = std::exchange(e.branch_runs[i], 0);")
+        emit("                o[131072 + i] = std::exchange(e.branch_taken[i], 0);")
+        emit("            }")
+        emit("            return out;")
+        emit("        })")
         emit("        .def(\"xray_take\", [](ENGINE_T& e) {")
         emit("            py::list paths;")
         emit("            for (long& n : e.xray_paths) paths.append(std::exchange(n, 0));")
+        emit("            py::list dispatches;")
+        emit("            for (long& n : e.xray_dispatches) dispatches.append(std::exchange(n, 0));")
         emit("            py::array_t<long> ops(256);")
         emit("            for (int i = 0; i < 256; ++i) ops.mutable_data()[i] = std::exchange(e.xray_opcodes[i], 0);")
-        emit("            return py::make_tuple(paths, ops);")
+        emit("            return py::make_tuple(paths, ops, dispatches);")
         emit("        })")
         # Reads per address since the last call (then zeroed); `on`
         # keeps counting enabled.
@@ -1807,15 +1904,17 @@ class GeneratedWeightsEngine:
 
     def __init__(self, model, *, step_spec: dict | None = None,
                  experts=None, cache_key: str | None = None,
-                 shapes_meta=None, mirror_cpu_ram: bool = False):
+                 shapes_meta=None, mirror_cpu_ram: bool = False,
+                 forward_hook: bool = False):
         self.n_experts = len(experts or [])
         self.mirror_cpu_ram = bool(mirror_cpu_ram)
+        self.forward_hook = bool(forward_hook)
         # Shape-window scan metadata (id/signature/length/close rule) so a
         # cache-hit load can populate the runtime table without refolding.
         self.shapes_meta = list(shapes_meta or [])
         source, self.n_memory_heads, self.has_machine_step = generate_source(
             model, step_spec, experts=experts,
-            mirror_cpu_ram=self.mirror_cpu_ram,
+            mirror_cpu_ram=self.mirror_cpu_ram, forward_hook=self.forward_hook,
         )
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         self.digest = digest
@@ -1848,6 +1947,7 @@ class GeneratedWeightsEngine:
                 "n_memory_heads": self.n_memory_heads,
                 "has_machine_step": self.has_machine_step,
                 "mirror_cpu_ram": self.mirror_cpu_ram,
+                "forward_hook": self.forward_hook,
                 "shapes": self.shapes_meta,
                 "compile_shards": n_shards,
             })
@@ -1872,6 +1972,7 @@ class GeneratedWeightsEngine:
         self.n_memory_heads = entry["n_memory_heads"]
         self.has_machine_step = entry["has_machine_step"]
         self.mirror_cpu_ram = bool(entry.get("mirror_cpu_ram", False))
+        self.forward_hook = bool(entry.get("forward_hook", False))
         self.shapes_meta = entry.get("shapes") or []
         module = load_engine_module(entry["digest"])
         self.bind(module)

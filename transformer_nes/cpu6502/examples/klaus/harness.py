@@ -26,8 +26,6 @@ KLAUS_BIN = os.path.join(os.path.dirname(__file__), "6502_functional_test.bin")
 START_PC = 0x0400
 SUCCESS_PC = 0x3469
 DEFAULT_MAX_STEPS = 100_000_000
-# Instruction count of a full passing run, measured on the reference core.
-KLAUS_EXPECTED_STEPS = 30_646_177
 
 
 def load_image(path: str = KLAUS_BIN) -> bytes:

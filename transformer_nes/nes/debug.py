@@ -21,15 +21,15 @@ XRAY_WINDOW = 30
 class DebugBridge:
     """app.cpp wraps these methods as the overlay's hooks (called from
     the frame/event callbacks with the GIL held).  The X-ray's CPU views
-    need the weights CPU (`cpu_runtime`) and its pixel views the render
-    graph (`render_engine`); app.cpp wires only those that are present."""
+    need the weights CPU (`cpu_runtime`) and its pixel views the PPU
+    transformer (`ppu_engine`); app.cpp wires only those that are present."""
 
-    def __init__(self, console, backend: str, *, cpu_runtime=None, render_engine=None):
+    def __init__(self, console, backend: str, *, cpu_runtime=None, ppu_engine=None):
         self.console = console
         self.backend = backend
         self.cpu_xray = CpuXray(cpu_runtime) if cpu_runtime is not None else None
-        self.ppu_xray = PpuXray(render_engine) if render_engine is not None else None
-        self.expert_names = list(render_engine.expert_names) if render_engine is not None else []
+        self.ppu_xray = PpuXray(ppu_engine) if ppu_engine is not None else None
+        self.expert_names = list(ppu_engine.expert_names) if ppu_engine is not None else []
         self.expert_colors = expert_colors(self.expert_names)
         self.pixel: dict | None = None
         self.pixel_x = 0

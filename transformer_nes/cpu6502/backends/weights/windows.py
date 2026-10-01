@@ -16,6 +16,23 @@ from transformer_nes.cpu6502.spec import BRANCH_OPERATIONS, OPCODES, READS_MEMOR
 SEQUENCE_WRITERS = frozenset({
     "sax", "jsr", "brk", "rti", "rts", "pla", "plp",
 })
+# Learned windows (block_code) are wider: they hold pushes and pulls (the
+# fold licenses a pull only when nothing earlier in the window wrote the
+# stack page), run through JSR like through an absolute JMP, and end with a
+# branch or a return, whose target is the model's.  What they never hold:
+WINDOW_EXCLUDED = frozenset({"brk", "sax"})
+
+
+def ends_window(op) -> bool:
+    """A window's last instruction: a branch, a return."""
+    return op.operation in BRANCH_OPERATIONS or op.operation in ("rts", "rti")
+
+
+def continues_at_target(op) -> bool:
+    """An instruction a window runs through to its constant target."""
+    return op.operation in ("jmp", "jsr") and op.mode == "abs"
+
+
 # Long enough to amortize a transformer forward on ordinary straight-line
 # 6502 basic blocks, still far below the sequence ABI's 32-row output bound.
 # Safety comes from folding/licensing, not this profitability horizon.
@@ -114,3 +131,52 @@ def scan_sequence_windows(image, *, base: int = 0, spin_repeat: int = 4,
             wrote_memory |= op.operation in MEMORY_WRITE_OPERATIONS
             pc = next_pc
     return tuple(windows[:limit])
+
+
+def block_code(read, head: int, *, limit: int = 32) -> bytes:
+    """The code a window from `head` could run, in execution order, as read
+    through `read(address)`: up to `limit` instructions, running through
+    absolute JMP and JSR, ending with a branch or a return or before what
+    no window holds (WINDOW_EXCLUDED, indirect JMP, undefined bytes).  The
+    fold's license checks decide how much of it one forward can take."""
+    code = bytearray()
+    pc = head
+    for _ in range(limit):
+        op = OPCODES.get(read(pc))
+        if op is None or op.operation in WINDOW_EXCLUDED or (
+            op.operation == "jmp" and op.mode != "abs"
+        ):
+            break
+        code += bytes(read((pc + i) & 0xFFFF) for i in range(op.length))
+        if ends_window(op):
+            break
+        if continues_at_target(op):
+            target = read((pc + 1) & 0xFFFF) | (read((pc + 2) & 0xFFFF) << 8)
+            if target == pc:  # a spin: the shape library's
+                code = code[: -op.length]
+                break
+            pc = target
+        else:
+            pc = (pc + op.length) & 0xFFFF
+    return bytes(code)
+
+
+def static_window_limit(code: bytes) -> int:
+    """How many leading instructions of `code` can possibly share a
+    window, judged from constant operand addresses alone (before any fold):
+    a store to $2000 or above reaches a device, which no window may; a
+    read of $2000-$7FFF may be a device read, which only a window's first
+    instruction may make."""
+    off = k = 0
+    while off < len(code):
+        op = OPCODES[code[off]]
+        if op.mode in ("abs", "abx", "aby"):
+            address = code[off + 1] | (code[off + 2] << 8)
+            if op.operation in MEMORY_WRITE_OPERATIONS and address >= 0x2000:
+                return k
+            reads = op.operation in READS_MEMORY and op.operation not in ("jmp", "jsr")
+            if k and reads and 0x2000 <= address < 0x8000:
+                return k
+        off += op.length
+        k += 1
+    return k

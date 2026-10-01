@@ -108,6 +108,8 @@ def grouped_read(
     if groups is None:
         assert group_count is not None
         groups = range(group_count)
+    if list(groups) != sorted(set(groups)):
+        raise ValueError(f"read groups must ascend: {tuple(groups)}")
     value = Expression()
     for group in groups:
         lo = group * group_size
