@@ -1,5 +1,5 @@
-"""blargg's self-reporting PPU/MMC3 test ROMs through the transformer
-backend.  These ROMs write a status byte to $6000 behind the signature
+"""blargg's self-reporting PPU/MMC3 ROMs through transformer CPU and PPU.
+These ROMs write a status byte to $6000 behind the signature
 DE B0 61 at $6001; 0 is a pass.  They are local fixtures (see
 examples/testroms/README.md) and skip when absent."""
 
@@ -40,6 +40,7 @@ def run_rom(path, frames=1200):
     console = hardware.Console(
         hardware.Cartridge.load(path), backend_factory("weights"), 44100.0
     )
+    assert console.ppu_engine is not None
     for _ in range(frames):
         console.run_frame()
         if console.read_ram(0x6001, 3) == b"\xde\xb0\x61":

@@ -65,12 +65,25 @@ def lockstep_arrays_vs_reference(ref: Cpu6502, out: dict) -> tuple[bool, int]:
     for i in range(steps):
         row = ref.step()
         s = row.state
-        got = (int(out["pc"][i]), int(out["a"][i]), int(out["x"][i]), int(out["y"][i]),
-               int(out["s"][i]), int(out["p"][i]))
+        got = (
+            int(out["pc"][i]),
+            int(out["a"][i]),
+            int(out["x"][i]),
+            int(out["y"][i]),
+            int(out["s"][i]),
+            int(out["p"][i]),
+        )
         if (s.pc, s.a, s.x, s.y, s.s, s.p) != got:
             logger.error(
                 "engine diverged from reference at step %d:\nREF:    PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X\nENGINE: PC=%04X A=%02X X=%02X Y=%02X S=%02X P=%02X",
-                i, s.pc, s.a, s.x, s.y, s.s, s.p, *got,
+                i,
+                s.pc,
+                s.a,
+                s.x,
+                s.y,
+                s.s,
+                s.p,
+                *got,
             )
             return False, i
         if {(w.addr, w.value) for w in row.writes} != writes_by_row.get(i, set()):
@@ -79,8 +92,12 @@ def lockstep_arrays_vs_reference(ref: Cpu6502, out: dict) -> tuple[bool, int]:
     return True, steps
 
 
-def run_weights(image: bytes, *, max_steps: int, union_only: bool = False,
-                ) -> tuple[bool, int, float, float, str]:
+def run_weights(
+    image: bytes,
+    *,
+    max_steps: int,
+    union_only: bool = False,
+) -> tuple[bool, int, float, float, str]:
     """Lockstep the real weights-based transformer against the reference.
 
     The generated engine runs the whole stream in C++, pausing only at the
@@ -92,7 +109,7 @@ def run_weights(image: bytes, *, max_steps: int, union_only: bool = False,
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(bcd=True, union_only=union_only)
-    mode = "union-only" if union_only else "codegen-exact-int32-runloop"
+    mode = "union-only" if union_only else "torch-int32-runloop"
     build_elapsed = time.perf_counter() - build_start
 
     ref_cpu = Cpu6502(memory=bytearray(image))
@@ -100,9 +117,9 @@ def run_weights(image: bytes, *, max_steps: int, union_only: bool = False,
 
     run_start = time.perf_counter()
     steps = 0
-    for out in machine.iter_run_arrays(list(image), start_pc=START_PC,
-                                       max_steps=max_steps, chunk=500_000,
-                                       stop_on_trap=True):
+    for out in machine.iter_run_arrays(
+        list(image), start_pc=START_PC, max_steps=max_steps, chunk=500_000, stop_on_trap=True
+    ):
         matched, n = lockstep_arrays_vs_reference(ref_cpu, out)
         if not matched:
             return False, steps + n, build_elapsed, time.perf_counter() - run_start, mode
@@ -124,9 +141,10 @@ def main() -> None:
     parser.add_argument("--image", default=KLAUS_BIN)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument(
-        "--union-only", action="store_true",
+        "--union-only",
+        action="store_true",
         help="build the weights engine with no experts, so every opcode "
-             "executes on the union proof model",
+        "executes on the union proof model",
     )
     args = parser.parse_args()
 
@@ -137,20 +155,25 @@ def main() -> None:
         passed, steps, elapsed = run_reference(image, max_steps=args.max_steps)
         rate = steps / elapsed if elapsed > 0 else 0.0
         status = "PASSED" if passed else "FAILED"
-        logger.info(
-            "reference: %s  %d steps in %.2fs (%.0f steps/s)", status, steps, elapsed, rate
-        )
+        logger.info("reference: %s  %d steps in %.2fs (%.0f steps/s)", status, steps, elapsed, rate)
         failed |= not passed
 
     if args.runner in ("weights", "both"):
         matched, steps, build_s, run_s, mode = run_weights(
-            image, max_steps=args.max_steps, union_only=args.union_only,
+            image,
+            max_steps=args.max_steps,
+            union_only=args.union_only,
         )
         rate = steps / run_s if run_s > 0 else 0.0
         status = "MATCHED" if matched else "DIVERGED"
         logger.info(
             "weights transformer (%s): %s  %d steps in %.1fs (%.1f steps/s), weights build %.1fs",
-            mode, status, steps, run_s, rate, build_s,
+            mode,
+            status,
+            steps,
+            run_s,
+            rate,
+            build_s,
         )
         failed |= not matched
 

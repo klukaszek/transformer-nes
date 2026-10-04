@@ -1,7 +1,7 @@
 # Native NES build: the two Python extension modules (hardware console,
 # sokol frontend) plus the native hardware test, all into bin/.  app.py
-# shells out to `make` and imports the artifacts; the weights-engine
-# codegen build (model/_engine_cache) is separate and stays torch-driven.
+# uses build.py to run `make` and import the artifacts; transformer kernel
+# compilation (model/_engine_cache) is separate and stays torch-driven.
 #
 # pybind11 is the vendored copy (same version torch bundles); Python.h
 # comes from the interpreter invoking make (PYTHON=... from app.py).
@@ -37,16 +37,26 @@ SOKOL_LANG := c
 endif
 
 HW_OBJS := $(addprefix $(OBJ)/,bindings.o bus.o ppu.o apu.o console.o tape.o)
+REF_OBJ := $(BIN)/reference_obj
+REF_OBJS := $(HW_OBJS:$(OBJ)/%=$(REF_OBJ)/%)
 IMGUI_OBJS := $(addprefix $(OBJ)/,imgui.o imgui_draw.o imgui_tables.o imgui_widgets.o)
 FRONTEND_OBJS := $(OBJ)/app.o $(OBJ)/debug_ui.o $(OBJ)/sokol_impl.o $(IMGUI_OBJS)
 
-.PHONY: all hardware frontend test-native clean
+.PHONY: all hardware frontend reference-hardware test-native clean
 all: hardware frontend
 hardware: $(BIN)/nes_hardware.so
 frontend: $(BIN)/nes_app.so
+reference-hardware: $(BIN)/nes_hardware_reference.so
 
 $(OBJ):
 	mkdir -p $(OBJ)
+
+$(REF_OBJ):
+	mkdir -p $(REF_OBJ)
+
+# The conventional PPU exists only as an independent test oracle.
+$(REF_OBJ)/%.o: $(NES)/%.cpp | $(REF_OBJ)
+	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) -DTRANSFORMER_NES_PPU_REFERENCE -MMD -MP -c $< -o $@
 
 $(OBJ)/%.o: $(NES)/%.cpp | $(OBJ)
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) -MMD -MP -c $< -o $@
@@ -68,12 +78,15 @@ $(OBJ)/sokol_impl.o: $(NES)/sokol_impl.m $(NES)/ui/sokol_platform.h | $(OBJ)
 $(BIN)/nes_hardware.so: $(HW_OBJS)
 	$(LDSHARED) $^ -o $@
 
+$(BIN)/nes_hardware_reference.so: $(REF_OBJS)
+	$(LDSHARED) $^ -o $@
+
 $(BIN)/nes_app.so: $(FRONTEND_OBJS)
 	$(LDSHARED) $^ -o $@ $(FRONTEND_LIBS)
 
-$(BIN)/native_hardware_test: $(NES)/tests/native_hardware_test.cpp \
-		$(OBJ)/bus.o $(OBJ)/ppu.o $(OBJ)/apu.o $(OBJ)/console.o $(OBJ)/tape.o
-	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $^ -o $@
+$(BIN)/native_hardware_test: $(NES)/tests/native_hardware_test.cpp $(NES)/ui/frame_clock.h \
+		$(REF_OBJ)/bus.o $(REF_OBJ)/ppu.o $(REF_OBJ)/apu.o $(REF_OBJ)/console.o $(REF_OBJ)/tape.o
+	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) -DTRANSFORMER_NES_PPU_REFERENCE $(filter %.cpp %.o,$^) -o $@
 
 test-native: $(BIN)/native_hardware_test
 	$(BIN)/native_hardware_test
@@ -82,3 +95,4 @@ clean:
 	rm -rf $(BIN)
 
 -include $(OBJ)/*.d
+-include $(REF_OBJ)/*.d

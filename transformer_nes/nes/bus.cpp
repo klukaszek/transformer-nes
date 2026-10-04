@@ -82,8 +82,6 @@ void Controller::write(int addr, int value, int64_t) {
   if (addr != 0x4016)
     return;
   bool next = (value & 1) != 0;
-  if (strobe_ && !next)
-    ++polls;
   if ((strobe_ && !next) || next)
     index_ = 0;
   strobe_ = next;

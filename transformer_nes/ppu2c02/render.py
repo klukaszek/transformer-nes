@@ -80,12 +80,14 @@ OUTPUTS = (
 
 # Folded experts, in model order after the full graph (model 0).  The
 # native PPU picks one per slot (nes/ppu.cpp:render_slot) only when its
-# pins hold -- background on (so rendering), no greyscale, no extended
+# pins hold. The ordinary slots require background on, no greyscale, no extended
 # attributes -- and then by slot: an inner slot without sprite pixels
 # gets one expert per background pattern table and fine x (the pixel
 # window folds to plain wiring), with sprites the sprite expert; the
 # edge slots 0 and 31 without sprites have their own.  Each comes twice:
 # with the CHR latches pinned off (carts without them), then with them.
+# A single blank-state expert keeps palette/greyscale behavior dynamic and
+# removes inactive fetch effects when both rendering enables are clear.
 _PLAIN = {
     "maskbit3": 1, "rendering": 1, "maskbit0": 0, "first_slot": 0, "last_slot": 0,
     "extended": 0,
@@ -120,6 +122,7 @@ _NO_LATCHES = {"latch": 0, "latch_set_fd": 0, "latch_set_fe": 0}
 EXPERTS = {
     **{name: {**pins, **_NO_LATCHES} for name, pins in _SLOT_EXPERTS.items()},
     **{f"{name}_latched": pins for name, pins in _SLOT_EXPERTS.items()},
+    "blank": {"maskbit3": 0, "maskbit4": 0, "rendering": 0},
 }
 
 
@@ -136,6 +139,7 @@ def dispatch(names: list[str]) -> list[dict]:
                 [model[f"no_sprites_bg{t}_fine_x{f}{suffix}"] for f in range(8)] for t in range(2)
             ],
             "sprites": model[f"sprites{suffix}"],
+            "blank": model["blank"],
             "first": [model[f"no_sprites_bg{t}_first{suffix}"] for t in range(2)],
             "last": [model[f"no_sprites_bg{t}_last{suffix}"] for t in range(2)],
         }
@@ -145,7 +149,7 @@ def dispatch(names: list[str]) -> list[dict]:
 
 def low_bits(value, width: int) -> list[Expression]:
     """Bits width-1..0 of a small non-negative integer, MSB first."""
-    one = graph.one
+    one = graph.current_graph().one
     bits, rest = [], to_expr(value)
     for b in range(width - 1, -1, -1):
         bit = stepglu(one, rest - (1 << b))
@@ -157,7 +161,7 @@ def low_bits(value, width: int) -> list[Expression]:
 def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expression]]:
     """`chr_full`: bytes of whole-CHR memory for MMC5 extended attributes
     (a power of two), or 0 to leave that path out."""
-    one = graph.one
+    one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in INPUTS}
     memory_inputs = [InputDimension(n) for n in ("is_mem_write", "mem_addr", "mem_value")]
     input_tokens = {
@@ -299,7 +303,10 @@ def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expressio
 
     outputs = {
         **{f"pixel{i}": p for i, p in enumerate(pixels)},
-        **{f"tile{i}": t for i, t in enumerate(tile)},
+        # A tile is an effect payload, consumed only when fetched is set.
+        # Masking its readout lets the blank-state fold remove all pattern,
+        # attribute and nametable reads while preserving palette computation.
+        **{f"tile{i}": gate(rendering, t) for i, t in enumerate(tile)},
         **{f"new_v_{f}": new_v[f] for f in LOOPY_FIELDS},
         "fetched": rendering,
         **{f"hit{i}": h for i, h in enumerate(hits)},

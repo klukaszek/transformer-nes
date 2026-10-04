@@ -2,9 +2,9 @@
 
 Everything is read from the live engines:
 
-- CPU paths: how each frame's instructions were retired -- whole loops in
-  one forward (sequence modules), folded per instruction shape, per-opcode
-  experts, interrupt experts, or the full union model.
+- CPU paths: how each frame's instructions were retired -- fixed polling
+  and counter shapes,
+  per-opcode experts, interrupt experts, or the full union model.
 - CPU memory: attention reads per address, as a decaying heatmap.
 - Instruction dissection: the next instruction through the full CPU model
   on a copy of the engine, the residual stream read after every layer and
@@ -17,6 +17,7 @@ Everything is read from the live engines:
 from __future__ import annotations
 
 import re
+from functools import cached_property
 
 import numpy as np
 
@@ -30,16 +31,29 @@ from transformer_nes.graph.core import (
 )
 from transformer_nes.ppu2c02.render import EXPERTS
 
-PATHS = ("sequence module", "shape expert", "interrupt expert", "opcode expert", "full model")
+PATHS = ("shape expert", "interrupt expert", "opcode expert", "full model")
 # Auto-generated names carry no meaning to a reader; only named values are
 # listed (the anonymous ones still count toward each layer's activity).
 _ANONYMOUS = re.compile(r"^(reglu|persist|lookup|dim|memory_read)_\d+")
 # Values whose meaning is the whole instruction's input or result,
 # shown even when the graph computes them early.
 _HEADLINE = (
-    "in_pc_lo", "in_pc_hi", "in_a", "in_x", "in_y", "in_s",
-    "fetched_opcode", "fetched_operand_lo", "fetched_operand_hi", "ea",
-    "new_a", "new_x", "new_y", "new_s", "new_pc_lo", "new_pc_hi",
+    "in_pc_lo",
+    "in_pc_hi",
+    "in_a",
+    "in_x",
+    "in_y",
+    "in_s",
+    "fetched_opcode",
+    "fetched_operand_lo",
+    "fetched_operand_hi",
+    "ea",
+    "new_a",
+    "new_x",
+    "new_y",
+    "new_s",
+    "new_pc_lo",
+    "new_pc_hi",
 )
 
 
@@ -69,10 +83,18 @@ def disassemble(memory: bytes, pc: int) -> str:
     operand = memory[pc + 1 : pc + op.length]
     value = int.from_bytes(operand, "little") if operand else 0
     forms = {
-        "imm": f"#${value:02X}", "zpg": f"${value:02X}", "zpx": f"${value:02X},X",
-        "zpy": f"${value:02X},Y", "abs": f"${value:04X}", "abx": f"${value:04X},X",
-        "aby": f"${value:04X},Y", "ind": f"(${value:04X})", "idx": f"(${value:02X},X)",
-        "idy": f"(${value:02X}),Y", "acc": "A", "imp": "",
+        "imm": f"#${value:02X}",
+        "zpg": f"${value:02X}",
+        "zpx": f"${value:02X},X",
+        "zpy": f"${value:02X},Y",
+        "abs": f"${value:04X}",
+        "abx": f"${value:04X},X",
+        "aby": f"${value:04X},Y",
+        "ind": f"(${value:04X})",
+        "idx": f"(${value:02X},X)",
+        "idy": f"(${value:02X}),Y",
+        "acc": "A",
+        "imp": "",
         "rel": f"${(pc + 2 + (value - 256 if value > 127 else value)) & 0xFFFF:04X}",
     }
     return f"${pc:04X}  {op.mnemonic} {forms.get(op.mode, '')}".rstrip()
@@ -80,6 +102,19 @@ def disassemble(memory: bytes, pc: int) -> str:
 
 def _named(lives) -> list:
     return [life for life in lives if not _ANONYMOUS.match(life[0].name)]
+
+
+def _memory_read(dim):
+    if isinstance(dim, MemoryReadDimension):
+        return dim, dim.memory_read.address
+    site = getattr(dim, "memory_read", None)
+    if site is not None:
+        return dim, site["address"]
+    if isinstance(dim, PersistDimension):
+        sources = [d for d in dim.expr.terms if not isinstance(d, InputDimension)]
+        if len(sources) == 1:
+            return _memory_read(sources[0])
+    return None
 
 
 def layer_steps(named, snap, f_bits, slot_of, read_label, headline=()) -> dict:
@@ -99,15 +134,16 @@ def layer_steps(named, snap, f_bits, slot_of, read_label, headline=()) -> dict:
         return total
 
     steps = []
+    first_row = {dim: first for dim, _slot, first, _end in named}
     for dim, slot, first, end in named:
         value = values[min(end, len(values)) - 1, slot]
         if value == 0.0 and dim.name not in headline:
             continue  # a decode line that stayed off
         detail = ""
-        site = getattr(dim, "memory_read", None)
+        site = _memory_read(dim)
         if site is not None and first > 0:
-            # The read's query is the residual entering its layer.
-            address = evaluate(site["address"], first - 1)
+            source, expression = site
+            address = evaluate(expression, first_row.get(source, first) - 1)
             if address is not None:
                 detail = read_label(int(round(address)))
         steps.append((int(first), _kind(dim), dim.name, detail, float(value)))
@@ -126,7 +162,12 @@ class CpuXray:
     def __init__(self, runtime):
         self.runtime = runtime
         self.engine = runtime.engine.engine
-        self.named = _named(runtime.lives)
+
+    @cached_property
+    def named(self):
+        # Counters need only the running engine. Materialize the full graph
+        # and its debug labels when a dissection actually asks for them.
+        return _named(self.runtime.lives)
 
     def take_paths(self) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
         """Instructions per path since the last call, and the opcodes that
@@ -134,8 +175,12 @@ class CpuXray:
         paths, opcodes, _dispatches = self.engine.xray_take()
         busiest = np.argsort(opcodes)[::-1][:8]
         top = [
-            (f"{OPCODES[int(b)].mnemonic} {OPCODES[int(b)].mode}" if int(b) in OPCODES
-             else f"${int(b):02X}", int(opcodes[b]))
+            (
+                f"{OPCODES[int(b)].mnemonic} {OPCODES[int(b)].mode}"
+                if int(b) in OPCODES
+                else f"${int(b):02X}",
+                int(opcodes[b]),
+            )
             for b in busiest
             if opcodes[b]
         ]
@@ -148,12 +193,16 @@ class CpuXray:
 
     def dissect(self) -> dict:
         """The next instruction, layer by layer through the full model."""
-        snap, f_bits = self.engine.trace_union()
+        snap, f_bits = self.runtime.trace_union()
         memory = self.runtime.engine.dump_ram()
         pc = int(self.runtime.engine.get_run_state()["pc"])
         out = layer_steps(
-            self.named, snap, f_bits, self.runtime.slot_of,
-            lambda address: f"mem[${address & 0xFFFF:04X}]", _HEADLINE,
+            self.named,
+            snap,
+            f_bits,
+            self.runtime.slot_of,
+            lambda address: f"mem[${address & 0xFFFF:04X}]",
+            _HEADLINE,
         )
         return {"title": disassemble(memory, pc), **out}
 
@@ -183,8 +232,14 @@ class PpuXray:
 
     def __init__(self, ppu_engine):
         self.engine = ppu_engine  # its model 0 is the full render graph
-        self.named = _named(ppu_engine.lives)
-        self.life_of = {life[0].name: life for life in self.named}
+
+    @cached_property
+    def named(self):
+        return _named(self.engine.lives)
+
+    @cached_property
+    def life_of(self):
+        return {life[0].name: life for life in self.named}
 
     def knock_out(self, console, name: str, value: int = 0) -> str:
         """Ablate a named value of the render graph: force it to `value`
@@ -245,7 +300,7 @@ class ReadHeat:
         return [(f"${int(p):02X}00", int(pages[p])) for p in order if pages[p] >= 1]
 
 
-NATIVE = 255  # Ppu::native_slot: a slot the native PPU drew
+UNRENDERED = 255  # Ppu::unrendered_slot: no transformer output yet
 
 
 def _rgba(r: int, g: int, b: int) -> int:
@@ -254,12 +309,12 @@ def _rgba(r: int, g: int, b: int) -> int:
 
 def expert_colors(names: list[str]) -> list[int]:
     """An RGBA color per render model id (0 the full graph, k the k-th
-    expert, NATIVE), from what each expert's pins fix: blue shades per
+    expert, UNRENDERED), from what each expert's pins fix: blue shades per
     fine x for the plain background experts (lighter with table 1),
     orange with sprites, green at the line's edge slots; the variants
     that keep the CHR-latch logic lean purple."""
     colors = [_rgba(230, 70, 60)] * 256  # the full graph
-    colors[NATIVE] = _rgba(70, 70, 76)
+    colors[UNRENDERED] = _rgba(70, 70, 76)
     for model, name in enumerate(names, start=1):
         pins = EXPERTS[name]
         r, g, b = 250, 160, 40  # sprites: nothing below pins sprite pixels off
@@ -276,8 +331,8 @@ def expert_colors(names: list[str]) -> list[int]:
 
 def ppu_expert_summary(expert_map: bytes, names: list[str]) -> list[tuple[str, int]]:
     """Slots per render expert in the last frame (0 = the full graph,
-    255 = native rendering), busiest first."""
+    255 = no output yet), busiest first."""
     counts = np.bincount(np.frombuffer(expert_map, np.uint8), minlength=256)
-    label = {0: "full graph", NATIVE: "native"} | {i + 1: n for i, n in enumerate(names)}
+    label = {0: "full graph", UNRENDERED: "no output yet"} | {i + 1: n for i, n in enumerate(names)}
     order = np.argsort(counts)[::-1]
     return [(label.get(int(i), f"model {int(i)}"), int(counts[i])) for i in order if counts[i]]

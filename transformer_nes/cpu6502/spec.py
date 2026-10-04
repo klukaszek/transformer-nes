@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import builtins
 from dataclasses import dataclass
 
 # ── Processor status flag bits (NV-BDIZC) ─────────────────────────
@@ -62,23 +61,47 @@ MODE_RELATIVE = "rel"
 MODE_IMPLIED = "imp"
 MODE_ACCUMULATOR = "acc"
 MODE_LENGTH = {
-    MODE_IMPLIED: 1, MODE_ACCUMULATOR: 1,
-    MODE_IMMEDIATE: 2, MODE_ZERO_PAGE: 2, MODE_ZERO_PAGE_X: 2, MODE_ZERO_PAGE_Y: 2,
-    MODE_RELATIVE: 2, MODE_INDIRECT_X: 2, MODE_INDIRECT_Y: 2,
-    MODE_ABSOLUTE: 3, MODE_ABSOLUTE_X: 3, MODE_ABSOLUTE_Y: 3, MODE_INDIRECT: 3,
+    MODE_IMPLIED: 1,
+    MODE_ACCUMULATOR: 1,
+    MODE_IMMEDIATE: 2,
+    MODE_ZERO_PAGE: 2,
+    MODE_ZERO_PAGE_X: 2,
+    MODE_ZERO_PAGE_Y: 2,
+    MODE_RELATIVE: 2,
+    MODE_INDIRECT_X: 2,
+    MODE_INDIRECT_Y: 2,
+    MODE_ABSOLUTE: 3,
+    MODE_ABSOLUTE_X: 3,
+    MODE_ABSOLUTE_Y: 3,
+    MODE_INDIRECT: 3,
 }
 
 # Reads that take a cycle more when an indexed address carries into the
 # high byte; the unofficial absolute,X NOPs read too (nestest's CYC column).
-PAGE_CROSS_READ_OPERATIONS = frozenset({
-    "load_a", "load_x", "load_y", "adc", "sbc", "cmp",
-    "and", "ora", "eor", "lax", "nop",
-})
+PAGE_CROSS_READ_OPERATIONS = frozenset(
+    {
+        "load_a",
+        "load_x",
+        "load_y",
+        "adc",
+        "sbc",
+        "cmp",
+        "and",
+        "ora",
+        "eor",
+        "lax",
+        "nop",
+    }
+)
 BRANCH_CONDITIONS = {
-    "bpl": (FLAG_N, 0), "bmi": (FLAG_N, FLAG_N),
-    "bvc": (FLAG_V, 0), "bvs": (FLAG_V, FLAG_V),
-    "bcc": (FLAG_C, 0), "bcs": (FLAG_C, FLAG_C),
-    "bne": (FLAG_Z, 0), "beq": (FLAG_Z, FLAG_Z),
+    "bpl": (FLAG_N, 0),
+    "bmi": (FLAG_N, FLAG_N),
+    "bvc": (FLAG_V, 0),
+    "bvs": (FLAG_V, FLAG_V),
+    "bcc": (FLAG_C, 0),
+    "bcs": (FLAG_C, FLAG_C),
+    "bne": (FLAG_Z, 0),
+    "beq": (FLAG_Z, FLAG_Z),
 }
 BRANCH_OPERATIONS = frozenset(BRANCH_CONDITIONS)
 
@@ -200,98 +223,51 @@ def opcode_for(byte: int) -> Opcode:
 # addressing mode they can trigger a device read.  RMW ops count (they read
 # before writing); so does NOP, whose unofficial memory modes issue real
 # bus reads on hardware.
-READS_MEMORY = frozenset({
-    "load_a", "load_x", "load_y", "adc", "sbc", "cmp", "cpx", "cpy",
-    "and", "ora", "eor", "bit", "asl", "lsr", "rol", "ror", "inc", "dec",
-    "lax", "dcp", "isb", "slo", "rla", "sre", "rra", "nop",
-})
+READS_MEMORY = frozenset(
+    {
+        "load_a",
+        "load_x",
+        "load_y",
+        "adc",
+        "sbc",
+        "cmp",
+        "cpx",
+        "cpy",
+        "and",
+        "ora",
+        "eor",
+        "bit",
+        "asl",
+        "lsr",
+        "rol",
+        "ror",
+        "inc",
+        "dec",
+        "lax",
+        "dcp",
+        "isb",
+        "slo",
+        "rla",
+        "sre",
+        "rra",
+        "nop",
+    }
+)
 
 # Addressing modes that access a memory operand (immediate, accumulator,
 # implied, and relative never touch the bus for their operand).
-MEMORY_MODES = frozenset({
-    MODE_ZERO_PAGE, MODE_ZERO_PAGE_X, MODE_ZERO_PAGE_Y,
-    MODE_ABSOLUTE, MODE_ABSOLUTE_X, MODE_ABSOLUTE_Y,
-    MODE_INDIRECT_X, MODE_INDIRECT_Y,
-})
-
-
-# ── Tiny assembler helpers (for tests / examples) ─────────────────
-
-class Asm:
-    """Minimal assembler for the initial opcode subset.
-
-    Usage:
-        program = (
-            Asm()
-            .lda_imm(0x42)
-            .sta_zpg(0x10)
-            .brk()
-            .bytes()
-        )
-    """
-
-    def __init__(self):
-        self.buf: bytearray = bytearray()
-
-    def append(self, *values: int) -> Asm:
-        for v in values:
-            if not 0 <= v <= 0xFF:
-                raise ValueError(f"byte out of range: {v}")
-            self.buf.append(v)
-        return self
-
-    def bytes(self) -> builtins.bytes:
-        return bytes(self.buf)
-
-    # Load / store
-    def lda_imm(self, value: int) -> Asm:
-        return self.append(0xA9, value)
-
-    def ldx_imm(self, value: int) -> Asm:
-        return self.append(0xA2, value)
-
-    def ldy_imm(self, value: int) -> Asm:
-        return self.append(0xA0, value)
-
-    def sta_zpg(self, addr: int) -> Asm:
-        return self.append(0x85, addr)
-
-    def sta_abs(self, addr: int) -> Asm:
-        return self.append(0x8D, addr & 0xFF, (addr >> 8) & 0xFF)
-
-    # Arithmetic
-    def adc_imm(self, value: int) -> Asm:
-        return self.append(0x69, value)
-
-    def sbc_imm(self, value: int) -> Asm:
-        return self.append(0xE9, value)
-
-    # Register inc/dec/transfer
-    def inx(self) -> Asm:
-        return self.append(0xE8)
-
-    def dex(self) -> Asm:
-        return self.append(0xCA)
-
-    def tax(self) -> Asm:
-        return self.append(0xAA)
-
-    # Flow control
-    def jmp_abs(self, addr: int) -> Asm:
-        return self.append(0x4C, addr & 0xFF, (addr >> 8) & 0xFF)
-
-    def beq(self, offset: int) -> Asm:
-        if not -128 <= offset <= 127:
-            raise ValueError(f"branch offset out of range: {offset}")
-        return self.append(0xF0, offset & 0xFF)
-
-    def brk(self) -> Asm:
-        return self.append(0x00)
-
-
-def asm() -> Asm:
-    """Return a fresh assembler builder."""
-    return Asm()
+MEMORY_MODES = frozenset(
+    {
+        MODE_ZERO_PAGE,
+        MODE_ZERO_PAGE_X,
+        MODE_ZERO_PAGE_Y,
+        MODE_ABSOLUTE,
+        MODE_ABSOLUTE_X,
+        MODE_ABSOLUTE_Y,
+        MODE_INDIRECT_X,
+        MODE_INDIRECT_Y,
+    }
+)
 
 
 def written_addresses(addr: int, mirror_cpu_ram: bool) -> range:

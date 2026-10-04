@@ -8,10 +8,9 @@ The persist/output phase is a linear projection. For each output slot:
   delta[slot] = persist_expr evaluated over gate/passthrough outputs
               - old_value (if slot was reused from a dead dim)
 
-The weights live in plain numpy arrays (WeightModel).  model/inference.py
-runs them as an exact reference forward; the 6502 executes through the
-generated C++ engine (model/engine_gen.py).  Torch is used only
-to compile that engine (torch.utils.cpp_extension), not as a tensor library.
+The weights live in plain numpy arrays (WeightModel). model/inference.py
+runs an exact reference forward; model/torch_codegen.py lowers their matrix
+operations through PyTorch Inductor for CPU and PPU execution.
 """
 
 import logging
@@ -35,14 +34,13 @@ from transformer_nes.graph.core import (
 
 logger = logging.getLogger(__name__)
 
-HARD_K = 1e10  # softmax temperature scaling to approximate hardmax (argmax) attention
+HARD_K = 1e10  # construction temperature: attention at its argmax limit (export divides it out)
 
 
 class BuildInfo(NamedTuple):
     """The schedule/layout facts a caller needs alongside the weights."""
 
     n_layers: int
-    std_layers: list
     slot_of: dict
     d_model: int
     # (dim, slot, first, end): the dim holds `slot` in the residual stream
@@ -76,26 +74,23 @@ class _Attn:
 
 
 class WeightModel:
-    """Numpy weight container the analytic construction populates and the
-    generated C++ engine reads.  Not a torch module; the reference forward is
-    model/inference.py."""
+    """Numpy weight container for analytic construction, Torch compilation,
+    export and the exact reference forward in model/inference.py."""
 
     # Per-layer classification metadata, attached by build_model: head/FFN
-    # kinds (0 unused, 1 lookup, 2 passthrough), tie-breaks, cache/memory
+    # kinds (0 unused, 1 lookup, 2 passthrough), tie-breaks, memory
     # groups, lookup provenance, and erase masks.
     head_kinds: list[list[int]]
     ffn_kinds: list[list[int]]
     head_tiebreak: list[list[int]]
-    head_cache_groups: list[list[int]]
     head_memory_groups: list[list[int]]
     head_lookup_ids: list[list[int]]
     head_pairs: list[list[int]]
     head_memory_outputs: list[list[tuple[str, ...] | None]]
     one_slot: int
 
-    def __init__(self, vocab, d_model, n_heads, n_layers, d_ffn, stop_token_id=0):
+    def __init__(self, vocab, d_model, n_heads, n_layers, d_ffn):
         # n_heads / d_ffn are per-layer sequences: the layers are ragged.
-        self.stop_token_id = stop_token_id
         self.tok = _Weight((vocab, d_model))
         self.attn = [_Attn(d_model, n_heads[li]) for li in range(n_layers)]
         self.ff_in = [_Weight((2 * d_ffn[li], d_model)) for li in range(n_layers)]
@@ -165,7 +160,8 @@ def assign_slots(input_dims, output_tokens, alive_after, n_layers, recycle_slots
 
     output_only = {
         d
-        for expr in output_tokens.values() if isinstance(expr, Expression)
+        for expr in output_tokens.values()
+        if isinstance(expr, Expression)
         for d in expr.terms
         if d not in slot_of and d not in input_dims
     }
@@ -179,8 +175,9 @@ def assign_slots(input_dims, output_tokens, alive_after, n_layers, recycle_slots
         slot_of=slot_of,
         d_model=next_slot + next_slot % 2,  # even, for the 2-wide head projections
         erased_at=erased_at,
-        lives=[(d, slot_of[d], first, end_row.get(d, n_layers + 1))
-               for d, first in first_row.items()],
+        lives=[
+            (d, slot_of[d], first, end_row.get(d, n_layers + 1)) for d, first in first_row.items()
+        ],
     )
 
 
@@ -225,9 +222,9 @@ def build_model(program_graph, schedule, recycle_slots=True):
         d for d in ALL_DIMS if isinstance(d, ReGLUDimension) and d not in non_internal
     }
     internal_lookups = {
-        d for d in ALL_DIMS
-        if isinstance(d, (LookUpDimension, MemoryReadDimension))
-        and d not in non_internal
+        d
+        for d in ALL_DIMS
+        if isinstance(d, (LookUpDimension, MemoryReadDimension)) and d not in non_internal
     }
     internal_persists = {
         d for d in ALL_DIMS if isinstance(d, PersistDimension) and d not in non_internal
@@ -272,8 +269,7 @@ def build_model(program_graph, schedule, recycle_slots=True):
                 if d not in slot_of or d in internal_dims:
                     continue
                 if not (
-                    isinstance(d, (LookUpDimension, MemoryReadDimension))
-                    and d in lookup_dims_set
+                    isinstance(d, (LookUpDimension, MemoryReadDimension)) and d in lookup_dims_set
                 ):
                     pt_srcs.add(slot_of[d])
 
@@ -304,13 +300,11 @@ def build_model(program_graph, schedule, recycle_slots=True):
         n_heads=heads_per_layer,
         n_layers=n_layers,
         d_ffn=ffn_per_layer,
-        stop_token_id=tok_to_idx_map.get("halt", 0),
     )
 
     # ── Populate weights ──────────────────────────────────────────
     sqrt_dh = math.sqrt(2.0)
     n_pt_h = n_pt_g = 0
-    head_map = {}  # layer_idx -> {head_idx -> info}
 
     # Embedding
     for tok_name, expr in input_tokens.items():
@@ -328,6 +322,13 @@ def build_model(program_graph, schedule, recycle_slots=True):
     # ── Per-layer weights ─────────────────────────────────────
     all_tiebreak = []
     all_ffn_kinds = []
+    # Emit only the metadata consumed by inference, lowering, and export.
+    # Provenance maps folded experts onto their union's attention state.
+    model.head_kinds = []
+    model.head_memory_groups = []
+    model.head_lookup_ids = []
+    model.head_pairs = []
+    model.head_memory_outputs = []
 
     for layer_idx in range(n_layers):
         attn, persist1, ffn, persist2 = std_layers[layer_idx]
@@ -349,10 +350,11 @@ def build_model(program_graph, schedule, recycle_slots=True):
         layer_tiebreak = []
 
         # 1) LookUp heads
-        layer_heads = {}
-
-        def expr_sig(expr):
-            return tuple(sorted((d.id, c) for d, c in expr.terms.items()))
+        kinds = [0] * n_heads
+        memory_groups = [-1] * n_heads
+        lookup_ids = [-1] * n_heads
+        pairs = [-1] * n_heads
+        memory_outputs = [None] * n_heads
 
         for lu in attn:
             if isinstance(lu, MemoryRead):
@@ -363,8 +365,8 @@ def build_model(program_graph, schedule, recycle_slots=True):
                 memory_group = MEMORY_GROUP_FUSED
             else:
                 value_exprs = lu.value_exprs
-                query_exprs = lu.query_exprs_2d
-                key_exprs = lu.key_exprs_2d
+                query_exprs = lu.query_exprs
+                key_exprs = lu.key_exprs
                 tie_break = lu.tie_break
                 memory_group = lu.memory_group
             nv = len(value_exprs)
@@ -390,42 +392,12 @@ def build_model(program_graph, schedule, recycle_slots=True):
                     if d1 not in internal_lookups:
                         op_w[slot_of[d1], h * 2 + 1] = 1.0
 
-                vals = [d0.name]
-                if p * 2 + 1 < nv:
-                    vals.append(lu.dims[p * 2 + 1].name)
-                v1_sig = expr_sig(value_exprs[p * 2 + 1]) if p * 2 + 1 < nv else ()
-                q_terms = {d.name: c for d, c in query_exprs[0].terms.items()}
-                q_terms.update(
-                    {"qy_" + d.name: c for d, c in query_exprs[1].terms.items()}
-                )
-                k_terms = {d.name: c for d, c in key_exprs[0].terms.items()}
-                k_terms.update(
-                    {"ky_" + d.name: c for d, c in key_exprs[1].terms.items()}
-                )
-                layer_heads[h] = {
-                    "type": "lookup",
-                    "lookup": lu.name,
-                    "lookup_id": lu.id,
-                    "pair": p,
-                    "values": vals,
-                    "tie_break": tie_break,
-                    "memory_group": (
-                        -1 if memory_group is None else memory_group
-                    ),
-                    "memory_outputs": (
-                        tuple(lu.output_kinds[p * 2:p * 2 + 2])
-                        if isinstance(lu, MemoryRead) else None
-                    ),
-                    "cache_key": (
-                        ("memory_read", lu.id, p)
-                        if isinstance(lu, MemoryRead)
-                        else (
-                            expr_sig(key_exprs[0]), expr_sig(key_exprs[1]),
-                            expr_sig(value_exprs[p * 2]), v1_sig,
-                        )
-                    ),
-                }
-        head_map[layer_idx] = layer_heads
+                kinds[h] = 1
+                memory_groups[h] = -1 if memory_group is None else memory_group
+                lookup_ids[h] = lu.id
+                pairs[h] = p
+                if isinstance(lu, MemoryRead):
+                    memory_outputs[h] = tuple(lu.output_kinds[p * 2 : p * 2 + 2])
 
         # 2) Passthrough contributions: src_slot -> {dst_slot: coeff}
         #    Persist terms referencing non-lookup dims need passthrough.
@@ -459,14 +431,12 @@ def build_model(program_graph, schedule, recycle_slots=True):
             for dst, coeff in dsts1.items():
                 op_w[dst, h * 2] += coeff
 
-            pt_info = {"type": "passthrough", "slot_v0": src1}
+            kinds[h] = 2
             if pair_idx + 1 < len(pt_items):
                 src2, dsts2 = pt_items[pair_idx + 1]
                 ip[v_base + h * 2 + 1, src2] = 1.0
                 for dst, coeff in dsts2.items():
                     op_w[dst, h * 2 + 1] += coeff
-                pt_info["slot_v1"] = src2
-            layer_heads[h] = pt_info
 
         n_pt_h += len(pt_items)
         # Passthrough/erase heads rely on the LATEST tie-break (constant
@@ -477,7 +447,11 @@ def build_model(program_graph, schedule, recycle_slots=True):
         while len(layer_tiebreak) < n_heads:
             layer_tiebreak.append(1)
         all_tiebreak.append(layer_tiebreak)
-
+        model.head_kinds.append(kinds)
+        model.head_memory_groups.append(memory_groups)
+        model.head_lookup_ids.append(lookup_ids)
+        model.head_pairs.append(pairs)
+        model.head_memory_outputs.append(memory_outputs)
 
         # ── FFN HALF-LAYER ────────────────────────────────────
         reglu_to_gate = {}
@@ -522,7 +496,6 @@ def build_model(program_graph, schedule, recycle_slots=True):
         assert j <= d_ffn, f"L{layer_idx} ffn: {j} neurons > {d_ffn}"
         all_ffn_kinds.append(layer_ffn_kinds)
 
-
     model.head_tiebreak = all_tiebreak
     # FFN neuron classification per layer: 0 unused, 1 ReGLU, 2 linear
     # passthrough/erase neuron.  Fast engines can fuse kind-2 neurons into a
@@ -531,48 +504,6 @@ def build_model(program_graph, schedule, recycle_slots=True):
     # the constant-one expression; one_slot lets consumers verify that.
     model.ffn_kinds = all_ffn_kinds
     model.one_slot = slot_of[next(iter(one_expr.terms))]
-    # Head classification per layer (0 unused, 1 lookup, 2 passthrough).
-    # Passthrough/erase heads provably attend to self (their key is 2*pos,
-    # strictly increasing), which lets the generated engine skip them.
-    model.head_kinds = []
-    model.head_cache_groups = []
-    model.head_memory_groups = []
-    # Lookup provenance per head: the graph LookUp id and value-pair index
-    # (-1 for non-lookup heads).  An engine hosting several models built
-    # from folds of one union graph uses these to map every model's heads
-    # onto the union's shared attention state (memory structure, registers).
-    model.head_lookup_ids = []
-    model.head_pairs = []
-    model.head_memory_outputs = []
-    for layer_idx in range(n_layers):
-        nh = model.attn[layer_idx].num_heads
-        kinds = [0] * nh
-        cache_groups = [-1] * nh
-        memory_groups = [-1] * nh
-        lookup_ids = [-1] * nh
-        pairs = [-1] * nh
-        memory_outputs = [None] * nh
-        cache_group_of_key = {}
-        for h, info in head_map.get(layer_idx, {}).items():
-            if info["type"] == "lookup":
-                kinds[h] = 1
-                key = info["cache_key"]
-                if key not in cache_group_of_key:
-                    cache_group_of_key[key] = len(cache_group_of_key)
-                cache_groups[h] = cache_group_of_key[key]
-                memory_groups[h] = info["memory_group"]
-                lookup_ids[h] = info["lookup_id"]
-                pairs[h] = info["pair"]
-                memory_outputs[h] = info["memory_outputs"]
-            else:
-                kinds[h] = 2
-        model.head_kinds.append(kinds)
-        model.head_cache_groups.append(cache_groups)
-        model.head_memory_groups.append(memory_groups)
-        model.head_lookup_ids.append(lookup_ids)
-        model.head_pairs.append(pairs)
-        model.head_memory_outputs.append(memory_outputs)
-
     n_persist = sum(len(p1) + len(p2) for _, p1, _, p2 in std_layers)
     logger.debug(
         "Built model: d_model=%d, n_layers=%d, heads/layer max=%d mean=%.1f, "
@@ -593,6 +524,5 @@ def build_model(program_graph, schedule, recycle_slots=True):
         n_pt_g,
     )
 
-    info = BuildInfo(n_layers=n_layers, std_layers=std_layers,
-                     slot_of=slot_of, d_model=D, lives=layout.lives)
-    return model, all_tokens, tok_to_idx_map, info
+    info = BuildInfo(n_layers=n_layers, slot_of=slot_of, d_model=D, lives=layout.lives)
+    return model, tok_to_idx_map, info

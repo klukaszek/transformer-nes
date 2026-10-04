@@ -14,15 +14,22 @@ in [`transformer_nes/nes/`](../nes/).
 
 | File | Purpose |
 |------|---------|
-| `spec.py` | Shared opcode, addressing-mode, flag, memory-read, and timing metadata. It contains 227 opcode entries: 151 official NMOS opcodes plus the stable unofficial opcodes exercised by the tests. It also includes a small assembler for examples. |
+| `spec.py` | Shared opcode, addressing-mode, flag, memory-read, and timing metadata. It contains 227 opcode entries: 151 official NMOS opcodes plus the stable unofficial opcodes exercised by the tests. |
 | `interpreter.py` | Builds the 6502 graph from the graph DSL. |
 | `construction.py` | Defines the construction boundary and exposes the named dimensions consumed by scheduling and code generation. |
 | `trace.py` | Instruction-level state and memory-write records shared by both backends. |
 | `backends/reference.py` | Straightforward Python implementation used as the behavioral oracle. |
 | `backends/weights/runner.py` | Builds, caches, and runs the transformer-weights backend. |
-| `backends/weights/experts.py` | Builds folded opcode, interrupt, shape, and sequence execution models. |
-| `backends/weights/windows.py` | Finds concrete instruction windows and matches the ROM-independent shape library. |
-| `backends/weights/run_protocol.py` | Generates the native run-loop protocol used by the weights backend and the NES bus. |
+| `backends/weights/engine.py` | Emits model-specific embedding, readout and dispatch into the CPU runtime template. All neural layers run in the shared Torch compiler. |
+| `backends/weights/export.py` | Exports the self-contained union or folded experts as exact int32 safetensors and machine metadata. |
+| `backends/weights/checkpoint_runner.py` | Standalone PyTorch union runner, importing only the standard library, Torch and safetensors. |
+| `backends/weights/expert_runner.py` | Independent routed expert runner for exported checkpoints and runtime verification. |
+| `backends/weights/experts.py` | Orchestrates folding, dispatch proofs, effect projection, scheduling and ABI lowering. |
+| `backends/weights/folds.py` | Opcode pins, register/PC feedback, sequence composition and cached expert construction. |
+| `backends/weights/proofs.py` | Build-time constants, conservative ranges, symbolic-PC evaluation and read licenses. |
+| `backends/weights/execution.py` | Typed architectural effects, control/cycles, graph projection and lowering to residual slots. |
+| `backends/weights/shapes.py` | Fixed shape templates, recurrence proofs and matching against live cartridge bytes. |
+| `backends/weights/native/engine.cpp` | CPU runtime template: watches, read leases, cycle budgets, tracing and console bindings. |
 | `examples/klaus/` | Klaus Dormann functional-test binary and harness. |
 | `examples/nestest.py` | Harness for the nestest ROM and its Nintendulator golden log. |
 
@@ -72,38 +79,45 @@ The reference core can model either of the relevant CPU variants:
 - `bcd_enabled=False` models the NES 2A03, whose ADC/SBC ignore the decimal
   flag.
 
+The transformer's decimal circuitry assumes valid packed BCD operands;
+invalid decimal digits can disagree with the reference. The NES variant
+always uses binary arithmetic, including when its decimal flag is set.
+
 ### Transformer-weights backend
 
 `backends/weights/runner.py` builds the graph, schedules it with
 `model/schedule.py:asap_schedule`, constructs the weights analytically, and
-emits a generated C++ engine. There is no training step. The current
-production build with decimal mode enabled is 624 dimensions wide and 56
-layers deep; its attention and FFN widths vary by layer according to liveness
-and the schedule.
+emits a generated C++ engine. There is no training step. Its attention and
+FFN widths vary by layer according to liveness and the schedule; current
+sizes and paired measurements are in
+[the architecture notes](../../docs/neural-architecture.md).
 
 The model uses hardmax attention, ReGLU feed-forward units, and a residual
 stream. It has no position encoding: ordering is represented by the `LATEST`
 tie-break. In the generated engine, the residual arithmetic is exact
 fixed-point int32, and attention is served by licensed integer structures:
 
-- memory queries use exact nearest-written-address state;
-- constant-query `LATEST` lookups use running argmax registers; and
+- licensed structural memory queries index the latest-written byte image;
+- full and folded execution models share the Torch weight compiler; and
 - unsupported lookup shapes are rejected during code generation.
 
 The engine routes execution through several equivalent paths:
 
-1. Optional per-ROM sequence modules handle explicitly attached, statically
-   licensed instruction windows.
-2. A ROM-independent shape library recognizes common windows such as counter
-   loops and polling branches. Shape models are folded once with the PC and
-   operand bytes left symbolic, then matched against the live image.
-3. Folded opcode experts cover all 227 entries in the opcode table. Their
-   compact execution path stages writes and routes them through the same
-   memory, mapper, and watch machinery as the general path.
-4. The union graph remains the exact fallback for unsupported dispatch cases
-   and other paths that cannot use a specialized model. Interrupts have
-   dedicated folded experts and still retain the union implementation behind
-   them.
+1. A ROM-independent shape library recognizes polling and counter loops.
+   Shapes fold once with symbolic PC and operand bytes; dispatch rechecks their
+   instruction bytes and budgets against live memory.
+2. Per-opcode and interrupt experts compute compact architectural receipts:
+   registers, flags, ordered writes, next PC and exact cycles.
+3. The union model supplies the complete fallback and diagnostic trace.
+
+The production runtime always compiles the actual expert layer weights into one fixed
+Inductor bank. FX expands sparse matrix coefficients into integer tensor
+operations; Inductor performs constant propagation and fusion. Its generated
+kernels bind directly to the engine's residual and RAM, with stack scratch.
+The bank is independent of the ROM and loads before the first frame. There is
+no runtime learner, mutable window program, weight tensor pool or background
+attachment queue. The standalone exported checkpoint runners remain separate
+checks of ordinary transformer inference.
 
 The generated engine is cached by a digest of the source and construction
 configuration. A cache hit can load the compiled core without repeating the
@@ -124,7 +138,11 @@ The weights backend follows this sequence:
    the analytic attention and ReGLU matrices.
 4. `graph/fold.py` partially evaluates the union graph to build licensed
    opcode, interrupt, shape, and sequence models.
-5. `model/engine_gen.py` emits straight-line C++ and the native run loop.
+5. `model/torch_layout.py` and `model/torch_codegen.py` compile the actual
+   matrices with PyTorch Inductor, shared with the PPU. The graph fold exposes
+   licensed indexed reads before scheduling. `backends/weights/engine.py`
+   supplies embedding, architectural readout and the native run loop;
+   `model/build.py` builds and caches the extensions.
 
 The run loop can execute for a step or cycle budget, stop at a HALT or
 jump-to-self trap, stream bounded trace arrays, and pause on watched device
@@ -153,8 +171,11 @@ The native NES bus connects those devices to the CPU protocol:
 - Mapper bank changes can replace mapped ROM bytes in the engine's address
   structures without pretending that the CPU executed a write for every byte.
 
-The public weights-machine methods used by the bus include `load_image`,
-`run`, `inject_write`, `set_nmi`, `set_irq`, `watch_read`, and `watch_write`.
+Python boots the weights machine through `load_image` and installs device
+watches. During play the bus calls the shared native ABI in
+`backends/weights/native/machine_abi.h` for runs, writes, cartridge mapping,
+read leases and interrupts. The Python `run` and injection methods support
+verification harnesses.
 
 ## Verification
 

@@ -81,7 +81,7 @@ class Memory:
 def nametable_page(nt: ExprLike, pages: list[ExprLike]) -> Expression:
     """The source page of logical nametable `nt` (0-3), from the token's
     four page numbers."""
-    one = graph.one
+    one = graph.current_graph().one
     ge = [stepglu(one, nt - k) for k in (1, 2, 3)]
     onehot = [1 - ge[0], ge[0] - ge[1], ge[1] - ge[2], ge[2]]
     return sum((gate(h, p) for h, p in zip(onehot, pages, strict=True)), Expression())
@@ -89,7 +89,7 @@ def nametable_page(nt: ExprLike, pages: list[ExprLike]) -> Expression:
 
 def palette_offset(index: ExprLike) -> Expression:
     """Palette index 0-31 with $10/$14/$18/$1C folded onto $00/$04/..."""
-    one = graph.one
+    one = graph.current_graph().one
     b4 = stepglu(one, index - 16)
     b3 = stepglu(one, index - 16 * b4 - 8)
     b2 = stepglu(one, index - 16 * b4 - 8 * b3 - 4)
@@ -100,6 +100,6 @@ def palette_offset(index: ExprLike) -> Expression:
 def in_palette_region(v: dict[str, ExprLike]) -> Expression:
     """v & $3FFF >= $3F00, from loopy fields: fine y 3 or 7, nametable 3,
     coarse y >= 24."""
-    one = graph.one
+    one = graph.current_graph().one
     fy_low3 = either(equals(v["fy"], 3), equals(v["fy"], 7))
     return both(both(fy_low3, equals(v["nt"], 3)), stepglu(one, v["cy"] - 24))

@@ -15,8 +15,6 @@ Correctness contract for graph construction:
 
 from __future__ import annotations
 
-from typing import cast
-
 from transformer_nes.cpu6502.spec import (
     FLAG_B,
     FLAG_C,
@@ -66,38 +64,15 @@ from transformer_nes.graph.ops import (
     signed_byte,
     wrap8,
     wrap16,
+    wrapped_nz,
 )
-
-# WRITE/start/state token input dims: module globals rebound by build()
-# after each reset_graph; memory_at and the token builders read them.
-byte_value = cast("InputDimension", None)
-is_memory_write = cast("InputDimension", None)
-addr_lo = cast("InputDimension", None)
-addr_hi = cast("InputDimension", None)
-is_start = cast("InputDimension", None)
-is_state = cast("InputDimension", None)
-# wide_bits builds: WRITE tokens also carry the byte's bits (MSB first),
-# so structural folds can serve a read's bits with the read itself.
-write_bits = cast("tuple", ())
-
-
-def memory_at(address: ExprLike, name: str) -> Expression:
-    """Read the latest WRITE token at the given 16-bit address."""
-    write_addr_expr = addr_lo + 256 * addr_hi
-    value = grouped_read(address, byte_value, write_addr_expr, is_memory_write, group_count=16)
-    # The 16-group form exists for the union's f32 attention-score range;
-    # expert engines serve reads exactly and never compute it.
-    return memory_site(
-        persist(value, name=name), address, byte_value, write_addr_expr, is_memory_write
-    )
-
 
 # ── Graph helper implementations ───────────────────────────────────
 
 
 def overflow(a: ExprLike, b: ExprLike, r: ExprLike) -> Expression:
     """Return 1 iff the sign of r differs from a and b while a and b agree."""
-    one = graph.one
+    one = graph.current_graph().one
     a_sign = stepglu(one, a - 128)
     b_sign = stepglu(one, b - 128)
     r_sign = stepglu(one, r - 128)
@@ -110,7 +85,7 @@ def overflow_wide(a_bit7: ExprLike, b_bit7: ExprLike, raw: ExprLike) -> Expressi
     """Signed-overflow flag in ONE parallel stage from served sign bits:
     the signed sum s = raw - 256*(a7 + b7) is in [-256, 255], and
     V = [s < -128] + [s > 127].  Exact for integer inputs."""
-    one = graph.one
+    one = graph.current_graph().one
     s = raw - 256 * to_expr(a_bit7) - 256 * to_expr(b_bit7)
     return (1 - stepglu(one, s + 128)) + stepglu(one, s - 128)
 
@@ -119,7 +94,7 @@ def flat_nz(raw: ExprLike) -> tuple[Expression, Expression]:
     """(N, Z) of wrap8(raw) for raw in [-255, 255], each ONE parallel
     stage on raw itself -- no serial wrap8 before the flag thresholds.
     N: result >= 128 iff raw >= 128 or -128 <= raw < 0; Z: raw == 0."""
-    one = graph.one
+    one = graph.current_graph().one
     n = (stepglu(one, raw - 128) + stepglu(one, raw + 128)
          - stepglu(one, raw))
     z = stepglu(one, raw) + stepglu(one, -raw) - 1
@@ -130,7 +105,7 @@ def bitwise_nz(bits_msb_first) -> tuple[ExprLike, ExprLike]:
     """(N, Z) of a logical result from its bits (MSB-first): N is the MSB,
     Z is set iff no bit is -- one parallel stage off the served result bits,
     not the reassembled byte's flag chain."""
-    one = graph.one
+    one = graph.current_graph().one
     return bits_msb_first[0], 1 - stepglu(one, sum(bits_msb_first) - 1)
 
 
@@ -140,7 +115,7 @@ def pulled_flag_bits(value: ExprLike, name: str) -> dict[int, Expression]:
     ge[k] = step(value >= k) for k in 1..255; every bit is then a linear
     telescoping run sum over the ladder (eq_k = ge_k - ge_{k+1}), so eight
     extractions share 255 parallel stepglus at depth one."""
-    one = graph.one
+    one = graph.current_graph().one
     ge = {k: stepglu(one, value - k) for k in range(1, 256)}
     bits: dict[int, Expression] = {}
     for b in range(8):
@@ -156,8 +131,7 @@ def pulled_flag_bits(value: ExprLike, name: str) -> dict[int, Expression]:
 # ── Main graph builder ─────────────────────────────────────────────
 
 
-def build(*, bcd: bool = True, wide_bits: bool = False,
-          ) -> tuple[dict[str, Expression], dict[str, Expression]]:
+def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expression], dict[str, Expression]]:
     """Build the 6502 graph.  See the module docstring for the construction
     contract; bcd=False builds the NES 2A03 variant (no decimal mode).
 
@@ -165,13 +139,17 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     (extract_bits_wide) and has the harness serve each byte's bits as 16
     extra inputs -- less depth, wider token contract.  The generated engine
     builds True; the safetensors export builds False because an artifact
-    must derive its own bits to stand alone.  Both are load-bearing."""
-    one = graph.one
+    must derive its own bits to stand alone. Both are load-bearing."""
+    one = graph.current_graph().one
     bits_of = extract_bits_wide if wide_bits else extract_bits
 
+    def memory_at(address: ExprLike, name: str) -> Expression:
+        """Latest WRITE at a 16-bit address, through attention."""
+        write_addr = addr_lo + 256 * addr_hi
+        value = grouped_read(address, byte_value, write_addr, is_memory_write, group_count=16)
+        return memory_site(persist(value, name=name), address, byte_value, write_addr, is_memory_write)
+
     # ── Input dimensions ────────────────────────────────────────────
-    global byte_value, is_memory_write, addr_lo, addr_hi, is_start, is_state
-    global write_bits
     byte_value = InputDimension("byte_value")
     is_memory_write = InputDimension("is_memory_write")
     addr_lo = InputDimension("addr_lo")
@@ -888,17 +866,28 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
     n_alu = stepglu(one, nz_alu - 128)
     z_alu = 1 - stepglu(one, nz_alu - 1)
 
-    # For memory-modifying operations (inc/dec/shifts), NZ comes from the result
-    nz_mem = mux(
-        family["inc"], inc_result,
-        mux(family["dec"], dec_result,
-            mux(family["asl"], asl_result,
-                mux(family["lsr"], lsr_result,
-                    mux(family["rol"], rol_result,
-                        mux(family["ror"], ror_result, 0))))))
-    nz_mem = persist(nz_mem, name="nz_mem")
-    n_mem = stepglu(one, nz_mem - 128)
-    z_mem = 1 - stepglu(one, nz_mem - 1)
+    # Read the flags in parallel with wrapping the result, rather than
+    # feeding the wrapped byte through another nonlinear layer.
+    direct_nz = {
+        name: wrapped_nz(raw, lo=lo, hi=hi)
+        for name, raw, lo, hi in (
+            ("inx", current_x + 1, 1, 256), ("iny", current_y + 1, 1, 256),
+            ("dex", current_x - 1, -1, 254), ("dey", current_y - 1, -1, 254),
+            ("inc", operand + 1, 1, 256), ("dec", operand - 1, -1, 254),
+        )
+    }
+    if not bcd:
+        direct_nz.update(adc=wrapped_nz(adc_raw, lo=0, hi=511),
+                         sbc=wrapped_nz(sbc_raw, lo=0, hi=511))
+    # A shift's surviving magnitude and sign are available before its byte
+    # result is projected. Discarding just the outgoing bit suffices for Z.
+    direct_nz.update(
+        asl=(operand_bits[1], 1 - stepglu(one, operand - 128 * operand_bits[0] - 1)),
+        rol=(operand_bits[1], 1 - stepglu(one, operand - 128 * operand_bits[0] + carry_in - 1)),
+        lsr=(0, 1 - stepglu(one, operand - operand_bits[7] - 1)),
+        ror=(carry_in, 1 - stepglu(one, operand - operand_bits[7] + carry_in - 1)),
+    )
+    direct_writers = sum(family[name] for name in direct_nz)
 
     # Branch/flag ops
     bpl_taken = multiply(1 - current_p_n, family["bpl"])
@@ -949,17 +938,13 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
         + family["inc"] + family["dec"] + family["asl"] + family["lsr"] + family["rol"] + family["ror"]
         + family["lax"] + family["slo"] + family["rla"] + family["sre"] + family["rra"] + family["isb"]
     )
-    # N and Z share one gate partition: the memory-result families (RMW and
-    # both shift modes) report the memory result, the rest of writes_z reports
-    # the ALU result, and compares/logic are disjoint from both -- so each flag
-    # is one parallel gated sum instead of a nine-deep select.  family["bit"]
-    # overrides further down, once bit_z/bit_n exist.
-    nz_from_mem = family["inc"] + family["dec"] + family["asl"] + family["lsr"] + family["rol"] + family["ror"]
+    # Direct readouts, ALU-result flags and compares/logic are disjoint, so
+    # each flag is one parallel gated sum. BIT overrides further down.
     nz_writers = (writes_z + family["cmp"] + family["cpx"] + family["cpy"] + family["dcp"]
                   + family["and"] + family["ora"] + family["eor"])
     new_p_z = (
-        multiply(nz_from_mem, z_mem)
-        + multiply(writes_z - nz_from_mem, z_alu)
+        multiply(writes_z - direct_writers, z_alu)
+        + sum(multiply(family[name], z) for name, (_n, z) in direct_nz.items())
         + multiply(family["cmp"], cmp_z)
         + multiply(family["cpx"], cpx_z)
         + multiply(family["cpy"], cpy_z)
@@ -973,8 +958,8 @@ def build(*, bcd: bool = True, wide_bits: bool = False,
 
     # Negative flag updates
     new_p_n = (
-        multiply(nz_from_mem, n_mem)
-        + multiply(writes_z - nz_from_mem, n_alu)
+        multiply(writes_z - direct_writers, n_alu)
+        + sum(multiply(family[name], n) for name, (n, _z) in direct_nz.items())
         + multiply(family["cmp"], cmp_n)
         + multiply(family["cpx"], cpx_n)
         + multiply(family["cpy"], cpy_n)

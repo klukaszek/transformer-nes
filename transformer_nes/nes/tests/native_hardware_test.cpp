@@ -3,6 +3,7 @@
 #include "nes/mappers/mappers.h"
 #include "nes/ppu.h"
 #include "nes/tape.h"
+#include "ui/frame_clock.h"
 
 #include <cassert>
 
@@ -221,7 +222,6 @@ static void test_bus_and_controller() {
   controller.write(0x4016, 0, 0);
   assert(controller.read(0x4016, 0) == 0x41);
   assert(controller.read(0x4016, 0) == 0x40);
-  assert(controller.polls == 1);
 }
 
 // A PPU showing tile 1 (solid, color 1) everywhere, sprite 0 an
@@ -367,10 +367,45 @@ static void test_tape() {
   assert(tape.buttons_at(9) == 0x81);
 }
 
+static void test_frame_clock() {
+  using transformer_nes::ui::FrameClock;
+  constexpr double period = 29'781.0 / 1'789'772.727272727;
+  FrameClock clock(period);
+  // A 6 ms emulation fits a 120 Hz display. Crossing the former half-frame
+  // budget must not erase the phase remaining after an emulated frame.
+  clock.advance(1.75 * period);
+  assert(clock.ready());
+  clock.consume();
+  clock.discard_backlog();
+  clock.advance(0.30 * period);
+  assert(clock.ready());
+  clock.consume();
+  assert(!clock.ready());
+  // Large stalls retain at most four complete frames plus fractional phase.
+  clock.advance(100.5 * period);
+  int due = 0;
+  while (clock.ready()) { clock.consume(); ++due; }
+  assert(due == 4);
+  clock.advance(-1.0);
+  clock.advance(0.5 * period);
+  assert(clock.ready());
+  // An uncapped wall clock keeps NTSC rate across 60/120/144 Hz displays.
+  for (double hz : {60.0, 120.0, 144.0}) {
+    FrameClock paced(period);
+    int frames = 0;
+    for (int display = 0; display < int(10 * hz); ++display) {
+      paced.advance(1.0 / hz);
+      while (paced.ready()) { paced.consume(); ++frames; }
+    }
+    assert(frames == int(10.0 / period));
+  }
+}
+
 int main() {
   test_mappers();
   test_bus_and_controller();
   test_ppu();
   test_apu();
   test_tape();
+  test_frame_clock();
 }

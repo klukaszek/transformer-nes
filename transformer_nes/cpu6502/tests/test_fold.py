@@ -8,57 +8,58 @@ reference/weights lockstep suites; this module only checks construction facts.
 import pytest
 
 from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.weights.experts import (
+from transformer_nes.cpu6502.backends.weights.engine import generate_source
+from transformer_nes.cpu6502.backends.weights.execution import (
     SEQUENCE_ROOT_DIMS,
     SEQUENCE_STATE_DIMS,
+    ControlFlow,
+    project_sequence_execution,
+)
+from transformer_nes.cpu6502.backends.weights.experts import (
     build_opcode_execution_experts,
     build_shape_experts,
-    decode_ops,
-    last_a_bit_step,
-    pinned_sequence_control,
-    project_sequence_execution,
     schedule_and_build,
-    sparse_forward_work,
 )
+from transformer_nes.cpu6502.backends.weights.folds import (
+    SEQUENCE_FEEDBACK,
+    SequenceFolder,
+    opcode_pins,
+    sequence_pins,
+)
+from transformer_nes.cpu6502.backends.weights.shapes import decode_ops, last_a_bit_step
 from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS
 from transformer_nes.cpu6502.interpreter import build
-from transformer_nes.cpu6502.spec import OPCODES
+from transformer_nes.cpu6502.spec import BRANCH_CONDITIONS, BRANCH_OPERATIONS, OPCODES
 from transformer_nes.graph.core import (
     MEMORY_GROUP_FUSED,
+    Expression,
     InputDimension,
     LookUpDimension,
     MemoryReadDimension,
     PersistDimension,
-    ProgramGraph,
     ReGLUDimension,
-    reset_graph,
+    construction,
+    current_graph,
 )
-from transformer_nes.graph.fold import (
-    SEQUENCE_FEEDBACK,
-    GraphFolder,
-    opcode_pins,
-    sequence_pins,
-)
-from transformer_nes.model.engine_gen import generate_source
-from transformer_nes.model.schedule import build_graph, min_layers
+from transformer_nes.graph.fold import linear_input_form
+from transformer_nes.model.schedule import asap_schedule
 
 
 @pytest.fixture(scope="module")
+@construction
 def union_pg():
-    reset_graph()
     input_tokens, output_tokens = build(bcd=False)
-    return ProgramGraph(input_tokens, output_tokens)
+    return current_graph().capture(input_tokens, output_tokens)
 
 
 @pytest.fixture(scope="module")
 def folder(union_pg):
-    return GraphFolder(union_pg, root_names=RUNTIME_READ_DIMS)
+    return SequenceFolder(union_pg, root_names=RUNTIME_READ_DIMS)
 
 
 def depth(fold_result):
     pg = fold_result.program_graph
-    g = build_graph(pg.all_dims, pg.all_lookups)
-    return min_layers(g["ops"], g["op_deps"]) if g["ops"] else 0
+    return asap_schedule(pg)["num_layers"]
 
 
 def graph_counts(pg):
@@ -75,11 +76,7 @@ def graph_counts(pg):
             lookups.add(dim.lookup)
             terms += sum(
                 len(expr.terms)
-                for expr in (
-                    dim.lookup.query_exprs_2d
-                    + dim.lookup.key_exprs_2d
-                    + dim.lookup.value_exprs
-                )
+                for expr in (dim.lookup.query_exprs + dim.lookup.key_exprs + dim.lookup.value_exprs)
             )
         elif isinstance(dim, MemoryReadDimension) and dim.memory_read not in lookups:
             lookups.add(dim.memory_read)
@@ -92,29 +89,22 @@ def union_fold(folder):
     return folder.fold({}, label="union")
 
 
-def test_unpinned_fold_metrics_match_materialized_graph(union_pg, union_fold):
-    r = union_fold
-    assert r.insert_side_hazards == ()
-    assert r.folded_roots == ()
-    assert (r.n_reglus, r.n_persists, r.n_lookups, r.n_terms) == graph_counts(
-        r.program_graph
-    )
-    graph = build_graph(union_pg.all_dims, union_pg.all_lookups)
-    assert depth(r) <= min_layers(graph["ops"], graph["op_deps"])
+def test_unpinned_fold_preserves_lookup_state_and_depth(union_pg, union_fold):
+    assert union_fold.insert_side_hazards == ()
+    assert depth(union_fold) <= asap_schedule(union_pg)["num_layers"]
 
 
 @pytest.mark.parametrize("byte", [0x4C, 0xAD, 0x29, 0xF0])
 def test_opcode_fold_is_materially_smaller(folder, union_fold, byte):
     # Isolate the benefit of pinning the decode one-hots first.
-    r = folder.fold(opcode_pins(byte, OPCODES, pin_fetched_byte=False),
-                    label=f"{byte:02X}")
+    r = folder.fold(opcode_pins(byte, OPCODES, pin_fetched_byte=False), label=f"{byte:02X}")
     base = union_fold
     # The shared-state contract: decode pins never reach insert-side exprs.
     assert r.insert_side_hazards == ()
     # Every runtime readout resolves by name (kept or re-materialized).
     for name in RUNTIME_READ_DIMS:
         assert name in r.dim_of_name, f"readout {name} missing from fold"
-    assert r.n_terms <= base.n_terms * 0.30
+    assert graph_counts(r.program_graph)[3] <= graph_counts(base.program_graph)[3] * 0.30
     assert depth(r) < depth(base) * 0.5
 
     # The default fold additionally pins the fetched byte (the router
@@ -122,8 +112,10 @@ def test_opcode_fold_is_materially_smaller(folder, union_fold, byte):
     # away, so the graph must get strictly smaller, never larger.
     rb = folder.fold(opcode_pins(byte, OPCODES), label=f"{byte:02X}+byte")
     assert rb.insert_side_hazards == ()
-    assert rb.n_terms < r.n_terms
-    assert rb.n_lookups < r.n_lookups  # the PC read's group lookups died
+    assert graph_counts(rb.program_graph)[3] < graph_counts(r.program_graph)[3]
+    assert (
+        graph_counts(rb.program_graph)[2] < graph_counts(r.program_graph)[2]
+    )  # the PC read's group lookups died
 
 
 # ── Sequence fold: the poll trio and the JMP spin as one step ────────
@@ -138,12 +130,16 @@ def test_sequence_execution_projection_keeps_only_final_state(folder):
     keeps exactly one final architectural receipt."""
     code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
     pin_list = sequence_pins(POLL_HEAD, code, OPCODES)
-    r = folder.fold_sequence(
-        pin_list, SEQUENCE_FEEDBACK, label="projected_poll",
+    r = folder.fold_execution_sequence(
+        pin_list,
+        SEQUENCE_FEEDBACK,
+        label="projected_poll",
     )
     proof_dims = len(r.program_graph.all_dims)
     execution = project_sequence_execution(
-        r, len(pin_list), pinned_sequence_control(r, pin_list, decode_ops(code)),
+        r,
+        len(pin_list),
+        pinned_sequence_control(r, pin_list, decode_ops(code)),
     )
 
     assert execution.memory_writes == ()
@@ -153,32 +149,49 @@ def test_sequence_execution_projection_keeps_only_final_state(folder):
     assert len(r.program_graph.all_dims) == proof_dims
     for k in range(len(pin_list) - 1):
         for name in (
-            "current_pc", "fetched_opcode", "fetched_operand_lo",
-            "fetched_operand_hi", "ea", "data_out", "next_pc",
-            "is_store", "is_store2", "is_store3",
+            "current_pc",
+            "fetched_opcode",
+            "fetched_operand_lo",
+            "fetched_operand_hi",
+            "ea",
+            "data_out",
+            "next_pc",
+            "is_store",
+            "is_store2",
+            "is_store3",
         ):
             assert f"{name}__s{k}" not in execution.dim_of_name
 
+
 def test_sequence_execution_projection_eliminates_deterministic_model(folder):
     """A licensed deterministic region needs no transformer operations."""
-    pins = sequence_pins(
-        SPIN_HEAD, bytes([0x4C, 0x08, 0x04]), OPCODES,
-    ) * 8
-    structural = GraphFolder(
-        folder.pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
+    pins = (
+        sequence_pins(
+            SPIN_HEAD,
+            bytes([0x4C, 0x08, 0x04]),
+            OPCODES,
+        )
+        * 8
     )
-    execution = structural.fold_sequence(
-        pins, SEQUENCE_FEEDBACK, label="execution_spin", inline_linear=True,
+    structural = SequenceFolder(
+        folder.pg,
+        root_names=SEQUENCE_ROOT_DIMS,
+        structural_reads=True,
+    )
+    execution = structural.fold_execution_sequence(
+        pins,
+        SEQUENCE_FEEDBACK,
+        label="execution_spin",
+        inline_linear=True,
     )
     execution_graph = project_sequence_execution(
-        execution, len(pins),
+        execution,
+        len(pins),
         pinned_sequence_control(execution, pins, decode_ops(bytes([0x4C, 0x08, 0x04])) * 8),
     )
-    _model, _tokens, _rows, execution_info = schedule_and_build(execution_graph)
+    _model, _rows, execution_info = schedule_and_build(execution_graph)
 
-    assert not any(
-        output.source == "model" for output in execution_graph.outputs
-    )
+    assert not any(output.source == "model" for output in execution_graph.outputs)
     assert execution_info.n_layers == 0
     assert {
         dim.name
@@ -190,30 +203,39 @@ def test_sequence_execution_projection_eliminates_deterministic_model(folder):
 def test_structural_execution_uses_external_memory_reads(folder):
     code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
     pins = sequence_pins(POLL_HEAD, code, OPCODES)
-    structural = GraphFolder(
-        folder.pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
+    structural = SequenceFolder(
+        folder.pg,
+        root_names=SEQUENCE_ROOT_DIMS,
+        structural_reads=True,
     )
-    proof = structural.fold_sequence(
-        pins, SEQUENCE_FEEDBACK, label="external_poll", inline_linear=True,
+    proof = structural.fold_execution_sequence(
+        pins,
+        SEQUENCE_FEEDBACK,
+        label="external_poll",
+        inline_linear=True,
     )
     execution = project_sequence_execution(
-        proof, len(pins), pinned_sequence_control(proof, pins, decode_ops(code)),
+        proof,
+        len(pins),
+        pinned_sequence_control(proof, pins, decode_ops(code)),
     )
-    model, _tokens, _rows, _info = schedule_and_build(execution)
+    model, _rows, _info = schedule_and_build(execution)
 
-    assert execution.memory_reads
+    assert execution.program_graph.all_memory_reads
     assert all(
-        dim.memory_read in execution.memory_reads
+        dim.memory_read in execution.program_graph.all_memory_reads
         for dim in execution.program_graph.all_dims
         if isinstance(dim, MemoryReadDimension)
     )
-    assert not {
-        "byte_value", "addr_lo", "addr_hi", "is_memory_write"
-    } & {field.name for field in execution.state_fields}
+    assert not {"byte_value", "addr_lo", "addr_hi", "is_memory_write"} & {
+        dim.name for dim in execution.program_graph.all_dims if isinstance(dim, InputDimension)
+    }
     fused = [
         outputs
         for groups, outputs_by_head in zip(
-            model.head_memory_groups, model.head_memory_outputs, strict=True,
+            model.head_memory_groups,
+            model.head_memory_outputs,
+            strict=True,
         )
         for group, outputs in zip(groups, outputs_by_head, strict=True)
         if group == MEMORY_GROUP_FUSED
@@ -224,14 +246,20 @@ def test_structural_execution_uses_external_memory_reads(folder):
 
 def test_execution_ir_retains_ordered_writes(folder):
     pins = sequence_pins(SPIN_HEAD, bytes([0x85, 0x10]), OPCODES)
-    structural = GraphFolder(
-        folder.pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
+    structural = SequenceFolder(
+        folder.pg,
+        root_names=SEQUENCE_ROOT_DIMS,
+        structural_reads=True,
     )
-    proof = structural.fold_sequence(
-        pins, SEQUENCE_FEEDBACK, label="ordered_store", inline_linear=True,
+    proof = structural.fold_execution_sequence(
+        pins,
+        SEQUENCE_FEEDBACK,
+        label="ordered_store",
+        inline_linear=True,
     )
     execution = project_sequence_execution(
-        proof, len(pins),
+        proof,
+        len(pins),
         pinned_sequence_control(proof, pins, decode_ops(bytes([0x85, 0x10]))),
     )
 
@@ -242,25 +270,32 @@ def test_execution_ir_retains_ordered_writes(folder):
     assert write.value in execution.program_graph.all_dims
 
 
+@construction
 def test_external_memory_read_exposes_only_consumed_bits():
-    reset_graph()
     input_tokens, output_tokens = build(bcd=False, wide_bits=True)
-    pg = ProgramGraph(input_tokens, output_tokens)
+    pg = current_graph().capture(input_tokens, output_tokens)
     code = bytes([0x6D, 0x00, 0x07])  # ADC $0700 consumes only operand bit 7.
     pins = sequence_pins(SPIN_HEAD, code, OPCODES)
     ops = decode_ops(code)
-    folder = GraphFolder(
-        pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
+    folder = SequenceFolder(
+        pg,
+        root_names=SEQUENCE_ROOT_DIMS,
+        structural_reads=True,
     )
-    proof = folder.fold_sequence(
-        pins, SEQUENCE_FEEDBACK, label="selective_bits", inline_linear=True,
+    proof = folder.fold_execution_sequence(
+        pins,
+        SEQUENCE_FEEDBACK,
+        label="selective_bits",
+        inline_linear=True,
         bit_feedback_until=last_a_bit_step(ops),
     )
     execution = project_sequence_execution(
-        proof, len(pins), pinned_sequence_control(proof, pins, ops),
+        proof,
+        len(pins),
+        pinned_sequence_control(proof, pins, ops),
     )
 
-    assert [read.output_kinds for read in execution.memory_reads] == [
+    assert [read.output_kinds for read in execution.program_graph.all_memory_reads] == [
         ("value", "address", "bit7"),
     ]
 
@@ -269,15 +304,16 @@ def test_execution_proof_materializes_only_license_facts(folder):
     code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
     pins = sequence_pins(POLL_HEAD, code, OPCODES)
     ops = decode_ops(code)
-    structural = GraphFolder(
-        folder.pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True,
-    )
-    full = structural.fold_sequence(
-        pins, SEQUENCE_FEEDBACK, label="full_proof", inline_linear=True,
-        bit_feedback_until=last_a_bit_step(ops),
+    structural = SequenceFolder(
+        folder.pg,
+        root_names=SEQUENCE_ROOT_DIMS,
+        structural_reads=True,
     )
     facts = structural.fold_execution_sequence(
-        pins, SEQUENCE_FEEDBACK, label="proof_facts", inline_linear=True,
+        pins,
+        SEQUENCE_FEEDBACK,
+        label="proof_facts",
+        inline_linear=True,
         bit_feedback_until=last_a_bit_step(ops),
     )
     for k in range(len(pins) - 1):
@@ -285,30 +321,21 @@ def test_execution_proof_materializes_only_license_facts(folder):
         assert f"new_halted__s{k}" in facts.dim_of_name
         assert f"fetched_opcode__s{k}" not in facts.dim_of_name
         assert f"data_out__s{k}" not in facts.dim_of_name
-    assert len(facts.program_graph.all_dims) < len(full.program_graph.all_dims)
 
-    full_execution = project_sequence_execution(
-        full, len(pins), pinned_sequence_control(full, pins, ops),
+    execution = project_sequence_execution(
+        facts,
+        len(pins),
+        pinned_sequence_control(facts, pins, ops),
     )
-    fact_execution = project_sequence_execution(
-        facts, len(pins), pinned_sequence_control(facts, pins, ops),
-    )
-    full_model, _t1, _r1, full_info = schedule_and_build(full_execution)
-    fact_model, _t2, _r2, fact_info = schedule_and_build(fact_execution)
-    assert (fact_info.n_layers, fact_info.d_model) == (
-        full_info.n_layers, full_info.d_model,
-    )
-    assert sparse_forward_work(fact_model, fact_info.n_layers) == (
-        sparse_forward_work(full_model, full_info.n_layers)
-    )
+    for k in range(len(pins) - 1):
+        assert f"next_pc__s{k}" not in execution.dim_of_name
+        assert f"new_halted__s{k}" not in execution.dim_of_name
 
-
-# ── Canonical shape fold: symbolic pc + operands, one fold per SHAPE ──
 
 def test_shape_absolute_store_is_rejected(union_pg):
     """Symbolic store shapes cannot prove disjointness from their own code."""
     shape = ("lda_sta_abs", bytes.fromhex("a9008d0000"), 1)
-    with pytest.raises(RuntimeError, match="not provably below"):
+    with pytest.raises(RuntimeError, match="store shapes are not licensed"):
         build_shape_experts(union_pg, [shape])
 
 
@@ -345,7 +372,16 @@ def test_compact_opcode_experts_cover_stack_and_control(union_pg):
         [0xCA, 0xA5, 0x0A, 0x85, 0x87, 0x48, 0x4C, 0x20, 0x60, 0x00],
     )
     assert [expert["byte"] for expert in experts] == [
-        0xCA, 0xA5, 0x0A, 0x85, 0x87, 0x48, 0x4C, 0x20, 0x60, 0x00,
+        0xCA,
+        0xA5,
+        0x0A,
+        0x85,
+        0x87,
+        0x48,
+        0x4C,
+        0x20,
+        0x60,
+        0x00,
     ]
     assert all(expert["kind"] == "exec_opcode" for expert in experts)
     dex = experts[0]
@@ -367,7 +403,9 @@ def test_compact_opcode_experts_cover_stack_and_control(union_pg):
     legacy.pop("kind")
     with pytest.raises(RuntimeError, match="compact opcodes, shapes or interrupts"):
         generate_source(
-            experts[0]["model"], experts[0]["step_spec"], experts=[legacy],
+            experts[0]["model"],
+            experts[0]["step_spec"],
+            experts=[legacy],
         )
 
 
@@ -376,3 +414,46 @@ def test_shape_interior_branch_is_rejected(union_pg):
     plain = ("bne_lda", bytes.fromhex("d000a900"), 1)
     with pytest.raises(RuntimeError, match="interior next_pc"):
         build_shape_experts(union_pg, [plain])
+
+
+def pinned_sequence_control(fold_result, pin_list, ops) -> ControlFlow:
+    k = len(pin_list) - 1
+    op = ops[k]
+    pins = pin_list[k]
+    pc = int(pins["current_pc_lo"]) | (int(pins["current_pc_hi"]) << 8)
+    fallthrough = (pc + op.length) & 0xFFFF
+    if op.operation in BRANCH_OPERATIONS:
+        offset = int(pins["fetched_operand_lo_all"])
+        signed = offset - 256 if offset & 0x80 else offset
+        predicate = fold_result.dim_of_name[f"branch_taken__s{k}"]
+        form = linear_input_form(Expression({predicate: 1}))
+        one = fold_result.program_graph.one
+        if all(dim is one for dim in form):
+            successor = (
+                (fallthrough + signed) & 0xFFFF if int(round(form.get(one, 0.0))) else fallthrough
+            )
+            return ControlFlow(
+                predicate=None,
+                fallthrough=successor,
+                target=successor,
+            )
+        return ControlFlow(
+            predicate=predicate,
+            fallthrough=fallthrough,
+            target=(fallthrough + signed) & 0xFFFF,
+            flag_mask=BRANCH_CONDITIONS[op.operation][0],
+            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
+        )
+    if op.operation in ("jmp", "jsr") and op.mode == "abs":
+        target = int(pins["fetched_operand_lo_all"]) | (int(pins["fetched_operand_hi_all"]) << 8)
+        return ControlFlow(predicate=None, fallthrough=target, target=target)
+    if op.operation in ("rts", "rti"):  # the return address is the model's
+        target = fold_result.dim_of_name[f"next_pc__s{k}"]
+        return ControlFlow(predicate=None, fallthrough=0, target=0, target_dimension=target)
+    if op.operation == "brk" or op.operation == "jmp":
+        raise RuntimeError(f"sequence final control {op.mnemonic} is not host-resolvable")
+    return ControlFlow(
+        predicate=None,
+        fallthrough=fallthrough,
+        target=fallthrough,
+    )

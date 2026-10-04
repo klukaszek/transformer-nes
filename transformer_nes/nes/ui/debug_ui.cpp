@@ -378,8 +378,6 @@ void draw_xray(const DebugHooks& hooks, UiState& state, std::optional<XrayFrame>
     ImGui::TreePop();
   }
   if (ImGui::TreeNodeEx("PPU: which expert drew each tile slot", open)) {
-    if (frame.expert_names.empty())
-      ImGui::TextDisabled("all native: --ppu weights renders through the transformer");
     ImGui::Checkbox("Tint the game picture with it (stays on with the overlay closed)",
                     &state.tint_game);
     draw_expert_map(frame);
@@ -469,7 +467,7 @@ bool handle_event(const sapp_event* event, UiState& state) {
   return io.WantCaptureMouse;
 }
 
-void draw(UiState& state, const DebugHooks& hooks) {
+void draw(UiState& state, const DebugHooks& hooks, double display_seconds) {
   // The game tint outlives the overlay: with it on, a frame is built even
   // while the window is closed, holding just the tint.
   const bool tint = state.tint_game && hooks.xray_frame;
@@ -479,7 +477,7 @@ void draw(UiState& state, const DebugHooks& hooks) {
   simgui_frame_desc_t frame{};
   frame.width = sapp_width();
   frame.height = sapp_height();
-  frame.delta_time = sapp_frame_duration();
+  frame.delta_time = std::max(display_seconds, 1e-6);
   frame.dpi_scale = sapp_dpi_scale();
   simgui_new_frame(&frame);
 

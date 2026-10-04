@@ -1,6 +1,6 @@
 """Run the exported 6502 checkpoint as a plain PyTorch transformer.
 
-Everything here comes from the two files model/export.py writes --
+Everything here comes from the two files cpu6502/backends/weights/export.py writes --
 ``weights.safetensors`` and ``machine.json`` -- and nothing else from this
 repository: no graph, no compiler, no generated engine.  This file imports
 only torch and safetensors, so it is the whole claim made checkable: a
@@ -12,25 +12,27 @@ The model (machine.json "format" has the contract):
 - a residual stream of d_model exact integers (units of 2**-scale_bits);
   a token embeds as its named input values written into their slots;
 - per layer, one attention block -- Q/K/V projections, 2-dimensional
-  heads, hardmax with exact ties going to the latest token, the current
-  token included, some heads masking tokens by a "clear gate" -- then a
-  ReGLU feed-forward block, each added to the residual;
-- no normalization and no position encoding: order enters only through
-  the latest-wins tie-break.
+  heads, softmax attention over each head's KV cache, some heads masking
+  tokens out by a "clear gate" -- then a ReGLU feed-forward block, each
+  added to the residual;
+- no normalization and no position encoding.
 
-The program is a token stream.  WRITE tokens lay down memory; a STATE
-token carries the CPU registers, and its forward reads the next state,
-the instruction's cycle count and up to three memory writes out of the
-residual stream.  The harness appends those writes as WRITE tokens and
-the next state as the next STATE token -- autoregressive decoding.
+A head's KV cache holds one entry per key: a token whose key matches a
+cached one replaces it.  Scores are integers, keys are distinct and the
+key encoding never lets two distinct keys tie, so the best key leads every
+other by at least 1, and softmax at machine.json's temperature is exact
+once each head output is rounded to the integer grid.  A head whose key is
+constant caches one entry, the current token, so it needs no cache: its
+output is the token's own value.
 
-Two exact shortcuts keep the KV cache small, both read off the weights:
-a head whose key ignores every input but the constant ties on every
-token, so it always attends to the current one (no cache at all); and a
-cached token whose key equals a newer one's can never win again, so each
-head keeps one entry per distinct key.
+The program is a token stream.  WRITE tokens lay down memory (a read of an
+address never written gives 0); a STATE token carries the CPU registers,
+and its forward reads the next state, the instruction's cycle count and
+up to three memory writes out of the residual stream.  The harness appends those
+writes as WRITE tokens and the next state as the next STATE token --
+autoregressive decoding.
 
-    python -m transformer_nes.model.checkpoint_runner CHECKPOINT \\
+    python -m transformer_nes.cpu6502.backends.weights.checkpoint_runner CHECKPOINT \\
         --nestest nestest.nes nestest.log
 """
 
@@ -68,43 +70,53 @@ class SparseLinear(torch.nn.Module):
         return y.index_add_(0, self.rows, self.data * x[self.cols])
 
 
-class HeadCache:
-    """One attention head's keys and values: one entry per distinct key,
-    holding the latest token's value and position (for the tie-break)."""
+EXACT = 2**53  # float64 holds every integer score below this
 
-    def __init__(self):
+
+class AmbiguousAttention(ValueError):
+    """Two cached keys tie for a query's best score, which the key encoding
+    rules out: softmax would average their values."""
+
+
+class HeadCache:
+    """One attention head's KV cache: one entry per key, a newer token
+    replacing the entry of an older one with the same key."""
+
+    def __init__(self, temperature: float):
+        self.temperature = temperature
         self.slot_of_key: dict[tuple[int, int], int] = {}
         self.keys = torch.zeros((64, 2), dtype=SCORE)
         self.values = torch.zeros((64, 2), dtype=INT)
-        self.positions = torch.zeros(64, dtype=torch.long)
 
-    def insert(self, key: torch.Tensor, value: torch.Tensor, position: int) -> None:
+    def insert(self, key: torch.Tensor, value: torch.Tensor) -> None:
         k = (int(key[0]), int(key[1]))
         slot = self.slot_of_key.get(k)
         if slot is None:
             slot = len(self.slot_of_key)
             if slot == len(self.keys):
-                grow = lambda t: torch.cat([t, torch.zeros_like(t)])  # noqa: E731
-                self.keys, self.values, self.positions = map(
-                    grow, (self.keys, self.values, self.positions)
-                )
+                self.keys, self.values = (torch.cat([t, torch.zeros_like(t)]) for t in (self.keys, self.values))
             self.slot_of_key[k] = slot
             self.keys[slot] = key
         self.values[slot] = value
-        self.positions[slot] = position
 
     def attend(self, query: torch.Tensor) -> torch.Tensor:
+        """Softmax attention over the cache, rounded to the integer grid."""
         n = len(self.slot_of_key)
         if n == 0:
             return torch.zeros(2, dtype=INT)
         scores = self.keys[:n] @ query.to(SCORE)
-        best = scores == scores.max()
-        latest = torch.where(best, self.positions[:n], -1).argmax()
-        return self.values[latest]
+        if scores.abs().max() >= EXACT:
+            raise OverflowError("an attention score beyond float64's exact integers")
+        best = scores.topk(min(n, 2)).values
+        if n > 1 and best[0] == best[1]:
+            raise AmbiguousAttention(f"two keys tie at score {int(best[0])}")
+        weights = torch.softmax(self.temperature * (scores - best[0]).double(), dim=0)
+        return torch.round(weights @ self.values[:n].double()).to(INT)
 
 
 class Layer(torch.nn.Module):
-    def __init__(self, tensors: dict, li: int, heads: int, ffn: int, d_model: int, one: int):
+    def __init__(self, tensors: dict, li: int, heads: int, ffn: int, d_model: int, one: int,
+                 temperature: float):
         super().__init__()
         self.heads, self.ffn = heads, ffn
         self.qkv = SparseLinear(tensors, f"L{li}.in_proj", 6 * heads)
@@ -115,15 +127,16 @@ class Layer(torch.nn.Module):
         # head when the gate's input column is non-zero.
         self.register_buffer("gate_heads", (tensors[f"L{li}.clear_rows"].long() - 2 * heads) // 2)
         self.register_buffer("gate_cols", tensors[f"L{li}.clear_cols"].long())
-        # Heads that need a cache: a key that varies with the input, or a
-        # clear gate.  Every other head attends to the current token.
+        # A head whose key is a constant and which has no clear gate holds
+        # one cache entry, the current token's: it needs no cache, its
+        # output is the token's own value.
         rows, cols = self.qkv.rows, self.qkv.cols
         varying = rows[(rows >= 2 * heads) & (rows < 4 * heads) & (cols != one)]
         self.cached = sorted({(r - 2 * heads) // 2 for r in varying.tolist()}
                              | set(self.gate_heads.tolist()))
-        self.caches = {h: HeadCache() for h in self.cached}
+        self.caches = {h: HeadCache(temperature) for h in self.cached}
 
-    def forward(self, x: torch.Tensor, position: int, shift: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, shift: int) -> torch.Tensor:
         h2 = 2 * self.heads
         qkv = self.qkv(x) >> shift
         q, k, v = qkv[:h2], qkv[h2 : 2 * h2], qkv[2 * h2 :]
@@ -132,7 +145,7 @@ class Layer(torch.nn.Module):
         for h in self.cached:
             pair = slice(2 * h, 2 * h + 2)
             if h not in masked:
-                self.caches[h].insert(k[pair], v[pair], position)
+                self.caches[h].insert(k[pair], v[pair])
             out[pair] = self.caches[h].attend(q[pair])
         x = x + (self.out_proj(out) >> shift)
         gates_values = self.ff_in(x) >> shift
@@ -150,7 +163,8 @@ class Transformer(torch.nn.Module):
         m = self.meta
         self.shift, self.d_model = m["scale_bits"], m["d_model"]
         self.layers = torch.nn.ModuleList(
-            Layer(tensors, li, m["layer_heads"][li], m["layer_ffn"][li], self.d_model, m["one_slot"])
+            Layer(tensors, li, m["layer_heads"][li], m["layer_ffn"][li], self.d_model, m["one_slot"],
+                  m["attention_temperature"])
             for li in range(m["n_layers"])
         )
         self.register_buffer("head", tensors["head"].to(INT))
@@ -164,7 +178,7 @@ class Transformer(torch.nn.Module):
         for name, value in token.items():
             x[self.meta["input_slots"][name]] = value << self.shift
         for layer in self.layers:
-            x = layer(x, self.position, self.shift)
+            x = layer(x, self.shift)
         self.position += 1
         return x
 

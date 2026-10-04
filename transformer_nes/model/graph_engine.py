@@ -1,11 +1,9 @@
-"""Compile any constructed graph into a native transformer engine.
+"""Compile constructed transformer graphs with PyTorch Inductor.
 
-The same emission the 6502 engine uses (``plan_model``/``emit_layer`` in
-model/engine_gen.py): each layer's licensed attention heads, fused
-direct maps and ReGLU block as straight-line exact fixed-point C++.
-Memory heads -- grouped exact-address reads over WRITE tokens -- are
-served by the nearest-written-address structure, so a WRITE token is one
-structure insert and the attention state stays O(1) in the log.
+The shared Torch compiler expands the actual attention and ReGLU matrices.
+Structural memory reads are licensed by the graph fold before scheduling;
+Inductor specializes constants and routing. Execution uses raw buffers and
+one fixed byte image, with no framework dispatch or growing KV cache.
 
 An engine hosts one or more token graphs over one memory (the PPU's:
 the tile slot, and the sprite unit's evaluation and fetch).  Each comes
@@ -35,192 +33,62 @@ model/inference.py is the float64 reference these engines agree with.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 
 import numpy as np
+import torch
 
-from transformer_nes.cpu6502.backends.weights.run_protocol import mem_query_cpp
-from transformer_nes.graph.core import InputDimension, ProgramGraph
+from transformer_nes.files import write_atomic
+from transformer_nes.graph.core import (
+    Expression,
+    InputDimension,
+    ProgramGraph,
+    project_program_graph,
+)
 from transformer_nes.graph.fold import GraphFolder
-from transformer_nes.model.engine_gen import (
+from transformer_nes.model.build import (
     CACHE_DIR,
-    FIXED_POINT_HELPERS,
-    INCLUDES,
-    EmitterContext,
-    emit_layer,
+    artifact_lock,
     load_module,
     manifest_put,
     manifest_read,
-    plan_model,
 )
 from transformer_nes.model.schedule import asap_schedule
+from transformer_nes.model.sources import source_digest
+from transformer_nes.model.torch_codegen import bank_source
 from transformer_nes.model.weights import build_model
 
 
 def construct(program_graph: ProgramGraph):
-    schedule = asap_schedule(
-        program_graph.input_tokens,
-        program_graph.output_tokens,
-        program_graph=program_graph,
-        log=lambda _: None,
-    )
+    schedule = asap_schedule(program_graph, log=lambda _: None)
     return build_model(program_graph=program_graph, schedule=schedule)
 
 
 def generate_graph_source(models: list[dict], memory_size: int = 0x10000) -> tuple[str, int]:
-    """models: [{model, d_model, one_slot, input_slots, output_slots,
-    union_lookup_of}], model 0 the union.
+    from pathlib import Path
 
-    The residual is a local array of each step with every layer inlined
-    and every index constant, so the compiler keeps the stream in
-    registers and drops dead erases.  The fixed-point scale (F=1) only
-    exists for +-0.5 coefficients; a source without them runs on plain
-    integers (F=0), where the scale checks compile away.  Returns the
-    source and its F."""
-    source = _generate(models, memory_size, f_bits=0)
-    # One "half(" is the helper's own definition; any other is a use.
-    if source.count("half(") == 1:
-        return source, 0
-    return _generate(models, memory_size, f_bits=1), 1
-
-
-def _generate(models: list[dict], memory_size: int, *, f_bits: int) -> str:
-    ctx = EmitterContext(elem="int", E="", ram_size=memory_size)
-    groups = -(-memory_size // 4096)
-    plans = [
-        plan_model(ctx, m["model"], f"model {k}", None if k == 0 else m["union_lookup_of"])
-        for k, m in enumerate(models)
-    ]
-    n_regs = max(1, len(ctx.reg_of))
-    n_in = ", ".join(str(len(m["input_slots"])) for m in models)
-    n_out = ", ".join(str(len(m["output_slots"])) for m in models)
-    lines = [INCLUDES, "", "struct ENGINE_T {"]
-    emit = lines.append
-    emit(f"    static constexpr int F = {f_bits};")
-    emit("    static constexpr int SCALE = 1 << F;")
-    emit(FIXED_POINT_HELPERS.replace("ELEM", "int"))
-    emit(mem_query_cpp("long long", groups))
-    emit("    // The same writes as a flat image: folded experts' reads are")
-    emit("    // served from it (value and bits), not from the attention fabric.")
-    emit(f"    static constexpr int MEMORY = {memory_size};")
-    emit("    unsigned char ram[MEMORY] = {};")
-    emit(f"    bool reg_any[{n_regs}] = {{}};")
-    emit(f"    long long reg_s[{n_regs}] = {{}};")
-    emit(f"    int reg_v0[{n_regs}] = {{}}, reg_v1[{n_regs}] = {{}};")
-    emit("    long long seq = -1;")
-    emit(f"    static constexpr int N_MODELS = {len(models)};")
-    emit(f"    static constexpr int N_IN[N_MODELS] = {{{n_in}}}, N_OUT[N_MODELS] = {{{n_out}}};")
-    emit("")
-    # Each model's layers inline into its step: one straight-line body the
-    # compiler can keep in registers across layer boundaries.
-    for k, model_plans in enumerate(plans):
-        for plan in model_plans:
-            layer = emit_layer(plan, f"_m{k}", "int* x")
-            layer[0] = layer[0].replace("    void ", "    __attribute__((always_inline)) void ", 1)
-            lines.extend(layer)
-    emit("")
-    emit("    // A WRITE token: one insert into the memory structure.")
-    emit("    void write(int addr, int value) {")
-    emit("        ++seq;")
-    emit("        if ((unsigned)addr >= (unsigned)MEMORY)")
-    emit('            throw std::out_of_range("write outside the engine memory");')
-    emit("        const int group = addr >> 12, wl = addr & 0xFFF;")
-    emit("        mem_val[group][wl] = value;")
-    emit("        mem_seq[group][wl] = seq;")
-    emit("        mem_bits[group][wl >> 6] |= 1ULL << (wl & 63);")
-    emit("        ram[addr] = (unsigned char)value;")
-    emit("    }")
-    # Ablation (the X-ray): model 0 forces one residual slot to a value
-    # right after the layer that computes it.  ablate_row -1 = off.
-    emit("    int ablate_slot = 0, ablate_row = -1, ablate_value = 0;")
-
-    def forward(k: int, indent: str, snap: bool) -> None:
-        """Model k's embedding and layer stack; model 0 also applies the
-        ablation, and with `snap` records the stream after each row."""
-        m, d = models[k], models[k]["d_model"]
-        emit(f"{indent}int x[{d}] = {{}};")
-        emit(f"{indent}x[{m['one_slot']}] = SCALE;")
-        for i, slot in enumerate(m["input_slots"]):
-            if slot >= 0:
-                emit(f"{indent}x[{slot}] = in[{i}] * SCALE;")
-        if snap:
-            emit(f"{indent}std::memcpy(snap, x, sizeof x);")
-        for row, plan in enumerate(plans[k], start=1):
-            emit(f"{indent}layer_{plan['li']}_m{k}(x);")
-            if k == 0:
-                emit(f"{indent}if (ablate_row == {row}) x[ablate_slot] = ablate_value;")
-            if snap:
-                emit(f"{indent}std::memcpy(snap + {row * d}, x, sizeof x);")
-
-    emit("    // Any other token, through model m: embed, run its stack, read out.")
-    emit("    void step(int m, const int* in, int* out) {")
-    emit("        ++seq;")
-    emit("        switch (m) {")
-    for k, m in enumerate(models):
-        emit(f"        case {k}: {{")
-        forward(k, "            ", snap=False)
-        for i, slot in enumerate(m["output_slots"]):
-            emit(f"            out[{i}] = (int)shr2(x[{slot}]);")
-        emit("            return;")
-        emit("        }")
-    emit("        }")
-    emit('        throw std::out_of_range("no such model");')
-    emit("    }")
-    emit(
-        f"    static constexpr int TRACE_ROWS = {len(plans[0]) + 1}, "
-        f"TRACE_D = {models[0]['d_model']};"
-    )
-    emit("    // Model 0, the residual stream after each row written to snap.")
-    emit("    void trace(const int* in, int* snap) {")
-    emit("        ++seq;")
-    forward(0, "        ", snap=True)
-    emit("    }")
-    emit("};")
-    emit("")
-    emit("static void abi_write(void* e, int addr, int value) {")
-    emit("    static_cast<ENGINE_T*>(e)->write(addr, value);")
-    emit("}")
-    emit("static void abi_step(void* e, int m, const int* in, int* out) {")
-    emit("    static_cast<ENGINE_T*>(e)->step(m, in, out);")
-    emit("}")
-    emit("// Traced on a copy, so the running engine never sees the extra token.")
-    emit("static void abi_trace(void* e, const int* in, int* snap) {")
-    emit("    std::make_unique<ENGINE_T>(*static_cast<ENGINE_T*>(e))->trace(in, snap);")
-    emit("}")
-    emit("")
-    emit("PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {")
-    emit('    py::class_<ENGINE_T>(m, "Engine")')
-    emit("        .def(py::init<>())")
-    emit('        .def("write", &ENGINE_T::write)')
-    emit(
-        '        .def("step", [](ENGINE_T& e, int model, py::array_t<int, '
-        "py::array::c_style | py::array::forcecast> in) {"
-    )
-    emit("            if (model < 0 || model >= ENGINE_T::N_MODELS)")
-    emit('                throw std::out_of_range("no such model");')
-    emit("            if (in.size() != ENGINE_T::N_IN[model])")
-    emit('                throw std::invalid_argument("wrong input count");')
-    emit("            py::array_t<int> out(ENGINE_T::N_OUT[model]);")
-    emit("            e.step(model, in.data(), out.mutable_data());")
-    emit("            return out;")
-    emit("        })")
-    emit('        .def("ablate", [](ENGINE_T& e, int slot, int row, int value) {')
-    emit("            e.ablate_slot = slot;")
-    emit("            e.ablate_row = row;")
-    emit("            e.ablate_value = value * ENGINE_T::SCALE;")
-    emit('        }, py::arg("slot") = 0, py::arg("row") = -1, py::arg("value") = 0)')
-    emit('        .def("abi", [](ENGINE_T& e) {')
-    emit("            return py::make_tuple(reinterpret_cast<std::uintptr_t>(&e),")
-    emit("                                  reinterpret_cast<std::uintptr_t>(&abi_write),")
-    emit("                                  reinterpret_cast<std::uintptr_t>(&abi_step),")
-    emit("                                  reinterpret_cast<std::uintptr_t>(&abi_trace),")
-    emit("                                  ENGINE_T::TRACE_ROWS, ENGINE_T::TRACE_D);")
-    emit("        });")
-    emit("}")
-    return "\n".join(lines) + "\n"
+    f_bits = max(m["fraction_bits"] for m in models)
+    for model in models:
+        model["fraction_bits"] = f_bits
+    table = ["struct Token { int n_in, n_out; };", "static const Token tokens[] = {"]
+    table.extend(f"{{{len(m['input_slots'])}, {len(m['output_slots'])}}}," for m in models)
+    table.append("};")
+    adapter = Path(__file__).with_name("native").joinpath("graph.cpp").read_text()
+    for key, value in {
+        "@TOKEN_TABLE@": "\n".join(table),
+        "@MEMORY@": str(memory_size),
+        "@F_BITS@": str(f_bits),
+        "@MAX_INPUT@": str(max(len(m["input_slots"]) for m in models) + 3),
+        "@PRIMARY_WIDTH@": str(models[0]["d_model"]),
+        "@MAX_OUTPUT@": str(max(len(m["output_slots"]) for m in models)),
+        "@TRACE_ROWS@": str(models[0]["n_layers"] + 1),
+    }.items():
+        adapter = adapter.replace(key, value)
+    return bank_source(models, adapter, memory_size=memory_size), f_bits
 
 
 @dataclass(frozen=True)
@@ -234,23 +102,121 @@ class TokenGraph:
     outputs: Sequence[str]
     experts: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
 
+    def project(self, outputs: Sequence[str]) -> TokenGraph:
+        """Compile only the dependency closure of selected readouts."""
+        if not set(outputs) <= set(self.outputs):
+            raise ValueError("projection must select existing token outputs")
+        dims = {d.name: d for d in self.program_graph.all_dims}
+        readout = Expression({dims[name]: 1e-6 for name in outputs})
+        projected = project_program_graph(self.program_graph, {"READOUT": readout})
+        return replace(self, program_graph=projected, outputs=tuple(outputs))
+
+
+@dataclass(frozen=True)
+class TokenIO:
+    """A compiled token graph's inputs and outputs, in the caller's order."""
+
+    inputs: Sequence[str]
+    outputs: Sequence[str]
+
+
+DEBUG_ADAPTER = r"""
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("kernel", [] { return py::make_tuple(
+        reinterpret_cast<std::uintptr_t>(circuits[0].run), circuits[0].aux); });
+    m.def("evaluate", [](py::array_t<int, py::array::c_style | py::array::forcecast> x,
+                          std::uintptr_t ram) {
+        py::array_t<int> out({@ROWS@, circuits[0].width / @ROWS@});
+        std::vector<int32_t> aux(std::max(1, circuits[0].aux));
+        invoke(circuits[0].run, x.data(), reinterpret_cast<const uint8_t*>(ram),
+               out.mutable_data(), aux.data());
+        return out;
+    });
+}
+"""
+
 
 class CompiledGraph:
     """Token graphs (and folded experts of them) compiled to weights and
     then to one native engine over one memory.  The first graph is the
     primary: its full model is model 0 (the one ``trace`` and ``ablate``
     see, described by ``slot_of``/``lives``) and its experts, named by
-    ``expert_names``, are models 1..n; ``model_id`` finds any model."""
+    ``expert_names``, are models 1..n; ``model_id`` finds any model.
 
-    def __init__(self, graphs: Mapping[str, TokenGraph], *, tag: str, memory_size: int = 0x10000):
-        self.graphs = dict(graphs)
-        self.expert_names = list(next(iter(self.graphs.values())).experts)
-        self.model_ids: dict[tuple[str, str | None], int] = {}
-        models = []
-        for name, token in self.graphs.items():
-            self.model_ids[name, None] = len(models)
+    `build_graphs` builds the token graphs.  The engine is cached under
+    `tag`, keyed by the code of `sources` (model/sources.py): a hit loads it
+    without building any graph, and only ``slot_of``/``lives`` build the
+    primary graph again (the X-ray's, on first use).  ``graphs`` gives
+    each token graph's inputs and outputs, in the caller's order."""
+
+    def __init__(
+        self,
+        build_graphs: Callable[[], Mapping[str, TokenGraph]],
+        *,
+        tag: str,
+        sources: tuple[str, ...],
+        memory_size: int = 0x10000,
+    ):
+        self.build_graphs = build_graphs
+        self.memory_size = memory_size
+        from pathlib import Path
+
+        native_files = tuple(str(p) for p in Path(__file__).with_name("native").iterdir())
+        key = f"graph:{tag}"
+        code = hashlib.sha256(
+            f"{source_digest(__name__, *sources, files=native_files)}|{torch.__version__}".encode()
+        ).hexdigest()
+        entry = manifest_read().get(key)
+        module = None
+        if (
+            entry is not None
+            and entry.get("sources") == code
+            and entry.get("memory_size") == memory_size
+        ):
+            with artifact_lock(entry["digest"]):
+                path = os.path.join(CACHE_DIR, f"graph_{entry['digest']}.cpp")
+                if os.path.exists(path):
+                    module = load_module(f"graph_gen_{entry['digest']}", entry["digest"], [path])
+        if module is None:
+            generated, source = self._generate(build_graphs(), memory_size)
+            entry = {
+                "kind": "graph",
+                "sources": code,
+                "memory_size": memory_size,
+                **generated,
+            }
+            with artifact_lock(entry["digest"]):
+                path = os.path.join(CACHE_DIR, f"graph_{entry['digest']}.cpp")
+                write_atomic(path, source.encode())
+                module = load_module(f"graph_gen_{entry['digest']}", entry["digest"], [path])
+                manifest_put(key, entry)
+        self.graphs = {name: TokenIO(*io) for name, io in entry["tokens"].items()}
+        self.digest, self.f_bits = entry["digest"], entry["f_bits"]
+        self.source_code = code
+        self.n_layers, self.d_model = entry["n_layers"], entry["d_model"]
+        self.expert_names = entry["expert_names"]
+        self.model_ids = {(graph, expert): i for graph, expert, i in entry["model_ids"]}
+        self.engine = module.Engine()
+        self._debug_modules = {}
+        import weakref
+
+        owner = weakref.proxy(self)
+        self.engine.set_debug_loader(lambda trace: owner._debug_kernel(trace))
+
+    @staticmethod
+    def _generate(graphs: Mapping[str, TokenGraph], memory_size: int) -> tuple[dict, str]:
+        """Compile every graph and expert to weights and emit the engine's
+        source; what the cache records of it."""
+        model_ids, models = [], []
+        for name, token in graphs.items():
+            model_ids.append((name, None, len(models)))
+            full = GraphFolder(
+                token.program_graph, root_names=list(token.outputs), structural_reads=True
+            ).fold({}, label=name)
             models.append(
-                self._compile(token, token.program_graph, token.program_graph.all_dims, None)
+                CompiledGraph._compile(
+                    token, full.program_graph, list(full.dim_of_name.values()), full.union_lookup_of
+                )
             )
             if token.experts:
                 # Structural folds: each memory read becomes one engine-served
@@ -260,46 +226,66 @@ class CompiledGraph:
                 )
                 for expert, pins in token.experts.items():
                     fold = folder.fold(dict(pins), label=expert)
-                    self.model_ids[name, expert] = len(models)
+                    model_ids.append((name, expert, len(models)))
                     models.append(
-                        self._compile(
+                        CompiledGraph._compile(
                             token,
                             fold.program_graph,
                             list(fold.dim_of_name.values()),
                             fold.union_lookup_of,
                         )
                     )
-        # The full primary model's residual layout: the X-ray labels its stream.
-        self.slot_of, self.lives = models[0]["info"].slot_of, models[0]["info"].lives
-        self.n_layers, self.d_model = models[0]["n_layers"], models[0]["d_model"]
-        source, self.f_bits = generate_graph_source(models, memory_size)
+        source, f_bits = generate_graph_source(models, memory_size)
+        source = f"// PyTorch {torch.__version__}\n" + source
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
-        self.digest = digest
-        source = source.replace("ENGINE_T", f"GraphEngine_{digest}")
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        path = os.path.join(CACHE_DIR, f"graph_{digest}.cpp")
-        if not os.path.exists(path):
-            with open(path, "w") as f:
-                f.write(source)
-        module = load_module(f"graph_gen_{digest}", digest, [path])
-        key = f"graph:{tag}"
-        if manifest_read().get(key, {}).get("digest") != digest:
-            manifest_put(key, {"kind": "graph", "digest": digest})
-        self.engine = module.Engine()
+        return {
+            "digest": digest,
+            "f_bits": f_bits,
+            "model_ids": model_ids,
+            "n_layers": models[0]["n_layers"],
+            "d_model": models[0]["d_model"],
+            "expert_names": list(next(iter(graphs.values())).experts),
+            "tokens": {name: (list(t.inputs), list(t.outputs)) for name, t in graphs.items()},
+        }, source.replace("ENGINE_T", f"GraphEngine_{digest}")
+
+    @functools.cached_property
+    def _primary(self):
+        """The primary graph's full model's construction info."""
+        token = next(iter(self.build_graphs().values()))
+        fold = GraphFolder(
+            token.program_graph, root_names=list(token.outputs), structural_reads=True
+        ).fold({}, label="primary")
+        return construct(fold.program_graph)[2]
+
+    @property
+    def slot_of(self) -> dict:
+        return self._primary.slot_of
+
+    @property
+    def lives(self) -> list:
+        return self._primary.lives
 
     def model_id(self, graph: str, expert: str | None = None) -> int:
         return self.model_ids[graph, expert]
 
     @staticmethod
     def _compile(token: TokenGraph, program_graph, dims, union_lookup_of) -> dict:
-        model, _tokens, _idx, info = construct(program_graph)
+        model, _idx, info = construct(program_graph)
         by_name = {}
         for d in dims:
             by_name.setdefault(d.name, d)
         inputs = {d.name: d for d in program_graph.all_dims if isinstance(d, InputDimension)}
         return {
             "model": model,
-            "info": info,
+            # Integer coefficients preserve integer residuals. Fractional
+            # projections need the same half-unit encoding as the CPU.
+            "fraction_bits": int(any(
+                (weight.weight != np.rint(weight.weight)).any()
+                for weight in [
+                    *model.ff_in, *model.ff_out,
+                    *(attn.out_proj for attn in model.attn),
+                ]
+            )),
             "n_layers": info.n_layers,
             "d_model": info.d_model,
             "one_slot": info.slot_of[program_graph.one],
@@ -309,6 +295,42 @@ class CompiledGraph:
             "output_slots": [info.slot_of[by_name[n]] for n in token.outputs],
             "union_lookup_of": union_lookup_of,
         }
+
+    def _debug_kernel(self, trace: bool):
+        if trace not in self._debug_modules:
+            from pathlib import Path
+
+            key = f"graph_debug:{self.digest}:{trace}"
+            entry = manifest_read().get(key)
+            if entry is not None and entry.get("code") == self.source_code:
+                with artifact_lock(entry["digest"]):
+                    path = Path(CACHE_DIR) / f"graph_{entry['digest']}_debug.cpp"
+                    if path.exists():
+                        self._debug_modules[trace] = load_module(
+                            f"graph_debug_{entry['digest']}", entry["digest"], [str(path)]
+                        )
+                        return self._debug_modules[trace].kernel()
+            token = next(iter(self.build_graphs().values()))
+            fold = GraphFolder(
+                token.program_graph, root_names=list(token.outputs), structural_reads=True
+            ).fold({}, label="primary")
+            model = self._compile(
+                token, fold.program_graph, list(fold.dim_of_name.values()), fold.union_lookup_of
+            )
+            model["fraction_bits"] = self.f_bits
+            adapter = DEBUG_ADAPTER.replace("@ROWS@", str(model["n_layers"] + 1 if trace else 1))
+            source = bank_source(
+                [model], adapter, memory_size=self.memory_size, trace=trace, ablation=True
+            )
+            digest = hashlib.sha256(source.encode()).hexdigest()[:16]
+            with artifact_lock(digest):
+                path = Path(CACHE_DIR) / f"graph_{digest}_debug.cpp"
+                write_atomic(path, source.encode())
+                self._debug_modules[trace] = load_module(
+                    f"graph_debug_{digest}", digest, [str(path)]
+                )
+                manifest_put(key, {"kind": "graph_debug", "digest": digest}, code=self.source_code)
+        return self._debug_modules[trace].kernel()
 
     def write(self, addr: int, value: int) -> None:
         self.engine.write(addr, value)

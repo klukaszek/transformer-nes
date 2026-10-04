@@ -110,7 +110,10 @@ def run_reference(image: bytearray, log_rows) -> tuple[bool, int, float]:
 
 
 def run_weights(
-    image: bytearray, *, max_steps: int, union_only: bool = False,
+    image: bytearray,
+    *,
+    max_steps: int,
+    union_only: bool = False,
 ) -> tuple[bool, int, float, float, str]:
     """Run the real weights-based transformer in lockstep with the reference."""
     from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
@@ -118,7 +121,7 @@ def run_weights(
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only)
-    mode = "union-only" if union_only else "codegen-exact-int32-runloop"
+    mode = "union-only" if union_only else "torch-int32-runloop"
     build_elapsed = time.perf_counter() - build_start
 
     # Whole suite through the C++ run loop, then lockstep the arrays.
@@ -143,9 +146,7 @@ def run_weights(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description="Run the nestest CPU suite.")
-    parser.add_argument(
-        "--runner", choices=["reference", "weights", "both"], default="reference"
-    )
+    parser.add_argument("--runner", choices=["reference", "weights", "both"], default="reference")
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -156,7 +157,7 @@ def main() -> None:
         "--union-only",
         action="store_true",
         help="build the weights engine with no experts, so every opcode "
-             "executes on the union proof model",
+        "executes on the union proof model",
     )
     args = parser.parse_args()
 

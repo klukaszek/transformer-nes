@@ -21,7 +21,7 @@ imgui_raw="https://raw.githubusercontent.com/ocornut/imgui/$IMGUI_TAG"
 mkdir -p imgui
 for f in imgui.h imgui_internal.h imconfig.h imstb_rectpack.h \
          imstb_textedit.h imstb_truetype.h imgui.cpp imgui_draw.cpp \
-         imgui_tables.cpp imgui_widgets.cpp imgui_demo.cpp LICENSE.txt; do
+         imgui_tables.cpp imgui_widgets.cpp LICENSE.txt; do
     curl -sf "$imgui_raw/$f" -o "imgui/$f"
     echo "imgui/$f"
 done

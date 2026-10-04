@@ -1,7 +1,7 @@
 """The overlay's X-ray reads the live engines without disturbing them."""
 
 from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
-from transformer_nes.nes.xray import PATHS, CpuXray
+from transformer_nes.nes.xray import PATHS, CpuXray, PpuXray
 
 
 def machine_at(program: bytes) -> Cpu6502TransformerMachine:
@@ -11,6 +11,21 @@ def machine_at(program: bytes) -> Cpu6502TransformerMachine:
     machine = Cpu6502TransformerMachine(bcd=False, mirror_cpu_ram=True)
     machine.load_image(bytes(image), start_pc=0x8000)
     return machine
+
+
+def test_counter_views_do_not_construct_debug_models():
+    class EngineOnly:
+        engine = None
+
+        @property
+        def lives(self):
+            raise AssertionError("debug graph built before dissection")
+
+    runtime = EngineOnly()
+    runtime.engine = runtime
+    cpu = CpuXray(runtime)
+    ppu = PpuXray(runtime)
+    assert cpu.engine is runtime and ppu.engine is runtime
 
 
 def test_dissection_follows_an_instruction_through_the_layers():
@@ -38,3 +53,19 @@ def test_path_counters_cover_every_instruction():
     assert [p for p, _ in paths] == list(PATHS)
     assert sum(n for _, n in paths) == out["steps"]
     assert sum(n for _, n in xray.take_paths()[0]) == 0  # taken and reset
+
+
+def test_overlay_reuses_one_snapshot_until_the_next_emulated_frame():
+    from types import SimpleNamespace
+
+    from transformer_nes.nes.debug import DebugBridge
+
+    maps = []
+    console = SimpleNamespace(ppu_expert_map=lambda: maps.append(True) or bytes([255]) * 7680)
+    bridge = DebugBridge(console, "reference")
+    first = bridge.xray_frame()
+    assert bridge.xray_frame() is first
+    assert len(maps) == 1
+    bridge.note_frame(0.003)
+    assert bridge.xray_frame() is not first
+    assert len(maps) == 2

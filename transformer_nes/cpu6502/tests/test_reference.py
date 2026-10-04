@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from transformer_nes.cpu6502.backends import reference
@@ -12,25 +10,16 @@ from transformer_nes.cpu6502.spec import (
     FLAG_N,
     FLAG_Z,
     MODE_ABSOLUTE_X,
-    asm,
     opcode_for,
 )
 from transformer_nes.cpu6502.trace import format_trace_row
-
-EXAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "examples", "tiny")
-
-
-def example(name: str) -> bytes:
-    with open(os.path.join(EXAMPLES_DIR, name), "rb") as f:
-        return f.read()
-
 
 # ── Program 1: load immediate ─────────────────────────────────────
 
 
 def test_lda_imm_sets_a_and_flags():
     cpu = reference.Cpu6502()
-    trace = cpu.run(example("load_immediate.bin"), start_pc=0x8000, max_steps=10)
+    trace = cpu.run(bytes.fromhex("A9 42 00"), start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
     assert final.a == 0x42
@@ -43,7 +32,7 @@ def test_lda_imm_sets_a_and_flags():
 
 
 def test_lda_zero_sets_z_flag():
-    trace = reference.run(example("zero_flag.bin"), start_pc=0x8000, max_steps=10)
+    trace = reference.run(bytes.fromhex("A9 00 00"), start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
     assert final.a == 0x00
@@ -52,7 +41,7 @@ def test_lda_zero_sets_z_flag():
 
 
 def test_lda_negative_sets_n_flag():
-    trace = reference.run(example("negative_flag.bin"), start_pc=0x8000, max_steps=10)
+    trace = reference.run(bytes.fromhex("A9 80 00"), start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
     assert final.a == 0x80
@@ -65,7 +54,7 @@ def test_lda_negative_sets_n_flag():
 
 def test_sta_zpg_writes_memory():
     cpu = reference.Cpu6502()
-    trace = cpu.run(example("store_zpg.bin"), start_pc=0x8000, max_steps=10)
+    trace = cpu.run(bytes.fromhex("A9 37 85 10 00"), start_pc=0x8000, max_steps=10)
     assert cpu.memory[0x0010] == 0x37
     # The trace also contains the BRK stack pushes; check the STA write.
     sta_writes = [w for w in trace.writes() if w.addr == 0x0010]
@@ -77,7 +66,7 @@ def test_sta_zpg_writes_memory():
 
 
 def test_bne_loop_counts_down():
-    trace = reference.run(example("branch_loop.bin"), start_pc=0x8000, max_steps=20)
+    trace = reference.run(bytes.fromhex("A2 03 CA D0 FD 00"), start_pc=0x8000, max_steps=20)
     final = trace.final_state()
     assert final is not None
     assert final.x == 0x00
@@ -111,7 +100,7 @@ def test_nes_internal_ram_mirrors_are_write_through():
 
 
 def test_ldx_imm():
-    program = asm().ldx_imm(0xAB).brk().bytes()
+    program = bytes.fromhex("A2 AB 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -120,7 +109,7 @@ def test_ldx_imm():
 
 
 def test_ldy_imm():
-    program = asm().ldy_imm(0x05).brk().bytes()
+    program = bytes.fromhex("A0 05 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -129,7 +118,7 @@ def test_ldy_imm():
 
 
 def test_sta_abs():
-    program = asm().lda_imm(0x55).sta_abs(0x0200).brk().bytes()
+    program = bytes.fromhex("A9 55 8D 00 02 00")
     cpu = reference.Cpu6502()
     trace = cpu.run(program, start_pc=0x8000, max_steps=10)
     assert cpu.memory[0x0200] == 0x55
@@ -139,7 +128,7 @@ def test_sta_abs():
 
 def test_adc_imm():
     # A=5 + 7 = 0x0C, no carry in
-    program = asm().lda_imm(0x05).adc_imm(0x07).brk().bytes()
+    program = bytes.fromhex("A9 05 69 07 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -150,8 +139,8 @@ def test_adc_imm():
 
 
 def test_adc_imm_with_carry():
-    # A=0xFF + 1 + carry=1 => 0x01 with C=1, V=0
-    program = asm().lda_imm(0xFF).adc_imm(0x01).brk().bytes()
+    # A=0xFF + 1 with carry initially clear => 0x00 with C=1, V=0
+    program = bytes.fromhex("A9 FF 69 01 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -164,7 +153,7 @@ def test_adc_imm_with_carry():
 def test_sbc_imm():
     # A=10 - 3.  With C=0 initially the operation is A - M - 1 = 6.
     # No unsigned borrow is required, so carry is set afterward.
-    program = asm().lda_imm(0x0A).sbc_imm(0x03).brk().bytes()
+    program = bytes.fromhex("A9 0A E9 03 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -173,7 +162,7 @@ def test_sbc_imm():
 
 
 def test_inx():
-    program = asm().ldx_imm(0x7F).inx().brk().bytes()
+    program = bytes.fromhex("A2 7F E8 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -183,7 +172,7 @@ def test_inx():
 
 
 def test_dex_wrap():
-    program = asm().ldx_imm(0x00).dex().brk().bytes()
+    program = bytes.fromhex("A2 00 CA 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -192,7 +181,7 @@ def test_dex_wrap():
 
 
 def test_tax():
-    program = asm().lda_imm(0x00).tax().brk().bytes()
+    program = bytes.fromhex("A9 00 AA 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -201,7 +190,7 @@ def test_tax():
 
 
 def test_jmp_abs():
-    program = asm().jmp_abs(0x8005).lda_imm(0xAA).brk().bytes()
+    program = bytes.fromhex("4C 05 80 A9 AA 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -211,7 +200,7 @@ def test_jmp_abs():
 
 
 def test_beq_taken():
-    program = asm().lda_imm(0x00).beq(0x02).lda_imm(0xFF).brk().bytes()
+    program = bytes.fromhex("A9 00 F0 02 A9 FF 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     final = trace.final_state()
     assert final is not None
@@ -226,7 +215,7 @@ def test_beq_taken():
 def test_trace_format_matches_contract():
     # Trace rows are post-execution snapshots labeled with the address of the
     # instruction that was just executed (PC has not yet advanced in the row).
-    program = asm().lda_imm(0x05).adc_imm(0x03).sta_zpg(0x00).brk().bytes()
+    program = bytes.fromhex("A9 05 69 03 85 00 00")
     trace = reference.run(program, start_pc=0x8000, max_steps=10)
     lines = trace.format().splitlines()
     assert len(lines) == 4

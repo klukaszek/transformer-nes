@@ -9,7 +9,7 @@ import pytest
 def test_exported_weights_are_self_describing(tmp_path):
     from safetensors.numpy import load_file
 
-    from transformer_nes.model.export import export_model
+    from transformer_nes.cpu6502.backends.weights.export import export_model
 
     meta = export_model(str(tmp_path))
     tensors = load_file(str(tmp_path / "weights.safetensors"))
@@ -25,7 +25,7 @@ def test_exported_weights_are_self_describing(tmp_path):
 
 @pytest.fixture(scope="module")
 def checkpoint(tmp_path_factory):
-    from transformer_nes.model.export import export_model
+    from transformer_nes.cpu6502.backends.weights.export import export_model
 
     out = tmp_path_factory.mktemp("checkpoint")
     export_model(str(out))
@@ -39,7 +39,7 @@ def test_checkpoint_runners_stand_alone(runner):
     import ast
     import importlib
 
-    module = importlib.import_module(f"transformer_nes.model.{runner}")
+    module = importlib.import_module(f"transformer_nes.cpu6502.backends.weights.{runner}")
     with open(module.__file__) as f:
         tree = ast.parse(f.read())
     modules = {
@@ -54,7 +54,7 @@ def test_vanilla_pytorch_runs_the_checkpoint(checkpoint):
     against the reference core: registers, cycles (page crossings and
     taken branches included), and the BRK halt."""
     from transformer_nes.cpu6502.backends import reference
-    from transformer_nes.model.checkpoint_runner import Cpu, Transformer
+    from transformer_nes.cpu6502.backends.weights.checkpoint_runner import Cpu, Transformer
 
     code = bytes([
         0xA2, 0x05,        # $8000 LDX #5
@@ -92,21 +92,41 @@ def test_vanilla_pytorch_runs_the_checkpoint(checkpoint):
     assert ref.halted and step > 20
 
 
+def test_sparse_memory_and_repeated_writes(checkpoint):
+    """Missing addresses read zero, and each address keeps its latest write."""
+    from transformer_nes.cpu6502.backends.weights.checkpoint_runner import Cpu, Transformer
+
+    code = bytes([0xAD, 3, 0, 0xAD, 6, 0, 0xAD, 6, 0, 0xAD, 0xFE, 0xFF])
+    image = bytearray(65536)
+    image[0x8000:0x8000 + len(code)] = code
+    image[6] = 255
+    cpu = Cpu(Transformer(checkpoint), image, 0x8000)
+    cpu.write(0, 0)
+    assert cpu.step() == 4 and cpu.state["a"] == 0
+    assert cpu.step() == 4 and cpu.state["a"] == 255
+    cpu.write(6, 17)
+    assert cpu.step() == 4 and cpu.state["a"] == 17
+    assert cpu.step() == 4 and cpu.state["a"] == 0
+
+
+
 @pytest.mark.slow
 def test_checkpoint_matches_the_nestest_golden_log(checkpoint):
+    from transformer_nes.cpu6502.backends.weights.checkpoint_runner import Transformer, nestest
     from transformer_nes.cpu6502.examples.nestest import NESTEST_LOG, NESTEST_ROM
-    from transformer_nes.model.checkpoint_runner import Transformer, nestest
 
     assert nestest(Transformer(checkpoint), NESTEST_ROM, NESTEST_LOG, steps=300) == 300
 
 
-def test_routed_experts_pass_nestest(tmp_path):
+@pytest.mark.parametrize("attention", [False, True], ids=["indexed", "attention"])
+def test_routed_experts_pass_nestest(tmp_path, attention):
     """The folded per-opcode experts as a mixture of small PyTorch models
-    routed by the byte at PC, with structural memory: all of nestest
-    against the golden log, registers and cycles."""
+    routed by the byte at PC: all of nestest against the golden log,
+    registers and cycles -- with memory read by index, and by softmax
+    attention over all of it, which the index must equal."""
+    from transformer_nes.cpu6502.backends.weights.expert_runner import nestest
+    from transformer_nes.cpu6502.backends.weights.export import export_experts
     from transformer_nes.cpu6502.examples.nestest import NESTEST_LOG, NESTEST_ROM
-    from transformer_nes.model.expert_runner import nestest
-    from transformer_nes.model.export import export_experts
 
     export_experts(str(tmp_path))
-    assert nestest(str(tmp_path), NESTEST_ROM, NESTEST_LOG) == 8991
+    assert nestest(str(tmp_path), NESTEST_ROM, NESTEST_LOG, attention=attention) == 8991

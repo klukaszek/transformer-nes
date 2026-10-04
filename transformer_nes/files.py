@@ -8,7 +8,7 @@ import tempfile
 
 def write_atomic(path: str, data: bytes) -> None:
     """Write `path` so no reader sees it half written, and writers racing
-    for it (the game and a learner folding the same window) each replace
+    for it each replace
     it whole: through a temporary file of the writer's own, then a rename."""
     directory = os.path.dirname(path) or "."
     fd, temporary = tempfile.mkstemp(dir=directory, prefix=".", suffix=".tmp")

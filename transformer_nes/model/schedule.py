@@ -22,9 +22,6 @@ from transformer_nes.graph.core import (
     MemoryReadDimension,
     PersistDimension,
     ReGLUDimension,
-    graph_dims,
-    graph_lookups,
-    graph_memory_reads,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,27 +31,11 @@ ATTENTION_OPS = (LookUp, MemoryRead)
 ATTENTION_DIMS = (LookUpDimension, MemoryReadDimension)
 
 
-def build_graph(all_dims=None, all_lookups=None, all_memory_reads=None):
-    """Build dependency graph from dim/lookup lists.
-
-    Args:
-        all_dims: list of Dimension objects (defaults to module-global graph_dims)
-        all_lookups: list of LookUp objects (defaults to module-global graph_lookups)
-    """
-    explicit_graph = all_dims is not None or all_lookups is not None
-    if all_dims is None:
-        all_dims = graph_dims
-    if all_lookups is None:
-        all_lookups = graph_lookups
-    if all_memory_reads is None:
-        all_memory_reads = (
-            list(dict.fromkeys(
-                dim.memory_read
-                for dim in all_dims
-                if isinstance(dim, MemoryReadDimension)
-            ))
-            if explicit_graph else graph_memory_reads
-        )
+def build_graph(program_graph):
+    """Build scheduling dependencies from one captured graph."""
+    all_dims = program_graph.all_dims
+    all_lookups = program_graph.all_lookups
+    all_memory_reads = program_graph.all_memory_reads
     inputs = [d for d in all_dims if isinstance(d, InputDimension)]
     reglus = [d for d in all_dims if isinstance(d, ReGLUDimension)]
     persists = [d for d in all_dims if isinstance(d, PersistDimension)]
@@ -82,7 +63,7 @@ def build_graph(all_dims=None, all_lookups=None, all_memory_reads=None):
         if isinstance(lu, MemoryRead):
             d |= edeps(lu.address)
         else:
-            for expr in lu.query_exprs_2d + lu.key_exprs_2d + lu.value_exprs:
+            for expr in lu.query_exprs + lu.key_exprs + lu.value_exprs:
                 d |= edeps(expr)
         deps_cache[lu] = d
 
@@ -102,54 +83,15 @@ def build_graph(all_dims=None, all_lookups=None, all_memory_reads=None):
                 op_deps[op].add(pred)
                 children[pred].add(op)
 
-    avg_lookups = {
-        lu for lu in lookups
-        if isinstance(lu, LookUp) and lu.tie_break == "average"
-    }
-    tight_to = defaultdict(set)
-    for op in reglus + persists:
-        for dim in deps_cache[op]:
-            if isinstance(dim, ATTENTION_DIMS) and dim in dim_to_op:
-                lu = dim_to_op[dim]
-                if lu in avg_lookups:
-                    tight_to[op].add(lu)
-
     return dict(
         ops=ops,
-        reglus=reglus,
-        persists=persists,
-        lookups=lookups,
         inputs=inputs,
         produced=produced,
-        deps_cache=deps_cache,
         dim_to_op=dim_to_op,
         op_deps=op_deps,
         children=children,
         consumers=consumers,
-        tight_to=dict(tight_to),
     )
-
-
-def min_layers(ops, op_deps):
-    """Critical path length with phase parity (ASAP without tight constraints)."""
-    phase, remaining = {}, set(ops)
-    while remaining:
-        progress = False
-        for op in list(remaining):
-            if not all(p in phase for p in op_deps[op]):
-                continue
-            lo = max((phase[p] for p in op_deps[op]), default=-1) + 1
-            if isinstance(op, ATTENTION_OPS):
-                lo += (-lo) % 4
-            elif isinstance(op, ReGLUDimension):
-                lo += (2 - lo % 4 + 4) % 4
-            else:
-                lo += 0 if lo % 2 == 1 else 1
-            phase[op] = lo
-            remaining.discard(op)
-            progress = True
-        assert progress, "Cycle in dependencies"
-    return max(phase.values()) // 4 + 1
 
 
 def all_result_dims(graph):
@@ -225,7 +167,7 @@ def layers_and_liveness(pa, all_dims, dim_to_op, consumers, output_dims):
             c = 4 * L + sp
             alive_after[c] = alive_at(c)
 
-    return num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after
+    return num_layers, std_layers, alive_after
 
 
 def legal_phases(lo, hi, op):
@@ -239,50 +181,33 @@ def legal_phases(lo, hi, op):
     return range(start, hi + 1, step)
 
 
-def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
-                  balance=True):
-    """Critical-path (ASAP) schedule, optionally load-balanced.
+def asap_schedule(program_graph, log=None):
+    """Load-balanced critical-path schedule for a captured graph.
 
-    Layer count equals the dependency critical path, which is also the
-    floor any scheduler can reach.
-
-    Plain ASAP piles ops into the earliest layers, and d_model ends up
-    dominated by the busiest layer's head/FFN demand rather than by
-    liveness.  With balance=True a reverse-topological leveling pass
-    re-places every op at the least-loaded legal phase within its
-    dependency window (ties -> latest, which also shortens lifetimes).
+    Layer count equals the dependency critical path. A reverse-topological
+    pass places every operation at the least-loaded legal phase within its
+    dependency window, breaking ties toward later phases to shorten lifetimes.
     """
     log = log or logger.debug
-
-    if program_graph is not None:
-        pg = program_graph
-        graph = build_graph(pg.all_dims, pg.all_lookups, pg.all_memory_reads)
-    else:
-        graph = build_graph()
+    graph = build_graph(program_graph)
 
     ops = graph["ops"]
     op_deps = graph["op_deps"]
     children = graph["children"]
-    if graph.get("tight_to"):
-        raise NotImplementedError(
-            "average-tiebreak lookups need same-layer constraints that no "
-            "scheduler here honors; every lookup must declare LATEST"
-        )
     all_dims = all_result_dims(graph)
 
-    output_dims = set()
-    for expr in output_tokens.values():
+    # Weight construction adds constant-one gates for linear passthroughs
+    # and erases after scheduling. Their implicit input must never be recycled.
+    output_dims = {program_graph.one}
+    for expr in program_graph.output_tokens.values():
         if isinstance(expr, Expression):
             output_dims |= set(expr.terms.keys())
 
     if not ops:
         log("ASAP schedule: 0 ops, 0 layers, max alive width 0, busiest layer 0 ops")
-        return dict(
-            phase_assign={}, std_layers=[], num_layers=0,
-            dim_birth={}, dim_death={}, alive_after={}, width=None,
-        )
+        return dict(std_layers=[], num_layers=0, alive_after={})
 
-    # ASAP with phase parity (the same rule min_layers uses).  Iterate in
+    # ASAP with phase parity. Iterate in
     # stable ops order, not set order: the schedule (and therefore the
     # constructed weights) must be deterministic across processes.
     asap, remaining = {}, set(ops)
@@ -299,44 +224,33 @@ def asap_schedule(input_tokens, output_tokens, log=None, program_graph=None,
             progress = True
         assert progress, "Cycle in dependencies"
 
-    pa = dict(asap)
-    if balance:
-        # Reverse-topological leveling: children are already placed, so
-        # each op's window is [its ASAP phase, min(children) - 1].  ASAP
-        # phases of parents are strictly below the op's, so windows stay
-        # nonempty as parents are placed after their children.
-        max_phase = max(pa.values())
-        pa = {}
-        load = defaultdict(int)
-        for op in reversed(topo_order):
-            kids = [pa[c] for c in children.get(op, ()) if c in pa]
-            hi = (min(kids) - 1) if kids else max_phase
-            hi = max(hi, asap[op])
-            candidates = list(legal_phases(asap[op], hi, op)) or [asap[op]]
-            best = min(candidates, key=lambda p: (load[p], -p))
-            pa[op] = best
-            load[best] += 1
+    # Reverse-topological leveling: children are already placed, so
+    # each op's window is [its ASAP phase, min(children) - 1].  ASAP
+    # phases of parents are strictly below the op's, so windows stay
+    # nonempty as parents are placed after their children.
+    max_phase = max(asap.values())
+    pa = {}
+    load = defaultdict(int)
+    for op in reversed(topo_order):
+        kids = [pa[c] for c in children.get(op, ()) if c in pa]
+        hi = (min(kids) - 1) if kids else max_phase
+        hi = max(hi, asap[op])
+        candidates = list(legal_phases(asap[op], hi, op)) or [asap[op]]
+        best = min(candidates, key=lambda p: (load[p], -p))
+        pa[op] = best
+        load[best] += 1
 
-    (num_layers, max_phase, std_layers, dim_birth, dim_death, alive_after) = (
-        layers_and_liveness(
-            pa, all_dims, graph["dim_to_op"], graph["consumers"], output_dims
-        )
+    (num_layers, std_layers, alive_after) = layers_and_liveness(
+        pa, all_dims, graph["dim_to_op"], graph["consumers"], output_dims
     )
     max_dep = max((len(s) for s in alive_after.values()), default=0)
-    busiest = max(
-        (len(p1) + len(f) + len(p2) for _, p1, f, p2 in std_layers), default=0
-    )
+    busiest = max((len(p1) + len(f) + len(p2) for _, p1, f, p2 in std_layers), default=0)
     log(
-        f"{'Balanced' if balance else 'ASAP'} schedule: {len(ops)} ops, "
+        f"Balanced schedule: {len(ops)} ops, "
         f"{num_layers} layers, max alive width {max_dep}, busiest layer {busiest} ops"
     )
     return dict(
-        phase_assign=pa,
         std_layers=std_layers,
         num_layers=num_layers,
-        dim_birth=dim_birth,
-        dim_death=dim_death,
         alive_after=alive_after,
-        width=None,
     )
-

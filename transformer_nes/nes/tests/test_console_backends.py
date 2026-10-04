@@ -77,3 +77,35 @@ def test_mmc1_rmw_register_write_uses_rom_byte(backend):
     # Register = 0b11111 -> bank 1 at $8000, whose first byte is the
     # code's 0xEE; the final-value bug would leave bank 0 (0x00).
     assert console.read_ram(0x10, 1) == b"\xee"
+
+
+def vblank_poll_cart(hardware):
+    """NROM cart that polls $2002 in a loop the engine retires as a
+    recurrence (LDA $2002; AND #$80; BNE), counting its passes.  At each
+    vblank the read pauses and the PPU serves $80, clearing the flag; the
+    lease it then sets serves $00, so the loop runs once more and exits."""
+    code = bytes([
+        0xE6, 0x10,        # $C000 INC $10
+        0xAD, 0x02, 0x20,  # $C002 LDA $2002
+        0x29, 0x80,        # $C005 AND #$80
+        0xD0, 0xF9,        # $C007 BNE $C002
+        0xE6, 0x11,        # $C009 INC $11
+        0x4C, 0x00, 0xC0,  # $C00B JMP $C000
+    ])
+    prg = bytearray(0x4000)
+    prg[: len(code)] = code
+    prg[0x3FFA:0x4000] = b"\x00\xC0\x00\xC0\x00\xC0"  # NMI, reset, IRQ -> $C000
+    header = bytes([0x4E, 0x45, 0x53, 0x1A, 1, 0, 0, 0]) + bytes(8)
+    return hardware.Cartridge.parse(header + bytes(prg))
+
+
+def test_leased_poll_recurrence_matches_reference():
+    """A poll recurrence extrapolates only what single steps would read: a
+    lease serving another value than the read the poll began with (served
+    by the device at a pause) ends it."""
+    hardware = load_hardware()
+    cart = vblank_poll_cart(hardware)
+    ref, _ = run_console(hardware, cart, "reference", 12, script={})
+    wts, _ = run_console(hardware, cart, "weights", 12, script={})
+    assert ref.cycles == wts.cycles
+    assert ref.read_ram(0x10, 2) == wts.read_ram(0x10, 2)

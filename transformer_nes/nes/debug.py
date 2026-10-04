@@ -41,6 +41,7 @@ class DebugBridge:
         self.no_sprite_limit = False
         self.last_ms = 0.0
         self.avg_ms = 0.0
+        self._xray_snapshot: dict | None = None
 
     def note_frame(self, seconds: float):
         # Called once per emulated frame: the CPU counters are taken here,
@@ -48,6 +49,7 @@ class DebugBridge:
         if self.cpu_xray is not None:
             self.cpu_frames.append(self.cpu_xray.take_paths())
             self.read_heat.add(self.cpu_xray.take_reads())
+        self._xray_snapshot = None
         self.last_ms = 1e3 * seconds
         self.avg_ms = self.last_ms if not self.avg_ms else 0.95 * self.avg_ms + 0.05 * self.last_ms
 
@@ -83,12 +85,14 @@ class DebugBridge:
         self.step_pending += 1
 
     def xray_frame(self) -> dict:
+        if self._xray_snapshot is not None:
+            return self._xray_snapshot
         paths, singles = Counter(), Counter()
         for frame_paths, frame_singles in self.cpu_frames:
             paths.update(dict(frame_paths))
             singles.update(dict(frame_singles))
         expert_map = self.console.ppu_expert_map()
-        return {
+        self._xray_snapshot = {
             "cpu_paths": [(name, paths[name]) for name in PATHS] if paths else [],
             "cpu_singles": singles.most_common(8),
             "ppu_models": ppu_expert_summary(expert_map, self.expert_names),
@@ -98,6 +102,8 @@ class DebugBridge:
             "read_heat": self.read_heat.image() if self.cpu_xray else b"",
             "hot_pages": self.read_heat.hottest() if self.cpu_xray else [],
         }
+
+        return self._xray_snapshot
 
     # ── With the render graph (ppu_xray) ──
 

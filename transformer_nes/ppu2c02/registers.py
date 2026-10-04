@@ -118,7 +118,7 @@ def gated(default: ExprLike, cases: list[tuple[ExprLike, ExprLike]]) -> Expressi
 def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expression]]:
     """`chr_full`: bytes of whole-CHR memory (MMC5), or 0 for the CHR
     windows."""
-    one = graph.one
+    one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in (*ACCESS_FIELDS, *STATE_FIELDS)}
     is_access = InputDimension("is_access")
     is_mem_write = InputDimension("is_mem_write")

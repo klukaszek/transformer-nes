@@ -29,6 +29,7 @@
 
 #include "nes/palette.h"
 #include "ui/debug_ui.h"
+#include "ui/frame_clock.h"
 
 namespace py = pybind11;
 
@@ -122,7 +123,10 @@ struct AppState {
   py::object quit_cb;
   unique_ptr<py::error_already_set> error;
   uint32_t buttons = 0;
-  double acc = 0.0;
+  transformer_nes::ui::FrameClock clock{nes_frame_seconds};
+  std::chrono::steady_clock::time_point last_tick;
+  double last_emulate_seconds = 0.0;
+  double last_present_seconds = 0.001;
   bool have_frame = false;
   array<uint8_t, frame_height * frame_width * 4> rgba{};
   sg_image image{};
@@ -191,6 +195,7 @@ void app_init() {
   pip.label = "nes-blit";
   state->pipeline = sg_make_pipeline(&pip);
   transformer_nes::ui::setup();
+  state->last_tick = std::chrono::steady_clock::now();
 }
 
 // One emulated frame: cb(buttons) -> (240, 256) uint8 palette indices, or None.
@@ -217,22 +222,25 @@ bool emulate_frame() {
 }
 
 void app_frame() {
+  const auto started = std::chrono::steady_clock::now();
   py::gil_scoped_acquire gil;
-  state->acc += sapp_frame_duration();
-  // A stall (window drag, machine handoff) must not queue a burst.
-  if (state->acc > 4 * nes_frame_seconds) {
-    state->acc = 4 * nes_frame_seconds;
-  }
-  // Wall-clock budget per callback: when the backend cannot keep up
-  // with real time, drop the backlog (the game slows down) instead of
-  // saturating the main thread -- the event loop must always breathe.
-  // Half the display cadence, so a 120 Hz callback keeps headroom too.
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                            std::chrono::duration<double>(0.5 * sapp_frame_duration()));
+  const double display_seconds = std::chrono::duration<double>(started - state->last_tick).count();
+  state->clock.advance(display_seconds);
+  state->last_tick = started;
+  // Reserve CPU presentation work (excluding drawable/queue waits) and
+  // predict the next emulation cost
+  // before starting a catch-up frame. The first due frame always progresses.
+  const double budget = std::max(0.0, sapp_frame_duration() - state->last_present_seconds);
+  const auto deadline = started + std::chrono::duration<double>(budget);
   bool fresh = false;
-  while (state->acc >= nes_frame_seconds && !state->error) {
-    state->acc -= nes_frame_seconds;
+  while (state->clock.ready() && !state->error) {
+    const auto now = std::chrono::steady_clock::now();
+    if (fresh && now + std::chrono::duration<double>(state->last_emulate_seconds) >= deadline) {
+      state->clock.discard_backlog();
+      break;
+    }
+    state->clock.consume();
+    const auto emulate_started = std::chrono::steady_clock::now();
     try {
       if (!emulate_frame())
         break;
@@ -242,11 +250,14 @@ void app_frame() {
       state->error = std::make_unique<py::error_already_set>(std::move(e));
       sapp_request_quit();
     }
-    if (std::chrono::steady_clock::now() > deadline) {
-      state->acc = 0.0;
+    const auto finished = std::chrono::steady_clock::now();
+    state->last_emulate_seconds = std::chrono::duration<double>(finished - emulate_started).count();
+    if (finished >= deadline) {
+      state->clock.discard_backlog();
       break;
     }
   }
+  const auto presentation_started = std::chrono::steady_clock::now();
   if (fresh) {
     sg_image_data data{};
     data.mip_levels[0] = {state->rgba.data(), state->rgba.size()};
@@ -274,18 +285,20 @@ void app_frame() {
   // Build the overlay's ImGui frame before the pass (font/texture
   // updates are illegal inside one); submit it inside the pass below.
   try {
-    transformer_nes::ui::draw(state->ui, state->hooks);
+    transformer_nes::ui::draw(state->ui, state->hooks, display_seconds);
   } catch (py::error_already_set& e) {
     std::fprintf(stderr, "debug overlay raised:\n%s\n", e.what());
     state->error = std::make_unique<py::error_already_set>(std::move(e));
     sapp_request_quit();
   }
 
+  const auto pass_started = std::chrono::steady_clock::now();
   sg_pass pass{};
   pass.swapchain = sglue_swapchain();
   pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
   pass.action.colors[0].clear_value = {0.0f, 0.0f, 0.0f, 1.0f};
   sg_begin_pass(&pass);
+  const auto pass_ready = std::chrono::steady_clock::now();
   if (state->have_frame) {
     sg_apply_viewport((w - vw) / 2, (h - vh) / 2, vw, vh, true);
     sg_apply_pipeline(state->pipeline);
@@ -301,6 +314,8 @@ void app_frame() {
   transformer_nes::ui::render(state->ui);
   sg_end_pass();
   sg_commit();
+  state->last_present_seconds = std::chrono::duration<double>(
+      (std::chrono::steady_clock::now() - presentation_started) - (pass_ready - pass_started)).count();
 }
 
 void app_event(const sapp_event* e) {
@@ -437,8 +452,7 @@ transformer_nes::ui::DebugHooks make_hooks(py::object bridge) {
 
 // Blocks until the window closes.  The callbacks run on this thread
 // inside sapp_run, each taking the GIL for itself: between them, while
-// sapp_run waits for the display, Python's other threads run (the
-// PyTorch forwards load and compile in the background, for one).
+// sapp_run waits for the display, Python's other threads can run.
 void run(const string& title, int scale, py::object frame_cb, py::object quit_cb,
          py::object debug, bool overlay) {
   if (scale <= 0)

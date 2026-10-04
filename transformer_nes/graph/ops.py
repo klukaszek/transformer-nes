@@ -29,8 +29,8 @@ def match_byte(value: ExprLike, byte: int) -> Expression:
 
 def match_zero(value: ExprLike) -> Expression:
     """Return a 0/1 gate: 1 iff an integer expression is exactly zero."""
-    one = graph.one
-    abs_diff = persist(reglu(value, value) + reglu(-value, -value))
+    one = graph.current_graph().one
+    abs_diff = persist(reglu(one, value) + reglu(one, -value))
     return stepglu(one, -abs_diff)
 
 
@@ -46,19 +46,41 @@ def mux(gate: ExprLike, if_one: ExprLike, if_zero: ExprLike) -> Expression:
 
 def wrap8(value: ExprLike) -> Expression:
     """Reduce an integer expression to an unsigned 8-bit value."""
-    one = graph.one
+    one = graph.current_graph().one
     return value - 256 * stepglu(one, value - 256) + 256 * stepglu(one, -value - 1)
 
 
 def wrap16(value: ExprLike) -> Expression:
     """Reduce an integer expression to an unsigned 16-bit value."""
-    one = graph.one
+    one = graph.current_graph().one
     return value - 65536 * stepglu(one, value - 65536) + 65536 * stepglu(one, -value - 1)
+
+
+def wrapped_nz(value: ExprLike, *, lo: int, hi: int) -> tuple[Expression, Expression]:
+    """N/Z of an integer byte result, directly from its pre-wrap value.
+
+    The inclusive bounds must cover ``value``. Finite differences express
+    each flag as an affine term plus ReLU hinges, all in one ReGLU stage.
+    Shared hinges serve both flags; the construction table is never executed.
+    """
+    if not -256 <= lo < hi <= 511:
+        raise ValueError("byte readout bounds must lie in [-256, 511]")
+    value = to_expr(value)
+    outputs = []
+    for mask in (lambda v: int(v >= 128), lambda v: int(v == 0)):
+        samples = [mask(v & 255) for v in range(lo, hi + 1)]
+        result = samples[0] + (samples[1] - samples[0]) * (value - lo)
+        for i in range(1, len(samples) - 1):
+            coefficient = samples[i + 1] - 2 * samples[i] + samples[i - 1]
+            if coefficient:
+                result = result + coefficient * reglu(1, value - (lo + i))
+        outputs.append(to_expr(result))
+    return tuple(outputs)
 
 
 def signed_byte(value: ExprLike) -> Expression:
     """Interpret an unsigned byte as a signed 8-bit value."""
-    one = graph.one
+    one = graph.current_graph().one
     return value - 256 * stepglu(one, value - 128)
 
 
@@ -67,7 +89,7 @@ def extract_bits(value: ExprLike, name: str) -> list[Expression]:
 
     Returns a list where bits[0] is bit 7 (MSB) and bits[7] is bit 0 (LSB).
     """
-    one = graph.one
+    one = graph.current_graph().one
     bits = []
     remaining = value
     for i, place in enumerate((128, 64, 32, 16, 8, 4, 2, 1)):
@@ -92,9 +114,9 @@ def grouped_read(
     """The latest WRITE token's value at `address`, 0 if never written.
 
     The space splits into 4 KiB lookup groups, each a nearest-address
-    attention over its own writes with a 12-bit local-address parabola
-    (K-side scores below 2^24, so adjacent addresses stay distinct after
-    float32 Q/K rounding).  Equal keys resolve by the LATEST tie-break.
+    attention over its own writes with a 12-bit local-address parabola.
+    Equal keys resolve to the latest write; a read whose nearest write is
+    another address is masked to 0.
 
     `groups` (ascending, default all `group_count`) restricts the read to
     groups the address is known to fall in: the gating that picks among
@@ -102,7 +124,7 @@ def grouped_read(
     single group needs none.  `dense` asserts every address the read can ask for has been
     written (the harness seeds the region), so the nearest write is the
     exact one and the exact-address mask is dropped."""
-    one = graph.one
+    one = graph.current_graph().one
     address = to_expr(address)
     write_addr = to_expr(write_addr)
     if groups is None:
@@ -165,23 +187,19 @@ def memory_site(result: Expression, address, byte_value, write_addr, is_write) -
 
 
 def extract_bits_wide(value: ExprLike, name: str) -> list[Expression]:
-    """extract_bits, depth-lean: split on the high nibble, then two
-    persist-free 15-step ladders ([v >= k] = relu(v-k+1) - relu(v-k),
-    exact for integer bytes).  Bits land ~4 layers after the value
-    instead of 8, at ~60 ReGLUs of width -- the trade the GPU mapping
-    wants (depth is what a single-threadgroup forward pays for) and the
-    emitted C++ engine does not (its cost is unit count).  The nibble
-    values are wrapped in unit-gated ReGLUs so linear inlining cannot
-    smear their ladder sums into every consumer row."""
-    v = to_expr(value)
-    hi_sum = Expression()
-    for k in range(1, 16):
-        hi_sum = hi_sum + reglu(1, v - (16 * k - 1)) - reglu(1, v - 16 * k)
-    hi = reglu(hi_sum, 1)
-    lo = reglu(v - 16 * hi_sum, 1)
+    """Extract an integer byte's bits with 51 ReGLUs in three stages.
 
-    def nibble_bits(nv):
-        ge = {k: reglu(1, nv - (k - 1)) - reglu(1, nv - k) for k in range(1, 16)}
+    The thresholds at multiples of 16 supply both the high nibble's value
+    and its bits. Only the low nibble needs another threshold ladder.
+    Unit-gated projections keep the low nibble and each high bit compact
+    when folding inlines linear expressions into their consumers.
+    """
+    v = to_expr(value)
+    high = {k: reglu(1, v - (16 * k - 1)) - reglu(1, v - 16 * k) for k in range(1, 16)}
+    lo = reglu(v - 16 * sum(high.values(), Expression()), 1)
+    low = {k: reglu(1, lo - (k - 1)) - reglu(1, lo - k) for k in range(1, 16)}
+
+    def nibble_bits(ge):
         out = []
         for b in range(4):
             r = Expression()
@@ -192,13 +210,8 @@ def extract_bits_wide(value: ExprLike, name: str) -> list[Expression]:
             out.append(r)
         return out  # bit 0..3 expressions
 
-    lo_bits = nibble_bits(lo)
-    hi_bits = nibble_bits(hi)
-    bits = []
-    for b in range(7, -1, -1):
-        src = hi_bits[b - 4] if b >= 4 else lo_bits[b]
-        bits.append(persist(src, name=f"{name}bit{b}"))
-    return bits
+    by_bit = nibble_bits(low) + [reglu(bit, 1) for bit in nibble_bits(high)]
+    return [persist(by_bit[b], name=f"{name}bit{b}") for b in range(7, -1, -1)]
 
 
 def read_bits(

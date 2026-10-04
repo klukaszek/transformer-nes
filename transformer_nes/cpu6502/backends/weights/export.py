@@ -2,17 +2,17 @@
 
 Writes ``weights.safetensors`` (per-matrix CSR of ragged per-layer
 matrices: dead heads/FFN units are pruned exactly and the remaining
-weights are still ~99% zeros; values are float32, exact after query
-rescaling) plus ``machine.json`` (the machine protocol: input
-slot map, readout slots, output-head rows, per-layer dims).  The artifact is
+weights are still ~99% zeros; coefficients are exact int32 fixed point)
+plus ``machine.json`` (the machine protocol: input slot map, readout slots, output-head rows, per-layer dims).  The artifact is
 self-contained: a standalone runner needs only these two files and the
-execution semantics documented in the JSON -- hardmax attention with the
-LATEST tie-break, ReGLU FFN, residual stream, no normalization.
+execution semantics documented in the JSON -- softmax attention over a
+KV cache holding one entry per key, ReGLU FFN, residual stream, no
+normalization.
 
 The exported model is the self-contained ``wide_bits=False`` build, which is
 NOT the shape the generated engine runs; see ``export_model``.
 
-Usage: ``uv run python -m transformer_nes.model.export OUT_DIR [--bcd]``
+Usage: ``uv run python -m transformer_nes.cpu6502.backends.weights.export OUT_DIR [--bcd]``
 """
 
 from __future__ import annotations
@@ -23,113 +23,25 @@ import os
 import time
 
 import numpy as np
-import scipy.sparse as sp
 
 from transformer_nes.cpu6502.backends.weights.experts import (
-    UNION_FALLBACK_OPERATIONS,
     build_interrupt_experts,
     build_opcode_execution_experts,
 )
 from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS, Cpu6502Graph
 from transformer_nes.cpu6502.spec import OPCODES
-from transformer_nes.graph.core import InputDimension, ProgramGraph
+from transformer_nes.graph.core import InputDimension
+from transformer_nes.model.artifacts import (
+    ATTENTION_TEMPERATURE,
+    SCALE_BITS,
+    csr_tensors,
+    prune_layer,
+    rescale_head_queries,
+    split_clear_gates,
+    to_fixed_point,
+)
 from transformer_nes.model.schedule import asap_schedule
 from transformer_nes.model.weights import build_model
-
-
-def csr_tensors(name: str, mat: np.ndarray, out: dict) -> None:
-    m = sp.csr_matrix(mat)
-    m.sort_indices()
-    out[f"{name}.data"] = to_fixed_point(m.data, f"{name}.data")
-    out[f"{name}.indices"] = m.indices.astype(np.int32)
-    out[f"{name}.indptr"] = m.indptr.astype(np.int32)
-
-
-def prune_layer(ip, op, fi, fo, num_heads, d_ffn):
-    """Drop dead heads and FFN units from one layer's matrices, exactly.
-
-    A head contributes 0 to the residual when its V rows or its out_proj
-    columns are all zero (zero Q/K with live V is a passthrough -- kept);
-    an FFN unit contributes 0 when its gate row, value row, or ff_out
-    column is all zero.  Returns ragged matrices plus the kept counts.
-    """
-    k_base, v_base = 2 * num_heads, 4 * num_heads
-    heads = [
-        h for h in range(num_heads)
-        if ip[v_base + 2 * h:v_base + 2 * h + 2].any()
-        and op[:, 2 * h:2 * h + 2].any()
-    ]
-    hi = [r for h in heads for r in (2 * h, 2 * h + 1)]
-    ip = np.vstack(
-        [ip[hi], ip[[k_base + r for r in hi]], ip[[v_base + r for r in hi]]]
-    )
-    op = op[:, hi]
-    units = [
-        j for j in range(d_ffn)
-        if fi[j].any() and fi[d_ffn + j].any() and fo[:, j].any()
-    ]
-    fi = np.vstack([fi[units], fi[[d_ffn + j for j in units]]])
-    fo = fo[:, units]
-    return ip, op, fi, fo, heads, units
-
-
-def rescale_head_queries(in_proj: np.ndarray, num_heads: int) -> np.ndarray:
-    """Divide each head's Q row pair by its hardmax temperature.
-
-    A positive per-head scalar on Q scales that head's scores uniformly, so
-    the argmax and its exact ties are untouched; the construction's memory
-    queries carry C = 1e10*sqrt(2), which this removes.  Only applied when
-    the quotients land on integers (guarded), so the exported coefficients
-    are integers -- the clear gates stay K-side and are never scaled.
-    """
-    out = in_proj.copy()
-    for h in range(num_heads):
-        rows = out[2 * h:2 * h + 2]
-        nz = np.abs(rows[rows != 0.0])
-        if nz.size == 0:
-            continue
-        s = nz.min()
-        if s <= 1.0:
-            continue
-        scaled = rows / s
-        ints = np.rint(scaled)
-        if (np.abs(scaled - ints) <= 1e-6 * np.maximum(1.0, np.abs(ints))).all():
-            out[2 * h:2 * h + 2] = ints
-    return out
-
-
-CLEAR_GATE_THRESHOLD = -1e29
-SCALE_BITS = 1
-
-
-def split_clear_gates(ip: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Lift the -1e30 clear gates out of a layer's Q/K/V projection.
-
-    A clear gate exists only to lose the argmax, never to be exact, so it is
-    a *predicate*, not a coefficient: token t is masked for head h when the
-    gated input is non-zero.  Extracting it leaves every surviving
-    coefficient finite and integral, which is what lets the artifact be
-    int32 with no magnitude reasoning anywhere.
-    """
-    mask = ip <= CLEAR_GATE_THRESHOLD
-    kept = np.where(mask, 0.0, ip)
-    rows, cols = np.nonzero(mask)
-    return kept, np.ascontiguousarray(rows, dtype=np.int32), \
-        np.ascontiguousarray(cols, dtype=np.int32)
-
-
-def to_fixed_point(arr: np.ndarray, name: str) -> np.ndarray:
-    """Exact int32 in units of 2**-SCALE_BITS; raises if any value is lost."""
-    scaled = arr * (1 << SCALE_BITS)
-    ints = np.rint(scaled)
-    if not np.array_equal(scaled, ints):
-        bad = scaled[scaled != ints]
-        raise AssertionError(
-            f"{name}: {bad.size} coefficients are not exact at "
-            f"SCALE_BITS={SCALE_BITS} (e.g. {bad[:3]})")
-    if np.abs(ints).max(initial=0.0) > np.iinfo(np.int32).max:
-        raise AssertionError(f"{name}: coefficient exceeds int32")
-    return ints.astype(np.int32)
 
 
 def export_model(out_dir: str, *, bcd: bool = False) -> dict:
@@ -142,14 +54,9 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
     # token contract for less depth -- a different model, exported nowhere.
     rt = Cpu6502Graph(bcd=bcd)
     dim_by_id = {d.id: d for d in rt.all_dims}
-    output_tokens = dict(rt.output_tokens)
-    readout = 0
-    for name in RUNTIME_READ_DIMS:
-        readout = readout + 1e-6 * dim_by_id[rt.dim_id_by_name[name]]
-    output_tokens["READOUT"] = readout
-    pg = ProgramGraph(rt.input_tokens, output_tokens)
-    sched = asap_schedule(pg.input_tokens, pg.output_tokens, program_graph=pg)
-    model, _tokens, tok_to_idx, info = build_model(program_graph=pg, schedule=sched)
+    pg = rt.program_graph()
+    sched = asap_schedule(pg)
+    model, tok_to_idx, info = build_model(program_graph=pg, schedule=sched)
 
     # Every coefficient is an exact int32 in units of 2**-SCALE_BITS: query
     # rescaling makes them integers, and the only half-integers left
@@ -207,53 +114,28 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
     }
     meta = {
         "format": (
-            "6502 transformer, analytically constructed (no training). "
-            "Matrices are CSR (name.data f32 / name.indices i32 / "
-            "name.indptr i32); tok and head are dense.  Layers are RAGGED "
-            "-- dead heads and FFN units are pruned exactly, so layer li "
-            "has H=layer_heads[li] heads and F=layer_ffn[li] units: "
-            "in_proj is (6H, D) (rows [0,2H) Q, [2H,4H) K, [4H,6H) V, 2 "
-            "dims per head), out_proj (D, 2H), ff_in (2F, D), ff_out "
-            "(D, F).  Execution: per layer, x -> in_proj; every token's "
-            "K/V appends to a per-layer cache; each head attends by "
-            "HARDMAX over qx*kx + qy*ky with exact ties won by the LATEST "
-            "token (insert before query, the current token included); "
-            "head outputs (2 dims at columns 2h, 2h+1) map through "
-            "out_proj into the residual; FFN is ReGLU: gates = "
-            "ff_in[:F] @ x, values = ff_in[F:] @ x, "
-            "act = gate > 0 ? gate*value : 0, x += ff_out @ act.  No "
-            "normalization, no position encoding: order enters ONLY "
-            "through the LATEST tie-break (passthrough heads tie every "
-            "token with constant Q/K and take the latest = themselves).  "
-            "Readouts round half-to-even.  Precision contract: THERE IS NO "
-            "FLOATING POINT.  Every coefficient is an exact int32 in units "
-            "of 2**-scale_bits, so a conforming runner is pure integer "
-            "arithmetic: multiply, add, shift right by scale_bits after "
-            "each matmul and after the ReGLU product, compare.  Two things "
-            "make that possible.  (1) Each head's Q row pair is stored "
-            "divided by its hardmax temperature -- a positive per-head "
-            "score scale, invisible to the argmax and its exact ties -- "
-            "which turns the queries into integers; the only half-integers "
-            "left are one FFN's (in_p_d - in_p_n)/2, exact at "
-            "scale_bits=1.  (2) The -1e30 clear gates are NOT stored as "
-            "coefficients: a clear gate exists only to lose the argmax, "
-            "never to be exact, so it is lifted into `clear_gates` as "
-            "(row, col) pairs.  Token t is masked for the head owning that "
-            "row when input col is non-zero at insert time.  That removes "
-            "the last unbounded magnitude: the residual is int32, and "
-            "a score (an address times a temperature, against another) "
-            "accumulates in int64.  This artifact is "
-            "the SELF-CONTAINED construction: it derives each byte's bits "
-            "inside the graph, so input_slots is the whole token contract.  "
-            "The repo's generated C++ engine executes a different build of "
-            "the same semantics in which the harness serves those bits as "
-            "16 extra inputs, trading token width for depth; its shape "
-            "therefore differs from the one reported here."
+            "Analytically constructed 6502 decoder, no training, normalization or positional encoding. "
+            "Dense tok/head and CSR matrices (data/indices/indptr int32). Per layer H=layer_heads, "
+            "F=layer_ffn, D=d_model: in_proj (6H,D) packs Q (2H), "
+            "K (2H), V (2H); out_proj (D,2H), ff_in (2F,D), ff_out (D,F). "
+            "Insert before query, one KV entry per distinct key, replacing equal keys with the "
+            "latest token. clear_rows/clear_cols are token-mask predicates on key rows: skip "
+            "insertion when any named input is nonzero. Softmax(attention_temperature * dot(Q,K)), "
+            "weighted V rounded to the fixed-point grid, then out_proj added to x. "
+            "ReGLU: split ff_in @ x into gate/value, relu(gate)*value, ff_out, residual addition. "
+            "Residual and matrix coefficients are int32 in units of 2**-scale_bits; shift after "
+            "each matrix multiply and ReGLU product. Scores accumulate in int64; "
+            "softmax runs in float64. "
+            "Quadratic memory uses Q=[q,1], K=[4k,k-2k^2] in sixteen 4KiB groups. "
+            "Keys have unique winners and an equality mask for unwritten addresses. "
+            "All address/byte features are computed inside the graph; input_slots is the "
+            "complete token contract. Constant-key heads return the current token's value."
         ),
         "dtype": "int32",
         "scale_bits": SCALE_BITS,
         "accumulator": "int32",
         "score_accumulator": "int64",
+        "attention_temperature": ATTENTION_TEMPERATURE,
         "clear_gates": n_clear,
         "bcd": bcd,
         "d_model": int(info.d_model),
@@ -341,12 +223,9 @@ def export_experts(
     from safetensors.numpy import save_file
 
     rt = Cpu6502Graph(bcd=bcd, wide_bits=True)
-    pg = ProgramGraph(rt.input_tokens, rt.output_tokens)
+    pg = rt.program
     if opcodes is None:
-        opcodes = sorted(
-            byte for byte in OPCODES
-            if OPCODES[byte].operation not in UNION_FALLBACK_OPERATIONS
-        )
+        opcodes = sorted(OPCODES)
     experts = build_opcode_execution_experts(pg, opcodes)
     experts.extend(build_interrupt_experts(pg))
     tensors: dict[str, np.ndarray] = {}

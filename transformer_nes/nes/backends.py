@@ -7,10 +7,6 @@ step); each backend gets a thin adapter, and backend_factory returns the
 
 from __future__ import annotations
 
-from transformer_nes.cpu6502.backends.reference import (
-    instruction_cycles,
-    irq_deliverable,
-)
 from transformer_nes.cpu6502.spec import MEMORY_MODES, READS_MEMORY, opcode_for
 
 
@@ -36,6 +32,8 @@ class ReferenceCore:
     def peek(self) -> tuple[int, int]:
         """The next step's cycles and the device read it issues (-1:
         none): an interrupt sequence reads nothing a device answers."""
+        from transformer_nes.cpu6502.backends.reference import instruction_cycles, irq_deliverable
+
         cpu = self.cpu
         if cpu.nmi_pending or irq_deliverable(cpu.p, cpu.irq_pending):
             return 7, -1
@@ -50,24 +48,26 @@ class ReferenceCore:
         return self.cpu.step()
 
 
-def backend_factory(name: str, *, forward_hook: bool = False):
+def backend_factory(name: str):
     def build(image: bytes, start_pc: int):
         if name == "weights":
             from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 
             machine = Cpu6502TransformerMachine(
-                bcd=False, mirror_cpu_ram=True, forward_hook=forward_hook,
+                bcd=False,
+                mirror_cpu_ram=True,
             )
             return machine, True
         if name == "reference":
             from transformer_nes.cpu6502.backends.reference import Cpu6502
 
             cpu = Cpu6502(
-                memory=bytearray(image), bcd_enabled=False, mirror_cpu_ram=True,
+                memory=bytearray(image),
+                bcd_enabled=False,
+                mirror_cpu_ram=True,
             )
             cpu.pc = start_pc
             return ReferenceCore(cpu), False
         raise ValueError(f"unknown backend {name!r}")
 
     return build
-

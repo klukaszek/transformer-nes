@@ -110,8 +110,8 @@ public:
   // The last frame whose visible lines finished (copied at line 240).
   [[nodiscard]] const Frame& completed_frame() const { return completed_; }
   // Which render model drew each 8-pixel slot of that frame (32 per line):
-  // 0 the full graph, k the k-th folded expert, native_slot otherwise.
-  static constexpr uint8_t native_slot = 0xFF;
+  // 0 the full graph, k the k-th folded expert, unrendered_slot otherwise.
+  static constexpr uint8_t unrendered_slot = 0xFF;
   using ExpertMap = array<uint8_t, frame_height * 32>;
   [[nodiscard]] const ExpertMap& completed_expert_map() const { return completed_experts_; }
 
@@ -175,24 +175,24 @@ public:
   // register access (ppu2c02/registers.py), per visible or prefetch tile
   // slot (render.py), and per visible line's sprite evaluation and fetch
   // (sprites.py), all over one WRITE log that follows the graph-memory
-  // view.  What depends on the dot stays native: the status races, bus
-  // side effects (A12), the overflow search, dry-run previews -- and the
-  // whole sprite unit with the 8-sprite limit off.  Each token runs the
-  // folded expert whose pins its state meets, by the dispatch tables; a
-  // slot without one runs model 0, the full render graph.  Null ctx
-  // restores the native PPU.
+  // view. Overflow selection and dry-run previews use these tokens too.
+  // The host owns the clock, status races, bus edges and line buffers.
+  // Each token selects an exact folded expert when its pins hold.
   struct RenderDispatch {
     array<array<uint8_t, 8>, 2> inner{}; // per background table, fine x
     uint8_t sprites = 0;
+    uint8_t blank = 0;
     array<uint8_t, 2> first{}, last{}; // slots 0 and 31, per table
   };
   // The sprite unit's models (ppu2c02/machine.py:sprite_dispatch):
-  // evaluation's full model, then its experts for 8x8 and 8x16 sprites;
-  // fetch's full model, then its experts per size and count 0-8 (only
-  // without CHR latches).
+  // evaluation: full, size experts from index 0, remaining-batch experts;
+  // overflow: full, size experts; debug fetch: frozen-latch size experts;
+  // fetch: full, then experts per size and count 0-8 without CHR latches.
   struct SpriteDispatch {
-    array<uint8_t, 3> evaluate{};
-    array<uint8_t, 19> fetch{};
+    array<uint8_t, 5> evaluate{};
+    array<uint8_t, 3> overflow{};
+    array<uint8_t, 2> debug_fetch{};
+    array<uint8_t, 19> fetch{}, fetch_bus{}, fetch_status{};
   };
   struct PpuEngine {
     void* ctx = nullptr;
@@ -204,6 +204,7 @@ public:
     int trace_rows = 0, trace_width = 0;
     array<RenderDispatch, 2> dispatch{}; // [CHR latches active]
     SpriteDispatch sprites{};
+    vector<int> render_status;
     array<array<uint8_t, 8>, 2> registers{}; // [is_write][register]
   };
   // The render graph's token layout (ppu2c02/render.py INPUTS, OUTPUTS).
@@ -214,7 +215,7 @@ public:
   static constexpr int access_inputs = 35, access_outputs = 20;
   static constexpr int in_access_banks = 13, in_access_state = 21;
   // The sprite graphs' (ppu2c02/sprites.py EVALUATE_*, FETCH_*).
-  static constexpr int evaluate_inputs = 3, evaluate_outputs = 9;
+  static constexpr int evaluate_inputs = 4, evaluate_outputs = 9;
   static constexpr int fetch_inputs = 23, fetch_outputs = 90;
   static constexpr int in_index = 4, in_latch = 12, in_banks = 15;
   static constexpr int out_sprite_x = 64, out_sprite_fetch = 72, out_sprite_a12 = 80,
@@ -368,39 +369,17 @@ private:
     int mem_value = 0;
   };
   int access(int reg, int value, bool is_write, int64_t dot);
-  RegisterResult transition(const RegisterAccess& request);
   RegisterResult graph_transition(const RegisterAccess& request, const RegisterFile& before);
   void access_effects(const RegisterAccess& request, const RegisterFile& before, int64_t dot);
   void write_physical(int addr, int value);
-  int increment() const { return (ctrl & 0x04) ? 32 : 1; }
   bool rendering_line() const { return r_.line < 240 || r_.line == prerender_line; }
   static size_t palette_index(int addr);
-  static size_t nt_offset_for(int addr, int mirr);
-  int nt_read(int addr) {
-    if (mmc5.active()) {
-      const int a = (addr - 0x2000) & 0xFFF;
-      return mmc5.read_nametable(mirroring, a >> 10, a & 0x3FF, nametables.data());
-    }
-    if (mirroring != nt_mirroring_)
-      map_nametables();
-    return nametables[nt_base_[(addr >> 10) & 3] + (addr & 0x3FF)];
-  }
-  void map_nametables();
-  size_t chr_index(const size_t* banks, size_t address) const {
-    if (chr_latch_active)
-      return chr_latch.map(address);
-    return banks[(address >> 10) & 7] + (address & 0x3FF);
-  }
   const size_t* bg_banks() const {
     return mmc5.active() ? mmc5.live_background_banks(ctrl) : chr_bank.data();
   }
   const size_t* sprite_banks() const {
     return mmc5.active() ? mmc5.sprite_banks() : chr_bank.data();
   }
-  std::pair<uint8_t, uint8_t> fetch_pattern(const size_t* banks, int pattern_addr);
-  int vram_peek(int addr);
-  void vram_write(int addr, int value);
-  uint8_t backdrop() const;
   int status(int64_t dot) const;
 
   static const vector<EventAt>& events_for(int line);
@@ -408,31 +387,22 @@ private:
   void advance_line();
   void emit(PpuEvent::Kind kind, int64_t dot);
   bool a12(bool high, int64_t dot);
-  void fetch_tile(int index, int64_t dot);
-  void output_pixels(int slot, int64_t dot);
-  void evaluate_sprites(int64_t dot);
-  void load_sprites(int64_t dot);
   bool start_sprite_line();
-  void search_overflow(int n, int64_t at);
   void draw_sprite_row(int x, span<const uint8_t, 8> row);
   // The sprite unit as graph steps (engine_.sprites).
-  bool sprites_as_graph() const { return engine_.ctx && !dry_ && sprite_limit; }
   void evaluate_sprites_graph(int64_t dot);
   void load_sprites_graph(int64_t dot);
-  void step_vram_address(bool rendering);
-  void increment_x();
-  void increment_y();
   void mark_status_change(int64_t dot);
 
   Render r_;
   Frame frame_{};
   Frame completed_{};
-  static ExpertMap all_native() {
+  static ExpertMap empty_expert_map() {
     ExpertMap map;
-    map.fill(native_slot);
+    map.fill(unrendered_slot);
     return map;
   }
-  ExpertMap experts_ = all_native(), completed_experts_ = all_native();
+  ExpertMap experts_ = empty_expert_map(), completed_experts_ = empty_expert_map();
   PpuWatcher* watcher_ = nullptr;
   bool wants_a12_ = false;
   int64_t lease_expiry_ = NEVER;
@@ -462,19 +432,13 @@ private:
   int page_byte(int page, int offset) const;
   void graph_step(int model, const int* in, int* out);
   void render_slot(int slot, int64_t dot);
+  void background_bus(int64_t dot);
   RegisterFile register_file() const;
   int32_t graph_address(int addr) const;
   bool schedule_changed_ = false;
-  // In-range sprites per line, OAM order, derived from OAM and the
-  // sprite size; rebuilt after OAM or size changes and every pre-render
-  // line (which also picks up direct writes to `oam`).
-  void index_sprites();
-  array<array<uint8_t, 64>, 240> line_sprites_{};
-  array<uint8_t, 240> line_sprite_count_{};
-  bool sprites_indexed_ = false;
-  // Physical base of each logical nametable under nt_mirroring_.
-  array<uint16_t, 4> nt_base_{};
-  int nt_mirroring_ = -1;
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+#include "tests/ppu_reference.h"
+#endif
   // Dry-run preview state: no frame writes, events go to the probe,
   // and the loop stops at the first status change or probe IRQ.
   bool dry_ = false;

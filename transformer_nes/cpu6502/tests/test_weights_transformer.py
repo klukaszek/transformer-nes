@@ -3,9 +3,8 @@
 Builds the analytic weights (ASAP schedule, no training) and runs genuine
 transformer inference -- per-position embeddings, Q/K/V projections, and
 licensed exact attention state
-hardmax attention, ReGLU FFN, output head -- lockstep against the
-reference core.  Expensive: real inference through the generated float32
-codegen C++ engine, lockstep against the reference oracle.
+attention, ReGLU FFN, output head -- lockstep against the
+reference core, through the compiled int32 Torch bank.
 """
 
 from __future__ import annotations
@@ -44,16 +43,13 @@ def test_transformer_weights_match_reference():
 
 
 def test_region_ops_keep_write_position_in_sync():
-    """inject_region advances the engine sequence one WRITE token per byte
-    and map_region not at all; the Python position mirror must match both,
-    or the next single-byte poke throws.  MMC2/MMC4 hit exactly this: a
-    bank switch (inject_region) and the clobbered-register repair
-    (inject_write) inside ONE pause servicing, with no run() between to
-    resync the mirror (Punch-Out, found 2026-07-13)."""
+    """Mapping a bank adds no WRITE tokens; a later injected write must
+    still agree with the engine's sequence position."""
     machine = Cpu6502TransformerMachine(bcd=False)
     machine.load_image(bytes(65536), start_pc=0x0400)
-    machine.inject_region(0x8000, bytes(range(1, 65)))
-    machine.inject_write(0x0010, 0x42)  # threw before the mirror fix
+    position = machine.get_state()["pos"]
+    machine.map_region(0x8000, bytes(range(1, 65)))
+    machine.inject_write(0x0010, 0x42)
     machine.map_region(0x9000, bytes(range(1, 65)))
     machine.inject_write(0x0011, 0x43)
     assert machine.read_ram(0x8001) == 2
@@ -61,13 +57,15 @@ def test_region_ops_keep_write_position_in_sync():
     assert machine.read_ram(0x0010) == 0x42
     assert machine.read_ram(0x0011) == 0x43
 
+    assert machine.get_state()["pos"] == position + 2
+
 
 @pytest.mark.slow
 def test_transformer_int32_engine_matches_high_address_nestest_prefix():
     from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
 
     image = load_image()
-    machine = Cpu6502TransformerMachine(bcd=False)
+    machine = Cpu6502TransformerMachine(bcd=False, union_only=True)
     trace = machine.run_image(bytes(image), start_pc=START_PC, max_steps=20)
 
     ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
@@ -102,11 +100,9 @@ def test_the_model_times_every_instruction(union_only):
 
 
 @pytest.mark.slow
-def test_run_loop_matches_per_step():
-    """The generated C++ run loop (EngineBus shape) must produce exactly the
-    trace the verified per-step machine_step path produces -- same states,
-    same writes -- and detect the jump-to-self trap.  Also checks the
-    chunked stream (w_row rebased per chunk) against the single native run."""
+def test_run_loop_and_chunks_match_union_steps():
+    """Routed and chunked execution match one-instruction union forwards,
+    including writes and jump-to-self trap detection."""
     from collections import defaultdict
 
     from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
@@ -114,44 +110,44 @@ def test_run_loop_matches_per_step():
     image = load_image()
     n = 120
 
-    # Verified reference: the per-step path (lockstep-exact vs the oracle).
-    per = Cpu6502TransformerMachine(bcd=False)
-    assert per.supports_run_loop
-    per.boot_image(list(image), start_pc=START_PC)
-    per_rows = [per.machine_step() for _ in range(n)]
-
     def as_tuples(out):
         wbr = defaultdict(set)
         for r, a, v in zip(out["w_row"], out["w_addr"], out["w_value"], strict=True):
             wbr[int(r)].add((int(a), int(v)))
         return [
             (
-                int(out["pc"][i]), int(out["a"][i]), int(out["x"][i]),
-                int(out["y"][i]), int(out["s"][i]), int(out["p"][i]),
-                int(out["ir"][i]), int(out["ea"][i]), int(out["data"][i]),
+                int(out["pc"][i]),
+                int(out["a"][i]),
+                int(out["x"][i]),
+                int(out["y"][i]),
+                int(out["s"][i]),
+                int(out["p"][i]),
+                int(out["ir"][i]),
+                int(out["ea"][i]),
+                int(out["data"][i]),
                 wbr.get(i, set()),
             )
             for i in range(len(out["pc"]))
         ]
 
-    def per_tuple(row):
-        s = row.state
-        return (
-            s.pc, s.a, s.x, s.y, s.s, s.p, s.ir, s.ea, s.data,
-            {(w.addr, w.value) for w in row.writes},
-        )
+    per = Cpu6502TransformerMachine(bcd=False, union_only=True)
+    per.load_image(image, start_pc=START_PC)
+    per_rows = []
+    for step in range(n):
+        out = per.run(1)
+        out["w_row"] -= step
+        per_rows.extend(as_tuples(out))
 
     single = Cpu6502TransformerMachine(bcd=False)
     out = single.run_image_arrays(bytes(image), start_pc=START_PC, max_steps=n)
     single_rows = as_tuples(out)
     assert len(single_rows) == n
-    assert single_rows == [per_tuple(r) for r in per_rows]
+    assert single_rows == per_rows
 
     # Chunked stream reconstructs the identical trace across chunk boundaries.
     chunked = Cpu6502TransformerMachine(bcd=False)
     streamed = []
-    for chunk in chunked.iter_run_arrays(bytes(image), start_pc=START_PC,
-                                         max_steps=n, chunk=17):
+    for chunk in chunked.iter_run_arrays(bytes(image), start_pc=START_PC, max_steps=n, chunk=17):
         streamed.extend(as_tuples(chunk))
     assert streamed == single_rows
 
@@ -166,49 +162,57 @@ def test_run_loop_matches_per_step():
     ref.pc = VERIFY_START
     for i in range(len(tout["pc"])):
         a = ref.step().state
-        got = (int(tout["pc"][i]), int(tout["a"][i]), int(tout["x"][i]),
-               int(tout["y"][i]), int(tout["s"][i]), int(tout["p"][i]))
+        got = (
+            int(tout["pc"][i]),
+            int(tout["a"][i]),
+            int(tout["x"][i]),
+            int(tout["y"][i]),
+            int(tout["s"][i]),
+            int(tout["p"][i]),
+        )
         assert (a.pc, a.a, a.x, a.y, a.s, a.p) == got, f"trap step {i}"
 
 
 @pytest.mark.slow
-def test_sequence_experts_match_per_step():
+def test_fixed_shapes_match_per_step():
     """Traced fallback stays byte-identical across configurations; untraced
     pinned/shape execution models finish with the same state, RAM and cycles
     as the per-instruction path across polls, branches and odd boundaries."""
     import numpy as np
 
-    from transformer_nes.cpu6502.backends.weights.windows import (
+    from transformer_nes.cpu6502.backends.weights.shapes import (
         match_shape_windows,
-        scan_sequence_windows,
     )
 
     image = bytearray(0x10000)
-    image[0x0400:0x0413] = bytes([
-        0xAD, 0x00, 0x07,  # 0400 LDA $0700   (abs poll trio)
-        0x29, 0x40,        # 0403 AND #$40
-        0xF0, 0xF9,        # 0405 BEQ $0400
-        0xEA,              # 0407 NOP
-        0xCA,              # 0408 DEX         (delay loop)
-        0xD0, 0xFD,        # 0409 BNE $0408
-        0xA5, 0x10,        # 040B LDA $10     (zero-page BPL poll)
-        0x10, 0xFC,        # 040D BPL $040B
-        0xEA,              # 040F NOP
-        0x4C, 0x10, 0x04,  # 0410 JMP $0410 (self)
-    ])
-    windows = scan_sequence_windows(image)
-    assert {(h, r) for h, _c, r in windows} == {
-        (0x0400, 1), (0x0408, 1), (0x040B, 1), (0x0410, 4),
-    }
-
-    fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
-              "ea", "data", "halted")
-    modes = ("pinned", "shape", "compact")
+    image[0x0400:0x0413] = bytes(
+        [
+            0xAD,
+            0x00,
+            0x07,  # 0400 LDA $0700   (abs poll trio)
+            0x29,
+            0x40,  # 0403 AND #$40
+            0xF0,
+            0xF9,  # 0405 BEQ $0400
+            0xEA,  # 0407 NOP
+            0xCA,  # 0408 DEX         (delay loop)
+            0xD0,
+            0xFD,  # 0409 BNE $0408
+            0xA5,
+            0x10,  # 040B LDA $10     (zero-page BPL poll)
+            0x10,
+            0xFC,  # 040D BPL $040B
+            0xEA,  # 040F NOP
+            0x4C,
+            0x10,
+            0x04,  # 0410 JMP $0410 (self)
+        ]
+    )
+    fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi", "ea", "data", "halted")
+    modes = ("shape", "compact")
     traces = []
     for mode in modes:
         m = Cpu6502TransformerMachine(bcd=False)
-        if mode == "pinned":
-            m.attach_sequence_module(windows)
         m.load_image(bytes(image), start_pc=0x0400)
         if mode == "compact":
             m.engine.clear_windows()
@@ -224,14 +228,12 @@ def test_sequence_experts_match_per_step():
                 chunks.append(out)
                 done += len(out["pc"])
 
-        drain(3000)                    # abs poll trio spins
-        m.inject_write(0x0700, 0x40)   # flag up: through NOP + DEX/BNE delay
-        drain(1000)                    # ...into the zp BPL poll
-        m.inject_write(0x0010, 0x80)   # bit 7 up: fall through to the spin
+        drain(3000)  # abs poll trio spins
+        m.inject_write(0x0700, 0x40)  # flag up: through NOP + DEX/BNE delay
+        drain(1000)  # ...into the zp BPL poll
+        m.inject_write(0x0010, 0x80)  # bit 7 up: fall through to the spin
         drain(1000)
-        traces.append({
-            k: np.concatenate([c[k] for c in chunks]) for k in fields
-        })
+        traces.append({k: np.concatenate([c[k] for c in chunks]) for k in fields})
     for t in traces[1:]:
         for k in fields:
             assert np.array_equal(traces[0][k], t[k]), f"{k} diverged"
@@ -244,8 +246,6 @@ def test_sequence_experts_match_per_step():
     final = []
     for mode in modes:
         m = Cpu6502TransformerMachine(bcd=False)
-        if mode == "pinned":
-            m.attach_sequence_module(windows)
         m.load_image(bytes(image), start_pc=0x0400)
         if mode == "compact":
             m.engine.clear_windows()
@@ -268,160 +268,64 @@ def test_sequence_experts_match_per_step():
         state = m.get_state()
         state = {
             name: state[name]
-            for name in ("pc", "a", "x", "y", "s", "p", "halted",
-                         "steps", "cycles")
-        }
-        final.append((state, m.dump_ram(), cycles))
-    assert final[0] == final[1] == final[2]
-
-
-def store_loop_image() -> bytearray:
-    """Three store-carrying micro-loops plus a spin: an indexed copy, an
-    RMW-led counter, and a stack-push loop -- every store bounded below
-    $2000 and disjoint from its window's own bytes."""
-    image = bytearray(0x10000)
-    image[0x0400:0x0415] = bytes([
-        0xBD, 0x00, 0x06,  # 0400 LDA $0600,X  (copy loop: read leads)
-        0x9D, 0x00, 0x03,  # 0403 STA $0300,X  (bound [0300, 03FF])
-        0xE8,              # 0406 INX
-        0xD0, 0xF7,        # 0407 BNE $0400
-        0xE6, 0x20,        # 0409 INC $20      (RMW leads its window)
-        0xCA,              # 040B DEX
-        0xD0, 0xFB,        # 040C BNE $0409
-        0x48,              # 040E PHA          (bound [0100, 01FF])
-        0x88,              # 040F DEY
-        0xD0, 0xFC,        # 0410 BNE $040E
-        0x4C, 0x12, 0x04,  # 0412 JMP $0412 (self)
-    ])
-    for i in range(256):
-        image[0x0600 + i] = (i * 7 + 3) & 0xFF
-    return image
-
-
-@pytest.mark.slow
-def test_store_windows_match_per_step():
-    """Store-licensed execution models must finish copy/RMW/push loops with
-    state, cycles and RAM byte-identical to the per-instruction path."""
-    import numpy as np
-
-    from transformer_nes.cpu6502.backends.weights.windows import (
-        scan_sequence_windows,
-    )
-
-    image = store_loop_image()
-    windows = scan_sequence_windows(image)
-    assert {(h, r) for h, _c, r in windows} == {
-        (0x0400, 1), (0x0409, 1), (0x040E, 1), (0x0412, 4),
-    }
-
-    fields = ("pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi",
-              "ea", "data", "halted", "w_addr", "w_value")
-    traces, rams = [], []
-    modes = ("pinned", "per_instruction")
-    for mode in modes:
-        m = Cpu6502TransformerMachine(bcd=False)
-        if mode == "pinned":
-            m.attach_sequence_module(windows)
-        m.load_image(bytes(image), start_pc=0x0400)
-        chunks = []
-        done = 0
-        while done < 2800:  # odd chunks: budgets land mid-window
-            out = m.run(min(701, 2800 - done))
-            assert len(out["pc"]), out["reason"]
-            chunks.append(out)
-            done += int(out["steps"])
-        traces.append({
-            k: np.concatenate([c[k] for c in chunks]) for k in fields
-        })
-        rams.append(m.dump_ram())
-        if mode == "pinned":
-            assert m.seq_module is not None
-    for k in fields:
-        assert np.array_equal(traces[0][k], traces[1][k]), f"{k} diverged"
-    assert rams[0] == rams[1]
-    assert rams[0][0x0300:0x0400] == bytes(image[0x0600:0x0700])
-
-    final = []
-    for mode in modes:
-        m = Cpu6502TransformerMachine(bcd=False)
-        if mode == "pinned":
-            m.attach_sequence_module(windows)
-        m.load_image(bytes(image), start_pc=0x0400)
-        done = cycles = 0
-        while done < 2800:
-            out = m.run(min(701, 2800 - done), trace=False)
-            assert int(out["steps"]) > 0, out["reason"]
-            done += int(out["steps"])
-            cycles += int(out["cycles"])
-        assert done == 2800
-        state = m.get_state()
-        state = {
-            name: state[name]
-            for name in ("pc", "a", "x", "y", "s", "p", "halted",
-                         "steps", "cycles")
+            for name in ("pc", "a", "x", "y", "s", "p", "halted", "steps", "cycles")
         }
         final.append((state, m.dump_ram(), cycles))
     assert final[0] == final[1]
 
 
 @pytest.mark.slow
-def test_store_windows_decline_under_low_watch():
-    """A write watch below $2000 must force every store window back to the
-    per-instruction path, where the watched write pauses as usual: the
-    static dispatch guard is what makes licensed stores safe."""
-    from transformer_nes.cpu6502.backends.weights.windows import (
-        scan_sequence_windows,
-    )
-
-    image = store_loop_image()
-    m = Cpu6502TransformerMachine(bcd=False)
-    m.attach_sequence_module(scan_sequence_windows(image))
-    m.load_image(bytes(image), start_pc=0x0400)
-    m.watch_write(0x0020, 0x0020)
-    hits = 0
-    done = 0
-    while done < 2800:
-        out = m.run(2800 - done)
-        done += int(out["steps"])
-        if len(out["hit_addr"]):
-            assert int(out["pause_ir"]) == 0xE6
-        for addr, value in zip(out["hit_addr"], out["hit_value"], strict=True):
-            assert int(addr) == 0x0020
-            hits += 1
-            assert int(value) == hits & 0xFF
-    assert hits == 256  # the INC $20 loop paused on every single write
-
-
-@pytest.mark.slow
 def test_compact_stack_and_control_match_reference():
     image = bytearray(0x10000)
-    image[0x0400:0x0405] = bytes([
-        0xA2, 0xFC,        # LDX #$FC
-        0x9A,              # TXS
-        0x40,              # RTI -> $0410 from the prepared stack
-        0xEA,
-    ])
-    image[0x0410:0x0425] = bytes([
-        0xA9, 0x42,        # LDA #$42
-        0x48,              # PHA
-        0xA9, 0x00,        # LDA #$00
-        0x68,              # PLA
-        0x08,              # PHP
-        0x18,              # CLC
-        0x28,              # PLP
-        0x20, 0x50, 0x04,  # JSR $0450
-        0x4C, 0x22, 0x04,  # JMP $0422
-        0xEA, 0xEA, 0xEA,
-        0x6C, 0x50, 0x00,  # JMP ($0050) -> $0430
-    ])
+    image[0x0400:0x0405] = bytes(
+        [
+            0xA2,
+            0xFC,  # LDX #$FC
+            0x9A,  # TXS
+            0x40,  # RTI -> $0410 from the prepared stack
+            0xEA,
+        ]
+    )
+    image[0x0410:0x0425] = bytes(
+        [
+            0xA9,
+            0x42,  # LDA #$42
+            0x48,  # PHA
+            0xA9,
+            0x00,  # LDA #$00
+            0x68,  # PLA
+            0x08,  # PHP
+            0x18,  # CLC
+            0x28,  # PLP
+            0x20,
+            0x50,
+            0x04,  # JSR $0450
+            0x4C,
+            0x22,
+            0x04,  # JMP $0422
+            0xEA,
+            0xEA,
+            0xEA,
+            0x6C,
+            0x50,
+            0x00,  # JMP ($0050) -> $0430
+        ]
+    )
     image[0x0430:0x0433] = bytes([0x00, 0xEA, 0x00])
     image[0x0450:0x0452] = bytes([0xE8, 0x60])  # INX; RTS
-    image[0x0460:0x0469] = bytes([
-        0xA9, 0x00,
-        0x8D, 0xFE, 0xFF,
-        0x8D, 0xFF, 0xFF,
-        0x40,
-    ])
+    image[0x0460:0x0469] = bytes(
+        [
+            0xA9,
+            0x00,
+            0x8D,
+            0xFE,
+            0xFF,
+            0x8D,
+            0xFF,
+            0xFF,
+            0x40,
+        ]
+    )
     image[0x0050:0x0052] = bytes([0x30, 0x04])
     image[0x01FD:0x0200] = bytes([0xA5, 0x10, 0x04])
     image[0xFFFE:0x10000] = bytes([0x60, 0x04])
@@ -441,7 +345,13 @@ def test_compact_stack_and_control_match_reference():
     assert int(out["steps"]) == len(ref_rows)
     state = machine.get_state()
     assert tuple(state[name] for name in ("pc", "a", "x", "y", "s", "p", "halted")) == (
-        ref.pc, ref.a, ref.x, ref.y, ref.s, ref.p, ref.halted,
+        ref.pc,
+        ref.a,
+        ref.x,
+        ref.y,
+        ref.s,
+        ref.p,
+        ref.halted,
     )
     assert machine.dump_ram() == bytes(ref.memory)
 
@@ -464,11 +374,33 @@ def test_full_trace_interrupt_uses_union_receipt():
     out = machine.run(1, trace=True)
 
     state = expected.state
-    assert tuple(int(out[name][0]) for name in (
-        "pc", "a", "x", "y", "s", "p", "ir", "oplo", "ophi", "ea", "data",
-    )) == (
-        state.pc, state.a, state.x, state.y, state.s, state.p, state.ir,
-        state.operand_lo, state.operand_hi, state.ea, state.data,
+    assert tuple(
+        int(out[name][0])
+        for name in (
+            "pc",
+            "a",
+            "x",
+            "y",
+            "s",
+            "p",
+            "ir",
+            "oplo",
+            "ophi",
+            "ea",
+            "data",
+        )
+    ) == (
+        state.pc,
+        state.a,
+        state.x,
+        state.y,
+        state.s,
+        state.p,
+        state.ir,
+        state.operand_lo,
+        state.operand_hi,
+        state.ea,
+        state.data,
     )
     assert list(zip(out["w_addr"], out["w_value"], strict=True)) == [
         (write.addr, write.value) for write in expected.writes
@@ -476,38 +408,28 @@ def test_full_trace_interrupt_uses_union_receipt():
 
 
 @pytest.mark.slow
-def test_store_window_license_rejections():
-    """Unlicensable windows must be skipped, never mis-dispatched: a store
-    to a register range ($2007) and a store into the window's own bytes."""
-    mmio_store = (0x0500, bytes([
-        0xA9, 0x55,        # LDA #$55
-        0x8D, 0x07, 0x20,  # STA $2007 (>= $2000: unlicensed)
-        0xCA,              # DEX
-        0xD0, 0xF8,        # BNE $0500
-    ]), 1)
-    self_modify = (0x0300, bytes([
-        0xA9, 0x55,        # LDA #$55
-        0x8D, 0x05, 0x03,  # STA $0305 (inside the window's own bytes)
-        0xD0, 0xF9,        # BNE $0300
-    ]), 1)
-    m = Cpu6502TransformerMachine(bcd=False)
-    m.attach_sequence_module((mmio_store, self_modify))
-    assert m.seq_module is None  # both rejected by the license
-
-
-@pytest.mark.slow
 def test_loop_recurrences_are_single_steps_exactly():
     """Counting and polling loops retire many iterations per dispatch at
     the model's own per-iteration cycles; under every budget the machine
     stops exactly where single steps would, in the same state."""
-    code = bytes([
-        0xA2, 0xC8,        # $8000 LDX #200
-        0xCA, 0xD0, 0xFD,  # $8002 DEX; BNE $8002   (count loop)
-        0xA0, 0x07,        # $8005 LDY #7
-        0x88, 0xD0, 0xFD,  # $8007 DEY; BNE $8007
-        0xA5, 0x10,        # $800A LDA $10           (poll: $10 never changes)
-        0x10, 0xFC,        # $800C BPL $800A
-    ])
+    code = bytes(
+        [
+            0xA2,
+            0xC8,  # $8000 LDX #200
+            0xCA,
+            0xD0,
+            0xFD,  # $8002 DEX; BNE $8002   (count loop)
+            0xA0,
+            0x07,  # $8005 LDY #7
+            0x88,
+            0xD0,
+            0xFD,  # $8007 DEY; BNE $8007
+            0xA5,
+            0x10,  # $800A LDA $10           (poll: $10 never changes)
+            0x10,
+            0xFC,  # $800C BPL $800A
+        ]
+    )
     image = bytearray(0x10000)
     image[0x8000 : 0x8000 + len(code)] = code
     for budget in (1, 2, 3, 5, 100, 401, 402, 403, 604, 605, 1000, 1001, 1002, 7777):
@@ -529,128 +451,113 @@ def test_loop_recurrences_are_single_steps_exactly():
         state = m.get_state()
         assert (int(out["steps"]), int(out["cycles"])) == (steps, cycles), budget
         assert (state["pc"], state["a"], state["x"], state["y"], state["p"]) == (
-            ref.pc, ref.a, ref.x, ref.y, ref.p
+            ref.pc,
+            ref.a,
+            ref.x,
+            ref.y,
+            ref.p,
         ), budget
         if budget >= 1000:  # the loops ran as recurrences, not step by step
             assert sum(dispatches) < steps / 10, (budget, steps, dispatches)
 
 
-@pytest.mark.slow
-def test_store_forwarding_windows_are_single_steps_exactly():
-    """A window whose later steps read its own earlier stores (an RNG
-    churn loop, unrolled three times through its JMP) folds them in
-    (graph/fold.py forward_stores); under every budget it leaves the
-    registers, RAM and cycles single steps would."""
-    loop = bytes([
-        0xE6, 0x20,        # $8000 INC $20
-        0x18,              # $8002 CLC
-        0xA5, 0x20,        # $8003 LDA $20   (reads the INC's store)
-        0x65, 0x21,        # $8005 ADC $21
-        0x85, 0x20,        # $8007 STA $20
-        0x4C, 0x00, 0x80,  # $8009 JMP $8000
-    ])
+def test_parallel_flag_readouts_match_reference_for_every_byte():
+    """Wrap boundaries and shifted-out bits must preserve all architectural flags."""
+    machine = Cpu6502TransformerMachine()
+    machine.engine.shapes_meta = []
+    machine.load_image(bytes(65536), start_pc=0x8000)
+    ref = reference.Cpu6502(memory=bytearray(65536), bcd_enabled=False)
+    cases = [bytes([opcode]) for opcode in (0xE8, 0xC8, 0xCA, 0x88, 0x0A, 0x2A, 0x4A, 0x6A)]
+    cases += [bytes([opcode, 0x20]) for opcode in (0xE6, 0xC6, 0x06, 0x26, 0x46, 0x66)]
+    cases += [bytes([opcode, operand]) for opcode in (0x69, 0xE9) for operand in (0, 127, 128, 255)]
+    for code in cases:
+        machine.map_region(0x8000, code)
+        ref.memory[0x8000 : 0x8000 + len(code)] = code
+        op = reference.opcode_for(code[0])
+        for value in range(256):
+            for carry in (0, 1):
+                flags = 0x6C | carry
+                machine.map_region(0x20, bytes([value]))
+                machine.engine.set_run_state(
+                    0x8000, value, value, value, 0xFD, flags, 0, 0, 0, 0, 0, 0
+                )
+                ref.pc, ref.a, ref.x, ref.y, ref.s, ref.p = 0x8000, value, value, value, 0xFD, flags
+                ref.memory[0x20] = value
+                cycles = reference.instruction_cycles(ref, op, ref.pc, ref.x, ref.y, ref.p)
+                ref.step()
+                out = machine.run(1, trace=False)
+                actual = machine.get_state()
+                assert tuple(actual[key] for key in ("pc", "a", "x", "y", "s", "p")) == (
+                    ref.pc,
+                    ref.a,
+                    ref.x,
+                    ref.y,
+                    ref.s,
+                    ref.p,
+                ), (code.hex(), value, carry)
+                assert int(out["cycles"]) == cycles
+                assert machine.read_ram(0x20) == ref.memory[0x20]
+    assert machine._torch_forwards.counts[1] == 0
+
+
+def test_counter_recurrences_cover_byte_wrap_and_page_cross_budgets():
+    """Closed-form skips stop before zero, budgets and a branch page crossing."""
+    machine = Cpu6502TransformerMachine()
+    for opcode, register in ((0xCA, "x"), (0x88, "y"), (0xE8, "x"), (0xC8, "y")):
+        for head in (0x8000, 0x80FE):
+            image = bytearray(65536)
+            # Counter; BNE head; NOP; JMP self.
+            target = head + 4
+            image[head : head + 7] = bytes(
+                [opcode, 0xD0, 0xFD, 0xEA, 0x4C, target & 255, target >> 8]
+            )
+            machine.load_image(image, start_pc=head)
+            for value in range(256):
+                for budget in (1, 4, 7, 13, 2048):
+                    x, y = (value, 37) if register == "x" else (37, value)
+                    machine.engine.set_run_state(head, 19, x, y, 0xFD, 0xE5, 0, 0, 0, 0, 0, 0)
+                    result = machine.run(2000, max_cycles=budget, trace=False)
+                    ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+                    ref.pc, ref.a, ref.x, ref.y, ref.p = head, 19, x, y, 0xE5
+                    cycles = steps = 0
+                    while cycles < budget and steps < 2000:
+                        op = reference.opcode_for(ref.read_memory(ref.pc))
+                        cycles += reference.instruction_cycles(ref, op, ref.pc, ref.x, ref.y, ref.p)
+                        ref.step()
+                        steps += 1
+                    state = machine.get_state()
+                    assert (state["pc"], state["a"], state["x"], state["y"], state["p"]) == (
+                        ref.pc,
+                        ref.a,
+                        ref.x,
+                        ref.y,
+                        ref.p,
+                    ), (opcode, head, value, budget)
+                    assert (result["steps"], result["cycles"]) == (steps, cycles)
+
+
+def test_cold_build_releases_reference_weights_and_still_executes(monkeypatch):
+    import gc
+    import weakref
+
+    from transformer_nes.cpu6502.backends.weights import runner
+
+    models = []
+    build_model = runner.build_model
+
+    def track_model(*args, **kwargs):
+        result = build_model(*args, **kwargs)
+        models.append(weakref.ref(result[0]))
+        return result
+
+    monkeypatch.setattr(runner, "build_model", track_model)
+    monkeypatch.setattr(runner.GeneratedWeightsEngine, "from_cache", staticmethod(lambda key: None))
+    machine = runner.Cpu6502TransformerMachine(bcd=False)
+    gc.collect()
+    assert models and all(model() is None for model in models)
+
     image = bytearray(0x10000)
-    image[0x8000 : 0x8000 + len(loop)] = loop
-    image[0x21] = 0x35
-    for budget in (1, 7, 20, 41, 42, 43, 60, 123, 1000, 1001):
-        m = Cpu6502TransformerMachine(bcd=False)
-        m.load_image(bytes(image), start_pc=0x8000)
-        m.attach_sequence_module([(0x8000, loop * 3, 1, True)])
-        m.engine.engine.xray_take()
-        out = m.run(100_000, max_cycles=budget, trace=False)
-        paths, _ops, _dispatches = m.engine.engine.xray_take()
-
-        ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
-        ref.pc = 0x8000
-        steps = cycles = 0
-        while cycles < budget:
-            op = reference.opcode_for(ref.read_memory(ref.pc))
-            cycles += reference.instruction_cycles(ref, op, ref.pc, ref.x, ref.y, ref.p)
-            ref.step()
-            steps += 1
-        state = m.get_state()
-        assert (int(out["steps"]), int(out["cycles"])) == (steps, cycles), budget
-        assert (state["pc"], state["a"], state["p"]) == (ref.pc, ref.a, ref.p), budget
-        assert (m.read_ram(0x20), m.read_ram(0x21)) == (ref.memory[0x20], ref.memory[0x21]), budget
-        if budget >= 1000:
-            assert paths[0] > steps // 2, paths  # the window ran
-
-
-def test_superblocks_are_single_steps_exactly():
-    """Windows through predicted branches (superblocks): the model's own
-    flag (BNE after AND) or the state's (a window headed by the branch)
-    guards each prediction, a wrong one declines to the shorter window,
-    and under every budget the run leaves what single steps would."""
-    loop = bytes([
-        0xE8,              # $8000 INX
-        0x8A,              # $8001 TXA
-        0x29, 0x07,        # $8002 AND #$07
-        0xD0, 0x04,        # $8004 BNE $800A   (taken 7 times in 8)
-        0xE6, 0x20,        # $8006 INC $20
-        0xA4, 0x20,        # $8008 LDY $20
-        0x86, 0x21,        # $800A STX $21
-        0x18,              # $800C CLC
-        0x65, 0x21,        # $800D ADC $21
-        0x85, 0x22,        # $800F STA $22
-        0x4C, 0x00, 0x80,  # $8011 JMP $8000
-    ])
-    image = bytearray(0x10000)
-    image[0x8000 : 0x8000 + len(loop)] = loop
-    head, skip, join = loop[:6], loop[6:10], loop[10:]
-    windows = [
-        (0x8000, head, 1),                         # the prefix: ends at the branch
-        (0x8000, head + join, 1, True, (True,)),  # model-flag guard
-        (0x8000, head + skip + join, 1, True, (False,)),
-        (0x8004, loop[4:6] + join, 1, True, (True,)),  # state-flag guard
-    ]
-    for budget in (1, 9, 30, 77, 78, 79, 200, 401, 1000, 1001):
-        m = Cpu6502TransformerMachine(bcd=False)
-        m.load_image(bytes(image), start_pc=0x8000)
-        m.attach_sequence_module(windows)
-        assert len(m.window_experts()) == len(windows)
-        m.engine.engine.xray_take()
-        out = m.run(100_000, max_cycles=budget, trace=False)
-        paths, _ops, _dispatches = m.engine.engine.xray_take()
-
-        ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
-        ref.pc = 0x8000
-        steps = cycles = 0
-        while cycles < budget:
-            op = reference.opcode_for(ref.read_memory(ref.pc))
-            cycles += reference.instruction_cycles(ref, op, ref.pc, ref.x, ref.y, ref.p)
-            ref.step()
-            steps += 1
-        state = m.get_state()
-        assert (int(out["steps"]), int(out["cycles"])) == (steps, cycles), budget
-        assert ((state["pc"], state["a"], state["x"], state["y"], state["p"])
-                == (ref.pc, ref.a, ref.x, ref.y, ref.p)), budget
-        assert m.dump_ram()[0x20:0x23] == bytes(ref.memory[0x20:0x23]), budget
-        if budget >= 1000:
-            assert paths[0] > steps * 3 // 4, paths  # the superblocks ran
-
-
-@pytest.mark.slow
-def test_pytorch_runs_every_expert_forward_exactly():
-    """With the forward hook set, PyTorch runs every expert's layers
-    (cpu6502/backends/weights/torch_forward.py: AOTInductor-compiled) from
-    the native run loop: nestest ends in the state, cycles and RAM the
-    generated engine's own forwards reach, and the X-ray counts the same
-    memory reads."""
-    from transformer_nes.cpu6502.backends.weights.torch_forward import TorchForwards
-    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
-
-    image = bytes(load_image())
-    runs = []
-    for hook in (False, True):
-        m = Cpu6502TransformerMachine(bcd=False, forward_hook=hook)
-        m.load_image(image, start_pc=START_PC)
-        torch_forwards = TorchForwards(m, wait=True) if hook else None
-        m.engine.engine.xray_reads(True)
-        out = m.run(5000, max_cycles=0, trace=False)
-        reads = m.engine.engine.xray_reads(False)
-        runs.append((m.get_state(), int(out["cycles"]), m.dump_ram(), reads))
-        if hook:
-            calls, declined = torch_forwards.counts
-            assert calls > 1000 and declined == 0
-    assert runs[0][:3] == runs[1][:3]
-    assert abs(int(runs[0][3].sum()) - int(runs[1][3].sum())) <= runs[0][3].sum() // 100
+    image[0x8000:0x8003] = bytes([0xA9, 0x42, 0x00])  # LDA #$42; BRK
+    machine.load_image(image, start_pc=0x8000)
+    machine.run(2, max_cycles=0, trace=False)
+    assert machine.get_state()["a"] == 0x42

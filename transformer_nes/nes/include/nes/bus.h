@@ -189,7 +189,6 @@ public:
   ReadLease read_lease(int addr) override;
   void lease_consumed(int addr, int count) override;
 
-  int polls = 0; // strobe falling edges: one per game controller read
 
 private:
   array<bool, 8> buttons_{};

@@ -11,12 +11,8 @@ build/
 .pytest_cache/
 .mypy_cache/
 .claude/
-/plan.yaml
-/allocation.yaml
 
 # C++ build output
-transformer
-_kernel_cache/
 _engine_cache/
 /bin/
 
@@ -32,19 +28,13 @@ vendor/pybind11/
 *.nes
 tapes/
 
-# F1 debug snapshots
-_debug_dumps/
-
 # Finder litter
 .DS_Store
-
-# Generated experiment artifacts (hundreds of MB, rebuilt by build.py)
-experiments/*/artifact/
 
 # Editor state
 .obsidian/
 checkpoint/
 experts/
 
-# Learned windows (per-ROM profiles of play)
+# Local profiles from earlier runs
 windows/

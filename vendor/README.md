@@ -1,15 +1,13 @@
-# vendor
+# Native dependencies
 
-Native-app dependencies, fetched at pinned revisions by
-`./install_deps.sh` (pins live at the top of the script).
+Run `./vendor/install_deps.sh` from the repository root to fetch the pinned
+revisions listed in that script:
 
-- `sokol/` — single-file headers (zlib): `sokol_app.h` window + input,
-  `sokol_gfx.h` the framebuffer quad, `sokol_glue.h`, `sokol_log.h`,
-  `sokol_audio.h` (unused until the APU exists), `sokol_imgui.h` for the
-  debug overlay.
-- `imgui/` — Dear ImGui (MIT), the debug-overlay dependency of
-  `sokol_imgui.h`.
+- `sokol/`: window, graphics, input, audio, and ImGui integration headers.
+- `imgui/`: debug overlay headers and its four compiled implementation files.
+- `pybind11/`: headers and license used by the native NES extensions.
 
-Consumed by `transformer_nes/nes/app.cpp` — the one implementation TU
-(`SOKOL_IMPL`), compiled as Objective-C++ with the Metal backend on
-macOS and digest-cached like every other native piece.
+The root Makefile builds the console and frontend into `bin/`. Sokol's
+implementation lives in `nes/sokol_impl.m`, compiled as Objective-C on macOS
+and C elsewhere. Generated transformer extensions use PyTorch's bundled
+pybind11 headers and the separate cache in `model/_engine_cache/`.

@@ -5,7 +5,15 @@ import os
 
 import numpy as np
 import pytest
-from carts import console_frames, latch_cart, mmc5_cart, register_cart
+from carts import (
+    absolute,
+    console_frames,
+    last_bank_cart,
+    latch_cart,
+    load_reference_hardware,
+    mmc5_cart,
+    register_cart,
+)
 
 from transformer_nes.nes.backends import backend_factory
 from transformer_nes.nes.build import load_hardware
@@ -24,8 +32,9 @@ def random_slot(rng, pins: dict) -> list[int]:
     first, last = pins.get("first_slot"), pins.get("last_slot")
     slot = 0 if first else 31 if last else int(rng.choice([*range(1, 31), 32, 33]))
     mask = int(rng.integers(256))
-    if "maskbit3" in pins:
-        mask = (mask | 0x08) & ~0x01
+    for bit in range(8):
+        if f"maskbit{bit}" in pins:
+            mask = (mask & ~(1 << bit)) | (pins[f"maskbit{bit}"] << bit)
     ctrl = int(rng.integers(256))
     if "ctrlbit4" in pins:
         ctrl = (ctrl & ~0x10) | (pins["ctrlbit4"] << 4)
@@ -51,7 +60,10 @@ def random_slot(rng, pins: dict) -> list[int]:
     latches = [int(rng.integers(2)), int(rng.integers(2)), int(rng.integers(2))]
     if "latch" in pins:  # carts without CHR latches
         latches = [0, 0, 0]
-    mmc5 = [0, int(rng.integers(4))]  # extended mode pinned off; chr_upper
+    mmc5 = [
+        int(rng.integers(2)) if pins.get("rendering") == 0 else 0,
+        int(rng.integers(4)),
+    ]  # extended mode pinned off; chr_upper
     return head + pages + latches + mmc5 + v + bg + sprites
 
 
@@ -67,18 +79,16 @@ def test_experts_agree_with_the_full_graph():
         for _ in range(300):
             inputs = random_slot(rng, render.EXPERTS[name])
             full, folded = engine.step(inputs, 0), engine.step(inputs, model)
+            projected = engine.step(inputs, engine.model_id("render_status", name))
+            assert np.array_equal(projected, folded[8:])
             if "latch" in render.EXPERTS[name]:  # new latches unused without them
                 full, folded = full[:-2], folded[:-2]
             assert np.array_equal(full, folded), (name, inputs, full, folded)
 
 
-
-def whole_ppu(hardware, cart, count):
-    """Frames with the PPU as one transformer: register file, rendering,
-    sprite unit."""
-    probe = hardware.Console(cart, backend_factory("weights"), 44100.0)
-    engine = ppu_engine(probe.ppu_graph_chr_full)
-    return console_frames(hardware, cart, count, lambda c: c.set_ppu_engine(engine))
+def whole_ppu(cart, count):
+    """Frames through the production console's mandatory transformer PPU."""
+    return console_frames(load_hardware(), cart, count)
 
 
 @pytest.mark.parametrize(("mask_bits", "vertical"), [(0x18, False), (0x18, True), (0x1F, False)])
@@ -87,27 +97,58 @@ def test_graph_renders_the_synthetic_cart(mask_bits, vertical):
     mid-frame, $2007 across CHR, nametables and palette, OAM, sprites,
     both mirrorings; with 0x1F also greyscale and left-edge clipping
     (the full render graph)."""
-    hardware = load_hardware()
+    hardware = load_reference_hardware()
     cart = register_cart(hardware, vertical=vertical, mask_bits=mask_bits)
-    assert np.array_equal(console_frames(hardware, cart, 6), whole_ppu(hardware, cart, 6))
+    assert np.array_equal(console_frames(hardware, cart, 6), whole_ppu(cart, 6))
 
 
 @pytest.mark.parametrize("mapper", [9, 10])
 def test_graph_renders_latch_mappers(mapper):
     """MMC2/MMC4: the render graph switches CHR through the latches its
     own fetches set (and the sprite fetches between lines)."""
-    hardware = load_hardware()
+    hardware = load_reference_hardware()
     cart = latch_cart(hardware, mapper=mapper)
-    assert np.array_equal(console_frames(hardware, cart, 6), whole_ppu(hardware, cart, 6))
+    assert np.array_equal(console_frames(hardware, cart, 6), whole_ppu(cart, 6))
 
 
 @pytest.mark.parametrize("exram_mode", [0, 1, 2])
 def test_graph_renders_mmc5(exram_mode):
     """MMC5: nametable maps over CIRAM, ExRAM and fill mode, both CHR
     sets, and (mode 1) extended attributes from the whole CHR ROM."""
-    hardware = load_hardware()
+    hardware = load_reference_hardware()
     cart = mmc5_cart(hardware, exram_mode=exram_mode)
-    assert np.array_equal(console_frames(hardware, cart, 6), whole_ppu(hardware, cart, 6))
+    assert np.array_equal(console_frames(hardware, cart, 6), whole_ppu(cart, 6))
+
+
+@pytest.mark.parametrize("mapper", [0, 9, 10, 5])
+def test_unlimited_sprites_preserve_hardware_bus_effects(mapper):
+    reference, production = load_reference_hardware(), load_hardware()
+    setup = [0xA9, 0] + absolute(0x8D, 0x2001) + absolute(0x8D, 0x2003)
+    for i in range(64):
+        for value in (40, 0xFD + i % 2, i % 4, i * 4):
+            setup += [0xA9, value] + absolute(0x8D, 0x2004)
+    # Distinct FD/FE windows expose accidental latch flips by debug rows.
+    if mapper in (9, 10):
+        for k, address in enumerate((0xB000, 0xC000, 0xD000, 0xE000)):
+            setup += [0xA9, k] + absolute(0x8D, address)
+    setup += [0xA9, 0x1E] + absolute(0x8D, 0x2001) + [0xD0, 0xFE]  # render, then spin
+    image = last_bank_cart(mapper, [], [], 0x10000, after_setup=setup)
+    cart = reference.Cartridge.parse(image)
+    limited = console_frames(reference, cart, 6)
+    unlimited = console_frames(reference, cart, 6, lambda c: c.set_sprite_limit(False))
+    actual = console_frames(production, cart, 6, lambda c: c.set_sprite_limit(False))
+    assert not np.array_equal(limited, unlimited)
+    assert np.array_equal(unlimited, actual)
+
+
+def test_production_console_requires_the_transformer_ppu():
+    hardware = load_hardware()
+    console = hardware.Console(
+        register_cart(hardware, vertical=False), backend_factory("weights"), 44100
+    )
+    assert console.ppu_engine is not None
+    with pytest.raises(ValueError, match="transformer engine is required"):
+        console.set_ppu_engine(None)
 
 
 @pytest.mark.slow
@@ -128,9 +169,9 @@ def test_graph_renders_games(rom):
     path = os.path.join(EXAMPLES, rom)
     if not os.path.exists(path):
         pytest.skip(f"{rom} not present")
-    hardware = load_hardware()
+    hardware = load_reference_hardware()
     cart = hardware.Cartridge.load(path)
-    assert np.array_equal(console_frames(hardware, cart, 300), whole_ppu(hardware, cart, 300))
+    assert np.array_equal(console_frames(hardware, cart, 300), whole_ppu(cart, 300))
 
 
 def test_slot_trace_explains_the_frame():
@@ -139,9 +180,7 @@ def test_slot_trace_explains_the_frame():
     from transformer_nes.nes.xray import PpuXray
 
     hardware = load_hardware()
-    console = hardware.Console(
-        latch_cart(hardware, mapper=9), backend_factory("weights"), 44100.0
-    )
+    console = hardware.Console(latch_cart(hardware, mapper=9), backend_factory("weights"), 44100.0)
     engine = ppu_engine()
     console.set_ppu_engine(engine)
     xray = PpuXray(engine)
@@ -154,16 +193,18 @@ def test_slot_trace_explains_the_frame():
         assert trace is not None and (trace["line"], trace["slot"]) == (line, x // 8)
         d = xray.dissect(trace, x)
         assert d["title"].endswith(f"color ${frame[line][x]:02X}"), d["title"]
-        assert any(kind == "attention" and "palette" in detail for _, kind, _, detail, _ in d["steps"])
+        assert any(
+            kind == "attention" and "palette" in detail for _, kind, _, detail, _ in d["steps"]
+        )
     assert console.take_ppu_slot_trace() is None  # one trace per request
 
 
 def test_knock_out_breaks_rendering_until_restored():
     """Ablation: the full model alone renders identically; forcing its
-    attribute read to 0 changes the picture; restoring brings it back."""
+    palette-selection neuron to 0 changes the picture; restoring brings it back."""
     from transformer_nes.nes.xray import PpuXray
 
-    hardware = load_hardware()
+    hardware = load_reference_hardware()
     cart = latch_cart(hardware, mapper=9)
     native = console_frames(hardware, cart, 8)
     console = hardware.Console(cart, backend_factory("weights"), 44100.0)
@@ -175,7 +216,7 @@ def test_knock_out_breaks_rendering_until_restored():
         if i == 2:
             console.ppu_force_full_render = True
         if i == 4:
-            xray.knock_out(console, "attr")
+            xray.knock_out(console, "palette_select+")
         if i == 6:
             xray.restore(console)
         console.set_buttons(0)
@@ -185,3 +226,28 @@ def test_knock_out_breaks_rendering_until_restored():
     # The first frame after restoring still shows the two tiles prefetched
     # for its line 0 while ablated; from the next frame on, it is gone.
     assert np.array_equal(native[7:], out[7:])
+
+
+@pytest.mark.parametrize("chr_full", [0, 0x20000], ids=["mapped-chr", "mmc5-chr"])
+def test_blank_expert_preserves_palette_and_disables_fetch_effects(chr_full):
+    engine = ppu_engine(chr_full)
+    blank = engine.model_id("render", "blank")
+    rng = np.random.default_rng(61)
+    for address in range(0x3F00, 0x3F20):
+        engine.write(address, int(rng.integers(64)))
+    for case in range(1024):
+        inputs = random_slot(rng, render.EXPERTS["blank"])
+        inputs[1] = case % 34  # includes clipping, vertical wrap and prefetch slots
+        inputs[5] = 0xE0 | (case & 1)  # rendering off, both greyscale states
+        address = (0x3F00, 0x2000, 0x7F00)[case % 3] + case % 32
+        start = render.INPUTS.index("v_cx")
+        inputs[start : start + 4] = [
+            address & 31,
+            (address >> 5) & 31,
+            (address >> 10) & 3,
+            (address >> 12) & 7,
+        ]
+        full, folded = engine.step(inputs, 0), engine.step(inputs, blank)
+        np.testing.assert_array_equal(full, folded)
+        assert folded[render.OUTPUTS.index("fetched")] == 0
+        assert not folded[8:16].any()  # inactive tile-effect payload

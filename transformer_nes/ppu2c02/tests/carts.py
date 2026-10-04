@@ -10,6 +10,14 @@ mapper's PPU-facing registers.
 import numpy as np
 
 
+def load_reference_hardware():
+    """Conventional PPU oracle; excluded from the production extension."""
+    from transformer_nes.nes.build import _import_extension, _make
+
+    _make("reference-hardware")
+    return _import_extension("nes_hardware_reference")
+
+
 def absolute(op: int, addr: int) -> list[int]:
     return [op, addr & 0xFF, addr >> 8]
 
@@ -89,10 +97,10 @@ def register_cart(hardware, *, vertical: bool, mask_bits: int = 0x18):
     return hardware.Cartridge.parse(cart(0, bytes(prg), pattern_chr(0x2000), vertical=vertical))
 
 
-def last_bank_cart(mapper: int, setup: list[int], per_pass: list[int], chr_size: int):
+def last_bank_cart(mapper: int, setup: list[int], per_pass: list[int], chr_size: int, *, after_setup=()):
     """Code at $E000 in the last 8 KiB of a 32 KiB PRG (fixed under MMC2,
     MMC4 and MMC5's power-on mode)."""
-    head = setup + ppu_setup() + [0xA2, 0x00]
+    head = setup + ppu_setup() + list(after_setup) + [0xA2, 0x00]
     code = head + main_loop(0xE000 + len(head), per_pass, 0x1F)
     prg = bytearray(0x8000)
     prg[0x6000 : 0x6000 + len(code)] = bytes(code)

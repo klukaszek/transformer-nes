@@ -31,7 +31,54 @@ def test_evaluation_selects_the_first_eight_in_oam_order(engine):
         want = [min(len(covering), 8), *(covering[:8] + [64] * 8)[:8]]
         tall = f"tall{int(height == 16)}"
         for model in (engine.model_id("evaluate"), engine.model_id("evaluate", tall)):
-            assert engine.step([1, line, ctrl], model).tolist() == want
+            assert engine.step([1, line, ctrl, 0], model).tolist() == want
+        # The ordinary expert must actually fold its start pin to zero.
+        assert engine.step([1, line, ctrl, 64], engine.model_id("evaluate", tall)).tolist() == want
+        start = int(rng.integers(65))
+        remaining = [i for i in covering if i >= start]
+        want = [min(len(remaining), 8), *(remaining[:8] + [64] * 8)[:8]]
+        for model in (
+            engine.model_id("evaluate"),
+            engine.model_id("evaluate", f"remaining_{tall}"),
+        ):
+            assert engine.step([1, line, ctrl, start], model).tolist() == want
+
+
+def test_overflow_reads_diagonally_including_non_y_bytes(engine):
+    rng = np.random.default_rng(41)
+    for trial in range(1024):
+        line, ctrl, start = int(rng.integers(240)), int(rng.integers(256)), trial % 65
+        height = 16 if ctrl & 0x20 else 8
+        oam = rng.integers(256, size=256)
+        if trial % 2:
+            # Dense matches exercise every phase and the first-hit rule.
+            oam[rng.random(256) < 0.5] = line
+        for a, value in enumerate(oam):
+            engine.write(0x4000 + a, int(value))
+        want = next(
+            (j for j in range(start, 64) if 0 <= line - int(oam[4 * j + (j - start) % 4]) < height),
+            64,
+        )
+        for model in (
+            engine.model_id("overflow"),
+            engine.model_id("overflow", f"tall{int(height == 16)}"),
+        ):
+            found = 64
+            # Include start=64: a completely empty batch must not match.
+            for base in range(start, max(start + 1, 64), 8):
+                batch = next(
+                    (
+                        j
+                        for j in range(base, min(base + 8, 64))
+                        if 0 <= line - int(oam[4 * j + (j - start) % 4]) < height
+                    ),
+                    64,
+                )
+                found = engine.step([1, line, ctrl, base], model).tolist()[0]
+                assert found == batch
+                if found != 64:
+                    break
+            assert found == want
 
 
 def after_fetch(latch, address, wide_low):
@@ -106,14 +153,19 @@ def test_fetch_is_the_native_sprite_fetch(engine):
         inputs = [1, line, ctrl, count, *index, *latch, wide_low, *[0] * 8]
         # The full model, and the expert for the size on a cart without
         # latches (inputs 0, no flips).
-        expert = engine.model_id("fetch", f"tall{int(height == 16)}_count{count}")
-        for model, latches in ((engine.model_id("fetch"), True), (expert, False)):
-            if not latches:
+        expert = f"tall{int(height == 16)}_count{count}"
+        debug = f"debug_tall{int(height == 16)}"
+        for name, latches in ((None, True), (debug, False), (expert, False)):
+            if name == expert:
                 inputs[12:14] = [0, 0]
             pixels, xs, fetch, a12, new_latch = native_fetch(
                 memory, line, ctrl, count, index, inputs[12:14], wide_low, latches
             )
-            out = engine.step(inputs, model).tolist()
+            out = engine.step(inputs, engine.model_id("fetch", name)).tolist()
+            projected = engine.model_id("fetch_bus", name)
+            assert engine.step(inputs, projected).tolist() == out[72:]
+            status = engine.model_id("fetch_status", name)
+            assert engine.step(inputs, status).tolist() == out[:8] + [out[64]] + out[72:]
             assert out[:64] == pixels
             assert out[72:80] == fetch
             for k in range(8):
@@ -121,5 +173,4 @@ def test_fetch_is_the_native_sprite_fetch(engine):
                     assert out[64 + k] == xs[k]
                 if fetch[k]:
                     assert out[80 + k] == a12[k]
-            if latches:
-                assert out[88:90] == new_latch
+            assert out[88:90] == new_latch

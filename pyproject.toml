@@ -8,7 +8,6 @@ license = {text = "Apache-2.0"}
 dependencies = [
     "ninja>=1.13.0",
     "numpy>=2.0.0",
-    "pybind11>=3.0.2",
     "safetensors>=0.8.0",
     "scipy>=1.17.1",
     "setuptools>=82.0.0",
@@ -28,9 +27,9 @@ dev = [
 6502-klaus = "transformer_nes.cpu6502.examples.klaus.harness:main"
 6502-nestest = "transformer_nes.cpu6502.examples.nestest:main"
 6502-transformer = "transformer_nes.cpu6502.backends.weights.runner:main"
-6502-export = "transformer_nes.model.export:main"
-6502-checkpoint = "transformer_nes.model.checkpoint_runner:main"
-6502-experts = "transformer_nes.model.expert_runner:main"
+6502-export = "transformer_nes.cpu6502.backends.weights.export:main"
+6502-checkpoint = "transformer_nes.cpu6502.backends.weights.checkpoint_runner:main"
+6502-experts = "transformer_nes.cpu6502.backends.weights.expert_runner:main"
 nes-run = "transformer_nes.nes.app:main"
 
 [build-system]
@@ -42,10 +41,13 @@ include = ["transformer_nes*"]
 
 [tool.setuptools.package-data]
 "transformer_nes" = [
+    "model/native/*.h",
+    "model/native/*.cpp",
+    "cpu6502/backends/weights/native/*.h",
+    "cpu6502/backends/weights/native/*.cpp",
     "cpu6502/examples/klaus/*",
     "nes/examples/nestest.*",
     "nes/*.cpp",
-    "nes/*.h",
     "nes/*.m",
 ]
 
@@ -61,7 +63,7 @@ ignore = ["E501"]
 known-first-party = ["transformer_nes"]
 
 [tool.pytest.ini_options]
-testpaths = ["transformer_nes/cpu6502/tests", "transformer_nes/nes/tests", "transformer_nes/ppu2c02/tests"]
+testpaths = ["transformer_nes/graph/tests", "transformer_nes/model/tests", "transformer_nes/cpu6502/tests", "transformer_nes/nes/tests", "transformer_nes/ppu2c02/tests"]
 addopts = "-v --tb=short"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",

@@ -61,6 +61,42 @@ def read_codes(outputs) -> list[int]:
     return [codes[k] for k in kinds] + [-3] * (2 - len(kinds))
 
 
+def share_queries(w_in: torch.Tensor, w_out: torch.Tensor, read_kind: torch.Tensor
+                  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Share complete query pairs and live (query, value kind) channels.
+
+    Input/output coefficients use half units here. Summing duplicate value
+    columns before splitting whole/half terms preserves the read projection's
+    single rounding. Passthrough values retain their separate rounding.
+    Query equality includes its scale, not just its address on sampled inputs.
+    """
+    queries, rows, routes, columns = {}, [], [], []
+    channels = {}
+    for h, kinds in enumerate(read_kind.tolist()):
+        pair = w_in[2 * h:2 * h + 2]
+        key = tuple(pair.flatten().tolist())
+        if key not in queries:
+            queries[key] = len(rows)
+            rows.append(pair)
+        query = queries[key]
+        for c, kind in enumerate(kinds):
+            column = w_out[:, 2 * h + c]
+            if kind == -3 or not column.any():
+                continue
+            value = (query, kind)
+            if value not in channels:
+                channels[value] = len(columns)
+                columns.append(column.to(torch.int64))
+                routes.append(value)
+            else:
+                columns[channels[value]] += column
+    projected = torch.cat([*rows, w_in[2 * len(read_kind):]])
+    values = torch.stack(columns, 1) if columns else w_out[:, :0]
+    out = torch.cat([values, w_out[:, 2 * len(read_kind):]], 1).to(torch.int64)
+    if ((out < -(2**31)) | (out >= 2**31)).any():
+        raise ValueError("shared value projection exceeds int32")
+    return projected, out.to(w_out.dtype), torch.tensor(routes, dtype=INT).reshape(-1, 2)
+
 def touched(W: torch.Tensor, dim: int) -> torch.Tensor:
     """The rows (dim 1) or columns (dim 0) of W holding a nonzero."""
     return (W != 0).any(dim=dim).nonzero().flatten().to(INT)
@@ -82,47 +118,74 @@ def linear(W: torch.Tensor, x: torch.Tensor, halves: torch.Tensor | None = None)
     return y if halves is None else y + ((halves * x).sum(1, dtype=INT) >> 1)
 
 
+def indexed_read(memory: torch.Tensor, address: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Each address's byte and whether the address exists: attention over
+    memory (attention_read) evaluated by indexing, which it equals."""
+    valid = (address >= 0) & (address < memory.numel())
+    return memory[address.clamp(0, memory.numel() - 1)].to(INT) * valid, valid
+
+
+def attention_read(memory: torch.Tensor, address: torch.Tensor,
+                   temperature: float = 32.0) -> tuple[torch.Tensor, torch.Tensor]:
+    """indexed_read as softmax attention: memory is the KV cache, one entry
+    per address k with key [4k, k - 2k^2] and value (byte, k); a query for
+    address q is [q, 1].  No two keys tie and the best leads by >= 1, so
+    the rounded weighted values are the best key's exactly.  A query for no
+    address gets its nearest key, whose address differs: masked to 0, as
+    the graph masks a read whose returned address differs from the query."""
+    keys = torch.arange(memory.numel(), dtype=torch.float64)
+    q = address.to(torch.float64)[:, None]
+    scores = 4 * q * keys + keys - 2 * keys * keys
+    weights = torch.softmax(temperature * (scores - scores.max(dim=1, keepdim=True).values), dim=1)
+    byte = torch.round(weights @ memory.to(torch.float64)).to(INT)
+    found = torch.round(weights @ keys).to(address.dtype)
+    valid = found == address
+    return byte * valid, valid
+
+
 def layer(x, memory, shift, in_slots, w_in, read_kind, out_slots, w_out, ff_in_slots, w_ff,
-          ff_out_slots, w_down, h_out=None, h_ff=None, h_down=None):
-    """One layer on the residual `x`: its output, and the address each
-    memory head read (-1 where its query names none; heads sharing a query
-    read the same one).
+          ff_out_slots, w_down, h_out=None, h_ff=None, h_down=None, *, read=indexed_read):
+    """One layer on residual `x`, and each distinct query's read address.
+
+    Query pairs are projected/read once. read_kind routes each live value
+    channel to its query and selects the byte, address or bit (-1 where a
+    query names no address in the returned read-address array).
 
     Neither kind of head needs keys: a passthrough head's output is its
     own value, and a memory head's query s * [address, 1] names the byte
-    the hardmax picks.  So the in-projection w_in is the memory heads'
-    queries, then the passthrough heads' values; the out-projection w_out
-    takes what the reads serve, then those values; and w_ff is the
-    ReGLU's gates, then its values.  A layer also reads and writes few of
+    attention picks. w_in projects distinct queries, then passthrough values;
+    w_out takes live memory channels, then passthrough values. w_ff is the
+    ReGLU's gates, then its values. A layer also reads and writes few of
     the residual's slots: each projection has only the slots it reads
-    (gathered) and writes (added back).  (Each part is used where it lies,
-    never copied out, so the compiled layer makes few intermediates.)"""
-    n_queries = 2 * read_kind.shape[0]
+    (gathered) and writes (added back).  Memory heads read through `read`:
+    indexed_read, or attention_read, which it equals."""
+    n_values = read_kind.shape[0]
+    query_rows = w_in.shape[0] - w_out.shape[1] + n_values
     projected = linear(w_in, x[in_slots])
-    torch._check(projected.shape[0] >= n_queries)
-    qx, qy = projected[0:n_queries:2], projected[1:n_queries:2]
+    torch._check(projected.shape[0] >= query_rows)
+    qx, qy = projected[0:query_rows:2], projected[1:query_rows:2]
     address = torch.div(qx, torch.where(qy == 0, 1, qy), rounding_mode="floor")
-    valid = (address >= 0) & (address < memory.numel())
-    byte = memory[address.clamp(0, memory.numel() - 1)].to(INT) * valid
-    read = torch.where(valid, address, -1)
+    byte, valid = read(memory, address)
+    addresses_read = torch.where(valid, address, -1)
     address = address * valid
-    # Each memory head's two output components serve the byte (-1), the
+    # Each memory value channel serves the byte (-1), the
     # address (-2) or bit n of the byte (n).
+    query, kinds = read_kind[:, 0], read_kind[:, 1]
+    byte, address = byte[query], address[query]
     served = torch.where(
-        read_kind == -1, byte[:, None],
-        torch.where(read_kind == -2, address[:, None],
-                    torch.where(read_kind >= 0, (byte[:, None] >> read_kind.clamp(min=0)) & 1, 0)))
-    reads, values = w_out[:, :n_queries], w_out[:, n_queries:]
-    read_halves, value_halves = (None, None) if h_out is None else (h_out[:, :n_queries], h_out[:, n_queries:])
-    attention = (linear(reads, served.reshape(-1) << shift, read_halves)
-                 + linear(values, projected[n_queries:], value_halves))
+        kinds == -1, byte,
+        torch.where(kinds == -2, address, (byte >> kinds.clamp(min=0)) & 1))
+    reads, values = w_out[:, :n_values], w_out[:, n_values:]
+    read_halves, value_halves = (None, None) if h_out is None else (h_out[:, :n_values], h_out[:, n_values:])
+    attention = (linear(reads, served << shift, read_halves)
+                 + linear(values, projected[query_rows:], value_halves))
     x = x.index_add(0, out_slots, attention)
     n_ffn = w_down.shape[1]
     gate_value = linear(w_ff, x[ff_in_slots], h_ff)
     torch._check(gate_value.shape[0] == 2 * n_ffn)
     gate, value = gate_value[:n_ffn], gate_value[n_ffn:]
     act = torch.where(gate > 0, (gate * value) >> shift, 0)
-    return x.index_add(0, ff_out_slots, linear(w_down, act, h_down)), read
+    return x.index_add(0, ff_out_slots, linear(w_down, act, h_down)), addresses_read
 
 
 class ExpertLayer(torch.nn.Module):
@@ -146,6 +209,9 @@ class ExpertLayer(torch.nn.Module):
             raise ValueError(f"{stem}: half coefficients in the in-projection")
         w_in = w_in[reads + [4 * heads + c for c in passes]]
         w_out = w_out[:, reads + passes]
+        w_in, w_out, read_kind = share_queries(w_in, w_out, torch.tensor(
+            [read_codes(outputs[h]) for h in range(heads) if kinds[h] == LOOKUP],
+            dtype=INT).reshape(-1, 2))
         in_slots, out_slots = touched(w_in, 0), touched(w_out, 1)
         ff_in_slots, ff_out_slots = touched(w_ff, 0), touched(w_down, 1)
         # The checkpoint's coefficients are in units of a half: split each
@@ -157,8 +223,7 @@ class ExpertLayer(torch.nn.Module):
         weights = {
             "in_slots": in_slots, "out_slots": out_slots, "ff_in_slots": ff_in_slots,
             "ff_out_slots": ff_out_slots,
-            "read_kind": torch.tensor([read_codes(outputs[h]) for h in range(heads) if kinds[h] == LOOKUP],
-                                      dtype=INT).reshape(-1, 2),
+            "read_kind": read_kind,
             **{name: W >> 1 for name, W in doubled.items()},
         }
         for name in WEIGHTS + (HALVES if self.has_halves else ()):
@@ -168,9 +233,9 @@ class ExpertLayer(torch.nn.Module):
         """layer()'s weight arguments."""
         return [getattr(self, name) for name in WEIGHTS + (HALVES if self.has_halves else ())]
 
-    def forward(self, x: torch.Tensor, memory: torch.Tensor,
-                shift: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return layer(x, memory, shift, *self.weights())
+    def forward(self, x: torch.Tensor, memory: torch.Tensor, shift: int,
+                read=indexed_read) -> tuple[torch.Tensor, torch.Tensor]:
+        return layer(x, memory, shift, *self.weights(), read=read)
 
 
 class Expert(torch.nn.Module):
@@ -187,24 +252,30 @@ class Expert(torch.nn.Module):
             for li in range(meta["n_layers"])
         )
 
-    def forward(self, x: torch.Tensor, memory: torch.Tensor, shift: int) -> torch.Tensor:
-        return self.forward_reads(x, memory, shift)[0]
+    def forward(self, x: torch.Tensor, memory: torch.Tensor, shift: int,
+                read=indexed_read) -> torch.Tensor:
+        return self.forward_reads(x, memory, shift, read)[0]
 
-    def forward_reads(self, x: torch.Tensor, memory: torch.Tensor,
-                      shift: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_reads(self, x: torch.Tensor, memory: torch.Tensor, shift: int,
+                      read=indexed_read) -> tuple[torch.Tensor, torch.Tensor]:
         """The forward, and each memory head's address, layer by layer
         (layer())."""
         reads = []
         for expert_layer in self.layers:
-            x, read = expert_layer(x, memory, shift)
-            reads.append(read)
+            x, addresses = expert_layer(x, memory, shift, read)
+            reads.append(addresses)
         return x, torch.cat(reads) if reads else torch.zeros(0, dtype=INT)
 
 
 class Cpu:
-    """The 6502 as routed expert forwards over a flat 64 KiB memory."""
+    """The 6502 as routed expert forwards over a flat 64 KiB memory.  Every
+    read of it -- the experts' memory heads, the router's opcode byte, the
+    control ABI's operand bytes -- goes through `memory_read`
+    (indexed_read, or attention_read, which it equals)."""
 
-    def __init__(self, checkpoint: str, image: bytes, pc: int, *, s: int = 0xFD, p: int = 0x24):
+    def __init__(self, checkpoint: str, image: bytes, pc: int, *, s: int = 0xFD, p: int = 0x24,
+                 memory_read=indexed_read):
+        self.memory_read = memory_read
         with open(os.path.join(checkpoint, "experts.json")) as f:
             meta = json.load(f)
         tensors = load_file(os.path.join(checkpoint, "expert_weights.safetensors"))
@@ -220,8 +291,7 @@ class Cpu:
         returns its cycle count."""
         st, memory = self.state, self.memory
         pc = st["pc"]
-        expert = (self.interrupt[nmi] if nmi or irq
-                  else self.by_opcode[int(memory[pc])])
+        expert = self.interrupt[nmi] if nmi or irq else self.by_opcode[self.peek(pc)]
         spec, shift = expert.spec, self.shift
         x = torch.zeros(expert.meta["d_model"], dtype=INT)
         x[expert.meta["one_slot"]] = 1 << shift
@@ -232,7 +302,7 @@ class Cpu:
             x[slot] = inputs[name] << shift
         for slot, mask in spec["p_flags"]:
             x[slot] = (1 << shift) if st["p"] & mask else 0
-        x = expert(x, memory, shift)
+        x = expert(x, memory, shift, self.memory_read)
 
         def read(slot: int) -> int:
             return int(x[slot]) >> shift
@@ -260,21 +330,25 @@ class Cpu:
         cycles = spec["sequence_cycles"]
         return cycles["constant"] + sum(read(slot) & 0xFF for slot in cycles["model"])
 
+    def peek(self, address: int) -> int:
+        """One byte of memory, read as the experts read it."""
+        byte, _valid = self.memory_read(self.memory, torch.tensor([address & 0xFFFF], dtype=INT))
+        return int(byte[0])
+
     def successor(self, control: dict, pc: int, read) -> int:
         """The next PC from the expert's control ABI (an operand byte, a
         model output, or a fixed offset; branches by the flag they test)."""
-        memory = self.memory
         if control["target_dimension"] is not None:
             target = fallthrough = read(control["target_dimension"])
         elif control["absolute_operand_offset"] is not None:
             at = pc + control["absolute_operand_offset"]
-            target = fallthrough = int(memory[at & 0xFFFF]) | int(memory[(at + 1) & 0xFFFF]) << 8
+            target = fallthrough = self.peek(at) | self.peek(at + 1) << 8
         elif control["relative_to_head"]:
             fallthrough, target = pc + control["fallthrough"], pc + control["target"]
         else:
             fallthrough, target = control["fallthrough"], control["target"]
         if control["relative_operand_offset"] is not None:
-            offset = int(memory[(pc + control["relative_operand_offset"]) & 0xFFFF])
+            offset = self.peek(pc + control["relative_operand_offset"])
             target = pc + control["fallthrough"] + (offset - 256 if offset >= 128 else offset)
         if control["flag_mask"]:
             mask = control["flag_mask"]
@@ -286,16 +360,19 @@ class Cpu:
         return target if taken else fallthrough
 
 
-def nestest(checkpoint: str, rom: str, log: str, steps: int | None = None) -> int:
+def nestest(checkpoint: str, rom: str, log: str, steps: int | None = None, *,
+            attention: bool = False) -> int:
     """nestest from $C000 against the golden log: PC, A, X, Y, P, SP and
-    CYC before every instruction.  Returns the instructions checked."""
+    CYC before every instruction, memory read by `attention` softmax or by
+    index.  Returns the instructions checked."""
     with open(rom, "rb") as f:
         prg = f.read()[16 : 16 + 0x4000]
     image = bytearray(0x10000)
     image[0x8000:0xC000] = image[0xC000:] = prg
     with open(log) as f:
         lines = f.readlines()[:steps]
-    cpu = Cpu(checkpoint, bytes(image), 0xC000)
+    cpu = Cpu(checkpoint, bytes(image), 0xC000,
+              memory_read=attention_read if attention else indexed_read)
     cycles = 7
     for n, line in enumerate(lines):
         def field(tag: str, line=line) -> int:
@@ -316,10 +393,12 @@ def main() -> None:
     parser.add_argument("checkpoint", help="directory with expert_weights.safetensors and experts.json")
     parser.add_argument("--nestest", nargs=2, metavar=("ROM", "LOG"), required=True)
     parser.add_argument("--steps", type=int)
+    parser.add_argument("--attention", action="store_true",
+                        help="read memory by softmax attention over all of it, not by index")
     args = parser.parse_args()
     start = time.perf_counter()
     with torch.inference_mode():
-        n = nestest(args.checkpoint, *args.nestest, args.steps)
+        n = nestest(args.checkpoint, *args.nestest, args.steps, attention=args.attention)
     elapsed = time.perf_counter() - start
     print(f"nestest: {n} instructions match the golden log (registers and cycles) "
           f"in {elapsed:.1f}s, {n / elapsed:.0f} instructions/s")

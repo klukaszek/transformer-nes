@@ -1,4 +1,4 @@
-"""The sprite unit as two computation graphs, the hardware's two phases.
+"""Sprite selection, overflow and pattern fetch as transformer tokens.
 
 Evaluation (an EVALUATE token at dot 65 of a visible line): which of the
 64 OAM sprites cover the line, and the first eight of them in OAM order.
@@ -14,10 +14,9 @@ the row as 8 screen-ordered pixels in the encoding the render graph
 composites (render.py: palette index, behind-background bit, sprite-0
 bit), with where it goes and the pattern table every fetch reads.
 
-What depends on the dot stays native, as for the background: the
-overflow search with its diagonal-scan bug, and A12 edges from the
-tables these graphs report.  So does the line buffer the rows are
-written into (lower OAM index first, first opaque pixel wins).
+Overflow reads the diagonal OAM addresses after the eighth sprite and
+reports the first matching index. The host stamps its dot and A12 edges
+and places fetched rows in the line buffer, first opaque pixel wins.
 """
 
 from __future__ import annotations
@@ -47,8 +46,10 @@ from transformer_nes.ppu2c02.space import (
 
 SPRITES = 8  # per line, the hardware's limit
 
-EVALUATE_INPUTS = ("is_evaluate", "line", "ctrl")
+EVALUATE_INPUTS = ("is_evaluate", "line", "ctrl", "start")
 EVALUATE_OUTPUTS = ("count", *(f"index{k}" for k in range(SPRITES)))
+OVERFLOW_INPUTS = ("is_overflow", "line", "ctrl", "start")
+OVERFLOW_OUTPUTS = ("index",)
 
 FETCH_INPUTS = (
     "is_fetch",
@@ -76,7 +77,11 @@ FETCH_OUTPUTS = (
 # Folded experts: evaluation by sprite size; fetch by sprite size and
 # count (the slots past it fold to dummy fetches) with the CHR latches
 # pinned off (every cart without them).
-EVALUATE_EXPERTS = {f"tall{t}": {"tall": t} for t in range(2)}
+EVALUATE_EXPERTS = {
+    **{f"tall{t}": {"tall": t, "evaluation_start": 0} for t in range(2)},
+    **{f"remaining_tall{t}": {"tall": t} for t in range(2)},
+}
+OVERFLOW_EXPERTS = {f"tall{t}": {"tall": t} for t in range(2)}
 FETCH_EXPERTS = {
     f"tall{t}_count{n}": {
         "tall": t,
@@ -88,6 +93,15 @@ FETCH_EXPERTS = {
     }
     for t in range(2)
     for n in range(SPRITES + 1)
+}
+# Extra debug rows read the current latch window without changing it.
+DEBUG_FETCH_EXPERTS = {
+    f"debug_tall{t}": {
+        "tall": t,
+        **{f"set_fd{k}": 0 for k in range(SPRITES)},
+        **{f"set_fe{k}": 0 for k in range(SPRITES)},
+    }
+    for t in range(2)
 }
 
 
@@ -111,10 +125,11 @@ def _tokens(name: str, inp: dict, memory_inputs: list, outputs: dict):
 
 
 def build_evaluation(chr_full: int = 0):
-    one = graph.one
+    one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in EVALUATE_INPUTS}
     memory_inputs, memory = _memory(chr_full)
     tall = persist(extract_bits(inp["ctrl"], "ctrl")[2], name="tall")
+    start = persist(inp["start"], name="evaluation_start")
     height = 8 + 8 * tall
 
     # P_i: sprites 0..i whose rows cover the line, in two levels so each
@@ -123,7 +138,12 @@ def build_evaluation(chr_full: int = 0):
     covers = []
     for i in range(64):
         row = inp["line"] - memory.read(0x4000 + 4 * i, OAM, f"y{i}")
-        covers.append(persist(stepglu(one, row) - stepglu(one, row - height), name=f"covers{i}"))
+        covers.append(
+            persist(
+                both(stepglu(one, i - start), stepglu(one, row) - stepglu(one, row - height)),
+                name=f"covers{i}",
+            )
+        )
     blocks = [
         persist(sum(covers[b : b + 8], Expression()), name=f"block{b // 8}")
         for b in range(0, 64, 8)
@@ -151,10 +171,39 @@ def build_evaluation(chr_full: int = 0):
     return _tokens("EVALUATE", inp, memory_inputs, outputs)
 
 
+def build_overflow(chr_full: int = 0):
+    """First diagonal-scan match in eight candidates, or sentinel 64.
+
+    The host advances start by eight after a miss, preserving the byte
+    phase (j-start) mod 4. Each token reads only its eight candidates;
+    early exit and a short final batch need no extra expert variants.
+    """
+    one = graph.current_graph().one
+    inp = {name: InputDimension(name) for name in OVERFLOW_INPUTS}
+    memory_inputs, memory = _memory(chr_full)
+    tall = persist(extract_bits(inp["ctrl"], "ctrl")[2], name="tall")
+    height = 8 + 8 * tall
+    hits = []
+    for j in range(8):
+        present = stepglu(one, 63 - inp["start"] - j)
+        address = 0x4000 + gate(present, 4 * (inp["start"] + j) + j % 4)
+        y = memory.read(address, OAM, f"diagonal{j}")
+        row = inp["line"] - y
+        hits.append(
+            persist(both(present, stepglu(one, row) - stepglu(one, row - height)), name=f"hit{j}")
+        )
+    first_match = sum(
+        (1 - stepglu(one, sum(hits[: j + 1], Expression()) - 1) for j in range(8)), Expression()
+    )
+    result = select(stepglu(one, 7 - first_match), inp["start"] + first_match, 64)
+    auto_name(locals())
+    return _tokens("OVERFLOW", inp, memory_inputs, {"index": result})
+
+
 def build_fetch(chr_full: int = 0):
     """`chr_full`: bytes of whole-CHR memory (MMC5, whose sprites fetch
     through their own banks from it), or 0 for the CHR windows."""
-    one = graph.one
+    one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in FETCH_INPUTS}
     memory_inputs, memory = _memory(chr_full)
     ctrl_bits = extract_bits(inp["ctrl"], "ctrl")  # MSB first

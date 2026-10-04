@@ -1,10 +1,10 @@
 """Exact reference inference for a constructed WeightModel.
 
 A plain transformer forward, one token at a time, in float64: the input
-slots form the embedding, then each layer applies attention (hardmax
-with ties to the latest position, over every token so far including this
-one) and a ReGLU feed-forward block, both residual.  No position
-encoding; order enters only through the tie-break.
+slots form the embedding, then each layer applies attention (in its
+argmax limit, over every token so far including this one; distinct keys
+never tie, and of equal keys the latest counts) and a ReGLU feed-forward
+block, both residual.  No position encoding.
 
 Two exact reductions keep it fast without changing any output:
 

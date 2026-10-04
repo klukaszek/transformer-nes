@@ -7,8 +7,9 @@ layer computes exactly:
 - InputDimension: a value the token embeds.
 - ReGLUDimension: relu(b) * a, one feed-forward neuron.
 - PersistDimension: a linear combination stored in its own slot.
-- LookUpDimension: hardmax attention over every token so far, latest
-  wins ties -- how a token reads earlier tokens (memory, state).
+- LookUpDimension: attention over every token so far, the latest of
+  equal keys counting -- how a token reads earlier tokens (memory, state).
+  Distinct keys never tie (to_2d_key), so softmax picks one exactly.
 
 Expressions are linear combinations of dimensions; the helpers below
 (reglu, stepglu, make_multiply, fetch) build the idioms everything else
@@ -18,23 +19,80 @@ them into weights.  Folded experts (graph/fold.py) may also contain a
 MemoryRead: one exact read the engine serves directly, in place of the
 grouped lookups that compute it in the full graph.
 
-Construction state is module-global (graph_dims, the caches); reset_graph
-starts a new graph.
+A GraphContext owns each construction's registry and interning caches.
+Captured ProgramGraphs retain their nodes, independently of the builder.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from functools import wraps
 from typing import TypeAlias
 
 BIG = 1e30  # large constant used to effectively zero-out attention keys (clear_key mechanism)
 
-graph_dims = []
-graph_lookups = []
-graph_memory_reads = []
-multiply_cache = {}
-reglu_cache = {}
-stepglu_cache = {}
-clear_key_cache = {}
+_active_graph: ContextVar[GraphContext | None] = ContextVar("active_graph", default=None)
+
+
+class GraphContext:
+    """One construction's nodes, local ids and common-expression caches.
+
+    Nodes retain only their graph's constant-one dimension as their owner,
+    so a captured or projected graph does not keep the builder's caches alive.
+    """
+
+    def __init__(self):
+        self.dims = []
+        self.lookups = []
+        self.memory_reads = []
+        self.multiply_cache = {}
+        self.reglu_cache = {}
+        self.stepglu_cache = {}
+        self.clear_key_cache = {}
+        self.one = InputDimension("one", context=self)
+
+    @contextmanager
+    def activate(self):
+        token = _active_graph.set(self)
+        try:
+            yield self
+        finally:
+            _active_graph.reset(token)
+
+    def check(self, *expressions):
+        for expression in expressions:
+            if expression.one is not None and expression.one is not self.one:
+                raise ValueError("cannot mix values from different graphs")
+
+    def capture(self, input_tokens, output_tokens) -> ProgramGraph:
+        return ProgramGraph(
+            input_tokens,
+            output_tokens,
+            tuple(self.dims),
+            tuple(self.lookups),
+            tuple(self.memory_reads),
+            self.one,
+        )
+
+
+def current_graph() -> GraphContext:
+    context = _active_graph.get()
+    if context is None:
+        raise RuntimeError("graph construction requires an active GraphContext")
+    return context
+
+
+def construction(build):
+    """Give a complete graph builder a fresh, scoped construction context."""
+
+    @wraps(build)
+    def construct(*args, **kwargs):
+        with GraphContext().activate():
+            return build(*args, **kwargs)
+
+    return construct
 
 
 def expr_key(expr):
@@ -46,15 +104,26 @@ class Expression:
     the constant term as a coefficient on `one`.  Supports +, - and scalar
     *; zero coefficients are dropped."""
 
-    __slots__ = ("terms",)
+    __slots__ = ("terms", "one")
 
     def __init__(self, terms: dict | None = None):
-        if terms is None:
-            self.terms = {}
-        elif isinstance(terms, dict):
-            self.terms = {k: v for k, v in terms.items() if v != 0}
-        else:
-            raise TypeError
+        self.terms = {}
+        self.one = None
+        if terms is not None:
+            if not isinstance(terms, dict):
+                raise TypeError("expression terms must be a dictionary")
+            for dim, coefficient in terms.items():
+                if coefficient == 0:
+                    continue
+                if self.one is None:
+                    self.one = dim.one
+                elif dim.one is not self.one:
+                    raise ValueError("cannot mix values from different graphs")
+                self.terms[dim] = coefficient
+
+    def constant(self, value):
+        one = self.one if self.one is not None else current_graph().one
+        return Expression({one: value})
 
     def copy(self) -> Expression:
         return Expression(dict(self.terms))
@@ -63,7 +132,7 @@ class Expression:
         if isinstance(other, (int, float)):
             if other == 0:
                 return self.copy()
-            return self + Expression({one: other})
+            return self + self.constant(other)
         if isinstance(other, Dimension):
             other = Expression({other: 1})
         if isinstance(other, Expression):
@@ -79,7 +148,7 @@ class Expression:
         if isinstance(other, (int, float)):
             if other == 0:
                 return self.copy()
-            return Expression({one: other}) + self
+            return self.constant(other) + self
         if isinstance(other, Dimension):
             return Expression({other: 1}) + self
         return NotImplemented
@@ -127,24 +196,29 @@ class Expression:
         return self.terms.get(dim, 0)
 
     def __setitem__(self, dim, value):
-        if value == 0 and dim in self.terms:
-            del self.terms[dim]
-        elif value != 0:
+        if value == 0:
+            self.terms.pop(dim, None)
+            if not self.terms:
+                self.one = None
+        else:
+            if self.one is not None and dim.one is not self.one:
+                raise ValueError("cannot mix values from different graphs")
+            self.one = dim.one
             self.terms[dim] = value
+
 
 class Dimension:
     """One scalar of a token's residual stream.  Ids are allocated in
     construction order, which the scheduler and the engines' digests
     depend on: building the same graph twice gives the same weights."""
 
-    counter = 0
-
-    def __init__(self, name=None, kind="generic"):
-        self.id = Dimension.counter
-        Dimension.counter += 1
+    def __init__(self, name=None, kind="generic", *, context=None):
+        context = current_graph() if context is None else context
+        self.id = len(context.dims)
+        self.one = context.dims[0] if context.dims else self
         self.name = name or f"dim_{self.id}"
         self.kind = kind
-        graph_dims.append(self)
+        context.dims.append(self)
 
     def as_expr(self):
         return Expression({self: 1})
@@ -168,12 +242,7 @@ class Dimension:
             return Expression({self: o})
         return NotImplemented
 
-    def __rmul__(self, o):
-        if isinstance(o, (int, float)):
-            if o == 0:
-                return Expression()
-            return Expression({self: o})
-        return NotImplemented
+    __rmul__ = __mul__
 
     def __neg__(self):
         return Expression({self: -1})
@@ -185,11 +254,8 @@ class Dimension:
 class InputDimension(Dimension):
     """A value the token's embedding sets."""
 
-    def __init__(self, name):
-        super().__init__(name, kind="input")
-
-
-one = InputDimension("one")  # the constant 1, set on every token
+    def __init__(self, name, *, context=None):
+        super().__init__(name, kind="input", context=context)
 
 
 class PersistDimension(Dimension):
@@ -201,7 +267,9 @@ class PersistDimension(Dimension):
     """
 
     def __init__(self, expr, name=None):
-        super().__init__(name or f"persist_{Dimension.counter}", kind="persist")
+        context = current_graph()
+        context.check(expr)
+        super().__init__(name or f"persist_{len(context.dims)}", kind="persist")
         self.expr = expr
 
 
@@ -209,40 +277,45 @@ class ReGLUDimension(Dimension):
     """relu(b) * a: one feed-forward neuron of an FFN block."""
 
     def __init__(self, a_expr, b_expr, name=None):
-        super().__init__(name or f"reglu_{Dimension.counter}", kind="reglu")
+        context = current_graph()
+        context.check(a_expr, b_expr)
+        super().__init__(name or f"reglu_{len(context.dims)}", kind="reglu")
         self.a_expr = a_expr
         self.b_expr = b_expr
 
 
 # memory_group sentinel for a fused 64K-span memory read (expert folds
 # only): one full-address query, group computed at serve time.  The union
-# keeps its 16 groups, whose purpose is the f32 attention-score range of
-# the exported artifact.
+# keeps its 16 groups to bound quadratic key construction's int32
+# intermediates in the exported artifact.
 MEMORY_GROUP_FUSED = -2
 
 
 class LookUp:
-    """One attention head: the 2-D query of this token against the 2-D key
+    """One attention head: this token's two-coordinate query against the key
     of every token so far (itself included); the best score wins, ties to
     the latest token, and its value expressions become this token's
     LookUpDimensions.  Keys are built so the intended token scores
     strictly highest (e.g. a parabola peaked at the queried address)."""
 
-    counter = 0
-
-    def __init__(self, value_exprs, query_exprs_2d, key_exprs_2d, tie_break="latest"):
-        self.id = LookUp.counter
-        LookUp.counter += 1
+    def __init__(self, value_exprs, query_exprs, key_exprs, tie_break="latest"):
+        if tie_break != "latest":
+            raise ValueError(f"only the LATEST tie-break is constructible, not {tie_break!r}")
+        if len(query_exprs) != 2 or len(key_exprs) != 2:
+            raise ValueError("attention queries and keys require two coordinates")
+        context = current_graph()
+        context.check(*value_exprs, *query_exprs, *key_exprs)
+        self.id = len(context.lookups)
         self.name = None
         self.value_exprs = value_exprs
-        self.query_exprs_2d = query_exprs_2d  # [qx_expr, qy_expr]
-        self.key_exprs_2d = key_exprs_2d  # [kx_expr, ky_expr]
+        self.query_exprs = query_exprs
+        self.key_exprs = key_exprs
         self.tie_break = tie_break
         self.memory_group: int | None = None  # tagged by memory_at / folds
         self.state_fetch = False  # latest-STATE fetch: an identity for
         # structural backends, which embed the current state directly
         self.dims = [LookUpDimension(self, i) for i in range(len(value_exprs))]
-        graph_lookups.append(self)
+        context.lookups.append(self)
 
 
 class LookUpDimension(Dimension):
@@ -259,46 +332,40 @@ class MemoryRead:
     only): the latest written value at `address`, that address, and
     optionally the value's bits."""
 
-    counter = 0
-
     def __init__(self, address, *, bits=()):
-        self.id = MemoryRead.counter
-        MemoryRead.counter += 1
-        self.name = f"memory_read_{self.id}"
+        context = current_graph()
         self.address = to_expr(address)
+        context.check(self.address)
+        self.id = len(context.memory_reads)
+        self.name = f"memory_read_{self.id}"
         self.output_kinds = ("value", "address", *tuple(bits))
-        self.dims = [
-            MemoryReadDimension(self, i, kind)
-            for i, kind in enumerate(self.output_kinds)
-        ]
-        graph_memory_reads.append(self)
+        self.dims = [MemoryReadDimension(self, i, kind) for i, kind in enumerate(self.output_kinds)]
+        context.memory_reads.append(self)
 
 
 class MemoryReadDimension(Dimension):
     """One output of a MemoryRead (value, address, or a bit)."""
 
     def __init__(self, memory_read, value_index, output_kind):
-        super().__init__(
-            f"memory_read_{memory_read.id}_{output_kind}", kind="memory_read"
-        )
+        super().__init__(f"memory_read_{memory_read.id}_{output_kind}", kind="memory_read")
         self.memory_read = memory_read
         self.value_index = value_index
         self.output_kind = output_kind
 
 
 def make_multiply(a, b):
+    context = current_graph()
+    context.check(a, b)
     ka, kb = expr_key(a), expr_key(b)
     key = (ka, kb)
-    if key in multiply_cache:
-        return multiply_cache[key]
+    if key in context.multiply_cache:
+        return context.multiply_cache[key]
     neg_b = Expression({d: -c for d, c in b.terms.items()})
-    r1 = ReGLUDimension(a, b)
-    r2 = ReGLUDimension(a, neg_b)
-    result = persist(Expression({r1: 1, r2: -1}))
+    result = persist(reglu(a, b) - reglu(a, neg_b))
     # Folds use this to collapse the product to a linear map when either
     # side pins to a constant (the ReGLU pair only has a rule for b).
     next(iter(result.terms)).multiply_of = (a, b)
-    multiply_cache[key] = result
+    context.multiply_cache[key] = result
     return result
 
 
@@ -314,7 +381,7 @@ def to_expr(x: Expression | Dimension | float) -> Expression:
     if isinstance(x, (int, float)):
         if x == 0:
             return Expression()
-        return Expression({one: x})
+        return Expression({current_graph().one: x})
     raise TypeError(f"Cannot convert {type(x)} to Expression")
 
 
@@ -323,13 +390,14 @@ def reglu(a, b):
 
     Use when b is known non-negative, giving reglu(a, b) = a * b.
     """
+    context = current_graph()
     a_expr = to_expr(a)
     b_expr = to_expr(b)
     key = (expr_key(a_expr), expr_key(b_expr))
-    if key in reglu_cache:
-        return Expression({reglu_cache[key]: 1})
+    if key in context.reglu_cache:
+        return Expression({context.reglu_cache[key]: 1})
     r = ReGLUDimension(a_expr, b_expr)
-    reglu_cache[key] = r
+    context.reglu_cache[key] = r
     return Expression({r: 1})
 
 
@@ -341,15 +409,15 @@ def stepglu(a, b):
     The two ReGLU dims are internal to the FFN; the persist dim
     stores the difference in a single residual slot.
     """
+    context = current_graph()
+    one = context.one
     a_expr = to_expr(a)
     b_expr = to_expr(b)
     key = (expr_key(a_expr), expr_key(b_expr))
-    if key in stepglu_cache:
-        return stepglu_cache[key]
-    r1 = ReGLUDimension(a_expr, b_expr + Expression({one: 1}))
-    r2 = ReGLUDimension(a_expr, b_expr)
-    result = persist(Expression({r1: 1, r2: -1}))
-    stepglu_cache[key] = result
+    if key in context.stepglu_cache:
+        return context.stepglu_cache[key]
+    result = persist(reglu(a_expr, b_expr + Expression({one: 1})) - reglu(a_expr, b_expr))
+    context.stepglu_cache[key] = result
     return result
 
 
@@ -365,36 +433,40 @@ def persist(expr, name=None):
     return Expression({dim: 1})
 
 
-def to_2d_key(k, clear_key_expr=None, tie_break="latest"):
+def to_2d_key(k, clear_key_expr=None):
     """Map 1D key + optional clear_key to 2D key expressions via ReGLU.
 
-    Scores carry no recency term: exact ties are the tie-break's job
-    (TieBreak::LATEST, positional), which keeps every key coefficient an
-    integer function of the key expression.
+    Against a query [q, 1] the key [4k, k - 2k^2] scores 2q^2 + q - (2d^2 - d)
+    for d = k - q: the matching key leads every other by at least 1, and no
+    two distinct keys tie (2d^2 - d takes each value once), so softmax at a
+    modest temperature picks one key exactly.  Equal keys -- one address
+    written twice -- are the cache's to resolve: the latest replaces.
     """
-    if tie_break != "latest":
-        raise ValueError(f"only the LATEST tie-break is constructible, not {tie_break!r}")
+    context = current_graph()
+    one = context.one
     if len(k.terms) == 1 and one in k.terms:
         c = k.terms[one]
         k_abs = Expression({one: c * c})
     else:
         k_abs = make_multiply(k, k)
-    kx = k * 2
-    ky = -k_abs
+    kx = k * 4
+    ky = k - k_abs * 2
     if clear_key_expr is not None:
         if len(clear_key_expr.terms) == 1:
             clear = clear_key_expr
         else:
             ck_key = expr_key(clear_key_expr)
-            if ck_key not in clear_key_cache:
-                clear_key_cache[ck_key] = persist(clear_key_expr)
-            clear = clear_key_cache[ck_key]
+            if ck_key not in context.clear_key_cache:
+                context.clear_key_cache[ck_key] = persist(clear_key_expr)
+            clear = context.clear_key_cache[ck_key]
         ky = ky - clear * BIG
     return [kx, ky]
 
 
 def to_2d_query(q):
     """Map 1D query to 2D query expressions (purely linear)."""
+    context = current_graph()
+    one = context.one
     return [q, Expression({one: 1})]
 
 
@@ -405,7 +477,7 @@ def fetch(value, query=None, key=None, clear_key=None, tie_break="latest"):
     q = to_expr(query) if query is not None else Expression()
     k = to_expr(key) if key is not None else Expression()
     ck = to_expr(clear_key) if clear_key is not None else None
-    key_2d = to_2d_key(k, ck, tie_break=tie_break)
+    key_2d = to_2d_key(k, ck)
     query_2d = to_2d_query(q)
     lookup = LookUp(value_exprs, query_2d, key_2d, tie_break=tie_break)
     if is_list:
@@ -461,47 +533,38 @@ def auto_name(local_vars):
                     name_expr_dims(f"{name}[{i}]", item)
 
 
-# ── Graph lifecycle ──────────────────────────────────────────────────
-
-
-def reset_graph():
-    """Reset all graph state for building a new program.
-
-    Must be called before constructing a new computation graph.
-    Recreates the built-in one dimension that every ALM requires.
-    """
-    global one
-    graph_dims.clear()
-    graph_lookups.clear()
-    graph_memory_reads.clear()
-    multiply_cache.clear()
-    reglu_cache.clear()
-    stepglu_cache.clear()
-    clear_key_cache.clear()
-    Dimension.counter = 0
-    LookUp.counter = 0
-    MemoryRead.counter = 0
-    one = InputDimension("one")
-
-
+@dataclass(frozen=True, eq=False)
 class ProgramGraph:
-    """Captured computation graph for a program, ready for scheduling
-    and weight construction.
+    """A construction snapshot; no mutable builder state or caches."""
 
-    Created by Program.build() after the graph is fully constructed.
-    """
+    input_tokens: dict
+    output_tokens: dict
+    all_dims: tuple[Dimension, ...]
+    all_lookups: tuple[LookUp, ...]
+    all_memory_reads: tuple[MemoryRead, ...]
+    one: InputDimension
 
-    def __init__(self, input_tokens, output_tokens):
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-        self.all_dims = list(graph_dims)
-        self.all_lookups = list(graph_lookups)
-        self.all_memory_reads = list(graph_memory_reads)
-        self.one = one
+    def __post_init__(self):
+        if any(dim.one is not self.one for dim in self.all_dims):
+            raise ValueError("cannot mix values from different graphs")
+        for tokens in (self.input_tokens, self.output_tokens):
+            for expr in tokens.values():
+                if (
+                    isinstance(expr, Expression)
+                    and expr.one is not None
+                    and expr.one is not self.one
+                ):
+                    raise ValueError("cannot mix values from different graphs")
+
+    def with_outputs(self, output_tokens):
+        return replace(self, output_tokens=output_tokens)
 
 
 def project_program_graph(
-    program_graph: ProgramGraph, output_tokens, *, retain_input_tokens: bool = True,
+    program_graph: ProgramGraph,
+    output_tokens,
+    *,
+    retain_input_tokens: bool = True,
 ) -> ProgramGraph:
     """Return the dependency closure of a new output-token set.
 
@@ -545,11 +608,7 @@ def project_program_graph(
                 continue
             live_lookups.add(lookup)
             pending.extend(lookup.dims)
-            for expr in (
-                lookup.query_exprs_2d
-                + lookup.key_exprs_2d
-                + lookup.value_exprs
-            ):
+            for expr in lookup.query_exprs + lookup.key_exprs + lookup.value_exprs:
                 pending.extend(expr.terms)
         elif isinstance(dim, MemoryReadDimension):
             memory_read = dim.memory_read
@@ -560,15 +619,13 @@ def project_program_graph(
             pending.extend(memory_read.address.terms)
 
     input_tokens = program_graph.input_tokens if retain_input_tokens else {}
-    projected = ProgramGraph(input_tokens, output_tokens)
-    projected.all_dims = [d for d in program_graph.all_dims if d in live_dims]
-    projected.all_lookups = [
-        lu for lu in program_graph.all_lookups if lu in live_lookups
-    ]
-    projected.all_memory_reads = [
-        read
-        for read in program_graph.all_memory_reads
-        if read in live_memory_reads
-    ]
-    projected.one = program_graph.one
-    return projected
+    return replace(
+        program_graph,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        all_dims=tuple(d for d in program_graph.all_dims if d in live_dims),
+        all_lookups=tuple(lu for lu in program_graph.all_lookups if lu in live_lookups),
+        all_memory_reads=tuple(
+            read for read in program_graph.all_memory_reads if read in live_memory_reads
+        ),
+    )

@@ -2,12 +2,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include "../cpu6502/backends/weights/native/machine_abi.h"
 #include "nes/apu.h"
 #include "nes/bus.h"
 #include "nes/cartridge.h"
 #include "nes/console.h"
 #include "nes/mappers/mappers.h"
-#include "nes/palette.h"
 #include "nes/ppu.h"
 #include "nes/tape.h"
 
@@ -69,7 +69,7 @@ const vector<string> render_inputs = fields(
 const vector<string> render_outputs =
     fields({{"pixel", 8}, {"tile", 8}, "new_v_cx", "new_v_cy", "new_v_nt", "new_v_fy", "fetched",
             {"hit", 8}, "new_latch_lo", "new_latch_hi"});
-const vector<string> evaluate_inputs = fields({"is_evaluate", "line", "ctrl"});
+const vector<string> evaluate_inputs = fields({"is_evaluate", "line", "ctrl", "start"});
 const vector<string> evaluate_outputs = fields({"count", {"index", 8}});
 const vector<string> fetch_inputs =
     fields({"is_fetch", "line", "ctrl", "count", {"index", 8}, "latch_lo", "latch_hi", "wide_low",
@@ -127,37 +127,6 @@ public:
 private:
   py::object core_;
 };
-
-// The generated CPU engine's native machine ABI
-// (cpu6502/backends/weights/run_protocol.py: MachineRunOut, MachineAbi).
-namespace cpu_engine {
-constexpr int abi_version = 1;
-struct RunOut {
-  const char* reason;
-  long cycles;
-  int read_addr;
-  long read_cycles;
-  int pause_ir;
-  const int* hit_addr;
-  const int* hit_value;
-  long n_hits;
-};
-struct Abi {
-  void (*run)(void*, long max_cycles, RunOut*);
-  int (*read_ram)(void*, int);
-  void (*inject_write)(void*, int, int);
-  void (*map_region)(void*, int, const unsigned char*, long);
-  void (*add_window)(void*, int, int);
-  int (*set_read_lease)(void*, int, int);
-  int (*set_read_lease_seq)(void*, int, const unsigned char*, long);
-  long (*take_lease_served)(void*, int);
-  void (*clear_read_lease)(void*);
-  void (*clear_read_lease_addr)(void*, int);
-  void (*set_nmi)(void*);
-  void (*set_irq)(void*);
-  void (*clear_irq)(void*);
-};
-} // namespace cpu_engine
 
 // The transformer CPU's run loop driven natively: Python sets it up
 // (image, watches) and names the shape windows of newly mapped code;
@@ -358,6 +327,10 @@ public:
     }
     console_ =
         std::make_unique<Console>(std::move(mapper), std::move(ppu), Apu(sample_rate), *machine_);
+#ifndef TRANSFORMER_NES_PPU_REFERENCE
+    set_ppu_engine(py::module_::import("transformer_nes.ppu2c02.machine")
+                       .attr("ppu_engine")(console_->ppu.graph_chr_full()));
+#endif
   }
   py::array_t<uint8_t> run_frame() {
     auto frame = console_->run_frame();
@@ -393,13 +366,17 @@ public:
   }
   // Run the PPU as the compiled transformer built by
   // ppu2c02.machine.ppu_engine (register accesses, tile slots, the sprite
-  // unit), kept alive here; None restores the native PPU.  Its token
-  // graphs must be the PPU's, checked field by field.
+  // unit), kept alive here. Its token graphs must be the PPU's,
+  // checked field by field.
   void set_ppu_engine(py::object engine) {
     if (engine.is_none()) {
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
       console_->ppu.set_engine({});
       ppu_engine_ = py::none();
       return;
+#else
+      throw std::invalid_argument("PPU transformer engine is required");
+#endif
     }
     const py::dict graphs = engine.attr("graphs");
     auto token_is = [&](const char* name, const vector<string>& in, const vector<string>& out) {
@@ -409,9 +386,19 @@ public:
       return py::cast<vector<string>>(g.attr("inputs")) == in &&
              py::cast<vector<string>>(g.attr("outputs")) == out;
     };
+    vector<string> fetch_status_outputs(fetch_outputs.begin(), fetch_outputs.begin() + 8);
+    fetch_status_outputs.push_back(fetch_outputs[64]);
+    fetch_status_outputs.insert(fetch_status_outputs.end(), fetch_outputs.begin() + 72,
+                                fetch_outputs.end());
     if (!token_is("render", render_inputs, render_outputs) ||
+        !token_is("render_status", render_inputs,
+                  vector<string>(render_outputs.begin() + 8, render_outputs.end())) ||
+        !token_is("fetch_status", fetch_inputs, fetch_status_outputs) ||
         !token_is("evaluate", evaluate_inputs, evaluate_outputs) ||
         !token_is("fetch", fetch_inputs, fetch_outputs) ||
+        !token_is("fetch_bus", fetch_inputs,
+                  vector<string>(fetch_outputs.begin() + 72, fetch_outputs.end())) ||
+        !token_is("overflow", {"is_overflow", "line", "ctrl", "start"}, {"index"}) ||
         !token_is("access", register_inputs, register_outputs))
       throw std::invalid_argument("engine is not the PPU graphs");
     const auto abi = engine.attr("abi")().cast<py::tuple>();
@@ -432,12 +419,18 @@ public:
       for (size_t t = 0; t < 2; ++t)
         std::ranges::copy(inner[t], out.inner[t].begin());
       out.sprites = static_cast<uint8_t>(d["sprites"].cast<int>());
+      out.blank = static_cast<uint8_t>(d["blank"].cast<int>());
       std::ranges::copy(d["first"].cast<vector<int>>(), out.first.begin());
       std::ranges::copy(d["last"].cast<vector<int>>(), out.last.begin());
     }
     const py::dict sprites = engine.attr("sprite_dispatch");
     std::ranges::copy(sprites["evaluate"].cast<vector<int>>(), api.sprites.evaluate.begin());
     std::ranges::copy(sprites["fetch"].cast<vector<int>>(), api.sprites.fetch.begin());
+    std::ranges::copy(sprites["fetch_bus"].cast<vector<int>>(), api.sprites.fetch_bus.begin());
+    std::ranges::copy(sprites["fetch_status"].cast<vector<int>>(), api.sprites.fetch_status.begin());
+    api.render_status = engine.attr("status_render_dispatch").cast<vector<int>>();
+    std::ranges::copy(sprites["overflow"].cast<vector<int>>(), api.sprites.overflow.begin());
+    std::ranges::copy(sprites["debug_fetch"].cast<vector<int>>(), api.sprites.debug_fetch.begin());
     const auto registers = engine.attr("register_dispatch").cast<vector<vector<int>>>();
     for (size_t w = 0; w < 2; ++w)
       std::ranges::copy(registers[w], api.registers[w].begin());
@@ -471,6 +464,7 @@ public:
     return out;
   }
   Console& console() { return *console_; }
+  py::object ppu_engine() const { return ppu_engine_; }
 
 private:
   py::object ppu_engine_ = py::none();
@@ -481,13 +475,12 @@ private:
 
 } // namespace
 
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+PYBIND11_MODULE(nes_hardware_reference, m) {
+#else
 PYBIND11_MODULE(nes_hardware, m) {
-  // The NTSC palette (include/nes/palette.h) as a (64, 3) uint8 array,
-  // for Python-side frame rendering (tape analysis, debug dumps).
-  py::array_t<uint8_t> pal({64, 3});
-  std::copy(NES_PALETTE.begin(), NES_PALETTE.end(), pal.mutable_data());
-  m.attr("NES_PALETTE") = pal;
-  py::class_<Cartridge>(m, "Cartridge")
+#endif
+  py::class_<Cartridge>(m, "Cartridge", py::module_local())
       .def_static("load", &Cartridge::load)
       .def_static("parse",
                   [](py::bytes b) {
@@ -495,19 +488,9 @@ PYBIND11_MODULE(nes_hardware, m) {
                     return Cartridge::parse(
                         span(reinterpret_cast<const uint8_t*>(s.data()), s.size()));
                   })
-      .def_property_readonly("prg",
-                             [](const Cartridge& c) {
-                               return py::bytes(reinterpret_cast<const char*>(c.prg.data()),
-                                                c.prg.size());
-                             })
-      .def_property_readonly("chr",
-                             [](const Cartridge& c) {
-                               return py::bytes(reinterpret_cast<const char*>(c.chr.data()),
-                                                c.chr.size());
-                             })
       .def_readonly("mapper", &Cartridge::mapper)
       .def_readonly("battery", &Cartridge::battery);
-  py::class_<ConsoleHost>(m, "Console")
+  py::class_<ConsoleHost>(m, "Console", py::module_local())
       .def(py::init<Cartridge, py::object, double>(), py::arg("cartridge"),
            py::arg("backend_factory"), py::arg("sample_rate") = 44100.0)
       .def("run_frame", &ConsoleHost::run_frame)
@@ -522,6 +505,7 @@ PYBIND11_MODULE(nes_hardware, m) {
            "Which render model drew each 8-pixel slot of the last frame "
            "(240x32 bytes: 0 full graph, k expert k, 255 native)")
       .def("set_ppu_engine", &ConsoleHost::set_ppu_engine, py::arg("engine"))
+      .def_property_readonly("ppu_engine", &ConsoleHost::ppu_engine)
       .def("request_ppu_slot_trace", &ConsoleHost::request_ppu_slot_trace, py::arg("line"),
            py::arg("slot"))
       .def("take_ppu_slot_trace", &ConsoleHost::take_ppu_slot_trace)
@@ -535,8 +519,6 @@ PYBIND11_MODULE(nes_hardware, m) {
       .def_property_readonly("frame_index",
                              [](ConsoleHost& h) { return h.console().frame_index; })
       .def_property_readonly("cycles", [](ConsoleHost& h) { return h.console().cycles; })
-      .def_property_readonly("controller_polls",
-                             [](ConsoleHost& h) { return h.console().controller.polls; })
       .def_property_readonly("halted", [](ConsoleHost& h) { return h.console().halted; })
       .def_property_readonly("last_audio", [](ConsoleHost& h) {
         const auto& a = h.console().last_audio;

@@ -83,7 +83,7 @@ void shutdown(); // before sg_shutdown
 // True when the UI consumed the event (game input must skip it).
 bool handle_event(const sapp_event* event, UiState& state);
 // Build the overlay's frame; call once per frame BEFORE the render pass.
-void draw(UiState& state, const DebugHooks& hooks);
+void draw(UiState& state, const DebugHooks& hooks, double display_seconds);
 // Submit the draw data; call inside the active render pass, after draw().
 void render(const UiState& state);
 

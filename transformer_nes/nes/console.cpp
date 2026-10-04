@@ -75,8 +75,9 @@ void Console::run_until(int64_t target) {
       halted = next.halted;
       machine.set_nmi();
     }
-    if (dirty)
+    if (dirty) {
       break;
+    }
   }
   check_interrupts();
 }

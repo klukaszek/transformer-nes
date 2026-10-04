@@ -1,854 +1,49 @@
-"""Fold-and-build expert models for the generated weights engine.
+"""Construct the fixed opcode, interrupt and shape expert bank.
 
-Each builder partially evaluates the union graph (graph/fold.py), checks its
-dispatch license (checked, never assumed), and compiles the folded graph into
-its own transformer.  The machine (weights_runner) owns orchestration and the
-engine cache; this module owns folds, licenses, and model construction.
+The stages are explicit: fold a candidate, prove its dispatch license,
+project architectural effects, schedule weights, then lower its runtime ABI.
+Execution contracts live in execution.py; numerical licenses live in proofs.py.
 """
 
 from __future__ import annotations
 
-import contextlib
+import functools
 import logging
-import math
-from dataclasses import replace
 from typing import Literal
 
 import numpy as np
 
-from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.weights.windows import (
-    SEQUENCE_WRITERS,
-    SHAPE_LIBRARY,
-)
-from transformer_nes.cpu6502.spec import (
-    BRANCH_CONDITIONS,
-    BRANCH_OPERATIONS,
-    OPCODES,
-    READS_MEMORY,
-)
-from transformer_nes.graph.core import (
-    Dimension,
-    Expression,
-    InputDimension,
-    LookUpDimension,
-    PersistDimension,
-    ReGLUDimension,
-    project_program_graph,
-)
-from transformer_nes.graph.execution import (
-    ArchitecturalOutput,
+from transformer_nes.cpu6502.backends.weights.execution import (
+    SEQUENCE_ROOT_DIMS,
+    WRITE_RECEIPTS,
     ControlFlow,
-    ExecutionGraph,
-    MemoryWrite,
-    StateField,
+    lower_execution,
+    opcode_execution_control,
+    project_sequence_execution,
+    shape_sequence_control,
+    shape_timing,
 )
-from transformer_nes.graph.fold import (
+from transformer_nes.cpu6502.backends.weights.folds import (
     SEQUENCE_FEEDBACK,
-    GraphFolder,
-    SequenceRejection,
-    sequence_pins,
+    SequenceFolder,
     sequence_shape_pins,
 )
+from transformer_nes.cpu6502.backends.weights.proofs import (
+    check_reads_licensed,
+    const_root,
+    eval_over_heads,
+)
+from transformer_nes.cpu6502.backends.weights.shapes import SHAPE_LIBRARY, last_a_bit_step
+from transformer_nes.cpu6502.spec import BRANCH_OPERATIONS, OPCODES
 from transformer_nes.model.schedule import asap_schedule
 from transformer_nes.model.weights import build_model
 
 logger = logging.getLogger(__name__)
-STACK_CONTROL_OPERATIONS = SEQUENCE_WRITERS - {"sax"}
-
-
-UNION_FALLBACK_OPERATIONS: frozenset[str] = frozenset()
-
-# Residual input slots shared by every generated step spec: spec key -> the
-# graph dimension name it resolves through (union slot map or fold name map).
-INPUT_SLOT_NAMES = {
-    "is_state": "is_state",
-    "pc_lo": "in_pc_lo", "pc_hi": "in_pc_hi",
-    "a": "in_a", "x": "in_x", "y": "in_y", "s": "in_s",
-    "ir": "in_ir", "oplo": "in_oplo", "ophi": "in_ophi",
-    "ea_lo": "in_ea_lo", "ea_hi": "in_ea_hi",
-    "data": "in_data", "halted": "in_halted", "nmi": "in_nmi",
-    "irq": "in_irq",
-}
-P_FLAG_NAMES = (
-    ("in_p_c", reference.FLAG_C), ("in_p_z", reference.FLAG_Z),
-    ("in_p_i", reference.FLAG_I), ("in_p_d", reference.FLAG_D),
-    ("in_p_b", reference.FLAG_B), ("in_p_u", reference.FLAG_U),
-    ("in_p_v", reference.FLAG_V), ("in_p_n", reference.FLAG_N),
-)
-# wide_bits builds only (absent from other graphs, so added when present):
-# served A-bit state inputs, MSB first.
-OPTIONAL_INPUT_SLOT_NAMES = {
-    f"a_bit{b}": f"in_a_bit{b}" for b in range(7, -1, -1)
-}
-
-
-def head_row(model, row: int) -> tuple[list[int], list[float]]:
-    """One output-head row as sparse (columns, values) lists."""
-    w = model.head.weight[row]
-    cols = np.nonzero(w)[0]
-    return ([int(c) for c in cols], [float(w[c]) for c in cols])
-
-
-def step_spec_base(slot) -> dict:
-    """The input/p_flag half of a generated step spec; ``slot`` maps a graph
-    dimension name to its residual slot."""
-    spec = {"inputs": {}, "p_flags": []}
-    for key, name in INPUT_SLOT_NAMES.items():
-        with contextlib.suppress(KeyError):
-            spec["inputs"][key] = slot(name)
-    for name, mask in P_FLAG_NAMES:
-        with contextlib.suppress(KeyError):
-            spec["p_flags"].append((slot(name), mask))
-    for key, name in OPTIONAL_INPUT_SLOT_NAMES.items():
-        with contextlib.suppress(KeyError):
-            spec["inputs"][key] = slot(name)
-    return spec
-
-
-SEQUENCE_STATE_DIMS = (
-    "new_a", "new_x", "new_y", "new_s",
-    "p_c", "p_z", "p_i", "p_d", "p_b", "p_v", "p_n",
-)
-
-SEQUENCE_FLAG_DIMS = (
-    ("p_c", "new_p_c_final", reference.FLAG_C, "in_p_c"),
-    ("p_z", "new_p_z_final", reference.FLAG_Z, "in_p_z"),
-    ("p_i", "new_p_i_final", reference.FLAG_I, "in_p_i"),
-    ("p_d", "new_p_d_final", reference.FLAG_D, "in_p_d"),
-    ("p_b", "new_p_b_final", reference.FLAG_B, "in_p_b"),
-    ("p_v", "new_p_v_final", reference.FLAG_V, "in_p_v"),
-    ("p_n", "new_p_n_final", reference.FLAG_N, "in_p_n"),
-)
-
-SEQUENCE_PRESERVE_INPUTS = {
-    "new_a": (("in_a", 1),),
-    "new_x": (("in_x", 1),),
-    "new_y": (("in_y", 1),),
-    "new_s": (("in_s", 1),),
-    **{name: ((input_name, 1),)
-       for name, _dim_name, _mask, input_name in SEQUENCE_FLAG_DIMS},
-}
-
-WRITE_RECEIPTS = (
-    ("is_store", "write_addr_out", "write_value_out"),
-    ("is_store2", "write_addr2_out", "write_value2_out"),
-    ("is_store3", "write_addr3_out", "write_value3_out"),
-)
-SEQUENCE_ROOT_DIMS = (
-    "new_a", "new_x", "new_y", "new_s",
-    *(dim_name for _name, dim_name, _mask, _input_name in SEQUENCE_FLAG_DIMS),
-    "ea", "next_pc", "new_halted", "branch_taken", "cycles",
-    *(name for receipt in WRITE_RECEIPTS for name in receipt),
-)
-
-
-def linear_input_form(expr: Expression) -> dict:
-    memo = {}
-
-    def expand_dim(dim):
-        if dim in memo:
-            return memo[dim]
-        result = (
-            expand_expr(dim.expr)
-            if isinstance(dim, PersistDimension)
-            else {dim: 1.0}
-        )
-        memo[dim] = result
-        return result
-
-    def expand_expr(value):
-        result = {}
-        for dim, coeff in value.terms.items():
-            for source, source_coeff in expand_dim(dim).items():
-                result[source] = result.get(source, 0.0) + coeff * source_coeff
-        return {dim: coeff for dim, coeff in result.items() if coeff}
-
-    return expand_expr(expr)
-
-
-def classify_sequence_state(fold_result, final_names) -> dict:
-    by_name = fold_result.dim_of_name
-    one = fold_result.program_graph.one
-    result = {"model": {}, "preserve": [], "constant": {}}
-    for name, dim_name in final_names.items():
-        dim = by_name[dim_name]
-        form = linear_input_form(Expression({dim: 1.0}))
-        expected = {
-            by_name[input_name]: float(coeff)
-            for input_name, coeff in SEQUENCE_PRESERVE_INPUTS[name]
-        }
-        if form == expected:
-            result["preserve"].append(name)
-        elif all(source is one for source in form):
-            result["constant"][name] = int(round(form.get(one, 0.0)))
-        else:
-            result["model"][name] = dim_name
-    return result
-
-
-def branch_guards(fold_result, pin_list, ops, label: str) -> list[tuple]:
-    """What a superblock's predictions need: for each interior branch the
-    fold pinned (sequence_pins), the flag it tests must read the predicted
-    way -- the flag entering its step, which is the state's own flag
-    ("state", mask, expected) or the model's output of the step before
-    ("model", dimension, expected).  A flag the fold proves constant
-    needs no guard, or contradicts the prediction (refused)."""
-    by_name = fold_result.dim_of_name
-    one = fold_result.program_graph.one
-    guards = []
-    for k, pins in enumerate(pin_list):
-        if "branch_taken" not in pins:
-            continue
-        mask, value = BRANCH_CONDITIONS[ops[k].operation]
-        expected = bool(value) == bool(pins["branch_taken"])
-        if k == 0:
-            guards.append(("state", mask, expected))
-            continue
-        dim_name, input_name = next(
-            (dim_name, input_name)
-            for _name, dim_name, flag, input_name in SEQUENCE_FLAG_DIMS if flag == mask)
-        dim = by_name[f"{dim_name}__s{k - 1}"]
-        form = linear_input_form(Expression({dim: 1.0}))
-        if all(source is one for source in form):
-            if bool(round(form.get(one, 0.0))) != expected:
-                raise WindowLicenseError(
-                    f"{label} step {k}: the branch never goes the predicted way", k)
-        elif form == {by_name[input_name]: 1.0}:
-            guards.append(("state", mask, expected))
-        else:
-            guards.append(("model", dim, expected))
-    return guards
-
-
-def project_sequence_execution(
-    fold_result, n_steps: int, control: ControlFlow,
-    halt_dimension: Dimension | None = None, guards: list[tuple] = (),
-) -> ExecutionGraph:
-    """Replace the proof graph's per-step trace ABI with its execution ABI.
-
-    The complete fold is retained until all control, read, write and halt
-    licenses have passed.  Only then do we keep the final architectural
-    state and the address/value of each statically-live ordered write.  The
-    projected graph is what gets scheduled and converted to weights.
-    """
-    final_names = {
-        name: f"{name}__s{n_steps - 1}"
-        for name in SEQUENCE_STATE_DIMS
-        if not name.startswith("p_")
-    }
-    final_names.update({
-        name: f"{dim_name}__s{n_steps - 1}"
-        for name, dim_name, _mask, _input_name in SEQUENCE_FLAG_DIMS
-    })
-    final = classify_sequence_state(fold_result, final_names)
-    outputs = []
-    output_tokens = {}
-    for name in SEQUENCE_STATE_DIMS:
-        if name in final["model"]:
-            dim = fold_result.dim_of_name[final["model"][name]]
-            outputs.append(ArchitecturalOutput(name, "model", dimension=dim))
-            output_tokens[f"state:{name}"] = Expression({dim: 1})
-        elif name in final["constant"]:
-            outputs.append(ArchitecturalOutput(
-                name, "constant", constant=final["constant"][name],
-            ))
-        else:
-            outputs.append(ArchitecturalOutput(name, "preserve"))
-
-    writes = []
-    for k in range(n_steps):
-        for order, (flag, addr, value) in enumerate(WRITE_RECEIPTS):
-            active = const_root(fold_result, flag, k, fold_result.label)
-            if active not in (0, 1):
-                raise RuntimeError(
-                    f"{fold_result.label} s{k}: {flag} is not boolean"
-                )
-            if not active:
-                continue
-            address = fold_result.dim_of_name[f"{addr}__s{k}"]
-            write_value = fold_result.dim_of_name[f"{value}__s{k}"]
-            writes.append(MemoryWrite(k, order, address, write_value))
-            output_tokens[f"write:{k}:{order}:address"] = Expression({address: 1})
-            output_tokens[f"write:{k}:{order}:value"] = Expression({write_value: 1})
-
-    # Each step's cycles: folded to a constant where the pins decide them
-    # (most opcodes), else a model output (taken branches, page crosses).
-    # The bound: the folded value's interval, or for cycles that depend on
-    # memory (an indirect read's page cross) the most an instruction
-    # costs, 7 + the penalties.
-    one = fold_result.program_graph.one
-    cycles, bounds = [], []
-    for k in range(n_steps):
-        dim = fold_result.dim_of_name[f"cycles__s{k}"]
-        form = linear_input_form(Expression({dim: 1.0}))
-        if all(source is one for source in form):
-            cycles.append(int(round(form.get(one, 0.0))))
-            bounds.append(cycles[-1])
-            continue
-        cycles.append(dim)
-        output_tokens[f"cycles:{k}"] = Expression({dim: 1})
-        try:
-            bounds.append(int(math.floor(interval_of(fold_result, dim)[1])))
-        except RuntimeError:
-            bounds.append(9)
-
-    for n, (source, dim, _expected) in enumerate(guards):
-        if source == "model":
-            output_tokens[f"guard:{n}"] = Expression({dim: 1})
-    if control.predicate is not None and not control.flag_mask:
-        output_tokens["control:branch"] = Expression({control.predicate: 1})
-    if control.target_dimension is not None:
-        output_tokens["control:target"] = Expression({
-            control.target_dimension: 1,
-        })
-    if halt_dimension is not None:
-        output_tokens["halt"] = Expression({halt_dimension: 1})
-    execution_control = (
-        replace(control, predicate=None) if control.flag_mask else control
-    )
-
-    program_graph = project_program_graph(
-        fold_result.program_graph, output_tokens, retain_input_tokens=False,
-    )
-    dim_of_name = {}
-    for dim in program_graph.all_dims:
-        dim_of_name.setdefault(dim.name, dim)
-    state_fields = tuple(
-        StateField(dim.name, dim)
-        for dim in program_graph.all_dims
-        if isinstance(dim, InputDimension) and dim is not program_graph.one
-    )
-    return ExecutionGraph(
-        program_graph=program_graph,
-        n_steps=n_steps,
-        state_fields=state_fields,
-        memory_reads=tuple(program_graph.all_memory_reads),
-        memory_writes=tuple(writes),
-        outputs=tuple(outputs),
-        control=execution_control,
-        halt_dimension=halt_dimension,
-        cycles=tuple(cycles),
-        cycle_bounds=tuple(bounds),
-        dim_of_name=dim_of_name,
-        guards=tuple(guards),
-    )
-
-
-def sequence_step_spec(execution: ExecutionGraph, info) -> dict:
-    def slot(name):
-        return info.slot_of[execution.dim_of_name[name]]
-
-    spec = step_spec_base(slot)
-    spec["sequence_final"] = {
-        "model": {
-            output.name: info.slot_of[output.dimension]
-            for output in execution.outputs if output.source == "model"
-        },
-        "preserve": [
-            output.name for output in execution.outputs
-            if output.source == "preserve"
-        ],
-        "constant": {
-            output.name: output.constant for output in execution.outputs
-            if output.source == "constant"
-        },
-    }
-    writes = [[] for _ in range(execution.n_steps)]
-    for write in execution.memory_writes:
-        writes[write.step].append((
-            info.slot_of[write.address], info.slot_of[write.value],
-        ))
-    spec["sequence_writes"] = writes
-    control = execution.control
-    spec["sequence_control"] = {
-        "predicate": (
-            None if control.predicate is None
-            else info.slot_of[control.predicate]
-        ),
-        "fallthrough": control.fallthrough,
-        "target": control.target,
-        "target_dimension": (
-            None if control.target_dimension is None
-            else info.slot_of[control.target_dimension]
-        ),
-        "relative_to_head": control.relative_to_head,
-        "relative_operand_offset": control.relative_operand_offset,
-        "absolute_operand_offset": control.absolute_operand_offset,
-        "flag_mask": control.flag_mask,
-        "flag_value": control.flag_value,
-    }
-    spec["sequence_cycles"] = {
-        "constant": sum(c for c in execution.cycles if isinstance(c, int)),
-        "model": [info.slot_of[c] for c in execution.cycles if not isinstance(c, int)],
-    }
-    spec["sequence_halt"] = (
-        None if execution.halt_dimension is None
-        else info.slot_of[execution.halt_dimension]
-    )
-    spec["sequence_guards"] = [
-        (source, info.slot_of[what] if source == "model" else what, expected)
-        for source, what, expected in execution.guards
-    ]
-    return spec
-
-
-def eval_over_heads(fold_result, dim, length):
-    """Evaluate a folded dim as a function of the symbolic head pc, for every
-    head where the window fits without wrapping $FFFF.  The head enters the
-    graph through the step-0 pc persists (state arrives via attention, so
-    raw inputs never carry it); evaluation cuts there and raises if the
-    value depends on anything else -- the straight-line license needs
-    next_pc to be a pure function of pc."""
-    heads = np.arange(0x10000 - length + 1, dtype=np.float64)
-    if "current_pc_lo__s0" in fold_result.dim_of_name:
-        memo: dict = {
-            fold_result.dim_of_name["current_pc_lo__s0"]: heads % 256.0,
-            fold_result.dim_of_name["current_pc_hi__s0"]: heads // 256.0,
-        }
-    else:
-        # Linear-inlined shape folds may substitute the byte persists into
-        # the already-combined address while retaining the same symbolic
-        # head license.
-        memo = {fold_result.dim_of_name["current_pc__s0"]: heads}
-
-    def ev(d):
-        r = memo.get(d)
-        if r is not None:
-            return r
-        if isinstance(d, InputDimension):
-            if d.name != "one":
-                raise RuntimeError(f"depends on input {d.name!r}")
-            r = np.float64(1.0)
-        elif isinstance(d, ReGLUDimension):
-            a, b = np.asarray(evx(d.a_expr)), np.asarray(evx(d.b_expr))
-            r = np.where(b > 0.0, a * b, 0.0)
-        elif isinstance(d, PersistDimension):
-            r = evx(d.expr)
-        elif isinstance(d, LookUpDimension):
-            raise RuntimeError("depends on a memory lookup")
-        else:
-            raise RuntimeError(f"unsupported dim {d.name!r}")
-        memo[d] = r
-        return r
-
-    def evx(e):
-        acc = np.float64(0.0)
-        for d, c in e.terms.items():
-            acc = acc + ev(d) * c
-        return acc
-
-    return heads, np.asarray(ev(dim))
-
-
-# Operations whose folded circuits read A's bit state (wide_bits builds):
-# logical/bitwise families, ADC/SBC (served-sign overflow + decimal
-# nibbles), and any accumulator-mode shift (operand bits mux to A's).
-A_BIT_OPERATIONS = frozenset({
-    "and", "ora", "eor", "bit", "sax", "slo", "rla", "sre", "adc", "sbc",
-})
-
-
-def last_a_bit_step(ops) -> int:
-    """Index of the last step consuming A's bit state; the fold seeds the
-    bit feedback chain only strictly before it (wrong pruning fails
-    loudly at build, not silently)."""
-    last = -1
-    for k, op in enumerate(ops):
-        if op.operation in A_BIT_OPERATIONS or op.mode == "acc":
-            last = k
-    return last
-
-
-def decode_ops(code: bytes) -> list:
-    ops, off = [], 0
-    while off < len(code):
-        op = OPCODES[code[off]]
-        ops.append(op)
-        off += op.length
-    return ops
-
-
-def pinned_sequence_control(fold_result, pin_list, ops) -> ControlFlow:
-    k = len(pin_list) - 1
-    op = ops[k]
-    pins = pin_list[k]
-    pc = int(pins["current_pc_lo"]) | (int(pins["current_pc_hi"]) << 8)
-    fallthrough = (pc + op.length) & 0xFFFF
-    if op.operation in BRANCH_OPERATIONS:
-        offset = int(pins["fetched_operand_lo_all"])
-        signed = offset - 256 if offset & 0x80 else offset
-        predicate = fold_result.dim_of_name[f"branch_taken__s{k}"]
-        form = linear_input_form(Expression({predicate: 1}))
-        one = fold_result.program_graph.one
-        if all(dim is one for dim in form):
-            successor = (
-                (fallthrough + signed) & 0xFFFF
-                if int(round(form.get(one, 0.0))) else fallthrough
-            )
-            return ControlFlow(
-                predicate=None, fallthrough=successor, target=successor,
-            )
-        return ControlFlow(
-            predicate=predicate,
-            fallthrough=fallthrough,
-            target=(fallthrough + signed) & 0xFFFF,
-            flag_mask=BRANCH_CONDITIONS[op.operation][0],
-            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
-        )
-    if op.operation in ("jmp", "jsr") and op.mode == "abs":
-        target = int(pins["fetched_operand_lo_all"]) | (
-            int(pins["fetched_operand_hi_all"]) << 8
-        )
-        return ControlFlow(predicate=None, fallthrough=target, target=target)
-    if op.operation in ("rts", "rti"):  # the return address is the model's
-        target = fold_result.dim_of_name[f"next_pc__s{k}"]
-        return ControlFlow(predicate=None, fallthrough=0, target=0, target_dimension=target)
-    if op.operation == "brk" or op.operation == "jmp":
-        raise RuntimeError(
-            f"sequence final control {op.mnemonic} is not host-resolvable"
-        )
-    return ControlFlow(
-        predicate=None, fallthrough=fallthrough, target=fallthrough,
-    )
-
-
-def shape_sequence_control(
-    fold_result, n_steps: int, ops, offsets, length: int, self_target: bool,
-) -> ControlFlow:
-    if self_target:
-        return ControlFlow(
-            predicate=None, fallthrough=0, target=0, relative_to_head=True,
-        )
-    op = ops[-1]
-    if op.operation in BRANCH_OPERATIONS:
-        return ControlFlow(
-            predicate=fold_result.dim_of_name[f"branch_taken__s{n_steps - 1}"],
-            fallthrough=length,
-            target=0,
-            relative_to_head=True,
-            relative_operand_offset=offsets[-1] + 1,
-            flag_mask=BRANCH_CONDITIONS[op.operation][0],
-            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
-        )
-    if op.operation in STACK_CONTROL_OPERATIONS or op.operation == "jmp":
-        raise RuntimeError(
-            f"shape final control {op.mnemonic} is not host-resolvable"
-        )
-    return ControlFlow(
-        predicate=None, fallthrough=length, target=length,
-        relative_to_head=True,
-    )
-
-
-def opcode_execution_control(fold_result, op) -> ControlFlow:
-    """Control ABI for one opcode whose operands remain runtime bytes."""
-    if op.operation in BRANCH_OPERATIONS:
-        return ControlFlow(
-            predicate=fold_result.dim_of_name["branch_taken__s0"],
-            fallthrough=op.length,
-            target=0,
-            relative_to_head=True,
-            relative_operand_offset=1,
-            flag_mask=BRANCH_CONDITIONS[op.operation][0],
-            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
-        )
-    if op.operation in {"jmp", "jsr"} and op.mode == "abs":
-        return ControlFlow(
-            predicate=None,
-            fallthrough=0,
-            target=0,
-            absolute_operand_offset=1,
-        )
-    if op.operation in {"jmp", "rts", "rti", "brk"}:
-        return ControlFlow(
-            predicate=None,
-            fallthrough=0,
-            target=0,
-            target_dimension=fold_result.dim_of_name["next_pc__s0"],
-        )
-    return ControlFlow(
-        predicate=None,
-        fallthrough=op.length,
-        target=op.length,
-        relative_to_head=True,
-    )
-
-
-POLL_PREFIXES = {("load_a",), ("bit",), ("load_a", "and")}
-COUNTERS = {"dex": ("x", -1), "inx": ("x", 1), "dey": ("y", -1), "iny": ("y", 1)}
-
-
-def loop_recurrence(ops, offsets) -> dict | None:
-    """A window that is one iteration of a loop the run loop can retire
-    many iterations of at once, when its closing branch points back at
-    its head (checked at dispatch: the operand byte at `closure_offset`
-    must be `closure_value`).
-
-    - poll: a read (of memory nothing in the loop writes) and a test; once
-      one iteration loops, every later one is identical.
-    - count: DEX/INX/DEY/INY then BNE; each iteration steps the register
-      until it wraps to 0.
-
-    The iterations' cycles are the model's: the run loop times one real
-    iteration and leaves the final, falling-through one to a forward."""
-    length = offsets[-1] + ops[-1].length
-    closure = {"closure_offset": offsets[-1] + 1, "closure_value": (-length) & 0xFF}
-    names = tuple(op.operation for op in ops)
-    if len(ops) == 2 and names[0] in COUNTERS and names[1] == "bne":
-        register, delta = COUNTERS[names[0]]
-        return {"kind": "count", "register": register, "delta": delta, **closure}
-    if (
-        names[:-1] in POLL_PREFIXES
-        and names[-1] in BRANCH_OPERATIONS
-        and ops[0].mode not in ("imp", "acc", "imm")
-    ):
-        return {"kind": "poll", **closure}
-    return None
-
-
-def exactly_emittable(model) -> bool:
-    """Whether a model's residual-writing weights (FFN, attention output
-    and values) are whole or half integers, all the exact int32 emission
-    represents (model/engine_gen.py).  Inlining a fold can compose two
-    halves into a quarter."""
-    def fine(matrix) -> bool:
-        doubled = np.asarray(matrix, dtype=np.float64) * 2.0
-        return not np.array_equal(doubled, np.round(doubled))
-
-    for li, attn in enumerate(model.attn):
-        heads = attn.num_heads
-        if fine(attn.in_proj_weight[4 * heads :]) or fine(attn.out_proj.weight):
-            return False
-        if fine(model.ff_in[li].weight) or fine(model.ff_out[li].weight):
-            return False
-    return True
-
-
-def window_timing(execution: ExecutionGraph, spin: bool, loop: dict | None = None) -> dict:
-    """How the run loop times a window.  Its budget guard needs a bound on
-    the cycles before the last step up front (`cycles_prefix`); every
-    step's exact cycles may stay a model output (a page cross, a closing
-    branch).  A `JMP *` spin changes nothing
-    per iteration, so the loop retires as many as the budget allows at
-    `spin` cycles each (0 for any other window); `loop` is the window's
-    loop_recurrence, if any."""
-    if spin and not isinstance(execution.cycles[0], int):
-        raise RuntimeError("a JMP spin's cycles did not fold")
-    return {
-        "cycles_prefix": execution.cycles_prefix,
-        "spin": execution.cycles[0] if spin else 0,
-        "loop": None if spin else loop,
-    }
-
-
-class WindowLicenseError(RuntimeError):
-    """A window the fold cannot license; `keep` is how many of its leading
-    steps still can be one, so a window builder knows where to cut.
-    `aliasing`: the cut is a read of an earlier step's store, which a fold
-    with store forwarding may take instead."""
-
-    def __init__(self, message: str, keep: int, *, aliasing: bool = False):
-        super().__init__(message)
-        self.keep = keep
-        self.aliasing = aliasing
-
-
-def window_layout(head: int, code: bytes, taken: tuple[bool, ...] = ()) -> list[tuple[int, int]]:
-    """Each instruction's (pc, length) in a window's code, in execution
-    order: the walk graph/fold.py:sequence_pins pins."""
-    return [
-        (int(pins["current_pc_lo"]) | int(pins["current_pc_hi"]) << 8, op.length)
-        for pins, op in zip(sequence_pins(head, code, OPCODES, taken), decode_ops(code),
-                            strict=True)
-    ]
-
-
-def may_alias(a: tuple[float, float], b: tuple[float, float]) -> bool:
-    """Whether two address intervals can name one byte, the NES's RAM
-    mirrors included ($0000-$07FF repeats through $1FFF)."""
-    if not all(map(math.isfinite, (*a, *b))):
-        return True
-    if a[1] < b[0] or b[1] < a[0]:
-        if not (a[1] < 0x2000 and b[1] < 0x2000):
-            return False
-    else:
-        return True
-    if a[1] - a[0] >= 0x7FF or b[1] - b[0] >= 0x7FF:
-        return True
-
-    def spans(lo, hi):
-        lo, hi = int(lo) & 0x7FF, int(hi) & 0x7FF
-        return [(lo, hi)] if lo <= hi else [(lo, 0x7FF), (0, hi)]
-
-    return any(x0 <= y1 and y0 <= x1 for x0, x1 in spans(*a) for y0, y1 in spans(*b))
-
-
-def check_reads_licensed(fold_result, ops, label: str, *, forwarded: bool = False) -> None:
-    """The run loop shadow-checks only the first instruction.  A later
-    memory read is nevertheless safe when folding proves its effective
-    address stays in native RAM (< $2000) or cartridge ROM (>= $8000),
-    outside every NES device/read-watch range -- and, since one forward
-    reads memory as it stood at the window's head, disjoint from every
-    earlier step's store (unless the fold `forwarded` stores, arbitrating
-    every in-window read itself: graph/fold.py forward_stores)."""
-    stores: list[tuple[float, float]] = []
-    for k, op in enumerate(ops):
-        # A pull reads the stack page: not what an earlier push wrote.
-        if k and not forwarded and op.operation in ("pla", "plp", "rts", "rti") and any(
-            may_alias((0x100, 0x1FF), store) for store in stores
-        ):
-            raise WindowLicenseError(
-                f"{label}: {op.mnemonic} step {k} may pull what an earlier step "
-                "pushed, which one forward does not feed back", k, aliasing=True)
-        if k and op.operation in READS_MEMORY and op.mode not in ("imp", "acc", "imm"):
-            try:
-                read = interval_of(fold_result, fold_result.dim_of_name[f"ea__s{k}"])
-            except RuntimeError as e:
-                raise WindowLicenseError(f"{label}: {op.mnemonic} step {k} read {e}", k) from e
-            if not (read[1] < 0x2000 or read[0] >= 0x8000):
-                raise WindowLicenseError(
-                    f"{label}: {op.mnemonic} step {k} read target bound "
-                    f"[{read[0]:.0f}, {read[1]:.0f}] may reach a watched device", k)
-            if not forwarded and any(may_alias(read, store) for store in stores):
-                raise WindowLicenseError(
-                    f"{label}: {op.mnemonic} step {k} may read an earlier step's "
-                    "store, which one forward does not feed back", k, aliasing=True)
-        if k + 1 < len(ops):  # this step's stores, pushes included
-            for store, addr in STORE_SLOTS:
-                if const_root(fold_result, store, k, label):
-                    try:
-                        stores.append(interval_of(
-                            fold_result, fold_result.dim_of_name[f"{addr}__s{k}"]))
-                    except RuntimeError:  # unbounded: no later read is disjoint
-                        stores.append((float("-inf"), float("inf")))
-
-
-def const_root(fold_result, root: str, k: int, label: str) -> int:
-    one = fold_result.program_graph.one
-    d = fold_result.dim_of_name[f"{root}__s{k}"]
-    expr = getattr(d, "expr", None)
-    if expr is None or any(t is not one for t in expr.terms):
-        raise RuntimeError(
-            f"{label} step {k}: {root} did not fold to a constant"
-        )
-    return int(round(expr.terms.get(one, 0.0)))
-
-
-def interval_of(fold_result, dim) -> tuple[float, float]:
-    """Conservative [lo, hi] bound of a folded dim over byte-valued inputs
-    (bits give [0, 1], 'one' gives 1); raises on memory lookups, whose
-    values cannot be bounded ahead of dispatch."""
-    BIT_INPUTS = frozenset({
-        "is_state", "in_nmi", "in_irq", "in_halted",
-        "in_p_c", "in_p_z", "in_p_i", "in_p_d",
-        "in_p_b", "in_p_u", "in_p_v", "in_p_n",
-    })
-    memo: dict = {}
-
-    def ev(d):
-        r = memo.get(d)
-        if r is not None:
-            return r
-        if isinstance(d, InputDimension):
-            if d.name == "one":
-                r = (1.0, 1.0)
-            elif d.name in BIT_INPUTS:
-                r = (0.0, 1.0)
-            else:
-                r = (0.0, 255.0)
-        elif isinstance(d, ReGLUDimension):
-            (alo, ahi), bhi = evx(d.a_expr), evx(d.b_expr)[1]
-            if bhi <= 0.0:
-                r = (0.0, 0.0)
-            else:
-                # b in (0, bhi]: extremes at b -> 0 and b == bhi.
-                r = (min(0.0, alo * bhi, ahi * bhi),
-                     max(0.0, alo * bhi, ahi * bhi))
-        elif isinstance(d, PersistDimension):
-            # These named fetch results come from byte-valued RAM even when
-            # their exact masked-read circuit has a very loose naive
-            # interval. Preserve that semantic range for symbolic shapes.
-            r = (
-                (0.0, 255.0)
-                if (d.name or "").startswith("fetched_operand_")
-                else evx(d.expr)
-            )
-        elif isinstance(d, LookUpDimension):
-            # A lookup returns one of its insert-side values (registers
-            # come in via state attention, so this is the live data
-            # path), or 0 when nothing matched.
-            lo, hi = evx(d.lookup.value_exprs[d.value_index])
-            r = (min(lo, 0.0), max(hi, 0.0))
-        else:
-            raise RuntimeError(f"unbounded dim {d.name!r}")
-        memo[d] = r
-        return r
-
-    def evx(e):
-        lo = hi = 0.0
-        for d, c in e.terms.items():
-            dlo, dhi = ev(d)
-            lo += min(c * dlo, c * dhi)
-            hi += max(c * dlo, c * dhi)
-        return (lo, hi)
-
-    return ev(dim)
-
-
-STORE_SLOTS = (
-    ("is_store", "write_addr_out"),
-    ("is_store2", "write_addr2_out"),
-    ("is_store3", "write_addr3_out"),
-)
-
-
-def check_writes_licensed(fold_result, n_steps: int, label: str, *,
-                          window_ranges: list[tuple[int, int]] = (),
-                          return_bounds: bool = False):
-    """Stores are licensed when the folded write address provably stays
-    below $2000 -- the console only ever watches registers at or above it,
-    and dispatch additionally requires no watch range below $2000, so a
-    licensed store can never swallow a watch_write pause.  window_range
-    (pinned windows) additionally forbids overlap with the window's own
-    code bytes (window_ranges): the fold pinned them, so a self-modifying
-    store would execute stale semantics.  Every step must still be non-halting.
-    Returns whether any step stores, or ``(has_stores, bounds)`` when
-    ``return_bounds`` is requested."""
-    has_stores = False
-    store_lo, store_hi = float("inf"), float("-inf")
-    for k in range(n_steps):
-        for store, addr in STORE_SLOTS:
-            if const_root(fold_result, store, k, label) == 0:
-                continue
-            has_stores = True
-            dim = fold_result.dim_of_name[f"{addr}__s{k}"]
-            try:
-                lo, hi = interval_of(fold_result, dim)
-            except RuntimeError as e:
-                raise WindowLicenseError(f"{label} step {k}: store target {e}", k) from e
-            if lo < 0.0 or hi >= 0x2000:
-                raise WindowLicenseError(
-                    f"{label} step {k}: store target bound [{lo:.0f}, {hi:.0f}]"
-                    " is not provably below $2000", k)
-            store_lo, store_hi = min(store_lo, lo), max(store_hi, hi)
-            for w_lo, w_hi in window_ranges:
-                if hi >= w_lo and lo < w_hi:
-                    raise WindowLicenseError(
-                        f"{label} step {k}: store bound [{lo:.0f}, {hi:.0f}] "
-                        "may modify the window's own pinned bytes", k)
-        if const_root(fold_result, "new_halted", k, label) != 0:
-            raise WindowLicenseError(f"{label} step {k}: may halt", k)
-    if return_bounds:
-        bounds = None if not has_stores else (int(store_lo), int(store_hi))
-        return has_stores, bounds
-    return has_stores
 
 
 def schedule_and_build(graph):
     fp = graph.program_graph
-    sched = asap_schedule(fp.input_tokens, fp.output_tokens,
-                          program_graph=fp, log=logger.debug)
+    sched = asap_schedule(fp, log=logger.debug)
     return build_model(program_graph=fp, schedule=sched, recycle_slots=False)
 
 
@@ -868,50 +63,42 @@ def prefer_inlined(materialized, inlined, label: str) -> bool:
     materialized_model, materialized_info = materialized
     inlined_model, inlined_info = inlined
     materialized_work = sparse_forward_work(
-        materialized_model, materialized_info.n_layers,
+        materialized_model,
+        materialized_info.n_layers,
     )
     inlined_work = sparse_forward_work(inlined_model, inlined_info.n_layers)
     accepted = (
-        inlined_work <= materialized_work
-        and inlined_info.n_layers <= materialized_info.n_layers
+        inlined_work <= materialized_work and inlined_info.n_layers <= materialized_info.n_layers
     )
     logger.debug(
         "%s: linear inlining %s (%d/%d layers, %d/%d sparse terms)",
-        label, "accepted" if accepted else "rejected",
-        inlined_info.n_layers, materialized_info.n_layers,
-        inlined_work, materialized_work,
+        label,
+        "accepted" if accepted else "rejected",
+        inlined_info.n_layers,
+        materialized_info.n_layers,
+        inlined_work,
+        materialized_work,
     )
     return accepted
 
 
 def build_opcode_execution_experts(pg, opcodes) -> list[dict]:
-    eligible = [
-        (int(byte), OPCODES[int(byte)])
-        for byte in opcodes or () if int(byte) in OPCODES
-    ]
+    eligible = [(int(byte), OPCODES[int(byte)]) for byte in opcodes or () if int(byte) in OPCODES]
     if not eligible:
         return []
 
     shapes = [
-        (f"exec_{byte:02X}", bytes([byte] + [0] * (op.length - 1)), 1)
-        for byte, op in eligible
+        (f"exec_{byte:02X}", bytes([byte] + [0] * (op.length - 1)), 1) for byte, op in eligible
     ]
     experts, _meta = _build_symbolic_execution_experts(
-        pg, shapes, expert_kind="exec_opcode",
+        pg,
+        shapes,
+        expert_kind="exec_opcode",
     )
     for expert, (byte, _op) in zip(experts, eligible, strict=True):
         if expert["spin"]:
-            raise RuntimeError(
-                f"compact opcode {byte:02X} escaped its execution license"
-            )
+            raise RuntimeError(f"compact opcode {byte:02X} escaped its execution license")
         expert["byte"] = byte
-    logger.info(
-        "compact execution experts: %d opcodes, %d layers, %d sparse terms",
-        len(experts),
-        sum(expert["layers"] for expert in experts),
-        sum(sparse_forward_work(expert["model"], expert["layers"])
-            for expert in experts),
-    )
     return experts
 
 
@@ -923,312 +110,198 @@ def build_interrupt_experts(pg) -> list[dict]:
         ("int_irq", {"is_nmi": 0.0, "is_irq": 1.0}),
     ):
         label = f"interrupt {name}"
-        folder = GraphFolder(pg, root_names=SEQUENCE_ROOT_DIMS,
-                             structural_reads=True)
+        folder = sequence_folder(pg)
         r = folder.fold_execution_sequence(
-            [pins], SEQUENCE_FEEDBACK, label=name,
-            pc_offsets=[0], inline_linear=False,
+            [pins],
+            SEQUENCE_FEEDBACK,
+            label=name,
+            pc_offsets=[0],
+            inline_linear=False,
         )
         if r.insert_side_hazards:
             raise RuntimeError(
-                f"{label}: pins reach insert-side expressions "
-                f"of {r.insert_side_hazards}"
+                f"{label}: pins reach insert-side expressions of {r.insert_side_hazards}"
             )
         control = ControlFlow(
-            predicate=None, fallthrough=0, target=0,
+            predicate=None,
+            fallthrough=0,
+            target=0,
             target_dimension=r.dim_of_name["next_pc__s0"],
         )
         execution = project_sequence_execution(r, 1, control)
-        model, _tokens, _tok_to_idx, info = schedule_and_build(execution)
-        experts.append({
-            "kind": "exec_int", "name": name, "nmi": name == "int_nmi",
-            "n_steps": 1, "model": model,
-            "step_spec": sequence_step_spec(execution, info),
-            "union_lookup_of": r.union_lookup_of,
-            "layers": info.n_layers, "_d": info.d_model,
-        })
-    logger.info(
-        "interrupt experts: %d folded, %d layers, %d sparse terms",
-        len(experts), sum(e["layers"] for e in experts),
-        sum(sparse_forward_work(e["model"], e["layers"]) for e in experts),
-    )
+        model, _tok_to_idx, info = schedule_and_build(execution)
+        experts.append(
+            {
+                "kind": "exec_int",
+                "name": name,
+                "nmi": name == "int_nmi",
+                "n_steps": 1,
+                "model": model,
+                "step_spec": lower_execution(execution, info),
+                "union_lookup_of": r.union_lookup_of,
+            }
+        )
     return experts
 
 
-def build_sequence_expert(pg, head: int, code: bytes, repeat: int,
-                          forward: bool = False, taken: tuple[bool, ...] = ()) -> dict:
-    """One sequence expert: a K-instruction window folded as ONE forward.
+@functools.cache
+def sequence_folder(pg) -> SequenceFolder:
+    """The folder of `pg`'s execution folds (one per graph: it caches)."""
+    return SequenceFolder(pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True)
 
-    The router guarantees pc == head, the window's bytes, no pending NMI,
-    and a remaining step/cycle budget covering the whole window, so the
-    fold pins all of it.  The license: every step non-halting with stores
-    bounded below $2000 (check_writes_licensed), control flow
-    straight-line inside the window (folded next_pc == the next step's
-    pinned pc), and later reads proven outside watched device ranges.
-    With `forward`, a later read of an earlier step's constant-address
-    store takes the stored value (graph/fold.py forward_stores).  With
-    `taken`, the window runs through its interior conditional branches the
-    predicted ways (a superblock): the fold pins each one's direction, and
-    the flag it tests becomes a guard the run loop checks before the
-    window commits anything (branch_guards).
-    """
-    label = f"sequence @{head:04X}"
-    taken = tuple(bool(t) for t in taken)
-    pin_list = sequence_pins(head, code, OPCODES, taken) * repeat
+
+def _build_execution_expert(
+    folder: SequenceFolder,
+    shape: tuple[str, bytes, int],
+    sid: int,
+    expert_kind: Literal["shape", "exec_opcode"],
+) -> tuple[dict, dict]:
+    """Fold and license one template before projecting or emitting its effects."""
+    name, template, repeat = shape
+    label = f"shape {name}"
+    pins, offsets = sequence_shape_pins(template, OPCODES)
+    ops = [OPCODES[template[offset]] for offset in offsets]
+    checks = list(zip(offsets, (op.byte for op in ops), strict=True))
+    self_target = (
+        expert_kind == "shape"
+        and len(ops) == 1
+        and ops[0].operation == "jmp"
+        and ops[0].mode == "abs"
+    )
+    if repeat > 1 and not self_target:
+        raise RuntimeError(f"{label}: only a JMP self-spin may repeat")
+    pin_list = pins * repeat
+    pc_offsets = offsets * repeat
     n_steps = len(pin_list)
-    base_ops = decode_ops(code)
-    ops = base_ops * repeat
-    offsets = [0]
-    for op in base_ops[:-1]:
-        offsets.append(offsets[-1] + op.length)
-    loop = loop_recurrence(base_ops, offsets) if repeat == 1 and not taken else None
-    folder = GraphFolder(pg, root_names=SEQUENCE_ROOT_DIMS,
-                         structural_reads=True)
 
     def fold_candidate(inline):
-        try:
-            return folder.fold_execution_sequence(
-                pin_list, SEQUENCE_FEEDBACK, label=f"seq_{head:04X}",
-                inline_linear=inline, bit_feedback_until=last_a_bit_step(ops),
-                forward_stores=forward,
-            )
-        except SequenceRejection as e:
-            raise WindowLicenseError(str(e), e.step or 0) from e
+        return folder.fold_execution_sequence(
+            pin_list,
+            SEQUENCE_FEEDBACK,
+            label=f"shape_{name}",
+            pc_offsets=pc_offsets,
+            inline_linear=inline,
+            bit_feedback_until=last_a_bit_step(ops * repeat),
+        )
 
     r = fold_candidate(False)
     if r.insert_side_hazards:
         raise RuntimeError(
-            f"{label}: pins reach insert-side expressions "
-            f"of {r.insert_side_hazards}"
+            f"{label}: pins reach insert-side expressions of {r.insert_side_hazards}"
         )
-    check_reads_licensed(r, ops, label, forwarded=forward)
-    has_stores = check_writes_licensed(
-        r, n_steps, label,
-        window_ranges=[(pc, pc + length) for pc, length in window_layout(head, code, taken)],
-    )
-    for k in range(n_steps - 1):
-        nxt = int(pin_list[k + 1]["current_pc_lo"]) | (
-            int(pin_list[k + 1]["current_pc_hi"]) << 8
-        )
-        if const_root(r, "next_pc", k, label) != nxt:
-            raise WindowLicenseError(
-                f"{label} step {k}: control flow leaves the window "
-                "(next_pc != the next step's pc)", k + 1)
+    check_reads_licensed(r, ops * repeat, label)
+    if expert_kind == "exec_opcode":
+        if n_steps != 1:
+            raise RuntimeError("staged effects require one instruction")
+        if ops[0].operation != "brk" and const_root(r, "new_halted", 0, label) != 0:
+            raise RuntimeError(f"{label}: may halt")
+    elif any(
+        const_root(r, store, k, label)
+        for k in range(n_steps)
+        for store, _addr, _value in WRITE_RECEIPTS
+    ):
+        # Fixed shapes cannot hide effects from the device pause protocol.
+        raise RuntimeError(f"{label}: store shapes are not licensed")
+    if not self_target:
+        for k in range(n_steps - 1):
+            expected = pc_offsets[k + 1]
+            try:
+                heads, got = eval_over_heads(r, r.dim_of_name[f"next_pc__s{k}"], len(template))
+                proven = np.array_equal(got, heads + expected)
+            except RuntimeError:
+                proven = False
+            if not proven:
+                raise RuntimeError(
+                    f"{label} step {k}: interior next_pc is not head + offset for every head"
+                )
 
-    control = pinned_sequence_control(r, pin_list, ops)
-    spin = (
-        len(base_ops) == 1
-        and base_ops[0].operation == "jmp"
-        and base_ops[0].mode == "abs"
-        and control.target == head
-    )
-    guards = branch_guards(r, pin_list, ops, label)
-    execution = project_sequence_execution(r, n_steps, control, guards=guards)
+    def execution_of(candidate):
+        control = (
+            opcode_execution_control(candidate, ops[0])
+            if expert_kind == "exec_opcode"
+            else shape_sequence_control(
+                candidate,
+                n_steps,
+                ops,
+                offsets,
+                len(template),
+                self_target,
+            )
+        )
+        halt = (
+            candidate.dim_of_name["new_halted__s0"]
+            if expert_kind == "exec_opcode" and ops[0].operation == "brk"
+            else None
+        )
+        return project_sequence_execution(
+            candidate,
+            n_steps,
+            control,
+            halt,
+        )
+
+    execution = execution_of(r)
     materialized = schedule_and_build(execution)
     inlined_r = fold_candidate(True)
     if inlined_r.insert_side_hazards:
         raise RuntimeError(
-            f"{label}: pins reach insert-side expressions "
-            f"of {inlined_r.insert_side_hazards}"
+            f"{label}: pins reach insert-side expressions of {inlined_r.insert_side_hazards}"
         )
-    inlined_execution = project_sequence_execution(
-        inlined_r, n_steps, pinned_sequence_control(inlined_r, pin_list, ops),
-        guards=branch_guards(inlined_r, pin_list, ops, label),
-    )
+    inlined_execution = execution_of(inlined_r)
     inlined = schedule_and_build(inlined_execution)
-    emittable = exactly_emittable(materialized[0]), exactly_emittable(inlined[0])
-    if not any(emittable):
-        raise WindowLicenseError(
-            f"{label}: weights finer than the exact emission's halves", n_steps - 1)
-    if emittable[1] and (not emittable[0] or prefer_inlined(
-        (materialized[0], materialized[3]),
-        (inlined[0], inlined[3]), label,
-    )):
+    if prefer_inlined(
+        (materialized[0], materialized[2]),
+        (inlined[0], inlined[2]),
+        label,
+    ):
         r, execution, materialized = inlined_r, inlined_execution, inlined
-    model, _tokens, _tok_to_idx, info = materialized
-    # Window bytes join the name: different banks may carry different
-    # windows at one head, and each needs its own step_core symbol.
-    return {
-        "kind": "seq",
-        "name": f"seq_{head:04X}_{bytes(code).hex()}"
-                + ("_" + "".join("TF"[not t] for t in taken) if taken else ""),
-        "head": head, "has_stores": has_stores, "taken": taken,
-        "window": bytes(code), "n_steps": n_steps, "model": model,
-        # The bytes dispatch re-verifies in live memory: each instruction
-        # at its own pc (an interior JMP moves on to its target).
-        "match": [
-            ((pc + j) & 0xFFFF, code[off + j])
-            for (pc, length), off in zip(
-                window_layout(head, code, taken),
-                (sum(op.length for op in base_ops[:i]) for i in range(len(base_ops))),
-                strict=True,
-            )
-            for j in range(length)
-        ],
-        "step_spec": sequence_step_spec(execution, info),
+    model, _tok_to_idx, info = materialized
+    expert = {
+        "kind": expert_kind,
+        "name": f"shape_{name}",
+        "shape_id": sid,
+        "opcode_checks": checks,
+        "length": len(template),
+        "n_steps": n_steps,
+        "model": model,
+        "step_spec": lower_execution(execution, info),
+        **shape_timing(execution, self_target),
         "union_lookup_of": r.union_lookup_of,
-        **window_timing(execution, spin, loop),
-        "layers": info.n_layers, "_d": info.d_model,
     }
+    metadata = {
+        "id": sid,
+        "name": name,
+        "sig": [[o, b] for o, b in checks],
+        "length": len(template),
+        "repeat": repeat,
+        "close": (
+            "jmp" if self_target else "branch" if ops[-1].operation in BRANCH_OPERATIONS else "none"
+        ),
+    }
+    return expert, metadata
 
 
 def _build_symbolic_execution_experts(
-    pg, shapes, *, expert_kind: Literal["shape", "exec_opcode"],
+    pg,
+    shapes,
+    *,
+    expert_kind: Literal["shape", "exec_opcode"],
 ) -> tuple[list[dict], list[dict]]:
-    """Symbolic-PC execution experts for shapes and individual opcodes.
-
-    Each template folds once with pc and every operand byte symbolic
-    (fold_sequence pc_offsets); the license: only the first instruction may
-    read memory, every step non-halting with stores bounded below $2000
-    (a symbolic zero-page operand bounds itself), and each interior
-    step's next_pc equals head + offset -- verified EXHAUSTIVELY over every
-    head the window fits at, which is possible exactly because the folded
-    expression may depend on nothing but the pc bytes.  The JMP self-spin's
-    closure is a dispatch property instead (the router compares the operand
-    bytes to the head). Canonical shapes reject stores and speculative interior
-    control. Single-opcode execution may instead expose ordered writes because
-    its generated caller stages them through runtime effect arbitration.
-    """
-    folder = GraphFolder(pg, root_names=SEQUENCE_ROOT_DIMS,
-                         structural_reads=True)
-    experts: list[dict] = []
-    meta: list[dict] = []
+    """Build licensed templates in their stable dispatch order."""
+    folder = sequence_folder(pg)
+    experts, metadata = [], []
     for sid, shape in enumerate(shapes):
-        name, template, repeat = shape
-        label = f"shape {name}"
-        ops = decode_ops(template)
-        offs = [0]
-        for op in ops[:-1]:
-            offs.append(offs[-1] + op.length)
-        checks = list(zip(offs, (op.byte for op in ops), strict=True))
-        self_target = (
-            expert_kind == "shape"
-            and len(ops) == 1
-            and ops[0].operation == "jmp"
-            and ops[0].mode == "abs"
-        )
-        if repeat > 1 and not self_target:
-            raise RuntimeError(f"{label}: only a JMP self-spin may repeat")
-        pins, offsets = sequence_shape_pins(template, OPCODES)
-        pin_list = pins * repeat
-        pc_offsets = offsets * repeat
-        n_steps = len(pin_list)
-        def fold_candidate(
-            inline, pin_list=pin_list, name=name, pc_offsets=pc_offsets,
-            ops=ops, repeat=repeat,
-        ):
-            return folder.fold_execution_sequence(
-                pin_list, SEQUENCE_FEEDBACK, label=f"shape_{name}",
-                pc_offsets=pc_offsets, inline_linear=inline,
-                bit_feedback_until=last_a_bit_step(ops * repeat),
-            )
-
-        r = fold_candidate(False)
-        if r.insert_side_hazards:
-            raise RuntimeError(
-                f"{label}: pins reach insert-side expressions "
-                f"of {r.insert_side_hazards}"
-            )
-        check_reads_licensed(r, ops * repeat, label)
-        if expert_kind == "exec_opcode":
-            if n_steps != 1:
-                raise RuntimeError("staged effects require one instruction")
-            if (
-                ops[0].operation != "brk"
-                and const_root(r, "new_halted", 0, label) != 0
-            ):
-                raise RuntimeError(f"{label}: may halt")
-        elif check_writes_licensed(r, n_steps, label):
-            # A shape's head is symbolic, so store disjointness from the
-            # window's own bytes cannot be proven. Store idioms belong to
-            # concrete sequence modules, where that proof is static.
-            raise RuntimeError(f"{label}: store shapes are not licensed")
-        if not self_target:
-            for k in range(n_steps - 1):
-                expected = pc_offsets[k + 1]
-                try:
-                    heads, got = eval_over_heads(
-                        r, r.dim_of_name[f"next_pc__s{k}"], len(template)
-                    )
-                    proven = np.array_equal(got, heads + expected)
-                except RuntimeError:
-                    proven = False
-                if not proven:
-                    raise RuntimeError(
-                        f"{label} step {k}: interior next_pc is not "
-                        "head + offset for every head"
-                    )
-
-        def execution_of(
-            candidate, ops, offs, template, n_steps, self_target,
-        ):
-            control = (
-                opcode_execution_control(candidate, ops[0])
-                if expert_kind == "exec_opcode"
-                else shape_sequence_control(
-                    candidate, n_steps, ops, offs, len(template), self_target,
-                )
-            )
-            halt = (
-                candidate.dim_of_name["new_halted__s0"]
-                if expert_kind == "exec_opcode" and ops[0].operation == "brk"
-                else None
-            )
-            return project_sequence_execution(
-                candidate, n_steps, control, halt,
-            )
-
-        execution = execution_of(
-            r, ops, offs, template, n_steps, self_target,
-        )
-        materialized = schedule_and_build(execution)
-        inlined_r = fold_candidate(True)
-        if inlined_r.insert_side_hazards:
-            raise RuntimeError(
-                f"{label}: pins reach insert-side expressions "
-                f"of {inlined_r.insert_side_hazards}"
-            )
-        inlined_execution = execution_of(
-            inlined_r, ops, offs, template, n_steps, self_target,
-        )
-        inlined = schedule_and_build(inlined_execution)
-        if prefer_inlined(
-            (materialized[0], materialized[3]),
-            (inlined[0], inlined[3]), label,
-        ):
-            r, execution, materialized = inlined_r, inlined_execution, inlined
-        model, _tokens, _tok_to_idx, info = materialized
-        experts.append({
-            "kind": expert_kind, "name": f"shape_{name}", "shape_id": sid,
-            "opcode_checks": checks, "length": len(template),
-            "n_steps": n_steps, "model": model,
-            "step_spec": sequence_step_spec(execution, info),
-            **window_timing(execution, self_target, loop_recurrence(ops, offs)),
-            "union_lookup_of": r.union_lookup_of,
-            "layers": info.n_layers, "_d": info.d_model,
-        })
-        meta.append({
-            "id": sid, "name": name, "sig": [[o, b] for o, b in checks],
-            "length": len(template), "repeat": repeat,
-            "close": (
-                "jmp" if self_target
-                else "branch" if ops[-1].operation in BRANCH_OPERATIONS
-                else "none"
-            ),
-        })
-    if experts:
-        logger.info(
-            "shape experts: %d folded, %d-%d layers, d_model %d-%d",
-            len(experts),
-            min(e["layers"] for e in experts), max(e["layers"] for e in experts),
-            min(e["_d"] for e in experts), max(e["_d"] for e in experts),
-        )
-    return experts, meta
+        expert, record = _build_execution_expert(folder, shape, sid, expert_kind)
+        experts.append(expert)
+        metadata.append(record)
+    return experts, metadata
 
 
 def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
     return _build_symbolic_execution_experts(
-        pg, shapes, expert_kind="shape",
+        pg,
+        shapes,
+        expert_kind="shape",
     )
 
 
@@ -1236,11 +309,7 @@ def build_core_experts(pg) -> tuple[list[dict], list[dict]]:
     """The core engine's experts in its build order (the forward hook's ids
     0..): per opcode, the interrupts, the canonical shapes; and the shapes'
     metadata."""
-    opcode_bytes = tuple(
-        byte for byte in sorted(OPCODES)
-        if OPCODES[byte].operation not in UNION_FALLBACK_OPERATIONS
-    )
-    experts = build_opcode_execution_experts(pg, opcode_bytes)
+    experts = build_opcode_execution_experts(pg, sorted(OPCODES))
     experts.extend(build_interrupt_experts(pg))
     shape_experts, shapes_meta = build_shape_experts(pg, SHAPE_LIBRARY)
     return experts + shape_experts, shapes_meta

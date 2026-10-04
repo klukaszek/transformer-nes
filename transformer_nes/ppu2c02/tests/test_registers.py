@@ -38,11 +38,12 @@ def test_compiled_engine_is_the_exact_forward():
     """The native engine against model/inference.py's float64 forward of
     the same weights, on random memory writes and accesses."""
     graph = register_graph()
-    model, _tokens, _rows, info = construct(graph)
+    model, _rows, info = construct(graph)
     reference = ExactInference(model, info.d_model)
     token = TokenGraph(graph, registers.INPUTS, registers.OUTPUTS)
     engine = CompiledGraph(
-        {"access": token}, tag="ppu_registers", memory_size=space.memory_size()
+        lambda: {"access": token}, tag="ppu_registers",
+        sources=("transformer_nes.ppu2c02.machine",), memory_size=space.memory_size()
     )
     dims = {d.name: d for d in graph.all_dims}
     inputs = {d.name: d for d in graph.all_dims if isinstance(d, InputDimension)}
