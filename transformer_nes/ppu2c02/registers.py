@@ -1,29 +1,9 @@
-"""The 2C02 PPU register file as a computation graph.
+"""Neural transitions for CPU accesses to $2000-$2007.
 
-One graph step executes one CPU access to $2000-$2007.  An ACCESS token
-carries the access (register, value, read/write) and the register file
-as it stands at that dot; the step computes the register file after the
-access, the value a read returns, and the PPU-memory write the access
-makes.  PPU memory is an append-only log of WRITE tokens read through
-attention, exactly like the 6502's memory, laid out as in space.py.
-
-The scroll registers t and v travel as their loopy fields -- coarse x
-(5 bits), coarse y (5), nametable (2), fine y (3) -- because every PPU
-operation on them ($2005/$2006 writes, the $2007 increments, rendering's
-own increments) is field-wise.
-
-What stays outside the graph is what depends on the dot rather than on
-the access: rendering's own updates to v, and the status bits and their
-races.  The token supplies them (status, rendering, v as of the access)
-and the step reports what the access did to them (clear_vblank,
-nmi_rise); the native PPU applies the timing.
-
-The step reads CHR as $2007 sees it: through the latch the address's
-half is set to on MMC2/MMC4 (the FD or FE window), or on MMC5 through
-the CPU-side banks into the whole CHR (bank0-7, 1 KiB units).
-
-Construction contract (see graph/ops.py): every threshold argument is an
-integer and every match/extract argument a byte-range integer.
+Tokens carry the register file, status and rendering context. Readouts return
+new registers, read values, writes and timing effects. Scroll addresses use
+loopy fields; CHR reads honor MMC2/MMC4 latches and MMC5 CPU banks.
+Thresholds require integer inputs; byte extraction requires values in 0..255.
 """
 
 from __future__ import annotations
@@ -91,6 +71,7 @@ EFFECT_FIELDS = (
     "mem_write_value",
     "clear_vblank",
     "nmi_rise",
+    "nmi_fall",
 )
 OUTPUTS = tuple(f"new_{f}" for f in STATE_FIELDS) + EFFECT_FIELDS
 
@@ -283,6 +264,7 @@ def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expressio
         "mem_write_value": value - gate(both(wr[7], palette_region), 128 * bit[7] + 64 * bit[6]),
         "clear_vblank": rd[2],
         "nmi_rise": both(both(wr[0], bit[7]), 1 - ctrl_nmi),
+        "nmi_fall": both(both(wr[0], ctrl_nmi), 1 - bit[7]),
     }
     readout = Expression()
     for name, expr in outputs.items():

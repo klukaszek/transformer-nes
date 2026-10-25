@@ -33,25 +33,12 @@ constexpr size_t cpu_ram_index(int address) {
 struct CpuWrite {
   int addr = 0;
   int value = 0;
-};
-
-// Read-modify-write opcodes issue two bus writes (original then result);
-// devices that care (MMC1's serial port) get them via write_rmw.
-constexpr bool is_memory_rmw(uint8_t opcode) {
-  const bool alu_rmw_family = (opcode & 0x80) == 0 || (opcode & 0x40) != 0;
-  return alu_rmw_family && (opcode & 3) >= 2;
-}
-
-struct CpuStep {
-  int pc = 0, a = 0, x = 0, y = 0, s = 0, p = 0;
-  bool halted = false;
-  vector<CpuWrite> writes;
+  int original = -1; // RMW operand supplied by the CPU; -1 for ordinary writes
 };
 
 class SteppedRuntime {
 public:
   virtual ~SteppedRuntime() = default;
-  virtual int pc() const = 0;
   virtual bool halted() const = 0;
   virtual void set_nmi() = 0;
   virtual void set_irq() = 0;
@@ -64,10 +51,14 @@ public:
     int read = -1;
   };
   virtual Next peek() const = 0;
-  virtual CpuStep step() = 0;
+  virtual vector<CpuWrite> step() = 0;
 };
 
-using ReadLease = variant<monostate, int, vector<uint8_t>>;
+struct ReadReply {
+  array<uint8_t, 8> bytes{};
+  int size = 0;
+};
+using ReadLease = variant<monostate, int, ReadReply>;
 class Device {
 public:
   virtual ~Device() = default;
@@ -76,7 +67,10 @@ public:
   // model time (the PPU, mappers watching it) use it, the rest ignore it.
   virtual int read(int addr, int64_t cycle) = 0;
   virtual void write(int addr, int value, int64_t cycle) = 0;
-  virtual void write_rmw(int addr, int value, int64_t cycle) { write(addr, value, cycle); }
+  virtual void write_rmw(int addr, int value, int original, int64_t cycle) {
+    (void)original;
+    write(addr, value, cycle);
+  }
   virtual int take_stall() { return 0; }
   virtual ReadLease read_lease(int) { return {}; }
   // The console cycle from which the lease just granted may be stale;
@@ -157,23 +151,20 @@ public:
   void set_irq() override { runtime_.set_irq(); }
   void clear_irq() override { runtime_.clear_irq(); }
   bool halted() const { return runtime_.halted(); }
-  CpuStep step();
+  void step();
   void clear_read_lease() override {}
   MachineRun run_cycles(int64_t budget, function<bool()> pause = {},
                         int64_t cycle_base = 0) override;
-  int read_ram(int addr) const override { return ram_[address_index(addr)]; }
+  int read_ram(int addr) const override { return ram_[cpu_ram_index(addr)]; }
   void poke(int addr, int value) override {
     runtime_.poke(addr, value);
     poke_ram(addr, value);
   }
   void map_region(int base, span<const uint8_t> data) override;
-  void poke_ram(int addr, int value) { ram_[address_index(addr)] = static_cast<uint8_t>(value); }
+  void poke_ram(int addr, int value) { ram_[cpu_ram_index(addr)] = static_cast<uint8_t>(value); }
   int64_t cycles() const { return cycles_; }
 
 private:
-  static constexpr size_t address_index(int address) {
-    return cpu_ram_index(address);
-  }
   SteppedRuntime& runtime_;
   array<uint8_t, 0x10000> ram_{};
   DeviceMap devices_;
@@ -183,17 +174,21 @@ private:
 
 class Controller final : public Device {
 public:
+  enum Event { Write, Read, Lease, Consume, EventCount };
+  struct Engine {
+    void* ctx = nullptr;
+    void (*step)(void*, int, const int*, int*) = nullptr;
+    array<int, EventCount> models{};
+  } engine;
   void set_button(size_t index, bool pressed);
   int read(int addr, int64_t) override;
   void write(int addr, int value, int64_t) override;
   ReadLease read_lease(int addr) override;
   void lease_consumed(int addr, int count) override;
-
-
 private:
-  array<bool, 8> buttons_{};
-  bool strobe_ = false;
-  size_t index_ = 0;
+  array<int, 8> buttons_{};
+  array<int, 2> state_{};
+  array<int, 12> apply(Event event, int value = 0, int count = 0);
 };
 
 } // namespace transformer_nes::nes

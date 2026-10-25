@@ -36,6 +36,7 @@ class MemWrite:
     step: int
     addr: int
     value: int
+    original: int = -1  # RMW operand; -1 for an ordinary/stack write
 
 
 @dataclass(frozen=True)

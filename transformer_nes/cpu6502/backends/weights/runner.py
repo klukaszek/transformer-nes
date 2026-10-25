@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import gc
 import logging
 import time
 
@@ -53,10 +54,21 @@ class Cpu6502TransformerMachine:
         if engine is not None:
             logger.info("engine cache hit (%d experts)", engine.n_experts)
         if engine is None:
-            # Without experts every opcode misses dispatch and falls to
-            # step_core, so the union alone executes the whole ISA.
+            # Union diagnostics run whole instructions until a device read
+            # requires the same retained continuation as production.
             core, meta = self.core_experts()
-            experts, shapes_meta = ([], []) if union_only else (core, meta)
+            experts, shapes_meta = (
+                (
+                    [
+                        e | {"hook_id": i, "external_only": e.get("read_resume", False)}
+                        for i, e in enumerate(core)
+                        if e["kind"] == "read_request" or e.get("read_resume")
+                    ],
+                    [],
+                )
+                if union_only
+                else (core, meta)
+            )
             engine = GeneratedWeightsEngine(
                 self.model,
                 step_spec=self.step_spec(),
@@ -71,10 +83,9 @@ class Cpu6502TransformerMachine:
             for cached in ("built", "execution_fold", "dim_by_name", "pg", "graph"):
                 self.__dict__.pop(cached, None)
             del core, meta, experts, shapes_meta
+            # Collect compiler graph cycles before the first gameplay frame.
+            gc.collect()
         self.engine = engine
-        # Shape matches per injected (base, bank content): a bank switch
-        # re-adds its windows from this memo instead of rescanning.
-        self._region_windows: dict[tuple[int, bytes], tuple] = {}
         from transformer_nes.cpu6502.backends.weights.torch_forward import TorchForwards
 
         TorchForwards(self)
@@ -142,9 +153,7 @@ class Cpu6502TransformerMachine:
             for addr in range(0x0800, 0x2000):
                 ram[addr] = ram[addr & 0x07FF]
         self.engine.seed_image(bytes(ram))
-        self.engine.set_run_state(
-            start_pc, 0, 0, 0, 0xFD, FLAG_U | FLAG_I, 0, 0, 0, 0, 0, 0
-        )
+        self.engine.set_run_state(start_pc, 0, 0, 0, 0xFD, FLAG_U | FLAG_I, 0, 0, 0, 0, 0, 0)
         self.engine.clear_windows()
         for sid, head in match_shape_windows(ram, self.engine.shapes_meta):
             self.engine.add_window(sid, head)
@@ -173,16 +182,8 @@ class Cpu6502TransformerMachine:
             self.engine.add_window(sid, head)
 
     def region_windows(self, base: int, data: bytes) -> tuple:
-        """Shape windows of newly banked-in code, so it dispatches at once
-        instead of waiting out JIT warmup; memoized per bank content."""
-        meta = self.engine.shapes_meta
-        if not meta:
-            return ()
-        key = (base, bytes(data))
-        hits = self._region_windows.get(key)
-        if hits is None:
-            hits = self._region_windows[key] = tuple(match_shape_windows(data, meta, base=base))
-        return hits
+        """Match newly mapped code. The native console owns bank-content caching."""
+        return tuple(match_shape_windows(data, self.engine.shapes_meta, base=base))
 
     def machine_abi(self) -> tuple[int, int, int]:
         """(version, engine, table) for native callers (native/machine_abi.h).
@@ -193,8 +194,10 @@ class Cpu6502TransformerMachine:
         """The native run's arrays as the canonical reference trace."""
         out = self.run_image_arrays(memory_image, start_pc=start_pc, max_steps=max_steps)
         writes = [[] for _ in out["pc"]]
-        for step, addr, value in zip(out["w_row"], out["w_addr"], out["w_value"], strict=True):
-            writes[int(step)].append(MemWrite(int(step), int(addr), int(value)))
+        for step, addr, value, original in zip(
+            out["w_row"], out["w_addr"], out["w_value"], out["w_original"], strict=True
+        ):
+            writes[int(step)].append(MemWrite(int(step), int(addr), int(value), int(original)))
         return Trace(
             [
                 TraceRow(
@@ -270,11 +273,7 @@ class Cpu6502TransformerMachine:
     ) -> dict:
         """Resume the native run loop from the engine's persistent state
         (no reboot), pausing on halt/trap/watch/cycle budget."""
-        out = self.engine.run(max_steps, stop_on_trap, max_cycles, trace)
-        # A watch_write pause ends on the step that wrote, so this is the
-        # writing opcode: the bus routes RMW writes through write_rmw.
-        out["pause_ir"] = self.engine.get_run_state()["ir"]
-        return out
+        return self.engine.run(max_steps, stop_on_trap, max_cycles, trace)
 
     def watch_read(self, lo: int, hi: int) -> None:
         self.engine.watch_read(lo, hi)

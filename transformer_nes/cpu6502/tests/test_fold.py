@@ -7,12 +7,10 @@ reference/weights lockstep suites; this module only checks construction facts.
 
 import pytest
 
-from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.weights.engine import generate_source
 from transformer_nes.cpu6502.backends.weights.execution import (
     SEQUENCE_ROOT_DIMS,
     SEQUENCE_STATE_DIMS,
-    ControlFlow,
     project_sequence_execution,
 )
 from transformer_nes.cpu6502.backends.weights.experts import (
@@ -29,10 +27,9 @@ from transformer_nes.cpu6502.backends.weights.folds import (
 from transformer_nes.cpu6502.backends.weights.shapes import decode_ops, last_a_bit_step
 from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS
 from transformer_nes.cpu6502.interpreter import build
-from transformer_nes.cpu6502.spec import BRANCH_CONDITIONS, BRANCH_OPERATIONS, OPCODES
+from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.graph.core import (
     MEMORY_GROUP_FUSED,
-    Expression,
     InputDimension,
     LookUpDimension,
     MemoryReadDimension,
@@ -41,7 +38,6 @@ from transformer_nes.graph.core import (
     construction,
     current_graph,
 )
-from transformer_nes.graph.fold import linear_input_form
 from transformer_nes.model.schedule import asap_schedule
 
 
@@ -139,7 +135,6 @@ def test_sequence_execution_projection_keeps_only_final_state(folder):
     execution = project_sequence_execution(
         r,
         len(pin_list),
-        pinned_sequence_control(r, pin_list, decode_ops(code)),
     )
 
     assert execution.memory_writes == ()
@@ -187,7 +182,6 @@ def test_sequence_execution_projection_eliminates_deterministic_model(folder):
     execution_graph = project_sequence_execution(
         execution,
         len(pins),
-        pinned_sequence_control(execution, pins, decode_ops(bytes([0x4C, 0x08, 0x04])) * 8),
     )
     _model, _rows, execution_info = schedule_and_build(execution_graph)
 
@@ -217,7 +211,6 @@ def test_structural_execution_uses_external_memory_reads(folder):
     execution = project_sequence_execution(
         proof,
         len(pins),
-        pinned_sequence_control(proof, pins, decode_ops(code)),
     )
     model, _rows, _info = schedule_and_build(execution)
 
@@ -260,7 +253,6 @@ def test_execution_ir_retains_ordered_writes(folder):
     execution = project_sequence_execution(
         proof,
         len(pins),
-        pinned_sequence_control(proof, pins, decode_ops(bytes([0x85, 0x10]))),
     )
 
     assert len(execution.memory_writes) == 1
@@ -268,6 +260,7 @@ def test_execution_ir_retains_ordered_writes(folder):
     assert (write.step, write.order) == (0, 0)
     assert write.address in execution.program_graph.all_dims
     assert write.value in execution.program_graph.all_dims
+    assert write.original is None
 
 
 @construction
@@ -292,7 +285,6 @@ def test_external_memory_read_exposes_only_consumed_bits():
     execution = project_sequence_execution(
         proof,
         len(pins),
-        pinned_sequence_control(proof, pins, ops),
     )
 
     assert [read.output_kinds for read in execution.program_graph.all_memory_reads] == [
@@ -325,7 +317,6 @@ def test_execution_proof_materializes_only_license_facts(folder):
     execution = project_sequence_execution(
         facts,
         len(pins),
-        pinned_sequence_control(facts, pins, ops),
     )
     for k in range(len(pins) - 1):
         assert f"next_pc__s{k}" not in execution.dim_of_name
@@ -344,21 +335,12 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
     experts, _meta = build_shape_experts(union_pg, [shape])
     spec = experts[0]["step_spec"]
 
-    # The pc enters only to time the closing branch (its page cross).
+    # The PC feeds the closing branch's target and page-cross timing.
     assert set(spec["inputs"]) == {"x", "pc_lo", "pc_hi"}
     assert spec["p_flags"] == []
     assert {"p_z", "p_n"} <= set(spec["sequence_final"]["model"])
-    assert spec["sequence_control"] == {
-        "predicate": None,
-        "fallthrough": 3,
-        "target": 0,
-        "target_dimension": None,
-        "relative_to_head": True,
-        "relative_operand_offset": 2,
-        "absolute_operand_offset": None,
-        "flag_mask": reference.FLAG_Z,
-        "flag_value": False,
-    }
+    assert "new_pc" in spec["sequence_final"]["model"]
+    assert "sequence_control" not in spec
     # DEX's 2 cycles fold; the closing BNE's are the model's (taken or
     # not, across a page or not), read out after the forward.
     assert experts[0]["cycles_prefix"] == 2 and experts[0]["spin"] == 0
@@ -385,23 +367,23 @@ def test_compact_opcode_experts_cover_stack_and_control(union_pg):
     ]
     assert all(expert["kind"] == "exec_opcode" for expert in experts)
     dex = experts[0]
-    assert set(dex["step_spec"]["inputs"]) == {"x"}
+    assert set(dex["step_spec"]["inputs"]) == {"x", "pc_lo", "pc_hi"}
     assert dex["step_spec"]["sequence_writes"] == [[]]
     sta = experts[3]
     assert len(sta["step_spec"]["sequence_writes"][0]) == 1
     sax = experts[4]
     assert len(sax["step_spec"]["sequence_writes"][0]) == 1
     assert experts[5]["step_spec"]["sequence_writes"][0]
-    assert experts[6]["step_spec"]["sequence_control"]["absolute_operand_offset"] == 1
+    assert "new_pc" in experts[6]["step_spec"]["sequence_final"]["model"]
     assert len(experts[7]["step_spec"]["sequence_writes"][0]) == 2
-    assert experts[8]["step_spec"]["sequence_control"]["target_dimension"] is not None
+    assert "new_pc" in experts[8]["step_spec"]["sequence_final"]["model"]
     brk = experts[9]
     assert len(brk["step_spec"]["sequence_writes"][0]) == 3
     assert brk["step_spec"]["sequence_halt"] is not None
 
     legacy = dict(experts[0])
     legacy.pop("kind")
-    with pytest.raises(RuntimeError, match="compact opcodes, shapes or interrupts"):
+    with pytest.raises(RuntimeError, match="unsupported execution contract"):
         generate_source(
             experts[0]["model"],
             experts[0]["step_spec"],
@@ -416,44 +398,16 @@ def test_shape_interior_branch_is_rejected(union_pg):
         build_shape_experts(union_pg, [plain])
 
 
-def pinned_sequence_control(fold_result, pin_list, ops) -> ControlFlow:
-    k = len(pin_list) - 1
-    op = ops[k]
-    pins = pin_list[k]
-    pc = int(pins["current_pc_lo"]) | (int(pins["current_pc_hi"]) << 8)
-    fallthrough = (pc + op.length) & 0xFFFF
-    if op.operation in BRANCH_OPERATIONS:
-        offset = int(pins["fetched_operand_lo_all"])
-        signed = offset - 256 if offset & 0x80 else offset
-        predicate = fold_result.dim_of_name[f"branch_taken__s{k}"]
-        form = linear_input_form(Expression({predicate: 1}))
-        one = fold_result.program_graph.one
-        if all(dim is one for dim in form):
-            successor = (
-                (fallthrough + signed) & 0xFFFF if int(round(form.get(one, 0.0))) else fallthrough
-            )
-            return ControlFlow(
-                predicate=None,
-                fallthrough=successor,
-                target=successor,
-            )
-        return ControlFlow(
-            predicate=predicate,
-            fallthrough=fallthrough,
-            target=(fallthrough + signed) & 0xFFFF,
-            flag_mask=BRANCH_CONDITIONS[op.operation][0],
-            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
-        )
-    if op.operation in ("jmp", "jsr") and op.mode == "abs":
-        target = int(pins["fetched_operand_lo_all"]) | (int(pins["fetched_operand_hi_all"]) << 8)
-        return ControlFlow(predicate=None, fallthrough=target, target=target)
-    if op.operation in ("rts", "rti"):  # the return address is the model's
-        target = fold_result.dim_of_name[f"next_pc__s{k}"]
-        return ControlFlow(predicate=None, fallthrough=0, target=0, target_dimension=target)
-    if op.operation == "brk" or op.operation == "jmp":
-        raise RuntimeError(f"sequence final control {op.mnemonic} is not host-resolvable")
-    return ControlFlow(
-        predicate=None,
-        fallthrough=fallthrough,
-        target=fallthrough,
-    )
+def test_completed_compilation_does_not_retain_the_source_graph():
+    import gc
+    import weakref
+
+    from transformer_nes.cpu6502.backends.weights.experts import sequence_folder
+    from transformer_nes.cpu6502.construction import Cpu6502Graph
+
+    program = Cpu6502Graph(bcd=False, wide_bits=True).program_graph()
+    reference = weakref.ref(program)
+    folder = sequence_folder(program)
+    del program, folder
+    gc.collect()
+    assert reference() is None

@@ -44,6 +44,22 @@ def mux(gate: ExprLike, if_one: ExprLike, if_zero: ExprLike) -> Expression:
     return if_zero + multiply(if_one - if_zero, gate)
 
 
+def remainder(value, modulus: int, maximum: int):
+    """Reduce integers in [0, maximum] modulo a positive constant.
+
+    Each stage subtracts one power-of-two multiple of the divisor. Circuit
+    size is logarithmic in the quotient range; no state/outcome table.
+    """
+    if modulus < 1 or maximum < 0:
+        raise ValueError("modulus must be positive and maximum nonnegative")
+    if modulus == 1:
+        return 0
+    for shift in reversed(range((maximum // modulus).bit_length())):
+        multiple = modulus << shift
+        value = value - multiple * stepglu(1, value - multiple)
+    return value
+
+
 def wrap8(value: ExprLike) -> Expression:
     """Reduce an integer expression to an unsigned 8-bit value."""
     one = graph.current_graph().one

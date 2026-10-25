@@ -6,7 +6,7 @@ def test_graph_builder_exposes_codegen_inputs():
 
     graph = Cpu6502Graph()
 
-    assert graph.input_tokens
-    assert graph.output_tokens
-    assert graph.start_pc_lo.name == "start_pc_lo"
-    assert graph.start_pc_hi.name == "start_pc_hi"
+    assert graph.program.input_tokens
+    assert graph.program.output_tokens
+    assert graph.dim_of_name["start_pc_lo"].name == "start_pc_lo"
+    assert graph.dim_of_name["start_pc_hi"].name == "start_pc_hi"

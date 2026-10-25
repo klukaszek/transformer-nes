@@ -1,6 +1,4 @@
-"""The sprite unit's graphs against the hardware rules they replace
-(nes/ppu.cpp: evaluate_sprites, load_sprites, ChrLatch::after_fetch),
-on random OAM, CHR and latch states."""
+"""Sprite selection, fetch and composition against independent hardware rules."""
 
 import numpy as np
 import pytest
@@ -11,6 +9,48 @@ from transformer_nes.ppu2c02.machine import ppu_engine
 @pytest.fixture(scope="module")
 def engine():
     return ppu_engine()
+
+
+def test_composition_executes_exact_weights_and_ordered_clipped_updates():
+    from transformer_nes.graph.core import InputDimension
+    from transformer_nes.model.graph_engine import construct
+    from transformer_nes.model.inference import ExactInference
+    from transformer_nes.ppu2c02 import control
+
+    engine = control.control_engine()
+    graph = control.composition_graph()
+    model, _, info = construct(graph)
+    eager = ExactInference(model)
+    dims = {d.name: d for d in graph.all_dims}
+    inputs = {d.name: d for d in graph.all_dims if isinstance(d, InputDimension)}
+    model_id = engine.model_id("compose")
+    rng = np.random.default_rng(79)
+    for trial in range(64):
+        actual, expected = np.zeros(264, dtype=np.int32), np.zeros(264, dtype=np.int32)
+        occupied = np.zeros(33, dtype=np.int32)
+        # Every x, reversed and repeated, includes overlaps past the hardware
+        # eight-sprite cap and all right-edge and tile-boundary cases.
+        for x in range(256) if trial % 2 else reversed(range(256)):
+            row = rng.integers(256, size=8) * rng.integers(2, size=8)
+            packet = [x, *occupied[x >> 3:(x >> 3) + 2], *row, *actual[x:x + 8]]
+            out = engine.step(packet, model_id)
+            if x == trial:
+                residual = np.zeros(info.d_model)
+                residual[info.slot_of[graph.one]] = 1
+                for name, value in zip(control.COMPOSE_INPUTS, packet, strict=True):
+                    residual[info.slot_of[inputs[name]]] = value
+                result = eager.forward(residual)
+                np.testing.assert_array_equal(
+                    out, [round(result[info.slot_of[dims[n]]]) for n in control.COMPOSE_OUTPUTS]
+                )
+            actual[x:x + 8] = out[:8]
+            occupied[x >> 3:(x >> 3) + 2] = out[8:]
+            for c in range(min(8, 256 - x)):
+                if not expected[x + c] and row[c]:
+                    expected[x + c] = row[c]
+            np.testing.assert_array_equal(actual, expected)
+            np.testing.assert_array_equal(occupied[:32], expected[:256].reshape(32, 8).any(axis=1))
+            assert not occupied[32] and not actual[256:].any()
 
 
 def test_evaluation_selects_the_first_eight_in_oam_order(engine):

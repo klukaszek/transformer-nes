@@ -16,6 +16,7 @@
 #include "ui/debug_ui.h"
 
 #include <algorithm>
+#include <array>
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
@@ -260,7 +261,7 @@ void draw_dissection(const char* id, const Dissection& d,
 }
 
 // Near black -> purple -> orange -> pale yellow, by intensity (0 = unread).
-uint32_t heat_rgba(unsigned char v) {
+constexpr uint32_t heat_rgba(unsigned char v) {
   static constexpr float stops[4][3] = {
       {0.10f, 0.05f, 0.25f}, {0.55f, 0.10f, 0.55f}, {0.95f, 0.45f, 0.10f}, {1.0f, 0.95f, 0.6f}};
   if (v == 0)
@@ -283,6 +284,13 @@ void draw_read_heat(const XrayFrame& frame) {
   static sg_image image{};
   static uint64_t texture = 0;
   static std::vector<uint32_t> rgba(0x10000);
+  static std::string previous;
+  static constexpr auto palette = [] {
+    std::array<uint32_t, 256> colors{};
+    for (size_t i = 0; i < colors.size(); ++i)
+      colors[i] = heat_rgba(static_cast<unsigned char>(i));
+    return colors;
+  }();
   if (!texture) {
     sg_image_desc img{};
     img.usage.dynamic_update = true;
@@ -296,12 +304,15 @@ void draw_read_heat(const XrayFrame& frame) {
     smp.min_filter = smp.mag_filter = SG_FILTER_NEAREST;
     texture = simgui_imtextureid_with_sampler(sg_make_view(&view), sg_make_sampler(&smp));
   }
-  const auto* heat = reinterpret_cast<const unsigned char*>(frame.read_heat.data());
-  for (size_t i = 0; i < rgba.size(); ++i)
-    rgba[i] = heat_rgba(heat[i]);
-  sg_image_data data{};
-  data.mip_levels[0] = {rgba.data(), rgba.size() * sizeof(uint32_t)};
-  sg_update_image(image, &data);
+  if (previous != frame.read_heat) {
+    const auto* heat = reinterpret_cast<const unsigned char*>(frame.read_heat.data());
+    for (size_t i = 0; i < rgba.size(); ++i)
+      rgba[i] = palette[heat[i]];
+    sg_image_data data{};
+    data.mip_levels[0] = {rgba.data(), rgba.size() * sizeof(uint32_t)};
+    sg_update_image(image, &data);
+    previous = frame.read_heat;
+  }
   const ImVec2 origin = ImGui::GetCursorScreenPos();
   ImGui::Image(ImTextureRef(static_cast<ImTextureID>(texture)), ImVec2(256.0f, 256.0f));
   if (ImGui::IsItemHovered()) {
@@ -338,14 +349,16 @@ void draw_pixel_dissection(const DebugHooks& hooks, const UiState& state) {
 
 // `fetched` receives the X-ray frame when the section drew it, so the
 // game tint can reuse it.
-void draw_xray(const DebugHooks& hooks, UiState& state, std::optional<XrayFrame>& fetched) {
+void draw_xray(const DebugHooks& hooks, UiState& state, const XrayFrame*& fetched) {
   if (!hooks.xray_frame)
     return;
   if (state.xray)
     ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-  if (!ImGui::CollapsingHeader("Transformer X-ray"))
+  state.xray_visible = ImGui::CollapsingHeader("Transformer X-ray");
+  if (!state.xray_visible)
     return;
-  const XrayFrame& frame = fetched.emplace(hooks.xray_frame());
+  fetched = &hooks.xray_frame();
+  const XrayFrame& frame = *fetched;
   const auto open = ImGuiTreeNodeFlags_DefaultOpen;
   if (!hooks.dissect)
     ImGui::TextDisabled("CPU views need the weights CPU (--backend weights)");
@@ -394,7 +407,7 @@ void draw_xray(const DebugHooks& hooks, UiState& state, std::optional<XrayFrame>
   }
 }
 
-void draw_window(UiState& state, const DebugHooks& hooks, std::optional<XrayFrame>& xray) {
+void draw_window(UiState& state, const DebugHooks& hooks, const XrayFrame*& xray) {
   ImGui::SetNextWindowSize(ImVec2(560.0f, 640.0f), ImGuiCond_FirstUseEver);
   if (ImGui::Begin("debug (~)", &state.open)) {
     if (ImGui::CollapsingHeader("Stats", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -470,6 +483,7 @@ bool handle_event(const sapp_event* event, UiState& state) {
 void draw(UiState& state, const DebugHooks& hooks, double display_seconds) {
   // The game tint outlives the overlay: with it on, a frame is built even
   // while the window is closed, holding just the tint.
+  state.xray_visible = false;
   const bool tint = state.tint_game && hooks.xray_frame;
   if (!state.open && !tint)
     return;
@@ -490,7 +504,7 @@ void draw(UiState& state, const DebugHooks& hooks, double display_seconds) {
       hooks.trace_pixel(y, x);
     }
   }
-  std::optional<XrayFrame> xray;
+  const XrayFrame* xray = nullptr;
   if (state.open) {
     draw_window(state, hooks, xray);
     if (state.pick_line >= 0 && state.game_w > 0)
@@ -498,7 +512,7 @@ void draw(UiState& state, const DebugHooks& hooks, double display_seconds) {
   }
   if (tint) {
     if (!xray)
-      xray = hooks.xray_frame();
+      xray = &hooks.xray_frame();
     tint_game(*xray, state);
   }
 }

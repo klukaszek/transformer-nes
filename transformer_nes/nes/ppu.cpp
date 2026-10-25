@@ -28,12 +28,6 @@ Ppu::Ppu(vector<uint8_t> chr_data, bool writable, bool vertical_mirroring)
 
 // ── Memory ──
 
-size_t Ppu::palette_index(int addr) {
-  size_t offset = (addr - 0x3F00) & 0x1F;
-  if (offset == 0x10 || offset == 0x14 || offset == 0x18 || offset == 0x1C)
-    offset -= 0x10;
-  return offset;
-}
 
 int Ppu::status(int64_t dot) const {
   return (r_.vblank ? 0x80 : 0) | (r_.hit_dot <= dot ? 0x40 : 0) |
@@ -44,14 +38,26 @@ int Ppu::status(int64_t dot) const {
 
 int Ppu::read(int addr, int64_t dot) {
   catch_up(dot);
-  return access((addr - 0x2000) & 7, 0, false, dot);
+  const int value = access((addr - 0x2000) & 7, 0, false, dot);
+  return value;
 }
 
 void Ppu::write(int addr, int value, int64_t dot) {
   const int reg = (addr - 0x2000) & 7;
-  // PPUMASK reaches the renderer one dot late (the rendering-enable
-  // latch), which decides e.g. whether this frame skips its odd dot.
-  catch_up(reg == 1 ? dot + 1 : dot);
+  // The access circuit supplies its scheduling delay before mutation.
+  int delay;
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+  if (!engine_.ctx)
+    delay = reference_write_delay(reg);
+  else
+#endif
+  {
+    if (!engine_.ctx)
+      throw std::runtime_error("PPU transformer engine is required");
+    const int in[17] = {reg, 1};
+    engine_.control_step(engine_.control_ctx, engine_.access_delay_model, in, &delay);
+  }
+  catch_up(dot + delay);
   (void)access(reg, value & 0xFF, true, dot);
 }
 
@@ -66,59 +72,40 @@ int Ppu::access(int reg, int value, bool is_write, int64_t dot) {
 #else
   const RegisterResult result = graph_transition(request, before);
 #endif
-  access_effects(request, before, dot);
+  access_effects(request, before, result, dot);
   return result.read_value;
 }
 
-// Everything an access does that depends on the dot or on the rest of
-// the console: the vblank/NMI races, mapper-visible A12 edges and CHR
-// latches, and the renderer's caches.
+// Apply neural timing effects, then deliver mapper-visible A12 edges,
+// CHR latches and renderer invalidations.
 void Ppu::access_effects(const RegisterAccess& request, const RegisterFile& before,
-                         int64_t dot) {
-  const int reg = request.reg;
-  if (reg == 2 && !request.is_write) {
-    // The vblank race (NESDEV PPU frame timing): a read one dot before
-    // the flag sets reads it clear and cancels this frame's flag and
-    // NMI; a read on the setting dot or the next reads it set but still
-    // cancels the NMI; later reads behave normally.
-    if (dot == vblank_dot() && r_.vblank_set_dot < 0)
-      r_.vblank_suppressed = true;
-    if (r_.vblank_set_dot >= 0 && dot - r_.vblank_set_dot <= 2)
-      r_.nmi_edge = false;
-    r_.vblank = false;
-  }
-  if (reg == 0 && request.is_write) {
-    const bool rising = (ctrl & 0x80) && !(before.ctrl & 0x80);
-    const bool falling = !(ctrl & 0x80) && (before.ctrl & 0x80);
-    // The NMI output lags by a dot: enabling on the flag's last dot
-    // raises no pulse.
-    if (rising && r_.vblank && dot != r_.frame_start + int64_t{prerender_line} * dots_per_line + 1)
-      r_.nmi_delayed = true;
-    // Disabling within two dots of the flag setting drops the NMI line
-    // before the CPU's edge detector latches it.
-    if (falling && r_.vblank_set_dot >= 0 && dot - r_.vblank_set_dot <= 2)
-      r_.nmi_edge = false;
-  }
-  // Outside rendering the PPU address bus shows v, so loading or
-  // stepping it can raise A12 (an MMC3 clock).
-  const bool v_loaded = reg == 6 && request.is_write && before.w && !rendering_enabled();
-  const bool v_stepped = reg == 7 && !request.rendering;
-  if ((v_loaded || v_stepped) && a12((r_.v & 0x1000) != 0, dot))
+                         const RegisterResult& result, int64_t dot) {
+  if (result.clear_vblank || result.nmi_rise || result.nmi_fall)
+    control(ControlEvent::Access, dot, result);
+  const int in[]{request.reg, request.is_write, request.rendering, before.w,
+                 before.ctrl, before.mask, ctrl, mask, (r_.v >> 12) & 7,
+                 before.v & 31, (before.v >> 5) & 31, (before.v >> 10) & 3,
+                 (before.v >> 12) & 7, chr_latch_active, chr_latch.wide_low,
+                 chr_latch.latch_fe[0], chr_latch.latch_fe[1]};
+  int out[7];
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+  if (!engine_.ctx)
+    reference_access_bus(in, out);
+  else
+#endif
+    engine_.control_step(engine_.control_ctx, engine_.access_bus_models[request.is_write][request.reg], in, out);
+  if (out[0] && a12(out[1] != 0, dot))
     schedule_changed_ = true;
-  // A $2007 read below $2000 is a pattern fetch the MMC2/MMC4 latches see.
-  if (reg == 7 && !request.is_write && chr_latch_active && (before.v & 0x3FFF) < 0x2000 &&
-      chr_latch.after_fetch(static_cast<size_t>(before.v & 0x3FFF)))
+  chr_latch.latch_fe[0] = out[2] != 0;
+  chr_latch.latch_fe[1] = out[3] != 0;
+  if (out[4]) {
+    refresh_mmc5_view();
     chr_map_changed();
-  if (before.ctrl != ctrl)
-    chr_map_changed(); // MMC5's background set follows the sprite size
-  if (((before.ctrl ^ ctrl) & 0x38) || ((before.mask ^ mask) & 0x18) ||
-      (reg == 4 && request.is_write && (ctrl & 0x20)))
-    schedule_changed_ = true;
+  }
+  schedule_changed_ |= out[5] != 0;
 }
 
-// The transition as an ACCESS token through the register expert for
-// this register and direction (ppu2c02/registers.py): load the register
-// file it returns and apply its memory write.
+// Commit the register expert's state and memory-write readouts.
 Ppu::RegisterResult Ppu::graph_transition(const RegisterAccess& request,
                                           const RegisterFile& before) {
   const int map = nt_map();
@@ -161,7 +148,7 @@ Ppu::RegisterResult Ppu::graph_transition(const RegisterAccess& request,
   read_buffer = out[13];
   if (out[15])
     write_physical(out[16], out[17]);
-  return {out[14], out[15] ? out[16] : -1, out[17]};
+  return {out[14], out[18] != 0, out[19] != 0, out[20] != 0};
 }
 
 // A graph-memory write (the physical space of ppu2c02/space.py) into
@@ -192,7 +179,9 @@ void Ppu::write_physical(int addr, int value) {
 
 void Ppu::set_engine(PpuEngine engine) {
   engine_ = engine;
+  sprite_rows_.valid.reset();
   graph_sync_.reset(); // the new engine's memory starts empty
+  refresh_mmc5_view();
 }
 
 int Ppu::nt_map() const {
@@ -286,9 +275,27 @@ void Ppu::graph_step(int model, const int* in, int* out) {
 }
 
 void Ppu::background_bus(int64_t dot) {
-  a12(false, dot);
-  if (!(mmc5.active() && mmc5.extended_attributes()))
-    a12((ctrl & 0x10) != 0, dot + 4);
+  bus_event(BusEvent::Background, false, dot);
+}
+
+// Neural run composition retains the first-pair stamp for an early IRQ stop.
+int Ppu::preview_background(int count, int64_t dot) {
+  if (!rendering_enabled() || !wants_a12_)
+    return count;
+  const int age = static_cast<int>(std::clamp<int64_t>(dot - r_.a12_low_since, -1, 11));
+  const int in[]{r_.a12_high, age, ctrl, mmc5.active() && mmc5.extended_attributes(), count};
+  int out[6];
+  engine_.control_step(engine_.control_ctx, engine_.background_span_model, in, out);
+  r_.a12_high = out[0] != 0;
+  if (out[5])
+    r_.a12_low_since = dot;
+  if (out[2])
+    emit(PpuEvent::A12Rise, dot + out[3]);
+  if (dry_stop_ >= 0)
+    return 1;
+  if (out[1])
+    r_.a12_low_since = dot + out[4];
+  return count;
 }
 
 void Ppu::render_slot(int slot, int64_t dot) {
@@ -321,7 +328,7 @@ void Ppu::render_slot(int slot, int64_t dot) {
                            (r_.v >> 5) & 0x1F,
                            (r_.v >> 10) & 3,
                            (r_.v >> 12) & 7};
-  const bool sprites = visible && ((r_.sprite_slots >> slot) & 1);
+  const bool sprites = visible && r_.sprite_slots[static_cast<size_t>(slot)];
   if (visible) {
     std::copy_n(r_.bg.data() + slot * 8, 16, in + in_bg);
     if (sprites)
@@ -401,31 +408,45 @@ optional<int> Ppu::read_lease(int addr, int64_t horizon) {
   return status(now);
 }
 
+array<int, 2> Ppu::dma_request(int page, int parity) const {
+  const int in[]{page, parity, 0, 0};
+  array<int, 2> out;
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+  if (!engine_.ctx) {
+    int packet[7];
+    reference_dma(in, packet);
+    return {packet[0], packet[1]};
+  }
+#endif
+  if (!engine_.control_step)
+    throw std::logic_error("PPU transformer engine is required");
+  engine_.control_step(engine_.control_ctx, engine_.dma_request_model, in, out.data());
+  return out;
+}
+
 void Ppu::oam_dma(span<const uint8_t, 256> page, int64_t dot) {
   catch_up(dot);
-  for (size_t i = 0; i < page.size(); ++i)
-    oam[(oam_addr + i) & 0xFF] = page[i];
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+  if (!engine_.ctx) {
+    reference_oam_dma(page);
+    return;
+  }
+#endif
+  if (!engine_.control_step)
+    throw std::logic_error("PPU transformer engine is required");
+  const int in[]{0, 0, oam_addr, ctrl};
+  int out[5];
+  engine_.control_step(engine_.control_ctx, engine_.dma_transfer_model, in, out);
+  std::copy_n(page.begin(), out[1], oam.begin() + out[0]);
+  std::copy_n(page.begin() + out[2], out[3], oam.begin());
   oam_changed();
-  if (ctrl & 0x20)
-    schedule_changed_ = true;
+  schedule_changed_ |= out[4] != 0;
 }
 
 // ── The register file ──
 
 Ppu::RegisterFile Ppu::register_file() const {
   return {t, r_.v, fine_x, write_latch, ctrl, mask, oam_addr, read_buffer};
-}
-
-// A PPU address's place in graph memory (ppu2c02/space.py).
-int32_t Ppu::graph_address(int addr) const {
-  addr &= 0x3FFF;
-  if (addr < 0x2000)
-    return addr;
-  if (addr < 0x3F00) {
-    const int table = (addr >> 10) & 3;
-    return 0x2000 + 0x400 * ((nt_map() >> (2 * table)) & 3) + (addr & 0x3FF);
-  }
-  return static_cast<int32_t>(0x3F00 + palette_index(addr));
 }
 
 // ── Clock ──
@@ -451,6 +472,13 @@ const vector<Ppu::EventAt>& Ppu::events_for(int line) {
     t[4].push_back({280, Ev::VCopy, 0});
     t[4].push_back({321, Ev::Prefetch, 0});
     t[4].push_back({339, Ev::OddSkip, 0});
+    for (auto& table : t)
+      for (int i = static_cast<int>(table.size()) - 2; i >= 0; --i) {
+        auto& e = table[static_cast<size_t>(i)];
+        const auto& next = table[static_cast<size_t>(i + 1)];
+        if (e.ev == Ev::Slot && next.ev == Ev::Slot && next.dot == e.dot + 8)
+          e.run = next.run + 1;
+      }
     return t;
   }();
   if (line < 240)
@@ -477,8 +505,19 @@ void Ppu::catch_up(int64_t dot) {
         return;
       }
       r_.pos = at;
-      ++r_.next_event;
-      process(e);
+      bool span = dry_ && !track_status_ && e.ev == Ev::Slot;
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+      span = span && engine_.ctx; // keep the independent literal-clock oracle
+#endif
+      if (span) {
+        const int count = static_cast<int>(std::min<int64_t>(e.run, 1 + (dot - at - 1) / 8));
+        const int consumed = preview_background(count, at);
+        r_.next_event += consumed;
+        r_.pos = at + 8 * (consumed - 1);
+      } else {
+        ++r_.next_event;
+        process(e);
+      }
       if (dry_stop_ >= 0)
         return;
       continue;
@@ -508,7 +547,17 @@ void Ppu::advance_line() {
 int64_t Ppu::next_frame_start() const {
   if (r_.line == prerender_line && r_.pos - r_.line_start >= 339)
     return r_.line_start + r_.line_len;
-  return r_.frame_start + frame_dots - (r_.odd && rendering_enabled() ? 1 : 0);
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+  if (!engine_.ctx)
+    return r_.frame_start + frame_dots - (r_.odd && rendering_enabled() ? 1 : 0);
+#endif
+  // Ask the same event expert used at dot 339. Its skip readout depends
+  // only on parity and mask; no preview or live state update is needed.
+  const auto event = static_cast<size_t>(ControlEvent::OddSkip);
+  const int in[control_inputs] = {static_cast<int>(event), mask, ctrl, r_.odd};
+  int out[control_outputs];
+  engine_.control_step(engine_.control_ctx, engine_.control_models[event], in, out);
+  return r_.frame_start + frame_dots - out[out_control_skip];
 }
 
 void Ppu::process(const EventAt& e) {
@@ -540,12 +589,10 @@ void Ppu::process(const EventAt& e) {
     }
     break;
   case Ev::VCopy:
-    if (rendering_enabled())
-      r_.v = static_cast<uint16_t>((r_.v & ~0x7BE0) | (t & 0x7BE0));
+    control(ControlEvent::VerticalCopy, dot, {});
     break;
   case Ev::OddSkip:
-    if (r_.odd && rendering_enabled())
-      r_.line_len = dots_per_line - 1;
+    control(ControlEvent::OddSkip, dot, {});
     break;
   case Ev::FrameDone:
     if (!dry_) {
@@ -556,20 +603,10 @@ void Ppu::process(const EventAt& e) {
     emit(PpuEvent::Idle, dot);
     break;
   case Ev::VBlank:
-    if (std::exchange(r_.vblank_suppressed, false))
-      break;
-    r_.vblank = true;
-    r_.vblank_set_dot = dot;
-    if (ctrl & 0x80)
-      r_.nmi_edge = true;
-    mark_status_change(dot);
+    control(ControlEvent::VBlank, dot, {});
     break;
   case Ev::Clear:
-    if (r_.vblank || r_.hit_dot != NEVER || r_.overflow_dot != NEVER)
-      mark_status_change(dot);
-    r_.vblank = false;
-    r_.vblank_set_dot = -1;
-    r_.hit_dot = r_.overflow_dot = NEVER;
+    control(ControlEvent::Clear, dot, {});
     break;
   }
 }
@@ -579,29 +616,72 @@ void Ppu::process(const EventAt& e) {
 // Dot 257: the next line's sprite buffer starts empty, v takes t's
 // horizontal bits and OAMADDR resets; false when not rendering.
 bool Ppu::start_sprite_line() {
-  if (r_.any_sprites)
-    r_.sprites.fill(0);
-  r_.any_sprites = r_.sprite0_on_line = false;
-  r_.sprite_slots = 0;
-  if (!rendering_enabled())
-    return false;
-  r_.v = static_cast<uint16_t>((r_.v & ~0x041F) | (t & 0x041F));
-  oam_addr = 0;
-  return true;
+  r_.sprites.fill(0);
+  r_.sprite_slots.fill(0);
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+  r_.sprite0_on_line = false;
+#endif
+  return control(ControlEvent::SpriteLine, r_.pos, {});
 }
 
-// A sprite row's 8 screen-ordered pixels (0 transparent) into the next
-// line's buffer at x: rows arrive in OAM order, and the first opaque
-// pixel at a position wins.
-void Ppu::draw_sprite_row(int x, span<const uint8_t, 8> row) {
-  for (int c = 0; c < 8 && x + c < 256; ++c) {
-    auto& pixel = r_.sprites[static_cast<size_t>(x + c)];
-    if (!row[c] || pixel)
-      continue;
-    pixel = row[c];
-    r_.any_sprites = true;
-    r_.sprite_slots |= 1U << ((x + c) >> 3);
-    r_.sprite0_on_line |= (row[c] & 0x80) != 0;
+// Pack bounded clock context, run the event circuit, and apply its state
+// and timestamp effects. Absolute clocks never enter the integer model.
+bool Ppu::control(ControlEvent event, int64_t dot, const RegisterResult& effects) {
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+  if (!engine_.ctx)
+    return reference_control(event, dot, effects);
+#endif
+  const int age = r_.vblank_set_dot < 0 ? -1 :
+      static_cast<int>(std::min<int64_t>(dot - r_.vblank_set_dot, 3));
+  int in[control_inputs] = {static_cast<int>(event), mask, ctrl, r_.odd,
+                static_cast<int>(dot - r_.frame_start), age,
+                r_.vblank, r_.vblank_suppressed, r_.nmi_edge, r_.nmi_delayed};
+  int* field = in + 10;
+  for (const int value : {int(t), int(r_.v)}) {
+    *field++ = value & 31;
+    *field++ = (value >> 5) & 31;
+    *field++ = (value >> 10) & 3;
+    *field++ = (value >> 12) & 7;
+  }
+  *field++ = oam_addr;
+  *field++ = effects.clear_vblank;
+  *field++ = effects.nmi_rise;
+  *field++ = effects.nmi_fall;
+  *field = r_.hit_dot != NEVER || r_.overflow_dot != NEVER;
+  int out[control_outputs];
+  engine_.control_step(engine_.control_ctx, engine_.control_models[static_cast<size_t>(event)], in, out);
+  r_.v = static_cast<uint16_t>(out[0] | (out[1] << 5) | (out[2] << 10) | (out[3] << 12));
+  oam_addr = static_cast<uint8_t>(out[4]);
+  r_.vblank = out[5] != 0;
+  r_.vblank_suppressed = out[6] != 0;
+  r_.nmi_edge = out[7] != 0;
+  r_.nmi_delayed = out[8] != 0;
+  if (out[9])
+    r_.vblank_set_dot = dot;
+  if (out[10])
+    r_.vblank_set_dot = -1;
+  if (out[11])
+    r_.hit_dot = r_.overflow_dot = NEVER;
+  if (out[12])
+    mark_status_change(dot);
+  if (event == ControlEvent::OddSkip)
+    r_.line_len = dots_per_line - out[out_control_skip];
+  return out[14] != 0;
+}
+
+// Transport ordered eight-pixel windows through the composition circuit.
+// Both bytes and occupancy return as state, including right-edge padding.
+void Ppu::compose_sprite_rows(const int* fetched, int count) {
+  for (int k = 0; k < count; ++k) {
+    const size_t x = static_cast<size_t>(fetched[out_sprite_x + k]);
+    int in[compose_inputs] = {static_cast<int>(x), r_.sprite_slots[x >> 3], r_.sprite_slots[(x >> 3) + 1]};
+    std::copy_n(fetched + k * 8, 8, in + 3);
+    std::copy_n(r_.sprites.data() + x, 8, in + 11);
+    int out[compose_outputs];
+    engine_.control_step(engine_.control_ctx, engine_.compose_model, in, out);
+    std::copy_n(out, 8, r_.sprites.data() + x);
+    r_.sprite_slots[x >> 3] = out[8];
+    r_.sprite_slots[(x >> 3) + 1] = out[9];
   }
 }
 
@@ -615,7 +695,22 @@ void Ppu::evaluate_sprites_graph(int64_t dot) {
     return; // only status changes and mapper bus clocks matter to a preview
   int in[evaluate_inputs] = {1, r_.line, ctrl, 0};
   int out[evaluate_outputs];
-  graph_step(engine_.sprites.evaluate[(ctrl & 0x20) ? 2 : 1], in, out);
+  auto& rows = sprite_rows_;
+  const int model = engine_.sprites.evaluate[(ctrl & 0x20) ? 2 : 1];
+  if (rows.oam_epoch != oam_epoch_ || rows.model != model) {
+    rows.valid.reset();
+    rows.oam_epoch = oam_epoch_;
+    rows.model = model;
+  }
+  const auto line = static_cast<size_t>(r_.line);
+  auto& row = rows.rows[line];
+  if (rows.valid[line]) {
+    std::copy(row.begin(), row.end(), out);
+  } else {
+    graph_step(model, in, out);
+    std::copy_n(out, row.size(), row.begin());
+    rows.valid[line] = true;
+  }
   r_.selected_count = out[0];
   for (int k = 0; k < out[0]; ++k)
     r_.selected[static_cast<size_t>(k)] = static_cast<uint8_t>(out[1 + k]);
@@ -677,8 +772,7 @@ void Ppu::load_sprites_graph(int64_t dot) {
   }
   for (int k = 0; k < 8; ++k)
     if (out[out_sprite_fetch + k]) {
-      a12(false, dot + 8 * k);
-      a12(out[out_sprite_a12 + k] != 0, dot + 8 * k + 4);
+      bus_event(BusEvent::Sprite, out[out_sprite_a12 + k] != 0, dot + 8 * k);
     }
   const bool latch_lo = out[out_sprite_latch] != 0, latch_hi = out[out_sprite_latch + 1] != 0;
   if (chr_latch_active &&
@@ -689,12 +783,7 @@ void Ppu::load_sprites_graph(int64_t dot) {
   }
   if (bus_only)
     return;
-  for (int k = 0; k < (status_only ? std::min(count, 1) : count); ++k) {
-    array<uint8_t, 8> row;
-    for (int c = 0; c < 8; ++c)
-      row[static_cast<size_t>(c)] = static_cast<uint8_t>(out[k * 8 + c]);
-    draw_sprite_row(out[out_sprite_x + k], row);
-  }
+  compose_sprite_rows(out, status_only ? std::min(count, 1) : count);
   if (status_only)
     return;
   // Debug rows past the hardware cap affect pixels only: no A12 edges
@@ -708,36 +797,52 @@ void Ppu::load_sprites_graph(int64_t dot) {
     in[in_latch + 1] = chr_latch_active && chr_latch.latch_fe[1];
     graph_step(chr_latch_active ? engine_.sprites.debug_fetch[(ctrl & 0x20) ? 1 : 0]
                                : models[1 + ((ctrl & 0x20) ? 9 : 0) + extra], in, out);
-    for (int k = 0; k < extra; ++k) {
-      array<uint8_t, 8> row;
-      for (int c = 0; c < 8; ++c)
-        row[static_cast<size_t>(c)] = static_cast<uint8_t>(out[k * 8 + c]);
-      draw_sprite_row(out[out_sprite_x + k], row);
-    }
+    compose_sprite_rows(out, extra);
   }
 }
 
 // ── Events ──
 
-// MMC3 counts A12 rises that follow at least ~3 CPU cycles of A12 low
-// (its M2 filter): once per line for the usual bg=$0000/sprites=$1000
-// split, never for the 4-dot dips between background fetches.
-bool Ppu::a12(bool high, int64_t dot) {
+// Deliver the neural bus packet. The host supplies only bounded clock
+// context and applies the returned timestamp and edge effects.
+bool Ppu::bus_event(BusEvent event, bool high, int64_t dot) {
   if (!wants_a12_)
     return false;
-  if (high) {
-    if (!r_.a12_high) {
-      r_.a12_high = true;
-      if (dot - r_.a12_low_since > 10) {
-        emit(PpuEvent::A12Rise, dot);
-        return true;
-      }
-    }
-  } else if (r_.a12_high) {
-    r_.a12_high = false;
+  const int age = static_cast<int>(std::clamp<int64_t>(dot - r_.a12_low_since, -1, 11));
+  const int in[]{static_cast<int>(event), r_.a12_high, age, high, ctrl,
+                 mmc5.active() && mmc5.extended_attributes()};
+  int out[4];
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+  if (!engine_.ctx)
+    reference_bus(in, out);
+  else
+#endif
+    engine_.control_step(engine_.control_ctx, engine_.bus_models[static_cast<size_t>(event)], in, out);
+  r_.a12_high = out[0] != 0;
+  if (out[1])
     r_.a12_low_since = dot;
+  if (out[2])
+    emit(PpuEvent::A12Rise, dot + out[3]);
+  return out[2] != 0;
+}
+
+void Ppu::refresh_mmc5_view() {
+  if (!mmc5.active())
+    return;
+  const int in[]{mmc5.exram_mode(), mmc5.fill_tile(), mmc5.fill_color(), ctrl};
+  int out[6];
+  if (!engine_.ctx) {
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+    reference_view(in, out);
+#else
+    // A mapper may configure storage before the PPU engine attaches.
+    // set_engine refreshes the descriptor before any graph can read it.
+    return;
+#endif
+  } else {
+    engine_.control_step(engine_.control_ctx, engine_.view_model, in, out);
   }
-  return false;
+  mmc5.apply_view(out);
 }
 
 void Ppu::emit(PpuEvent::Kind kind, int64_t dot) {

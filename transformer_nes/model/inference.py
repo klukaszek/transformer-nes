@@ -1,22 +1,7 @@
-"""Exact reference inference for a constructed WeightModel.
+"""Float64 reference inference with argmax attention and ReGLU residual blocks.
 
-A plain transformer forward, one token at a time, in float64: the input
-slots form the embedding, then each layer applies attention (in its
-argmax limit, over every token so far including this one; distinct keys
-never tie, and of equal keys the latest counts) and a ReGLU feed-forward
-block, both residual.  No position encoding.
-
-Two exact reductions keep it fast without changing any output:
-
-- A head whose query and key rows are the constant ``one`` scores every
-  token equally, so its winner is the current token (the passthrough and
-  erase heads the construction packs; ``head_kinds`` marks them).
-- A cached key that is equal to a newer one can never win again (equal
-  scores go to the later token), so it is replaced in place.  Memory
-  heads therefore hold one entry per written address.
-
-This is the reference the generated C++ engines are fast versions of,
-and it runs any graph built with model/weights.py.
+Equal attention scores select the latest token. Constant-key heads use the
+current token; replacing older equal keys bounds memory by written addresses.
 """
 
 from __future__ import annotations
@@ -65,8 +50,7 @@ class _HeadCache:
 
 
 class ExactInference:
-    def __init__(self, model: WeightModel, d_model: int):
-        self.d_model = d_model
+    def __init__(self, model: WeightModel):
         self.layers = []
         q_scale = HARD_K * math.sqrt(2.0)
         for li, attn in enumerate(model.attn):

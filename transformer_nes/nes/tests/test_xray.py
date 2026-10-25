@@ -37,7 +37,7 @@ def test_dissection_follows_an_instruction_through_the_layers():
     assert len(d["activity"]) == d["layers"]
     steps = {name: (row, kind, detail, value) for row, kind, name, detail, value in d["steps"]}
     # The opcode arrives by attention over memory, the result later.
-    fetch = steps["fetched_opcode_raw"]
+    fetch = steps["fetched_opcode"]
     assert fetch[1:] == ("attention", "mem[$8000]", 0xA9)
     assert steps["new_a"][3] == 0x42 and steps["new_a"][0] > fetch[0]
     # It ran on a copy: the machine has not moved.
@@ -69,3 +69,41 @@ def test_overlay_reuses_one_snapshot_until_the_next_emulated_frame():
     bridge.note_frame(0.003)
     assert bridge.xray_frame() is not first
     assert len(maps) == 2
+
+
+def test_overlay_collects_reads_only_while_observed():
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from transformer_nes.nes.debug import DebugBridge
+
+    calls = []
+
+    class Engine:
+        def xray_take(self):
+            calls.append("paths")
+            return [1, 0, 0, 0], np.zeros(256, dtype=int), [1, 0, 0, 0]
+
+        def xray_reads(self, enabled):
+            calls.append(enabled)
+            return np.ones(65536, dtype=np.uint32)
+
+    runtime = SimpleNamespace(engine=SimpleNamespace(engine=Engine()))
+    bridge = DebugBridge(None, "weights", cpu_runtime=runtime)
+    bridge.note_frame(0.001)
+    assert calls == [] and not bridge.cpu_frames
+    bridge.set_observing(True)
+    assert calls == ["paths", True]
+    bridge.note_frame(0.002)
+    assert len(bridge.cpu_frames) == 1 and bridge.read_heat.heat.sum() == 65536
+    before = list(calls)
+    bridge.set_observing(True)
+    assert calls == before and len(bridge.cpu_frames) == 1
+    bridge.set_observing(False)
+    assert calls[-2:] == ["paths", False]
+    before = list(calls)
+    bridge.note_frame(0.003)
+    assert calls == before and not bridge.cpu_frames
+    assert not bridge.read_heat.heat.any() and bridge.last_ms == 3
+

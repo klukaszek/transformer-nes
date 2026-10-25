@@ -1,7 +1,7 @@
 """Compile a fixed bank of transformer weights with PyTorch Inductor.
 
 The FX graph is a scalar expansion of the checkpoint's attention and ReGLU
-matrices, including their integer rounding points. Inductor folds immutable
+matrices, including integer rounding points or float32 residual arithmetic. Inductor folds immutable
 coefficients, removes dead residual slots and fuses each expert. No opcode
 semantics are supplied to this compiler.
 """
@@ -27,6 +27,10 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     Only declared ABI readouts escape; other residual slots are dead.
     """
     model, spec = expert["model"], expert.get("step_spec")
+    dtype = torch.float32 if expert.get("dtype") == "float32" else INT
+    floating = dtype == torch.float32
+    if floating and spec is not None:
+        raise ValueError("float32 circuits require a graph token input contract")
     f_bits = expert.get("fraction_bits", 1)
     scale = 1 << f_bits
     D = model.tok.weight.shape[1]
@@ -40,7 +44,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
 
     def const(v):
         if v not in constants:
-            constants[v] = op(torch.full, (1,), v, dtype=INT)
+            constants[v] = op(torch.full, (1,), v, dtype=dtype)
         return constants[v]
 
     zero = const(0)
@@ -68,7 +72,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
         for c, v in zip(weights, values, strict=True):
             if not c:
                 continue
-            term = v if c == 1 else op(operator.mul, v, int(c))
+            term = v if c == 1 else op(operator.mul, v, float(c) if floating else int(c))
             result = term if result is None else op(operator.add, result, term)
         return zero if result is None else result
 
@@ -85,7 +89,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     if trace:
         snapshots.append(op(torch.cat, state))
     for li in range(len(model.attn)):
-        a = layer_arrays(model, li)
+        a = layer_arrays(model, li, floating=floating)
         nvalues = len(a["read_kind"])
         qrows = len(a["w_in"]) - a["w_out"].shape[1] + nvalues
         projected = linear(a["w_in"], [state[s] for s in a["in_slots"]])
@@ -137,16 +141,19 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
             state[slot] = op(operator.add, state[slot], op(operator.add, r, v))
         projected = linear(a["w_ff"], [state[s] for s in a["ff_in_slots"]], a.get("h_ff"))
         nff = a["w_down"].shape[1]
-        acts = [
-            op(
-                torch.where,
-                op(operator.gt, gate, 0),
-                op(operator.rshift, op(operator.mul, gate, value), f_bits)
-                if f_bits else op(operator.mul, gate, value),
-                0,
-            )
-            for gate, value in zip(projected[:nff], projected[nff:], strict=True)
-        ]
+        acts = []
+        for gate, value in zip(projected[:nff], projected[nff:], strict=True):
+            if floating:
+                act = op(operator.mul, op(torch.relu, gate), value)
+            else:
+                product = op(operator.mul, gate, value)
+                act = op(
+                    torch.where,
+                    op(operator.gt, gate, 0),
+                    op(operator.rshift, product, f_bits) if f_bits else product,
+                    0,
+                )
+            acts.append(act)
         down = linear(a["w_down"], acts, a.get("h_down"))
         for slot, v in zip(a["ff_out_slots"], down, strict=True):
             state[slot] = op(operator.add, state[slot], v)
@@ -170,37 +177,22 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
             ]
         if trace:
             snapshots.append(op(torch.cat, state))
-    keep = set(expert.get("output_slots", ()))
-    if spec is not None:
-        keep.update(spec.get("outputs", {}).values())
-    if spec is not None and "sequence_final" in spec:
-        keep.update(spec["sequence_final"]["model"].values())
-    if spec is not None and "sequence_final" in spec:
-        keep.update(s for writes in spec["sequence_writes"] for pair in writes for s in pair)
-        keep.update(spec["sequence_cycles"]["model"])
-        for name in ("target_dimension", "predicate"):
-            slot = spec["sequence_control"][name]
-            if slot is not None:
-                keep.add(slot)
-        if spec["sequence_halt"] is not None:
-            keep.add(spec["sequence_halt"])
-    values = (
-        [state[s] for s in expert["output_slots"]]
-        if spec is None
-        else [v if i in keep else zero for i, v in enumerate(state)]
-    )
+    readout_slots = tuple(expert["output_slots"]) if not trace else None
+    values = [state[s] for s in readout_slots or ()]
     out = op(torch.cat, snapshots if trace else values)
     addresses = op(torch.cat, reads) if reads else op(torch.empty, (0,), dtype=INT)
     g.output((out, addresses))
     g.eliminate_dead_code()
     module = GraphModule({}, g)
     module.input_width = (D if spec else len(expert["input_slots"])) + (3 if ablation else 0)
+    module.readout_slots = readout_slots
     module.f_bits = f_bits
+    module.dtype = dtype
     return module
 
 
-def extract_kernel(source, index):
-    """Parse a single fused kernel's fixed int32 buffers and slice aliases.
+def extract_kernel(source, index, *, scalar="int32_t"):
+    """Parse a fused kernel's typed buffers and fixed slice aliases.
 
     Input pointers bind to residual/RAM; returned buffers bind to out/reads;
     intermediate buffers get local stack storage. Reject unfamiliar layouts
@@ -266,7 +258,7 @@ def extract_kernel(source, index):
                 size = math.prod(ast.literal_eval(v.args[0]))
                 sizes[name] = size
                 assert isinstance(v.args[2], ast.Attribute)
-                types[name] = {"int32": "int32_t", "int64": "int64_t", "bool": "bool"}[
+                types[name] = {"int32": "int32_t", "int64": "int64_t", "bool": "bool", "float32": "float"}[
                     v.args[2].attr
                 ]
                 buffers[name] = (name, 0)
@@ -335,7 +327,7 @@ def extract_kernel(source, index):
             )
             dispatch.append(f"    {name}({', '.join(values)});")
     generated = "\n".join(helpers) + (
-        f"\nvoid circuit_{index}(const int32_t* x, const uint8_t* ram, int32_t* out, int32_t* reads) {{\n"
+        f"\nvoid circuit_{index}(const {scalar}* x, const uint8_t* ram, {scalar}* out, int32_t* reads) {{\n"
         + "\n".join(declarations)
         + "\n"
         + "\n".join(dispatch)
@@ -373,6 +365,10 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
     from torch._inductor.utils import get_code
 
     bodies, metadata, includes = [], [], set()
+    dtypes = {expert.get("dtype", "int32") for expert in experts}
+    if len(dtypes) != 1 or not dtypes <= {"int32", "float32"}:
+        raise ValueError("a weight bank requires one numeric type")
+    scalar = "float" if dtypes == {"float32"} else "int32_t"
     compiled = {}
     for index, expert in enumerate(experts):
         module = weight_module(expert, memory_size=memory_size, trace=trace, ablation=ablation)
@@ -397,7 +393,7 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
             metadata.append(compiled[key])
             continue
         example = (
-            torch.zeros(module.input_width, dtype=INT),
+            torch.zeros(module.input_width, dtype=module.dtype),
             torch.zeros(memory_size, dtype=torch.uint8),
         )
         with torch._inductor.config.patch(INDUCTOR_CONFIG):
@@ -411,11 +407,12 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
         if len(wrappers) != 1:
             raise RuntimeError(f"expert {index}: expected one fused Inductor wrapper")
         try:
-            body, headers, meta = extract_kernel(wrappers[0], index)
+            body, headers, meta = extract_kernel(wrappers[0], index, scalar=scalar)
         except (AssertionError, ValueError, AttributeError, StopIteration) as error:
             raise RuntimeError(f"expert {index}: unsupported Inductor buffer layout") from error
         bodies.append(body)
         meta["circuit"] = index
+        meta["input_width"] = module.input_width
         compiled[key] = meta
         metadata.append(meta)
         includes.update(header.strip() for header in headers)
@@ -429,8 +426,10 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
     hook = runtime + "\n" + adapter
     for name, value in {
         "@ENTRIES@": entries,
+        "@SCALAR@": scalar,
         "@MAX_WIDTH@": str(max(meta["width"] for meta in metadata)),
         "@MAX_AUX@": str(max(1, max(meta["reads"] for meta in metadata))),
+        "@INPUT_WIDTHS@": ", ".join(str(meta["input_width"]) for meta in metadata),
     }.items():
         hook = hook.replace(name, value)
     return "\n".join(sorted(includes)) + "\n" + "\n".join(bodies) + "\n" + hook

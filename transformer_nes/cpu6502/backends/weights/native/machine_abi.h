@@ -3,15 +3,16 @@
 // Shared by the generated CPU engine and native NES console. The function
 // table and run receipt cross a module boundary; change both with this version.
 namespace cpu_engine {
-constexpr int abi_version = 1;
+constexpr int abi_version = 2;
+constexpr int read_lease_capacity = 4;
 struct RunOut {
   const char* reason;
   long cycles;
   int read_addr;
   long read_cycles;
-  int pause_ir;
   const int* hit_addr;
   const int* hit_value;
+  const int* hit_original; // -1: ordinary write; 0..255: neural RMW operand
   long n_hits;
 };
 struct Abi {

@@ -87,7 +87,7 @@ void Console::run_until(int64_t target) {
 // that must interrupt it -- vblank (NMI), the frame's end, or the
 // mapper IRQ a PPU dry run predicts.  Sprite-0 hits and every other
 // PPU-visible effect are resolved lazily at the access that sees them.
-Ppu::Frame Console::run_frame() {
+const Ppu::Frame& Console::run_frame() {
   const int64_t start = ppu.frame_start();
   while (!halted) {
     ppu.catch_up(cycles * 3);
@@ -109,7 +109,7 @@ Ppu::Frame Console::run_frame() {
     machine.clear_read_lease();
   }
   ++frame_index;
-  last_audio = apu.take_samples();
+  apu.take_samples(last_audio);
   irq_.set(IRQ_APU, apu.irq_pending());
   return ppu.completed_frame();
 }

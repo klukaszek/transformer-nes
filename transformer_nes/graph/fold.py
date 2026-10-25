@@ -7,9 +7,7 @@ persists inline, and backward liveness from the output tokens plus
 ``root_names`` keeps the rest.  Folded-away roots come back as named
 persists so readout slots always resolve by name.
 
-Surviving ops keep their union names, and LookUps carry provenance
-(``union_lookup_of``, ``memory_group``) so engines share attention state
-across folds.  That contract is checked, not assumed: a lookup whose
+Surviving ops keep their names and memory-group annotations. A lookup whose
 insert-side expressions can reach a pin is reported in
 ``FoldResult.insert_side_hazards`` for the caller to refuse.
 
@@ -157,13 +155,12 @@ def walk_live(
 
 class GraphMaterializer:
     """Translate live folded union dims into the fresh graph context.
-    Lookup provenance accumulates across per-step calls.
+    Pinning hazards accumulate across per-step calls.
     Lookup deduplication is per call, so each
     sequence step gets its own lookup instances."""
 
     def __init__(self, structural_reads: bool = False):
         self.structural_reads = structural_reads
-        self.union_lookup_of: dict[int, int] = {}
         self.insert_side_hazards: list[str] = []
 
     def materialize(self, all_dims, live, val, folded, lookup_exprs, sub, tr,
@@ -212,10 +209,7 @@ class GraphMaterializer:
                         )
                     if wanted_bits:
                         read = next(iter(expr.terms)).memory_read
-                        fused_reads[d] = (
-                            read,
-                            {j: read.dims[2 + i] for i, j in enumerate(wanted_bits)},
-                        )
+                        fused_reads[d] = {j: read.dims[2 + i] for i, j in enumerate(wanted_bits)}
                     nd = PersistDimension(expr, name=name_of(d.name))
                     sub[d] = Expression({nd: 1})
                     continue
@@ -223,7 +217,7 @@ class GraphMaterializer:
                 if rb is not None and rb[0] in fused_reads:
                     # This bit's read serves it directly: substitute the
                     # fused lookup's bit value; the ladder never builds.
-                    _read, bit_dims = fused_reads[rb[0]]
+                    bit_dims = fused_reads[rb[0]]
                     sub[d] = Expression({bit_dims[rb[1]]: 1})
                     continue
                 (e,) = folded[d]
@@ -250,7 +244,6 @@ class GraphMaterializer:
                 )
                 nlu.name = name_of(lu.name)
                 nlu.memory_group = lu.memory_group
-                self.union_lookup_of[nlu.id] = lu.id
                 for ud, ndim in zip(lu.dims, nlu.dims, strict=True):
                     ndim.name = name_of(ud.name)
                     sub[ud] = Expression({ndim: 1})
@@ -291,21 +284,16 @@ def masked_exact_read(addr, byte_value, write_addr, is_write, *,
 
 @dataclass
 class FoldResult:
-    """A rebuilt graph plus the provenance an engine needs to share state."""
+    """A rebuilt graph, named roots and checked pinning hazards."""
 
     label: str
     program_graph: ProgramGraph
-    # First-seen name -> dim in the *new* graph (mirrors dim_id_by_name).
+    # First-seen name -> dim in the rebuilt graph.
     dim_of_name: dict[str, Dimension]
-    # New LookUp id -> union LookUp id.
-    union_lookup_of: dict[int, int]
     # Union lookup names whose insert-side expressions can reach a pinned
     # gate: inserting through such a lookup would put pin-dependent history
     # into state shared across experts.  Empty for the 6502 decode pins.
     insert_side_hazards: tuple[str, ...]
-    # Sequence folds: number of composed steps (root/readout names carry a
-    # __s<k> suffix per step; step-0 input dims keep their canonical names).
-    n_steps: int = 1
 
 
 class GraphFolder:
@@ -485,6 +473,5 @@ class GraphFolder:
             label=label,
             program_graph=new_pg,
             dim_of_name=dim_of_name,
-            union_lookup_of=mat.union_lookup_of,
             insert_side_hazards=tuple(mat.insert_side_hazards),
         )

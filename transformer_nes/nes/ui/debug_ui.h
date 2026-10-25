@@ -50,7 +50,8 @@ struct DebugHooks {
   std::function<std::vector<std::pair<std::string, bool>>()> options;
   std::function<void(const std::string& name, bool value)> set_option;
   std::function<void()> step_frame;
-  std::function<XrayFrame()> xray_frame;
+  std::function<void(bool)> set_observing;
+  std::function<const XrayFrame&()> xray_frame;
   // The next instruction through the full CPU model.
   std::function<Dissection()> dissect;
   // Ask for the slot under (line, x) when it is next drawn, then poll.
@@ -69,6 +70,7 @@ struct UiState {
   // first nametable column, which an 8-pixel overscan crop would remove.
   bool crop = false;
   bool xray = false;      // start with the X-ray section expanded
+  bool xray_visible = false;
   bool tint_game = false; // the expert map over the game picture
   // Where the game picture lands, in ImGui points (set by the app).
   float game_x = 0, game_y = 0, game_w = 0, game_h = 0;

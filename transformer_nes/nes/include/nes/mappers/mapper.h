@@ -3,6 +3,7 @@
 #include "nes/bus.h"
 #include "nes/cartridge.h"
 #include "nes/chr.h"
+#include "nes/mappers/irq.h"
 #include "nes/ppu.h"
 
 #include <algorithm>
@@ -17,6 +18,8 @@
 #include <vector>
 
 namespace transformer_nes::nes {
+
+struct BankControl;
 
 using std::array;
 using std::optional;
@@ -48,17 +51,24 @@ class Mapper : public PpuWatcher {
 public:
   explicit Mapper(Cartridge cart) : cart_(std::move(cart)) {}
   ~Mapper() override = default;
+  span<const uint8_t> prg_rom() const { return cart_.prg; }
+  vector<uint8_t> take_chr() { return std::exchange(cart_.chr, {}); }
   virtual bool banked() const { return false; }
   virtual vector<uint8_t> cpu_image() const = 0;
   virtual int read(int) { throw std::runtime_error("mapper range is write-only"); }
   virtual void write(int, int) { throw std::runtime_error("mapper is not writable"); }
-  virtual void write_rmw(int addr, int value) { write(addr, value); }
+  virtual void write_rmw(int addr, int value, int original) {
+    (void)original;
+    write(addr, value);
+  }
   virtual vector<pair<int, int>> register_ranges() const { return {}; }
   // Whether the PPU should report A12 rises (costs a little per fetch).
   virtual bool wants_a12() const { return false; }
-  // A copy of the IRQ counter that predicts, over a PPU dry run, when
-  // the IRQ fires; null when no IRQ can fire.
+  // A private neural IRQ deadline consumed over a PPU dry run;
+  // null when no prediction is needed.
   virtual std::unique_ptr<IrqProbe> irq_probe() const { return nullptr; }
+  virtual MapperIrq* irq_state() { return nullptr; }
+  virtual BankControl* bank_state() { return nullptr; }
 
   void connect(MapperHost host) {
     host_ = host;
@@ -70,6 +80,12 @@ protected:
   MapperHost host_;
 
   virtual void on_connected() {}
+
+  void irq_event(MapperIrq& state, MapperIrq::Event event, int value = 0) {
+    state.apply(event, value);
+    if (state.irq_write)
+      host_.irq->set(IRQ_MAPPER, state.level);
+  }
 
   void repair(int addr, int value) { host_.machine->poke(addr, value & 0xFF); }
   void map_region(int base, span<const uint8_t> data) { host_.machine->map_region(base, data); }

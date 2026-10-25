@@ -1,6 +1,6 @@
-"""Project transformer layer weights into the exact integer runtime layout.
+"""Project transformer weights into integer or memory-free float32 layouts.
 
-Attention queries are shared by identical projection. Whole and half
+Integer attention queries are shared by identical projection. Whole and half
 coefficients remain separate so each matrix keeps its own rounding point.
 """
 
@@ -44,7 +44,7 @@ def share_queries(w_in, w_out, read_kind):
     return projected, out.to(w_out.dtype), torch.tensor(routes, dtype=torch.int32).reshape(-1, 2)
 
 
-def layer_arrays(model, li: int) -> dict:
+def layer_arrays(model, li: int, *, floating: bool = False) -> dict:
     """Layer `li` of a folded model in expert_runner.layer's form (as
     expert_runner.ExpertLayer cuts it from the exported checkpoint)."""
     attn, heads = model.attn[li], model.attn[li].num_heads
@@ -55,6 +55,24 @@ def layer_arrays(model, li: int) -> dict:
     # 4H + 2h, + 1; its output, out-projection columns 2h, 2h + 1.  No
     # head needs its keys.  In units of a half, the engine's fixed point.
     memory = [h for h in range(heads) if kinds[h] == LOOKUP and groups[h] != NO_MEMORY_GROUP]
+    if floating:
+        if memory:
+            raise ValueError("float32 circuits require memory-free attention")
+        passes = [2 * h + c for h in range(heads) if kinds[h] == PASSTHROUGH for c in range(2)]
+        w_in = attn.in_proj_weight[[4 * heads + c for c in passes]]
+        w_out = attn.out_proj.weight[:, passes]
+        w_ff, w_down = model.ff_in[li].weight, model.ff_out[li].weight
+        ins, outs = touched(w_in, 0), touched(w_out, 1)
+        ff_ins, ff_outs = touched(w_ff, 0), touched(w_down, 1)
+        return {
+            "in_slots": ins, "out_slots": outs,
+            "ff_in_slots": ff_ins, "ff_out_slots": ff_outs,
+            "read_kind": np.empty((0, 2), dtype=np.int32),
+            "w_in": w_in[:, ins].astype(np.float32),
+            "w_out": w_out[outs].astype(np.float32),
+            "w_ff": w_ff[:, ff_ins].astype(np.float32),
+            "w_down": w_down[ff_outs].astype(np.float32),
+        }
     if any(groups[h] >= 0 for h in memory):
         raise ValueError("Torch models require structural memory reads before scheduling")
     reads = [2 * h + c for h in memory for c in range(2)]

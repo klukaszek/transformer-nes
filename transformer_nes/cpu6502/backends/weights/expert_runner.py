@@ -1,24 +1,7 @@
-"""Run the exported folded 6502 experts as a mixture of small PyTorch
-transformers, routed by opcode.
+"""Run exported opcode/interrupt experts with PyTorch and safetensors.
 
-The union checkpoint (checkpoint_runner.py) is the whole 6502 in one
-63-layer model.  ``6502-export --experts`` writes what the generated
-engine actually runs instead: one small model per opcode (and per
-interrupt), each the union graph partially evaluated with that opcode
-pinned -- a handful of layers and a few hundred weights.  Running them is
-a mixture of experts whose router is the byte at PC.
-
-Two things make an expert cheap besides its size, both in experts.json:
-
-- its memory reads are *structural*: a lookup head's query names one
-  address (``qx / qy``), so it reads that byte -- or the address, or one
-  of the byte's bits -- from a flat memory, and a write is an assignment;
-- its ``step_spec`` is the instruction's ABI: which registers it reads,
-  which outputs are the next registers, flags, writes, control flow,
-  halt and cycle count (folded to constants where the opcode decides
-  them).
-
-Like checkpoint_runner.py this imports only torch and safetensors.
+The PC byte routes execution. Declared memory queries read the byte image;
+step_spec supplies the embedding and architectural readout contract.
 """
 
 from __future__ import annotations
@@ -38,7 +21,8 @@ INT = torch.int32
 PASSTHROUGH, LOOKUP = 2, 1
 FLAG_MASKS = {"p_c": 0x01, "p_z": 0x02, "p_i": 0x04, "p_d": 0x08,
               "p_b": 0x10, "p_v": 0x40, "p_n": 0x80}
-REGISTERS = {"new_a": "a", "new_x": "x", "new_y": "y", "new_s": "s"}
+REGISTERS = {"new_pc": ("pc", 0xFFFF), "new_a": ("a", 0xFF), "new_x": ("x", 0xFF),
+             "new_y": ("y", 0xFF), "new_s": ("s", 0xFF)}
 
 
 def dense(tensors: dict, name: str, rows: int, cols: int) -> torch.Tensor:
@@ -145,20 +129,11 @@ def attention_read(memory: torch.Tensor, address: torch.Tensor,
 
 def layer(x, memory, shift, in_slots, w_in, read_kind, out_slots, w_out, ff_in_slots, w_ff,
           ff_out_slots, w_down, h_out=None, h_ff=None, h_down=None, *, read=indexed_read):
-    """One layer on residual `x`, and each distinct query's read address.
+    """Apply one layer and return its distinct memory-read addresses.
 
-    Query pairs are projected/read once. read_kind routes each live value
-    channel to its query and selects the byte, address or bit (-1 where a
-    query names no address in the returned read-address array).
-
-    Neither kind of head needs keys: a passthrough head's output is its
-    own value, and a memory head's query s * [address, 1] names the byte
-    attention picks. w_in projects distinct queries, then passthrough values;
-    w_out takes live memory channels, then passthrough values. w_ff is the
-    ReGLU's gates, then its values. A layer also reads and writes few of
-    the residual's slots: each projection has only the slots it reads
-    (gathered) and writes (added back).  Memory heads read through `read`:
-    indexed_read, or attention_read, which it equals."""
+    Projections touch only live slots. read_kind selects each query's byte,
+    address or bit; w_ff holds ReGLU gates followed by values.
+    """
     n_values = read_kind.shape[0]
     query_rows = w_in.shape[0] - w_out.shape[1] + n_values
     projected = linear(w_in, x[in_slots])
@@ -254,23 +229,15 @@ class Expert(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, memory: torch.Tensor, shift: int,
                 read=indexed_read) -> torch.Tensor:
-        return self.forward_reads(x, memory, shift, read)[0]
-
-    def forward_reads(self, x: torch.Tensor, memory: torch.Tensor, shift: int,
-                      read=indexed_read) -> tuple[torch.Tensor, torch.Tensor]:
-        """The forward, and each memory head's address, layer by layer
-        (layer())."""
-        reads = []
         for expert_layer in self.layers:
-            x, addresses = expert_layer(x, memory, shift, read)
-            reads.append(addresses)
-        return x, torch.cat(reads) if reads else torch.zeros(0, dtype=INT)
+            x, _addresses = expert_layer(x, memory, shift, read)
+        return x
 
 
 class Cpu:
     """The 6502 as routed expert forwards over a flat 64 KiB memory.  Every
-    read of it -- the experts' memory heads, the router's opcode byte, the
-    control ABI's operand bytes -- goes through `memory_read`
+    read of it -- the experts' memory heads and the router's opcode byte
+    -- goes through `memory_read`
     (indexed_read, or attention_read, which it equals)."""
 
     def __init__(self, checkpoint: str, image: bytes, pc: int, *, s: int = 0xFD, p: int = 0x24,
@@ -278,6 +245,8 @@ class Cpu:
         self.memory_read = memory_read
         with open(os.path.join(checkpoint, "experts.json")) as f:
             meta = json.load(f)
+        if meta.get("execution_abi") != 3:
+            raise ValueError("unsupported expert execution ABI; export a new checkpoint")
         tensors = load_file(os.path.join(checkpoint, "expert_weights.safetensors"))
         self.shift = meta["scale_bits"]
         experts = [Expert(tensors, m) for m in meta["experts"]]
@@ -308,11 +277,11 @@ class Cpu:
             return int(x[slot]) >> shift
 
         final = spec["sequence_final"]
-        for name, register in REGISTERS.items():
+        for name, (register, mask) in REGISTERS.items():
             if name in final["model"]:
-                st[register] = read(final["model"][name]) & 0xFF
+                st[register] = read(final["model"][name]) & mask
             elif name in final["constant"]:
-                st[register] = final["constant"][name] & 0xFF
+                st[register] = final["constant"][name] & mask
         for name, mask in FLAG_MASKS.items():
             if name in final["model"]:
                 bit = read(final["model"][name]) & 1
@@ -321,44 +290,18 @@ class Cpu:
             else:
                 continue
             st["p"] = (st["p"] & ~mask) | (mask if bit else 0)
-        st["pc"] = self.successor(spec["sequence_control"], pc, read) & 0xFFFF
         if spec["sequence_halt"] is not None:
             st["halted"] = read(spec["sequence_halt"]) & 1
         for step_writes in spec["sequence_writes"]:
-            for addr_slot, value_slot in step_writes:
-                memory[read(addr_slot) & 0xFFFF] = read(value_slot) & 0xFF
+            for write in step_writes:
+                memory[read(write["address"]) & 0xFFFF] = read(write["value"]) & 0xFF
         cycles = spec["sequence_cycles"]
-        return cycles["constant"] + sum(read(slot) & 0xFF for slot in cycles["model"])
+        return cycles["constant"] + sum(read(slot) for slot in cycles["model"])
 
     def peek(self, address: int) -> int:
         """One byte of memory, read as the experts read it."""
         byte, _valid = self.memory_read(self.memory, torch.tensor([address & 0xFFFF], dtype=INT))
         return int(byte[0])
-
-    def successor(self, control: dict, pc: int, read) -> int:
-        """The next PC from the expert's control ABI (an operand byte, a
-        model output, or a fixed offset; branches by the flag they test)."""
-        if control["target_dimension"] is not None:
-            target = fallthrough = read(control["target_dimension"])
-        elif control["absolute_operand_offset"] is not None:
-            at = pc + control["absolute_operand_offset"]
-            target = fallthrough = self.peek(at) | self.peek(at + 1) << 8
-        elif control["relative_to_head"]:
-            fallthrough, target = pc + control["fallthrough"], pc + control["target"]
-        else:
-            fallthrough, target = control["fallthrough"], control["target"]
-        if control["relative_operand_offset"] is not None:
-            offset = self.peek(pc + control["relative_operand_offset"])
-            target = pc + control["fallthrough"] + (offset - 256 if offset >= 128 else offset)
-        if control["flag_mask"]:
-            mask = control["flag_mask"]
-            taken = (self.state["p"] & mask) == (mask if control["flag_value"] else 0)
-        elif control["predicate"] is not None:
-            taken = read(control["predicate"]) & 1
-        else:
-            return fallthrough
-        return target if taken else fallthrough
-
 
 def nestest(checkpoint: str, rom: str, log: str, steps: int | None = None, *,
             attention: bool = False) -> int:

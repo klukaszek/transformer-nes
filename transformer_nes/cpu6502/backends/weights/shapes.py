@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 from transformer_nes.cpu6502.spec import OPCODES
-
-SEQUENCE_WRITERS = frozenset({"sax", "jsr", "brk", "rti", "rts", "pla", "plp"})
+from transformer_nes.graph.core import (
+    InputDimension,
+    ProgramGraph,
+    construction,
+    current_graph,
+    persist,
+    reglu,
+    stepglu,
+)
 
 # Canonical window shapes compile once into the core engine with pc and every
 # operand byte symbolic. Entries are (name, template, spin_repeat); operands
@@ -60,6 +67,36 @@ def match_shape_windows(image, shapes_meta, *, base: int = 0, limit: int = 4096)
 POLL_PREFIXES = {("load_a",), ("bit",), ("load_a", "and")}
 COUNTERS = {"inx": (1, 1), "iny": (2, 1), "dex": (1, -1), "dey": (2, -1)}
 POLL_BRANCHES = {"bne", "beq", "bpl", "bmi", "bvc", "bvs"}
+
+
+@construction
+def counter_recurrence_graph(register: str, delta: int) -> ProgramGraph:
+    """A closed byte-counter loop, advanced within a supplied iteration limit.
+
+    The first instruction shape has already run and closed its branch, so
+    the incoming counter is nonzero. Stop before its zero/exit iteration;
+    that iteration retains the instruction graph's different branch timing.
+    """
+    counter = InputDimension(f"in_{register}")
+    limit = InputDimension("in_loop_limit")
+    cycles = InputDimension("in_loop_cycles")
+    result = persist(
+        1 + reglu(1, counter - limit - 1)
+        if delta < 0 else counter + limit - reglu(1, counter + limit - 255),
+        name=f"new_{register}",
+    )
+    iterations = persist(delta * (result - counter), name="loop_iterations")
+    outputs = {
+        "counter": result,
+        "p_z": persist(1 - stepglu(1, result - 1), name="loop_z"),
+        "p_n": persist(stepglu(1, result - 128), name="loop_n"),
+        "cycles": persist(reglu(cycles, iterations), name="loop_elapsed"),
+        "iterations": iterations,
+    }
+    return current_graph().capture(
+        {"STATE": counter + limit + cycles},
+        outputs,
+    )
 
 
 def shape_loop(opcode_checks, length: int) -> list[int]:

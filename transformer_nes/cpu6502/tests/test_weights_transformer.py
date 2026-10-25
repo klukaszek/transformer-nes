@@ -33,6 +33,62 @@ def lockstep_vs_reference(trace, image):
         }, f"step {i} writes"
 
 
+@pytest.mark.parametrize("union_only", [False, True])
+def test_write_effects_carry_rmw_operands_without_host_opcode_decoding(union_only):
+    from transformer_nes.cpu6502.spec import MODE_ACCUMULATOR, OPCODES
+
+    machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only)
+    machine.engine.shapes_meta = []
+    rmw_operations = {"inc", "dec", "asl", "lsr", "rol", "ror", "dcp", "isb", "slo", "rla", "sre", "rra"}
+    for op in OPCODES.values():
+        for value in (0, 1, 127, 128, 254, 255):
+            image = bytearray(65536)
+            image[0x0400:0x0403] = bytes((op.byte, 0x20, 0x60))
+            ref = reference.Cpu6502(memory=image, bcd_enabled=False)
+            ref.pc, ref.a, ref.x, ref.y, ref.p = 0x0400, 0xA5, 3, 5, 0x24 | (value & 1)
+            lo, hi, _ = ref.read_operand(op)
+            address = ref.resolve_ea(op, lo, hi)
+            if op.mode != MODE_ACCUMULATOR:
+                ref.write_memory(address, value)
+            machine.load_image(bytes(ref.memory), start_pc=ref.pc)
+            machine.engine.set_run_state(ref.pc, ref.a, ref.x, ref.y, ref.s, ref.p, 0, 0, 0, 0, 0, 0)
+            machine.watch_write(0, 65535)
+            expected = ref.step().writes
+            actual = machine.run(1, trace=bool(value & 1))
+            receipt = list(zip(actual["hit_addr"], actual["hit_value"], actual["hit_original"], strict=True))
+            assert receipt == [(w.addr, w.value, w.original) for w in expected], (op, value)
+            rmw = op.operation in rmw_operations and op.mode != MODE_ACCUMULATOR
+            assert [original for _, _, original in receipt] == ([value] if rmw else [-1] * len(receipt))
+            if value & 1:
+                assert actual["w_original"].tolist() == [w.original for w in expected]
+
+
+@pytest.mark.parametrize("union_only", [False, True])
+@pytest.mark.parametrize("trace", [False, True])
+def test_rmw_receipt_uses_the_serviced_reply_after_code_changes(union_only, trace):
+    image = bytearray(65536)
+    image[0x0400:0x0403] = bytes.fromhex("ee00d0")  # INC $D000
+    image[0xFFFA:0xFFFC] = bytes.fromhex("0005")
+    machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only)
+    machine.load_image(image, start_pc=0x0400)
+    machine.watch_read(0xD000, 0xD000)
+    machine.watch_write(0xD000, 0xD000)
+    request = machine.run(1, trace=trace)
+    assert request["reason"] == "watch_read" and not len(request["hit_original"])
+    # The device reply changes code and raises NMI before completion.
+    machine.inject_write(0x0400, 0x8D)  # memory now says STA, not INC
+    machine.inject_write(0xD000, 0xFE)
+    machine.set_nmi()
+    out = machine.run(1, trace=trace)
+    assert out["hit_original"].tolist() == [0xFE]
+    assert out["hit_value"].tolist() == [0xFF]
+    assert machine.read_ram(0xD000) == 0xFF and machine.get_state()["pc"] == 0x0403
+    machine.watch_write(0x0100, 0x01FF)
+    interrupt = machine.run(1, trace=trace)
+    assert interrupt["hit_original"].tolist() == [-1, -1, -1]
+    assert machine.get_state()["pc"] == 0x0500
+
+
 @pytest.mark.slow
 def test_transformer_weights_match_reference():
     machine = Cpu6502TransformerMachine(bcd=False)
@@ -356,6 +412,47 @@ def test_compact_stack_and_control_match_reference():
     assert machine.dump_ram() == bytes(ref.memory)
 
 
+def test_neural_next_pc_covers_branch_and_address_wrap_boundaries():
+    """Untraced experts decide control even when operands and targets wrap.
+
+    NOP also needs a forward: advancing its PC is neural work, despite
+    preserving every byte register and flag.
+    """
+    machine = Cpu6502TransformerMachine()
+    machine.engine.shapes_meta = []
+    cases = [
+        (head, bytes([opcode, offset]), flags)
+        for opcode in (0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0)
+        for flags in (0x24, 0xE7)
+        for head in (0, 0x00FE, 0x7FFF, 0xFFFE, 0xFFFF)
+        for offset in (0, 1, 0x7F, 0x80, 0xFE, 0xFF)
+    ]
+    cases += [
+        (head, code, 0x24)
+        for head in (0xFFFE, 0xFFFF)
+        for code in (b"\xea", b"\xa9\x42", b"\x4c\xff\xff", b"\x4c\x00\x00")
+    ]
+    calls_before = machine._torch_forwards.counts[0]
+    for head, code, flags in cases:
+        image = bytearray(65536)
+        for offset, byte in enumerate(code):
+            image[(head + offset) & 0xFFFF] = byte
+        ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
+        ref.pc, ref.p = head, flags
+        cycles = reference.instruction_cycles(
+            ref, reference.opcode_for(code[0]), head, ref.x, ref.y, flags
+        )
+        ref.step()
+        machine.load_image(image, start_pc=head)
+        machine.engine.set_run_state(head, 0, 0, 0, 0xFD, flags, 0, 0, 0, 0, 0, 0)
+        result = machine.run(1, trace=False)
+        actual = machine.get_state()
+        assert (actual["pc"], actual["a"], actual["p"], result["cycles"]) == (
+            ref.pc, ref.a, ref.p, cycles
+        ), (head, code.hex(), flags)
+    assert machine._torch_forwards.counts == (calls_before + len(cases), 0)
+
+
 @pytest.mark.slow
 def test_full_trace_interrupt_uses_union_receipt():
     image = bytearray(0x10000)
@@ -405,6 +502,7 @@ def test_full_trace_interrupt_uses_union_receipt():
     assert list(zip(out["w_addr"], out["w_value"], strict=True)) == [
         (write.addr, write.value) for write in expected.writes
     ]
+    assert out["w_original"].tolist() == [-1, -1, -1]
 
 
 @pytest.mark.slow

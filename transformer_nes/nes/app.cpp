@@ -1,11 +1,8 @@
-// Native NES app: a Sokol window over the console frame loop.  The
-// window, input, audio, and one textured quad live here; display frames
-// call back into Python (Console.run_frame via app.py) at the NTSC rate
-// and blit the returned 256x240 palette indices.  Metal on Apple, GL
-// elsewhere (ui/sokol_platform.h).
+// Sokol window, input and audio over the console frame callback.
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -48,6 +45,14 @@ constexpr int view_width = 240;
 constexpr int view_height = 224;
 // NTSC: 29,781 CPU cycles per frame at 1.789773 MHz.
 constexpr double nes_frame_seconds = 29'781.0 / 1'789'772.727272727;
+constexpr auto rgba_palette = [] {
+  array<uint32_t, 64> colors{};
+  for (size_t i = 0; i < colors.size(); ++i) {
+    const auto* rgb = transformer_nes::nes::NES_PALETTE.data() + 3 * i;
+    colors[i] = std::bit_cast<uint32_t>(array<uint8_t, 4>{rgb[0], rgb[1], rgb[2], 255});
+  }
+  return colors;
+}();
 
 // Button bit i == console.BUTTONS[i].
 enum Button : uint32_t {
@@ -128,7 +133,8 @@ struct AppState {
   double last_emulate_seconds = 0.0;
   double last_present_seconds = 0.001;
   bool have_frame = false;
-  array<uint8_t, frame_height * frame_width * 4> rgba{};
+  bool observing = false;
+  array<uint32_t, frame_height * frame_width> rgba{};
   sg_image image{};
   sg_view view{};
   sg_sampler sampler{};
@@ -210,14 +216,9 @@ bool emulate_frame() {
     throw std::runtime_error("frame callback must return (240, 256) uint8 indices");
   }
   const uint8_t* src = arr.data();
-  uint8_t* dst = state->rgba.data();
-  for (int i = 0; i < frame_width * frame_height; ++i) {
-    const uint8_t* color = transformer_nes::nes::NES_PALETTE.data() + (src[i] & 0x3F) * 3;
-    dst[4 * i + 0] = color[0];
-    dst[4 * i + 1] = color[1];
-    dst[4 * i + 2] = color[2];
-    dst[4 * i + 3] = 0xFF;
-  }
+  uint32_t* dst = state->rgba.data();
+  for (int i = 0; i < frame_width * frame_height; ++i)
+    dst[i] = rgba_palette[src[i] & 0x3F];
   return true;
 }
 
@@ -227,9 +228,8 @@ void app_frame() {
   const double display_seconds = std::chrono::duration<double>(started - state->last_tick).count();
   state->clock.advance(display_seconds);
   state->last_tick = started;
-  // Reserve CPU presentation work (excluding drawable/queue waits) and
-  // predict the next emulation cost
-  // before starting a catch-up frame. The first due frame always progresses.
+  // Reserve presentation work and predict the next emulation cost before
+  // starting a catch-up frame. The first due frame always progresses.
   const double budget = std::max(0.0, sapp_frame_duration() - state->last_present_seconds);
   const auto deadline = started + std::chrono::duration<double>(budget);
   bool fresh = false;
@@ -260,7 +260,7 @@ void app_frame() {
   const auto presentation_started = std::chrono::steady_clock::now();
   if (fresh) {
     sg_image_data data{};
-    data.mip_levels[0] = {state->rgba.data(), state->rgba.size()};
+    data.mip_levels[0] = {state->rgba.data(), state->rgba.size() * sizeof(uint32_t)};
     sg_update_image(state->image, &data);
     state->have_frame = true;
   }
@@ -291,6 +291,11 @@ void app_frame() {
     state->error = std::make_unique<py::error_already_set>(std::move(e));
     sapp_request_quit();
   }
+  const bool observing = state->ui.xray_visible || state->ui.tint_game;
+  if (state->hooks.set_observing && observing != state->observing) {
+    state->hooks.set_observing(observing);
+    state->observing = observing;
+  }
 
   const auto pass_started = std::chrono::steady_clock::now();
   sg_pass pass{};
@@ -316,6 +321,7 @@ void app_frame() {
   sg_commit();
   state->last_present_seconds = std::chrono::duration<double>(
       (std::chrono::steady_clock::now() - presentation_started) - (pass_ready - pass_started)).count();
+
 }
 
 void app_event(const sapp_event* e) {
@@ -421,9 +427,11 @@ transformer_nes::ui::DebugHooks make_hooks(py::object bridge) {
     bridge.attr("set_option")(name, value);
   };
   hooks.step_frame = [bridge] { bridge.attr("step_frame")(); };
-  hooks.xray_frame = [bridge] {
+  hooks.set_observing = [bridge](bool enabled) { bridge.attr("set_observing")(enabled); };
+  hooks.xray_frame = [bridge, snapshot = py::object(), frame = XrayFrame{}]() mutable -> const XrayFrame& {
     const py::dict x = bridge.attr("xray_frame")();
-    XrayFrame frame;
+    if (snapshot && snapshot.is(x))
+      return frame;
     frame.cpu_paths = py::cast<Counts>(x["cpu_paths"]);
     frame.cpu_singles = py::cast<Counts>(x["cpu_singles"]);
     frame.ppu_models = py::cast<Counts>(x["ppu_models"]);
@@ -432,6 +440,7 @@ transformer_nes::ui::DebugHooks make_hooks(py::object bridge) {
     frame.expert_colors = py::cast<std::vector<uint32_t>>(x["expert_colors"]);
     frame.read_heat = py::cast<std::string>(x["read_heat"]);
     frame.hot_pages = py::cast<Counts>(x["hot_pages"]);
+    snapshot = x;
     return frame;
   };
   if (!bridge.attr("cpu_xray").is_none())
@@ -480,6 +489,8 @@ void run(const string& title, int scale, py::object frame_cb, py::object quit_cb
     py::gil_scoped_release unlocked;
     sapp_run(&desc);
   }
+  if (st.observing && st.hooks.set_observing)
+    st.hooks.set_observing(false);
   state = nullptr;
   st.frame_cb = py::object();
   st.hooks = {};

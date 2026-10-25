@@ -26,29 +26,26 @@ Bus::Bus(SteppedRuntime& runtime, span<const uint8_t> image) : runtime_(runtime)
 void Bus::attach(Device& device, int lo, int hi, bool writes_only) {
   devices_.attach(device, lo, hi, writes_only);
 }
-CpuStep Bus::step() {
-  const uint8_t opcode = ram_[address_index(runtime_.pc())];
+void Bus::step() {
   const auto next = runtime_.peek();
   cycles_ += next.cycles;
   if (next.read >= 0)
     if (auto* d = devices_.find(next.read, true)) {
       const int value = d->read(next.read, stamp_base_ + cycles_) & 0xFF;
       runtime_.poke(next.read, value);
-      ram_[address_index(next.read)] = static_cast<uint8_t>(value);
+      ram_[cpu_ram_index(next.read)] = static_cast<uint8_t>(value);
       cycles_ += d->take_stall();
     }
-  CpuStep row = runtime_.step();
-  for (const auto& write : row.writes) {
-    ram_[address_index(write.addr)] = static_cast<uint8_t>(write.value);
+  for (const auto& write : runtime_.step()) {
+    ram_[cpu_ram_index(write.addr)] = static_cast<uint8_t>(write.value);
     if (auto* d = devices_.find(write.addr)) {
-      if (is_memory_rmw(opcode))
-        d->write_rmw(write.addr, write.value, stamp_base_ + cycles_);
+      if (write.original >= 0)
+        d->write_rmw(write.addr, write.value, write.original, stamp_base_ + cycles_);
       else
         d->write(write.addr, write.value, stamp_base_ + cycles_);
       cycles_ += d->take_stall();
     }
   }
-  return row;
 }
 MachineRun Bus::run_cycles(int64_t budget, function<bool()> pause, int64_t cycle_base) {
   const int64_t start = cycles_;
@@ -69,37 +66,42 @@ void Controller::set_button(size_t index, bool pressed) {
     throw std::out_of_range("controller button");
   buttons_[index] = pressed;
 }
+array<int, 12> Controller::apply(Event event, int value, int count) {
+  if (!engine.step)
+    throw std::runtime_error("controller transformer is required");
+  array<int, 13> in{};
+  std::copy(state_.begin(), state_.end(), in.begin());
+  std::copy(buttons_.begin(), buttons_.end(), in.begin() + 2);
+  in[10] = event;
+  in[11] = value;
+  in[12] = count;
+  array<int, 12> out;
+  engine.step(engine.ctx, engine.models[event], in.data(), out.data());
+  std::copy_n(out.begin(), state_.size(), state_.begin());
+  return out;
+}
 int Controller::read(int addr, int64_t) {
-  if (addr != 0x4016)
-    return 0x40;
-  if (strobe_)
-    return 0x40 | buttons_[0];
-  if (index_ >= 8)
-    return 0x41;
-  return 0x40 | buttons_[index_++];
+  return addr == 0x4016 ? apply(Read)[2] : 0x40;
 }
 void Controller::write(int addr, int value, int64_t) {
-  if (addr != 0x4016)
-    return;
-  bool next = (value & 1) != 0;
-  if ((strobe_ && !next) || next)
-    index_ = 0;
-  strobe_ = next;
+  if (addr == 0x4016)
+    apply(Write, value & 0xFF);
 }
 ReadLease Controller::read_lease(int addr) {
   if (addr != 0x4016)
     return {};
-  if (strobe_)
-    return 0x40 | buttons_[0];
-  if (index_ >= 8)
-    return 0x41;
-  vector<uint8_t> out;
-  for (size_t i = index_; i < buttons_.size(); ++i)
-    out.push_back(static_cast<uint8_t>(0x40 | buttons_[i]));
-  return out;
+  const auto out = apply(Lease);
+  if (out[3] < 0 || out[3] > 8)
+    throw std::runtime_error("invalid controller reply packet length");
+  if (out[3] == 0)
+    return out[2];
+  ReadReply reply;
+  reply.size = out[3];
+  std::copy_n(out.begin() + 4, reply.size, reply.bytes.begin());
+  return reply;
 }
 void Controller::lease_consumed(int addr, int count) {
-  if (addr == 0x4016 && !strobe_ && count > 0)
-    index_ = std::min(buttons_.size(), index_ + static_cast<size_t>(count));
+  if (addr == 0x4016)
+    apply(Consume, 0, count);
 }
 } // namespace transformer_nes::nes

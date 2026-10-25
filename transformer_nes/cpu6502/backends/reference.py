@@ -441,9 +441,9 @@ class Cpu6502:
             ops[name] = getattr(self, f"op_{name}")
         return ops
 
-    def write(self, ea: int, value: int) -> MemWrite:
+    def write(self, ea: int, value: int, original: int = -1) -> MemWrite:
         self.write_memory(ea, value)
-        return MemWrite(self.step_count, ea, value & 0xFF)
+        return MemWrite(self.step_count, ea, value & 0xFF, original)
 
     def push_writes(self, *values: int) -> tuple[MemWrite, ...]:
         """The stack writes of pushing `values` in order (before pushing)."""
@@ -484,18 +484,20 @@ class Cpu6502:
         """ASL/LSR/ROL/ROR on A or on memory: rule(value, carry) gives the
         result and the bit shifted out into C."""
         on_a = opcode.mode == MODE_ACCUMULATOR
-        value, carry = rule(self.a if on_a else self.fetch_byte(ea), self.p & FLAG_C)
+        original = self.a if on_a else self.fetch_byte(ea)
+        value, carry = rule(original, self.p & FLAG_C)
         self.set_flag("C", carry)
         self.set_nz(value)
         if on_a:
             self.a = value
             return value, self.pc + opcode.length, ()
-        return value, self.pc + opcode.length, (self.write(ea, value),)
+        return value, self.pc + opcode.length, (self.write(ea, value, original),)
 
     def step_memory(self, delta: int, opcode: Opcode, lo: int, hi: int, ea: int) -> Result:
-        value = (self.fetch_byte(ea) + delta) & 0xFF
+        original = self.fetch_byte(ea)
+        value = (original + delta) & 0xFF
         self.set_nz(value)
-        return value, self.pc + opcode.length, (self.write(ea, value),)
+        return value, self.pc + opcode.length, (self.write(ea, value, original),)
 
     def branch(self, mask: int, expected: int, opcode: Opcode, lo: int, hi: int, ea: int
                ) -> Result:

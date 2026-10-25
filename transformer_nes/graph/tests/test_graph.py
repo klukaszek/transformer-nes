@@ -120,7 +120,7 @@ def test_cpu_capture_survives_other_constructions_and_folds():
     captured = cpu.program_graph()
     assert captured.all_dims == original.all_dims
     assert captured.all_lookups == original.all_lookups
-    assert captured.one is cpu.one
+    assert captured.one is cpu.program.one
     assert captured.one is not ppu.one
     assert captured.output_tokens["READOUT"].terms == original.output_tokens["READOUT"].terms
 

@@ -376,6 +376,36 @@ def test_token_projection_removes_unused_computation():
         full.project(("missing",))
 
 
+def test_float32_weights_preserve_real_inputs_trace_and_ablation():
+    import ctypes
+
+    import numpy as np
+
+    @construction
+    def graphs():
+        x = InputDimension("x")
+        y = persist(0.125 * reglu(x + 0.25, x - 0.375) - 0.9995 * x, name="y")
+        graph = current_graph().capture({"VALUE": x.as_expr()}, {"READOUT": y})
+        return {"real": TokenGraph(graph, ("x",), ("y",))}
+
+    engine = CompiledGraph(graphs, tag="real_test", sources=(), memory_size=1, dtype="float32")
+    assert engine.dtype == np.dtype("float32") and engine.f_bits == 0
+    for x in np.linspace(-2, 2, 65):
+        expected = 0.125 * (x + 0.25) * max(x - 0.375, 0) - 0.9995 * x
+        np.testing.assert_allclose(engine.step([x]), [expected], rtol=0, atol=3e-7)
+    abi = engine.abi()
+    trace = ctypes.PYFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(abi[3])
+    inputs = np.array([0.8125], dtype=np.float32)
+    residuals = np.zeros((abi[4], abi[5]), dtype=np.float32)
+    trace(abi[0], inputs.ctypes.data, residuals.ctypes.data)
+    slot = next(slot for dim, slot in engine.slot_of.items() if dim.name == "y")
+    np.testing.assert_allclose(residuals[-1, slot], engine.step(inputs)[0], rtol=0, atol=3e-7)
+    engine.engine.ablate(slot, engine.n_layers, 0.123456789)
+    assert engine.step(inputs).tolist() == [float(np.float32(0.123456789))]
+    engine.engine.ablate()
+    np.testing.assert_array_equal(engine.step(inputs), residuals[-1, slot:slot + 1])
+
+
 @pytest.mark.parametrize(("gate", "input_value"), [(1, 2), (0.5, 4)])
 def test_constant_one_survives_implicit_linear_gates(gate, input_value):
     import torch
@@ -397,7 +427,7 @@ def test_constant_one_survives_implicit_linear_gates(gate, input_value):
     pg = token.program_graph
     _model, _idx, info = construct(pg)
     assert (pg.one, info.slot_of[pg.one], 0, info.n_layers + 1) in info.lives
-    compiled = CompiledGraph._compile(token, pg, pg.all_dims, {})
+    compiled = CompiledGraph._compile(token, pg, pg.all_dims)
     forward = weight_module(compiled)
     assert forward.f_bits == int(gate == 0.5)
     result, _reads = forward(

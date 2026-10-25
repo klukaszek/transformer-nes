@@ -1,268 +1,114 @@
 #pragma once
 
-#include <array>
-#include <cstdint>
-
-#include "nes/mappers/mapper.h"
+#include "nes/mappers/banked.h"
 
 namespace transformer_nes::nes {
 
-// CPU-side MMC5: register decoding, PRG banking, ExRAM CPU access, the
-// multiplier.  The PPU-side substitution state lives in Mmc5Ppu (chr.h).
+// MMC5 storage and effect delivery. Register transitions, permissions,
+// bank arithmetic and the multiplier are supplied by the transformer.
 class Mmc5 final : public Mapper {
 public:
-  explicit Mmc5(Cartridge cart) : Mapper(std::move(cart)), prg_ram(0x10000) {
-    if (cart_.prg.empty() || cart_.prg.size() % BANK8 || cart_.chr.size() % 0x400)
+  explicit Mmc5(Cartridge cart) : Mapper(std::move(cart)), prg_ram_(0x10000) {
+    if (cart_.prg.empty() || cart_.prg.size() % BANK8 || cart_.chr.size() % CHR_BANK1)
       throw std::invalid_argument("MMC5 requires 8 KiB PRG and 1 KiB CHR banks");
-    n_prg_ = cart_.prg.size() / BANK8;
-    n_chr_ = cart_.chr.empty() ? CHR_RAM_BANKS : cart_.chr.size() / CHR_BANK1;
+    bank_.chip = BankControl::Mmc5;
+    bank_.unit = BANK8;
+    bank_.n_prg = cart_.prg.size() / BANK8;
+    bank_.n_chr = cart_.chr.empty() ? CHR_RAM_BANKS : cart_.chr.size() / CHR_BANK1;
+    bank_.prg_count = 4;
+    bank_.chr_count = 16;
+    bank_.initial_mirror = 0;
+    bank_.latches = false;
   }
   bool banked() const override { return true; }
+  BankControl* bank_state() override { return &bank_; }
+  MapperIrq* irq_state() override { return &irq_; }
   vector<pair<int, int>> register_ranges() const override { return {{0x5000, 0x7FFF}}; }
-  array<size_t, 4> prg_banks() const {
-    array<size_t, 4> r{};
-    for (size_t i = 0; i < r.size(); ++i)
-      r[i] = prg_regs[i] & 0x7F;
-    if (prg_mode == 0) {
-      const size_t b = r[3] & ~3uz;
-      return {b, b + 1, b + 2, b + 3};
-    }
-    if (prg_mode == 1) {
-      const size_t a = r[1] & ~1uz;
-      const size_t b = r[3] & ~1uz;
-      return {a, a + 1, b, b + 1};
-    }
-    if (prg_mode == 2) {
-      const size_t a = r[1] & ~1uz;
-      return {a, a + 1, r[2], r[3]};
-    }
-    return r;
-  }
-  ChrBanks chr_banks() const { return expand_chr(false); }
-  ChrBanks background_chr_banks() const { return expand_chr(true); }
-  array<bool, 4> prg_ram_slots() const {
-    static constexpr size_t src[4][4] = {{3, 3, 3, 3}, {1, 1, 3, 3}, {1, 1, 2, 3}, {0, 1, 2, 3}};
-    array<bool, 4> out{};
-    for (size_t i = 0; i < out.size(); ++i) {
-      const size_t j = src[prg_mode][i];
-      out[i] = j != 3 && !(prg_regs[j] & 0x80);
-    }
-    return out;
-  }
-  array<pair<size_t, bool>, 4> prg_layout() const {
-    auto banks = prg_banks();
-    auto ram = prg_ram_slots();
-    array<pair<size_t, bool>, 4> out{};
-    for (size_t i = 0; i < out.size(); ++i)
-      out[i] = {banks[i], ram[i]};
-    return out;
-  }
-  span<const uint8_t> slot_region(size_t slot) const {
-    auto [bank, is_ram] = prg_layout()[slot];
-    return is_ram ? region(prg_ram, (bank & 7) * BANK8, BANK8)
-                  : region(cart_.prg, (bank % n_prg_) * BANK8, BANK8);
-  }
-  int rom_byte(int addr) const {
-    const size_t slot = (addr - 0x8000) >> 13;
-    auto [bank, is_ram] = prg_layout()[slot];
-    return is_ram ? prg_ram[(bank & 7) * BANK8 + (addr & 0x1FFF)]
-                  : cart_.prg[(bank % n_prg_) * BANK8 + (addr & 0x1FFF)];
-  }
   vector<uint8_t> cpu_image() const override {
+    if (!bank_.engine.step)
+      throw std::runtime_error("mapper bank transformer is required");
     vector<uint8_t> image(0x10000);
-    for (size_t i = 0; i < 4; ++i) {
-      auto data = slot_region(i);
-      std::copy(data.begin(), data.end(), image.begin() + 0x8000 + i * BANK8);
-    }
+    for (size_t i = 0; i < 4; ++i)
+      std::ranges::copy(slot_region(i), image.begin() + 0x8000 + i * BANK8);
     return image;
   }
-  // Scanline detection (the PPU's scanline-start events, dot 3 of each
-  // rendered line): the first line of a frame enters "in frame" with
-  // the counter at 0, each later one increments it; a match with the
-  // $5203 target sets pending.  Idle PPU lines leave the frame.
   void ppu_event(const PpuEvent& event) override {
-    if (scanline_.step(event) && irq_target) {
-      irq_pending = true;
-      if (irq_enabled)
-        host_.irq->set(IRQ_MAPPER, true);
-    }
+    if (event.kind == PpuEvent::ScanlineStart)
+      irq_event(irq_, MapperIrq::Clock);
+    else if (event.kind == PpuEvent::Idle)
+      irq_event(irq_, MapperIrq::Idle);
   }
   std::unique_ptr<IrqProbe> irq_probe() const override {
-    return irq_enabled && irq_target && !irq_pending ? std::make_unique<Probe>(scanline_)
-                                                     : nullptr;
+    return irq_.predictable ? std::make_unique<MapperIrqProbe>(irq_) : nullptr;
   }
-  bool ram_writable() const { return ram_protect1 == 2 && ram_protect2 == 1; }
   int read(int addr) override {
-    if (addr >= 0x6000 && addr <= 0x7FFF)
-      return prg_ram[(prg_ram_bank & 7) * BANK8 + (addr & 0x1FFF)];
-    if (addr >= 0x8000)
-      return rom_byte(addr);
-    if (addr == 0x5204) {
-      int out = (irq_pending ? 0x80 : 0) | (scanline_.in_frame ? 0x40 : 0);
-      irq_pending = false;
-      host_.irq->set(IRQ_MAPPER, false);
-      return out;
-    }
-    if (addr == 0x5205)
-      return (mul_a * mul_b) & 0xFF;
-    if (addr == 0x5206)
-      return (mul_a * mul_b) >> 8;
-    if (addr >= 0x5C00 && addr <= 0x5FFF)
-      return host_.ppu->mmc5.exram(addr - 0x5C00);
-    return 0;
+    const auto packet = bank_.access(addr, false);
+    if (packet.irq_event >= 0)
+      irq_event(irq_, static_cast<MapperIrq::Event>(packet.irq_event));
+    return load(packet);
   }
   void write(int addr, int value) override {
     value &= 0xFF;
-    auto old = prg_layout();
-    if (addr == 0x5100)
-      prg_mode = value & 3;
-    else if (addr == 0x5101)
-      chr_mode = value & 3;
-    else if (addr == 0x5102)
-      ram_protect1 = value & 3;
-    else if (addr == 0x5103)
-      ram_protect2 = value & 3;
-    else if (addr == 0x5104)
-      exram_mode = value & 3;
-    else if (addr == 0x5105) {
-      nametable_map = value;
-      host_.ppu->mirroring = value;
-    } else if (addr == 0x5106)
-      fill_tile = value;
-    else if (addr == 0x5107)
-      fill_color = value & 3;
-    else if (addr == 0x5113)
-      prg_ram_bank = value & 7;
-    else if (addr >= 0x5114 && addr <= 0x5117)
-      prg_regs[addr - 0x5114] = value;
-    else if (addr >= 0x5120 && addr <= 0x512B) {
-      chr_regs[addr - 0x5120] = value;
-      sync_chr();
-    } else if (addr == 0x5130) {
-      chr_upper = value & 3;
-      sync_chr();
-    } else if (addr == 0x5203) {
-      irq_target = value;
-      scanline_.target = value;
-      host_.irq->sched_dirty = true;
-    } else if (addr == 0x5204) {
-      irq_enabled = value & 0x80;
-      host_.irq->set(IRQ_MAPPER, irq_enabled && irq_pending);
-      host_.irq->sched_dirty = true;
+    const auto packet = bank_.access(addr, true);
+    if (packet.port >= 0) {
+      const auto& port = bank_.engine.ports[static_cast<size_t>(packet.port)];
+      array<pair<int, int>, 4> before;
+      for (size_t i = 0; i < before.size(); ++i)
+        before[i] = {bank_.map[i], bank_.map[Ram + i]};
+      const int dirty = bank_.transition(port.write, packet.event, port.address, value);
+      if (dirty & BankControl::Prg)
+        for (size_t i = 0; i < 4; ++i)
+          if (before[i] != pair{bank_.map[i], bank_.map[Ram + i]})
+            map_region(0x8000 + static_cast<int>(i * BANK8), slot_region(i));
+      if (dirty & BankControl::Chr)
+        deliver_chr();
+      if (dirty & BankControl::Mirror)
+        deliver_ppu();
     }
-    else if (addr == 0x5205)
-      mul_a = value;
-    else if (addr == 0x5206)
-      mul_b = value;
-    else if (addr >= 0x5C00 && addr <= 0x5FFF) {
-      host_.ppu->set_mmc5_exram(addr - 0x5C00, value);
-    } else if (addr >= 0x6000 && addr <= 0x7FFF) {
-      // A locked write still landed in the machine image before this
-      // dispatch; restore the byte the CPU should keep seeing.
-      if (ram_writable())
-        prg_ram[(prg_ram_bank & 7) * BANK8 + (addr & 0x1FFF)] = static_cast<uint8_t>(value);
-      else
-        repair(addr, prg_ram[(prg_ram_bank & 7) * BANK8 + (addr & 0x1FFF)]);
-    }
-    if ((addr >= 0x5104 && addr <= 0x5107) || addr == 0x5130)
-      host_.ppu->set_mmc5_state(exram_mode, nametable_map, fill_tile, fill_color, chr_upper);
-    auto now = prg_layout();
-    for (size_t i = 0; i < old.size(); ++i)
-      if (old[i] != now[i])
-        map_region(0x8000 + static_cast<int>(i * BANK8), slot_region(i));
-    if (addr >= 0x8000) {
-      const size_t slot = (addr - 0x8000) >> 13;
-      auto [bank, is_ram] = now[slot];
-      if (is_ram && ram_writable()) {
-        prg_ram[(bank & 7) * BANK8 + (addr & 0x1FFF)] = static_cast<uint8_t>(value);
-        repair(addr, value);
-      } else
-        repair(addr, rom_byte(addr));
-    }
+    if (packet.irq_event >= 0)
+      irq_event(irq_, static_cast<MapperIrq::Event>(packet.irq_event), value);
+    host_.irq->sched_dirty |= packet.schedule != 0;
+    if (packet.write == BankControl::Ram)
+      prg_ram_[static_cast<size_t>(packet.index)] = static_cast<uint8_t>(value);
+    else if (packet.write == BankControl::Exram)
+      host_.ppu->set_mmc5_exram(packet.index, value);
+    if (packet.repair)
+      repair(addr, load(packet));
   }
 
 private:
-  struct Scanline {
-    bool in_frame = false;
-    int counter = 0, target = 0;
-    // True when this event's line matches the target.
-    bool step(const PpuEvent& event) {
-      if (event.kind == PpuEvent::Idle) {
-        in_frame = false;
-        return false;
-      }
-      if (event.kind != PpuEvent::ScanlineStart)
-        return false;
-      if (!in_frame) {
-        in_frame = true;
-        counter = 0;
-      } else {
-        ++counter;
-      }
-      return counter == target;
-    }
-  };
-  struct Probe final : IrqProbe {
-    explicit Probe(Scanline s) : scanline(s) {}
-    void ppu_event(const PpuEvent& event) override {
-      if (scanline.step(event) && fire_dot < 0)
-        fire_dot = event.dot;
-    }
-    Scanline scanline;
-  };
+  enum Map { Mirror = 20, Ram = 21, Exram = 27, FillTile = 28, FillColor = 29, Upper = 30 };
+  BankControl bank_;
+  MapperIrq irq_{MapperIrq::Mmc5};
+  vector<uint8_t> prg_ram_;
 
-  Scanline scanline_;
-  uint8_t prg_mode = 3, chr_mode = 3, chr_upper = 0;
-  int irq_target = 0, mul_a = 0xFF, mul_b = 0xFF;
-  bool irq_enabled = false, irq_pending = false;
-  array<uint8_t, 4> prg_regs{0x80, 0x80, 0x80, 0xFF};
-  array<uint8_t, 12> chr_regs{0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3};
-  vector<uint8_t> prg_ram;
-  uint8_t prg_ram_bank = 0;
-  int ram_protect1 = 0, ram_protect2 = 0;
-  int exram_mode = 0, nametable_map = 0, fill_tile = 0, fill_color = 0;
-  size_t n_prg_ = 0, n_chr_ = 1;
-  ChrBanks expand_chr(bool background) const {
-    ChrBanks r{};
-    if (background)
-      for (size_t i = 0; i < r.size(); ++i)
-        r[i] = (chr_upper << 8) | chr_regs[8 + (i & 3)];
-    else
-      for (size_t i = 0; i < r.size(); ++i)
-        r[i] = (chr_upper << 8) | chr_regs[i];
-    ChrBanks out{};
-    if (chr_mode == 0)
-      for (size_t i = 0; i < out.size(); ++i)
-        out[i] = (r[background ? 3 : 7] * 8 + i) % n_chr_;
-    else if (chr_mode == 1) {
-      const size_t b = background ? 3 : 7;
-      for (size_t half = 0; half < 2; ++half) {
-        const size_t reg = half == 0 ? 3 : b;
-        for (size_t i = 0; i < 4; ++i)
-          out[half * 4 + i] = (r[reg] * 4 + i) % n_chr_;
-      }
-    } else if (chr_mode == 2) {
-      const auto registers =
-          background ? array<size_t, 4>{1, 3, 1, 3} : array<size_t, 4>{1, 3, 5, 7};
-      for (size_t i = 0; i < registers.size(); ++i) {
-        const size_t bank = r[registers[i]] * 2;
-        out[i * 2] = bank % n_chr_;
-        out[i * 2 + 1] = (bank + 1) % n_chr_;
-      }
-    } else {
-      for (size_t i = 0; i < out.size(); ++i)
-        out[i] = r[i] % n_chr_;
+  int load(const BankControl::Access& packet) const {
+    switch (packet.source) {
+    case BankControl::Rom: return cart_.prg[static_cast<size_t>(packet.index)];
+    case BankControl::Ram: return prg_ram_[static_cast<size_t>(packet.index)];
+    case BankControl::Exram: return host_.ppu->mmc5.exram(packet.index);
+    case BankControl::Irq: return irq_.read_value;
+    default: return packet.value;
     }
-    return out;
   }
-  void sync_chr() {
-    host_.ppu->set_chr_banks(chr_banks());
-    host_.ppu->set_mmc5_chr(chr_banks(), background_chr_banks());
+  span<const uint8_t> slot_region(size_t slot) const {
+    const auto& storage = bank_.map[Ram + slot] ? prg_ram_ : cart_.prg;
+    return region(storage, bank_.map[slot] * BANK8, BANK8);
   }
-
+  void deliver_chr() {
+    ChrBanks sprite{}, background{};
+    std::copy_n(bank_.map.begin() + 4, 8, sprite.begin());
+    std::copy_n(bank_.map.begin() + 12, 8, background.begin());
+    host_.ppu->set_chr_banks(sprite);
+    host_.ppu->set_mmc5_chr(sprite, background);
+  }
+  void deliver_ppu() {
+    host_.ppu->set_mmc5_state(bank_.map[Exram], bank_.map[Mirror], bank_.map[FillTile],
+                              bank_.map[FillColor], bank_.map[Upper]);
+  }
   void on_connected() override {
-    host_.ppu->set_mmc5_state(exram_mode, nametable_map, fill_tile, fill_color, chr_upper);
-    sync_chr();
+    deliver_ppu();
+    deliver_chr();
   }
 };
 

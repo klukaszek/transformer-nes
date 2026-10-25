@@ -1,6 +1,6 @@
 """Adapt the CPU runtime backends to the native console's interface.
 
-The console drives one core protocol (pc, interrupt lines, poke, peek,
+The console drives one core protocol (interrupt lines, poke, peek,
 step); each backend gets a thin adapter, and backend_factory returns the
 (runtime, is_engine) pair the Console constructor expects.
 """
@@ -14,7 +14,6 @@ class ReferenceCore:
     def __init__(self, cpu):
         self.cpu = cpu
 
-    pc = property(lambda s: s.cpu.pc)
     halted = property(lambda s: s.cpu.halted)
 
     def set_nmi(self):

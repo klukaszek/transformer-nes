@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from carts import (
     absolute,
+    cart,
     console_frames,
     last_bank_cart,
     latch_cart,
@@ -89,6 +90,68 @@ def test_experts_agree_with_the_full_graph():
 def whole_ppu(cart, count):
     """Frames through the production console's mandatory transformer PPU."""
     return console_frames(load_hardware(), cart, count)
+
+
+def test_dma_wrap_mirrors_parity_and_destination_after_render_catchup():
+    from transformer_nes.cpu6502.backends.reference import Cpu6502, instruction_cycles
+    from transformer_nes.cpu6502.spec import opcode_for
+
+    # The first request ends at CPU cycle 89 (dot 265), crossing dot 257
+    # after OAMADDR was set to $FF at cycle 83. Rendering resets it to zero.
+    code = [0xA9, 0x18] + absolute(0x8D, 0x2001) + [0xEA] * 34 + [0x24, 0]
+    code += [0xA9, 0xFF] + absolute(0x8D, 0x2003)
+    code += [0xA9, 0xB0] + absolute(0x8D, 0x4014)
+    code += [0xA9, 0] + absolute(0x8D, 0x2001)
+
+    def capture(index):
+        nonlocal code
+        # DMA preserves OAMADDR; its current byte should be source byte 0.
+        code += absolute(0xAD, 0x2004) + absolute(0x8D, 0x7F00 + index)
+        body = [0x8A] + absolute(0x8D, 0x2003) + absolute(0xAD, 0x2004)
+        body += absolute(0x9D, 0x6000 + 256 * index) + [0xE8]
+        code += [0xA2, 0] + body + [0xD0, (-len(body) - 2) & 255]
+
+    rom_page = bytes((29 * i + 7) & 255 for i in range(256))
+    expected = [rom_page]
+    capture(0)
+    # Seed $0200 and transfer it through all four internal-RAM mirrors.
+    body = [0x8A, 0x49, 0xA5] + absolute(0x9D, 0x0200) + [0xE8]
+    code += [0xA2, 0] + body + [0xD0, (-len(body) - 2) & 255]
+    ram_page = bytes(i ^ 0xA5 for i in range(256))
+    for index, (page, address) in enumerate(((2, 1), (10, 255), (18, 127), (26, 0)), 1):
+        code += [0xA9, address] + absolute(0x8D, 0x2003)
+        code += [0xA9, page] + absolute(0x8D, 0x4014)
+        expected.append(ram_page[-address:] + ram_page[:-address] if address else ram_page)
+        capture(index)
+    code += [0x00]  # BRK to vector zero: the harness's halt convention
+    prg = bytearray(0x4000)
+    prg[:len(code)] = bytes(code)
+    prg[0x3000:0x3100] = rom_page
+    prg[-4:-2] = bytes((0, 0x80))
+    image = cart(0, prg, bytes(0x2000))
+
+    # Independent instruction-cycle oracle; MMIO data never affects a branch.
+    cpu = Cpu6502(memory=bytearray(0x8000) + prg * 2, bcd_enabled=False, mirror_cpu_ram=True)
+    cpu.pc = 0x8000
+    cycles, parities = 0, set()
+    while not cpu.halted:
+        op = opcode_for(cpu.read_memory(cpu.pc))
+        cycles += instruction_cycles(cpu, op, cpu.pc, cpu.x, cpu.y, cpu.p)
+        if cpu.read_memory(cpu.pc) == 0x8D and cpu.memory[cpu.pc + 1:cpu.pc + 3] == b'\x14\x40':
+            parities.add(cycles & 1)
+            cycles += 513 + (cycles & 1)
+        cpu.step()
+    assert parities == {0, 1}
+    for hardware in (load_reference_hardware(), load_hardware()):
+        for backend in ("reference", "weights"):
+            console = hardware.Console(hardware.Cartridge.parse(image), backend_factory(backend), 44100)
+            for _ in range(10):
+                console.run_frame()
+                if console.halted:
+                    break
+            assert console.halted and console.cycles == cycles
+            assert console.read_ram(0x6000, 256 * len(expected)) == b''.join(expected)
+            assert console.read_ram(0x7F00, len(expected)) == bytes((rom_page[0], *[ram_page[0]] * 4))
 
 
 @pytest.mark.parametrize(("mask_bits", "vertical"), [(0x18, False), (0x18, True), (0x1F, False)])

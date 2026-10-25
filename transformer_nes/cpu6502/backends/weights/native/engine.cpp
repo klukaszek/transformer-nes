@@ -5,6 +5,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -25,13 +26,14 @@ struct ENGINE_T {
     unsigned int xray_reads[65536] = {};
     static constexpr int SCALE = 1 << F;
     int xbuf[@XBUF_SIZE@];
+    int readouts[@READOUT_SIZE@];
 
     static long long shr2(int value) {
         if (value & 1) throw std::runtime_error("fractional readout value");
         return value >> 1;
     }
 
-    unsigned char ram[65536];  // mirror of the write log, for shadow decode
+    unsigned char ram[65536];  // current byte image used by memory attention
     int st_pc = 0, st_a = 0, st_x = 0, st_y = 0, st_s = 0xFD, st_p = 0x24;
     int st_ir = 0, st_oplo = 0, st_ophi = 0, st_ea = 0, st_data = 0;
     bool st_halted = false;
@@ -40,13 +42,9 @@ struct ENGINE_T {
     // clear (stays pending until then); NMI wins when both are set.
     bool irq_pending = false;
     bool resume_read_skip = false;
-    // Read leases: watched reads of these addresses are served natively.
-    // n == 0 repeats one value (device semantics frozen until the bus
-    // clears it); otherwise a finite value queue (controller serial
-    // reads) whose exhaustion pauses, with served reads counted so the
-    // bus can advance the device model.  Multiple slots keep interleaved
-    // port reads ($4016/$4017 bit pairs) from thrashing one slot.
-    static constexpr int NLEASE = 4;
+    // A lease repeats one value (n == 0) or consumes a finite reply queue.
+    // Exhaustion pauses execution; served counts advance the device model.
+    static constexpr int NLEASE = cpu_engine::read_lease_capacity;
     int lease_addr[NLEASE] = {-1, -1, -1, -1};
     int lease_value[NLEASE] = {0, 0, 0, 0};
     int lease_vals[NLEASE][8];
@@ -55,8 +53,30 @@ struct ENGINE_T {
     long lease_served[NLEASE] = {0, 0, 0, 0};
     long step_index = 0;
     long cycles_total = 0;
-    std::vector<std::pair<int,int>> rwatch, wwatch;
-    static constexpr unsigned char READ_MODE[256] = { @READ_MODE@ };
+    // Fixed 16-bit address space: membership never scans device ranges.
+    struct Watches {
+        std::array<uint64_t, 1024> words{};
+        bool any = false;
+        bool empty() const { return !any; }
+        bool contains(int addr) const {
+            return (unsigned)addr < 65536 && (words[addr >> 6] & (uint64_t{1} << (addr & 63)));
+        }
+        void add(int lo, int hi) {
+            lo &= 65535; hi &= 65535;
+            if (lo > hi) return;
+            const int first = lo >> 6, last = hi >> 6;
+            const auto head = ~uint64_t{0} << (lo & 63);
+            const auto tail = ~uint64_t{0} >> (63 - (hi & 63));
+            if (first == last) words[first] |= head & tail;
+            else {
+                words[first] |= head;
+                std::fill(words.begin() + first + 1, words.begin() + last, ~uint64_t{0});
+                words[last] |= tail;
+            }
+            any = true;
+        }
+        void clear() { if (any) { words.fill(0); any = false; } }
+    } rwatch, wwatch;
     static constexpr unsigned char TRACE_MODE[256] = { @TRACE_MODE@ };
     static constexpr unsigned char TRACE_LENGTH[256] = { @TRACE_LENGTH@ };
     static constexpr unsigned char TRACE_DATA[256] = { @TRACE_DATA@ };
@@ -74,6 +94,7 @@ struct ENGINE_T {
         st_ir = st_oplo = st_ophi = st_ea = st_data = 0;
         st_halted = false; nmi_pending = false; irq_pending = false;
         resume_read_skip = false;
+        pending_read = {-1, 0, 0, 0};
         clear_read_lease();
         step_index = 0; cycles_total = 0;
         clear_watches();
@@ -89,14 +110,18 @@ struct ENGINE_T {
         const int first = (MIRROR_CPU_RAM && addr < 0x2000) ? (addr & 0x07FF) : addr;
         const int last = (MIRROR_CPU_RAM && addr < 0x2000) ? first + 0x1800 : first;
         for (int mapped = first; mapped <= last; mapped += 0x0800) {
-            ram[mapped] = (unsigned char)value;  // shadow-decode mirror
+            ram[mapped] = (unsigned char)value;
         }
     }
 
     // One whole 6502 instruction from the persistent st_* state:
     // STATE embed -> layers -> readout -> direct WRITE inserts ->
-    // halt state.  Fills the 22-slot out buffer (trace row, next
+    // halt state.  Fills the 23-slot out buffer (trace row, next
     // state, writes, cycles) and advances st_* to the next instruction.
+
+    struct ReadRequest { int address, cycles, oplo, ophi; };
+    ReadRequest pending_read{-1, 0, 0, 0};
+    unsigned char read_ir = 0;
 
 @FORWARDS@
 
@@ -104,12 +129,13 @@ struct ENGINE_T {
 
     // The cycles the last expert forward retired: its model's output.
     long seq_cycles = 0;
-    // Required Torch bank entry over the embedded residual stream.
+    int loop_limit = 0, loop_cycles = 0, loop_iterations = 0;
+    // Required Torch bank entry: residual inputs and packed outputs are separate.
     // IDs follow the core expert order; a missing entry stops execution.
-    bool (*forward_hook)(void*, int, int*) = nullptr;
+    bool (*forward_hook)(void*, int, const int*, int*) = nullptr;
     void* forward_hook_ctx = nullptr;
     void set_forward_hook(std::uintptr_t fn, std::uintptr_t ctx) {
-        forward_hook = (bool (*)(void*, int, int*))fn;
+        forward_hook = (bool (*)(void*, int, const int*, int*))fn;
         forward_hook_ctx = (void*)ctx;
     }
     std::uintptr_t ram_address() { return (std::uintptr_t)ram; }
@@ -158,21 +184,24 @@ struct ENGINE_T {
         long extra = (max_steps - i) / steps - 1;
         if (max_cycles > 0)
             extra = std::min(extra, (max_cycles - cycles_this - w.prefix - 1) / seq_cycles);
-        if (w.loop.kind == LOOP_POLL) {
-            const int polled = shadow_read_target();
+        if (w.loop.kind == LOOP_POLL && !rwatch.empty()) {
+            const int polled = pending_read.address;
             const int lease = lease_slot(polled);
-            const bool holds = !in_ranges(rwatch, polled)
+            const bool holds = !rwatch.contains(polled)
                 || (lease >= 0 && lease_n[lease] == 0 && lease_value[lease] == ram[polled]);
             if (!holds) extra = 0;
-        } else {
+        } else if (w.loop.kind == LOOP_COUNTER) {
             int& counter = w.loop.reg == 1 ? st_x : st_y;
             if (((counter - before) & 0xFF) != (w.loop.delta & 0xFF) || !counter) return (int)steps;
             // Stop at the last nonzero result. The zero/fallthrough iteration
             // runs through the transformer, including its different cycles.
-            extra = std::min(extra, (long)(w.loop.delta < 0 ? counter - 1 : 255 - counter));
-            counter = (counter + extra * w.loop.delta) & 0xFF;
-            st_p = (st_p & ~0x82) | (counter & 0x80);
-            seq += extra;
+            if (extra <= 0) return (int)steps;
+            const long initial_cycles = seq_cycles;
+            counter_recurrence(w.loop.reg, w.loop.delta, (int)std::min(extra, 255L), (int)initial_cycles);
+            // The extra forward represents loop_iterations state transitions.
+            seq += loop_iterations - 1;
+            seq_cycles += initial_cycles;
+            return (int)((1 + loop_iterations) * steps);
         }
         seq_cycles *= 1 + extra;
         return (int)((1 + extra) * steps);
@@ -183,28 +212,6 @@ struct ENGINE_T {
 @SHAPE_RUNS@
     }
 
-
-    // Shadow-decode the instruction at st_pc; return the address it
-    // will read, or -1 (mirrors nes/bus read_target).
-    int shadow_read_target() const {
-        const int mode = READ_MODE[ram[st_pc]];
-        if (mode == 0) return -1;
-        const int lo = ram[(st_pc + 1) & 0xFFFF];
-        const int hi = ram[(st_pc + 2) & 0xFFFF];
-        switch (mode) {
-            case 1: return lo;
-            case 2: return (lo + st_x) & 0xFF;
-            case 3: return (lo + st_y) & 0xFF;
-            case 4: return lo | (hi << 8);
-            case 5: return ((lo | (hi << 8)) + st_x) & 0xFFFF;
-            case 6: return ((lo | (hi << 8)) + st_y) & 0xFFFF;
-            case 7: { const int zp = (lo + st_x) & 0xFF;
-                      return ram[zp] | (ram[(zp + 1) & 0xFF] << 8); }
-            case 8: { const int base = ram[lo] | (ram[(lo + 1) & 0xFF] << 8);
-                      return (base + st_y) & 0xFFFF; }
-        }
-        return -1;
-    }
 
     int trace_ea(int opcode, int pc, int xr, int yr) const {
         const int mode = TRACE_MODE[opcode];
@@ -250,11 +257,6 @@ struct ENGINE_T {
         return 0;
     }
 
-    static bool in_ranges(const std::vector<std::pair<int,int>>& v, int addr) {
-        for (const auto& r : v) if (addr >= r.first && addr <= r.second) return true;
-        return false;
-    }
-
     // An interrupt or execution expert's staged writes, in order: into
     // memory, the trace, and the watched-write hits.  Returns the hits.
     int commit_writes(bool trace) {
@@ -263,10 +265,12 @@ struct ENGINE_T {
             const int wa = exec_write_addr[w], wv = exec_write_value[w];
             if (trace) {
                 w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);
+                w_original.push_back(exec_write_original[w]);
             }
             insert_write(wa, wv, seq + 1);
-            if (!wwatch.empty() && in_ranges(wwatch, wa)) {
+            if (!wwatch.empty() && wwatch.contains(wa)) {
                 hit_addr.push_back(wa); hit_value.push_back(wv);
+                hit_original.push_back(exec_write_original[w]);
                 ++hits;
             }
         }
@@ -280,14 +284,10 @@ struct ENGINE_T {
         t_halted.push_back(halted ? 1 : 0);
     }
 
-    // Run up to max_steps instructions, stopping on halt, a jump-to-self
-    // trap, a watched device access the leases cannot serve, or the cycle
-    // budget.  The console drives run_core through the machine ABI
-    // (nes/bindings.cpp:EngineMachine); run() wraps it as a dict for
-    // Python, with the per-step trace arrays when `trace` is set.  The
-    // per-run outputs are members, reused across runs: the ABI hands out
-    // the hit arrays without copying.
+    // Reusable run receipts: the machine ABI borrows these buffers until
+    // the next run; Python run() copies them into arrays.
     std::vector<int> t_pc, t_a, t_x, t_y, t_s, t_p, t_ir, t_oplo, t_ophi, t_ea, t_data, t_halted;
+    std::vector<int> w_original, hit_original;
     std::vector<long> w_row; std::vector<int> w_addr, w_value;
     std::vector<int> hit_addr, hit_value;
     struct RunResult {
@@ -297,7 +297,7 @@ struct ENGINE_T {
     };
     RunResult run_core(long max_steps, bool stop_on_trap, long max_cycles, bool trace) {
         for (auto* v : {&t_pc, &t_a, &t_x, &t_y, &t_s, &t_p, &t_ir, &t_oplo, &t_ophi, &t_ea,
-                        &t_data, &t_halted, &w_addr, &w_value, &hit_addr, &hit_value})
+                        &t_data, &t_halted, &w_addr, &w_value, &w_original, &hit_addr, &hit_value, &hit_original})
             v->clear();
         w_row.clear();
         const char* reason = "budget";
@@ -306,14 +306,16 @@ struct ENGINE_T {
         long cycles_this = 0;
         const long steps_entry = step_index;
         long n_forward = 0;
-        long long o[22];
+        long long o[23];
         for (long i = 0; i < max_steps; ++i) {
             if (st_halted) { reason = "halt"; break; }
             const bool skip = resume_read_skip;
             resume_read_skip = false;
-            if (!nmi_pending && !irq_ready() && !skip && !rwatch.empty()) {
-                const int target = shadow_read_target();
-                if (target >= 0 && in_ranges(rwatch, target)) {
+            bool read_serviced = skip;
+            if (!nmi_pending && !irq_ready() && !skip) {
+                const auto request = pending_read = request_read();
+                const int target = request.address;
+                if (target >= 0 && !rwatch.empty() && rwatch.contains(target)) {
                     // Leased: serve the device read here, the value the
                     // device would return.  An exhausted queue keeps its
                     // slot (preserving the served count for the bus) but
@@ -328,10 +330,11 @@ struct ENGINE_T {
                             ++lease_served[ls]; served = true;
                         }
                     }
+                    read_serviced = served;
                     if (!served) {
                         // The device access lands on the instruction's
                         // last cycle: report its length for the stamp.
-                        read_cycles = probe_cycles();
+                        read_cycles = request.cycles;
                         resume_read_skip = true; read_addr = target; reason = "watch_read"; break;
                     }
                 }
@@ -344,6 +347,7 @@ struct ENGINE_T {
                 const int k_seq = shape_dispatch(i, max_steps, cycles_this,
                                                max_cycles, stop_on_trap);
                 if (k_seq > 0) {
+                    pending_read.address = -1;
                     xray_paths[0] += k_seq;
                     ++xray_dispatches[0];
                     step_index += k_seq;
@@ -355,23 +359,25 @@ struct ENGINE_T {
                     continue;
                 }
             }
-            const bool was_int = nmi_pending || irq_ready();
+            const bool was_int = !skip && (nmi_pending || irq_ready());
             const int prev_pc = st_pc;
-            const unsigned char exec_opcode = ram[prev_pc];
+            const bool read = !was_int && pending_read.address >= 0;
+            const unsigned char exec_opcode = read ? read_ir : ram[prev_pc];
             int pre_a = st_a, pre_x = st_x, pre_y = st_y, pre_p = st_p;
             int tr_lo = 0, tr_hi = 0, tr_ea = 0, tr_operand = 0;
             if (trace) {
                 const int tr_len = TRACE_LENGTH[exec_opcode];
-                if (tr_len > 1 || was_int) tr_lo = ram[(prev_pc + 1) & 0xFFFF];
-                if (tr_len > 2 || was_int) tr_hi = ram[(prev_pc + 2) & 0xFFFF];
+                if (tr_len > 1 || was_int) tr_lo = read ? pending_read.oplo : ram[(prev_pc + 1) & 0xFFFF];
+                if (tr_len > 2 || was_int) tr_hi = read ? pending_read.ophi : ram[(prev_pc + 2) & 0xFFFF];
                 // Interrupts report the interrupted PC with no effective address.
                 if (!was_int) {
-                    tr_ea = trace_ea(exec_opcode, prev_pc, pre_x, pre_y);
+                    tr_ea = read ? pending_read.address : trace_ea(exec_opcode, prev_pc, pre_x, pre_y);
                     if (TRACE_DATA[exec_opcode] >= 11)
                         tr_operand = TRACE_MODE[exec_opcode] == 11 ? tr_lo : ram[tr_ea];
                 }
             }
-            if (was_int ? interrupt_step(nmi_pending) : execution_step(exec_opcode)) {
+            if (was_int ? interrupt_step(nmi_pending) : execution_step(exec_opcode, read_serviced)) {
+                pending_read.address = -1;
                 ++xray_paths[was_int ? 1 : 2];
                 ++xray_dispatches[was_int ? 1 : 2];
                 if (!was_int) ++xray_opcodes[exec_opcode];
@@ -391,7 +397,6 @@ struct ENGINE_T {
                 cycles_this += step_cycles; cycles_total += step_cycles;
                 if (!was_int && stop_on_trap && st_pc == prev_pc) { reason = "trap"; break; }
                 if (hits > 0) {
-                    if (!was_int) st_ir = exec_opcode;  // the bus routes RMW writes by it
                     reason = "watch_write"; break;
                 }
                 if (st_halted) { reason = "halt"; break; }
@@ -401,6 +406,7 @@ struct ENGINE_T {
             // The full union model (undefined bytes, unfolded interrupts):
             // its receipt o[] carries the state, writes and stop flags.
             step_core(o);
+            pending_read.address = -1;
             ++xray_paths[3];
             ++xray_dispatches[3];
             ++xray_opcodes[exec_opcode];
@@ -413,9 +419,11 @@ struct ENGINE_T {
                 const int wa = (int)o[15 + 2 * w], wv = (int)o[16 + 2 * w];
                 if (trace) {
                     w_row.push_back(step_index); w_addr.push_back(wa); w_value.push_back(wv);
+                    w_original.push_back(w == 0 ? (int)o[22] : -1);
                 }
-                if (!wwatch.empty() && in_ranges(wwatch, wa)) {
+                if (!wwatch.empty() && wwatch.contains(wa)) {
                     hit_addr.push_back(wa); hit_value.push_back(wv);
+                    hit_original.push_back(w == 0 ? (int)o[22] : -1);
                     ++hits;
                 }
             }
@@ -454,9 +462,11 @@ struct ENGINE_T {
             out["w_row"] = py::array_t<long>((py::ssize_t)w_row.size(), w_row.data());
             out["w_addr"] = arr(w_addr);
             out["w_value"] = arr(w_value);
+            out["w_original"] = arr(w_original);
         }
         out["hit_addr"] = arr(hit_addr);
         out["hit_value"] = arr(hit_value);
+        out["hit_original"] = arr(hit_original);
         out["read_addr"] = r.read_addr;
         out["read_cycles"] = r.read_cycles;
         out["reason"] = r.reason;
@@ -468,9 +478,9 @@ struct ENGINE_T {
 
     // ── Machine API (machine_abi.h) ──────────────────────────
 
-    void watch_read(int lo, int hi) { rwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF); }
+    void watch_read(int lo, int hi) { rwatch.add(lo, hi); }
     void watch_write(int lo, int hi) {
-        wwatch.emplace_back(lo & 0xFFFF, hi & 0xFFFF);
+        wwatch.add(lo, hi);
     }
     void clear_watches() {
         rwatch.clear(); wwatch.clear();
@@ -626,8 +636,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 +[](void* c, long max_cycles, E::MachineRunOut* out) {
                     auto* e = static_cast<E*>(c);
                     const auto r = e->run_core(LONG_MAX, false, max_cycles, false);
-                    *out = {r.reason, r.cycles, r.read_addr, r.read_cycles, e->st_ir,
-                            e->hit_addr.data(), e->hit_value.data(), (long)e->hit_addr.size()};
+                    *out = {r.reason, r.cycles, r.read_addr, r.read_cycles,
+                            e->hit_addr.data(), e->hit_value.data(), e->hit_original.data(),
+                            (long)e->hit_addr.size()};
                 },
                 +[](void* c, int a) { return static_cast<E*>(c)->read_ram(a); },
                 +[](void* c, int a, int v) { static_cast<E*>(c)->inject_write(a, v); },

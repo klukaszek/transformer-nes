@@ -26,7 +26,7 @@ constexpr int64_t access_dot(int64_t cycle) { return cycle * 3 - 2; }
 class Console {
 public:
   Console(unique_ptr<Mapper> mapper, Ppu ppu, Apu apu, ConsoleMachine& machine);
-  Ppu::Frame run_frame();
+  const Ppu::Frame& run_frame();
   void set_button(size_t index, bool pressed) { controller.set_button(index, pressed); }
 
   unique_ptr<Mapper> mapper;
@@ -79,12 +79,10 @@ private:
     void write(int address, int value, int64_t cycle) override {
       if (cycle >= 0)
         apu_.advance_to(cycle);
-      apu_.write(address, value);
       // A DMC register can start, stop or retime its sample fetches: the
       // CPU run is cut so the next chunk ends at the new fetch (and each
       // fetch's stall lands when it happens, not lumped at the chunk's end).
-      if ((address >= 0x4010 && address <= 0x4013) || address == 0x4015)
-        dmc_moved = true;
+      dmc_moved |= apu_.write(address, value);
     }
     ReadLease read_lease(int address) override {
       return address == 0x4017 ? ReadLease(0x40) : ReadLease{};
@@ -109,10 +107,10 @@ private:
       machine_.drop_leases(ppu_device_);
       m_.write(a, v);
     }
-    void write_rmw(int a, int value, int64_t cycle) override {
+    void write_rmw(int a, int value, int original, int64_t cycle) override {
       ppu_.catch_up(access_dot(cycle));
       machine_.drop_leases(ppu_device_);
-      m_.write_rmw(a, value);
+      m_.write_rmw(a, value, original);
     }
 
   private:
@@ -121,7 +119,7 @@ private:
     ConsoleMachine& machine_;
     Device& ppu_device_;
   };
-  // $4014: copy a 256-byte CPU page into OAM, stalling for 513 or 514 cycles.
+  // $4014: deliver the neural DMA request and accumulate its CPU stall.
   class OamDma final : public Device {
   public:
     OamDma(ConsoleMachine& machine, Ppu& ppu, IrqLine& irq, Device& ppu_device)
@@ -129,14 +127,14 @@ private:
     int read(int, int64_t) override { return 0; }
     void write(int, int value, int64_t cycle) override {
       array<uint8_t, 256> page{};
-      const int base = (value & 0xFF) << 8;
+      const auto request = ppu_.dma_request(value & 0xFF, static_cast<int>(cycle & 1));
       for (size_t i = 0; i < page.size(); ++i)
-        page[i] = static_cast<uint8_t>(machine_.read_ram(base + static_cast<int>(i)));
+        page[i] = static_cast<uint8_t>(machine_.read_ram(request[0] + static_cast<int>(i)));
       ppu_.oam_dma(page, access_dot(cycle));
       machine_.drop_leases(ppu_device_); // sprite 0 may have moved
       if (ppu_.take_schedule_change())
         irq_.sched_dirty = true;
-      stall_ += 513 + static_cast<int>(cycle & 1);
+      stall_ += request[1];
     }
     int take_stall() override {
       const int out = stall_;

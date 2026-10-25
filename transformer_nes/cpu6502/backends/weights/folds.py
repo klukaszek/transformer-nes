@@ -29,12 +29,25 @@ from transformer_nes.graph.fold import (
 from transformer_nes.model.build import CACHE_DIR, artifact_lock, manifest_put
 from transformer_nes.model.sources import source_digest
 
-EXECUTION_INTERIOR_ROOTS = frozenset({
-    "ea", "next_pc", "new_halted", "cycles",
-    "is_store", "write_addr_out", "write_value_out",
-    "is_store2", "write_addr2_out", "write_value2_out",
-    "is_store3", "write_addr3_out", "write_value3_out",
-})
+EXECUTION_INTERIOR_ROOTS = frozenset(
+    {
+        "ea",
+        "next_pc",
+        "new_halted",
+        "cycles",
+        "is_store",
+        "write_addr_out",
+        "write_value_out",
+        "rmw_write",
+        "write_original_out",
+        "is_store2",
+        "write_addr2_out",
+        "write_value2_out",
+        "is_store3",
+        "write_addr3_out",
+        "write_value3_out",
+    }
+)
 
 
 PC_NAMES = ("current_pc_lo", "current_pc_hi")
@@ -78,16 +91,24 @@ def opcode_pins(byte: int, opcodes, *, pin_fetched_byte: bool = True) -> dict[st
 # (sequence_pins knows them); ea feeds back as a byte split, so it must fold
 # constant -- true for the write-free poll/spin windows this is built for.
 SEQUENCE_FEEDBACK = {
-    "current_a": "new_a", "current_x": "new_x", "current_y": "new_y",
-    "current_s": "new_s", "current_halted": "new_halted",
-    "current_p_c": "new_p_c_final", "current_p_z": "new_p_z_final",
-    "current_p_i": "new_p_i_final", "current_p_d": "new_p_d_final",
-    "current_p_b": "new_p_b_final", "current_p_u": 1.0,  # U reads 1 always
-    "current_p_v": "new_p_v_final", "current_p_n": "new_p_n_final",
+    "current_a": "new_a",
+    "current_x": "new_x",
+    "current_y": "new_y",
+    "current_s": "new_s",
+    "current_halted": "new_halted",
+    "current_p_c": "new_p_c_final",
+    "current_p_z": "new_p_z_final",
+    "current_p_i": "new_p_i_final",
+    "current_p_d": "new_p_d_final",
+    "current_p_b": "new_p_b_final",
+    "current_p_u": 1.0,  # U reads 1 always
+    "current_p_v": "new_p_v_final",
+    "current_p_n": "new_p_n_final",
     "current_ir": "fetched_opcode",
     "current_oplo": "fetched_operand_lo",
     "current_ophi": "fetched_operand_hi",
-    "current_ea_lo": ("ea", "lo"), "current_ea_hi": ("ea", "hi"),
+    "current_ea_lo": ("ea", "lo"),
+    "current_ea_hi": ("ea", "hi"),
     "current_data": "data_out",
 }
 
@@ -160,9 +181,17 @@ def sequence_pins(head_pc: int, code: bytes, opcodes) -> list[dict[str, float]]:
 class SequenceFolder(GraphFolder):
     """Compose 6502 steps with register feedback and symbolic PC offsets."""
 
-    def fold_execution_sequence(self, pin_list, feedback, label: str = "",
-                                pc_offsets=None, *, inline_linear: bool = False,
-                                bit_feedback_until: int | None = None) -> FoldResult:
+    def fold_execution_sequence(
+        self,
+        pin_list,
+        feedback,
+        label: str = "",
+        pc_offsets=None,
+        *,
+        inline_linear: bool = False,
+        bit_feedback_until: int | None = None,
+        bindings: dict[str, dict[str, float]] | None = None,
+    ) -> FoldResult:
         """Fold a K-step composition of the union graph into ONE graph: it
         evaluates every step, then materializes them all.
 
@@ -188,6 +217,8 @@ class SequenceFolder(GraphFolder):
 
         """
         n_steps = len(pin_list)
+        if bindings and n_steps != 1:
+            raise ValueError("runtime stage bindings require one instruction")
         feedback = dict(feedback)
         # Bit-state feedback (wide_bits only): A's bits chain like A itself.
         # ``bit_feedback_until`` prunes the chain past the last step whose
@@ -211,7 +242,7 @@ class SequenceFolder(GraphFolder):
         fb_live: set[str] = set()  # non-constant feedback the next step binds
         for k in range(n_steps):
             pins = dict(pin_list[k])
-            frozen: set[str] = set()
+            frozen: set[str] = set(bindings or ())
             unbound: set[str] = set()
             if pc_offsets is not None and k > 0:
                 frozen |= set(PC_NAMES)
@@ -244,9 +275,12 @@ class SequenceFolder(GraphFolder):
                             unbound.add(in_name)
 
             evaluation = self.evaluate(
-                pins, frozenset(frozen), inline_linear=inline_linear,
+                pins,
+                frozenset(frozen),
+                inline_linear=inline_linear,
                 preserve=frozenset(self.by_name[n] for n in PC_NAMES)
-                if pc_offsets is not None and k == 0 else frozenset(),
+                if pc_offsets is not None and k == 0
+                else frozenset(),
             )
             val = evaluation.val
             hazards = {lu.name or f"lookup_{lu.id}" for lu in self.insert_hazards(frozenset(pins))}
@@ -272,10 +306,13 @@ class SequenceFolder(GraphFolder):
                         fb_source[out_name] = src
             steps.append(SequenceStep(frozen, unbound, evaluation, hazards, fb_source))
         return self.materialize_sequence(
-            steps, feedback, label=label, pc_offsets=pc_offsets)
+            steps, feedback, label=label, pc_offsets=pc_offsets, bindings=bindings
+        )
 
     @construction
-    def materialize_sequence(self, steps, feedback, *, label, pc_offsets) -> FoldResult:
+    def materialize_sequence(
+        self, steps, feedback, *, label, pc_offsets, bindings=None
+    ) -> FoldResult:
         """The evaluated steps materialized as one graph, step by step."""
         pg = self.pg
         n_steps = len(steps)
@@ -284,7 +321,14 @@ class SequenceFolder(GraphFolder):
         for d in self.inputs:
             base_sub.setdefault(d, Expression({InputDimension(d.name): 1}))
 
-        mat = GraphMaterializer(  # provenance accumulates per step
+        bound_inputs = {
+            name: InputDimension(name) for fields in (bindings or {}).values() for name in fields
+        }
+        bound = {
+            name: sum(bound_inputs[field] * coefficient for field, coefficient in fields.items())
+            for name, fields in (bindings or {}).items()
+        }
+        mat = GraphMaterializer(
             structural_reads=self.structural_reads,
         )
         keep_alive = Expression()
@@ -298,7 +342,8 @@ class SequenceFolder(GraphFolder):
                 root_dims
                 if k + 1 == n_steps
                 else [
-                    self.by_name[name] for name in self.root_names
+                    self.by_name[name]
+                    for name in self.root_names
                     if name in EXECUTION_INTERIOR_ROOTS
                 ]
             )
@@ -309,18 +354,23 @@ class SequenceFolder(GraphFolder):
                 seeds |= set(val[d].terms) if d in val else {d}
 
             def is_leaf(d, *, frozen=step.frozen):
-                return (
-                    isinstance(d, InputDimension)
-                    or (isinstance(d, PersistDimension) and d.name in frozen)
+                return isinstance(d, InputDimension) or (
+                    isinstance(d, PersistDimension) and d.name in frozen
                 )
 
             def bit_leaf(d):
                 rb = getattr(d, "read_bit", None)
                 return rb[0] if rb is not None and self.structural_reads else None
 
-            live = walk_live(seeds, val, folded, lookup_exprs, is_leaf,
-                             bit_leaf=bit_leaf,
-                             structural_reads=self.structural_reads)
+            live = walk_live(
+                seeds,
+                val,
+                folded,
+                lookup_exprs,
+                is_leaf,
+                bit_leaf=bit_leaf,
+                structural_reads=self.structural_reads,
+            )
 
             # Materialize this step (fresh sub: the same union dim holds a
             # different value per step); frozen persists resolve to the
@@ -329,7 +379,12 @@ class SequenceFolder(GraphFolder):
             for in_name in step.frozen:
                 if in_name in step.unbound or in_name in PC_NAMES:
                     continue
-                sub[self.by_name[in_name]] = fb_expr[feedback[in_name]]
+                if in_name in bound:
+                    sub[self.by_name[in_name]] = Expression(
+                        {PersistDimension(bound[in_name], name=f"{in_name}__s{k}"): 1}
+                    )
+                else:
+                    sub[self.by_name[in_name]] = fb_expr[feedback[in_name]]
             if pc_offsets is not None and k > 0:
                 # Shape fold: pc(k) = head + offset, byte-split with one
                 # stepglu carry (exact on integer bytes).  No $FFFF wrap by
@@ -341,7 +396,9 @@ class SequenceFolder(GraphFolder):
                     lo_e, hi_e = lo0, hi0
                 else:
                     carry = stepglu(1, lo0 + Expression({graph.current_graph().one: off - 256}))
-                    lo_e = lo0 + Expression({graph.current_graph().one: float(off)}) + carry * -256.0
+                    lo_e = (
+                        lo0 + Expression({graph.current_graph().one: float(off)}) + carry * -256.0
+                    )
                     hi_e = hi0 + carry
                 sub[self.by_name["current_pc_lo"]] = lo_e
                 sub[self.by_name["current_pc_hi"]] = hi_e
@@ -357,13 +414,23 @@ class SequenceFolder(GraphFolder):
                             )
                         s = sub[d] = tr(val[d])
                     return s
+
                 return scaled_sum((term(d), c) for d, c in expr.terms.items())
 
             def sname(name, *, k=k):
                 return f"{name}__s{k}" if name else None
 
-            mat.materialize(self.in_order(live), live, val, folded, lookup_exprs,
-                            sub, tr, name_of=sname, is_leaf=is_leaf)
+            mat.materialize(
+                self.in_order(live),
+                live,
+                val,
+                folded,
+                lookup_exprs,
+                sub,
+                tr,
+                name_of=sname,
+                is_leaf=is_leaf,
+            )
 
             # Roots: every step's readout set, suffixed; folded-away roots
             # come back as named persists (same contract as fold()).
@@ -374,9 +441,7 @@ class SequenceFolder(GraphFolder):
                 keep_alive = keep_alive + 1e-6 * sub[d]
 
             if pc_offsets is not None and k == 0 and n_steps > 1:
-                pc_exprs = tuple(
-                    tr(Expression({self.by_name[n]: 1})) for n in PC_NAMES
-                )
+                pc_exprs = tuple(tr(Expression({self.by_name[n]: 1})) for n in PC_NAMES)
             fb_expr = {name: tr(src) for name, src in step.fb_source.items()}
 
             if k + 1 == n_steps:
@@ -385,6 +450,8 @@ class SequenceFolder(GraphFolder):
                     for name, expr in pg.input_tokens.items()
                 }
         assert new_inputs is not None
+        if bound_inputs:
+            new_inputs["STATE"] = new_inputs["STATE"] + sum(bound_inputs.values())
         new_outputs = {"READOUT": keep_alive}
         new_pg = graph.current_graph().capture(new_inputs, new_outputs)
 
@@ -396,9 +463,7 @@ class SequenceFolder(GraphFolder):
             label=label,
             program_graph=new_pg,
             dim_of_name=dim_of_name,
-            union_lookup_of=mat.union_lookup_of,
             insert_side_hazards=tuple(sorted(set().union(*(step.hazards for step in steps)))),
-            n_steps=n_steps,
         )
 
 

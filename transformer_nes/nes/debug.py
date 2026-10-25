@@ -41,12 +41,25 @@ class DebugBridge:
         self.no_sprite_limit = False
         self.last_ms = 0.0
         self.avg_ms = 0.0
+        self.observing = False
         self._xray_snapshot: dict | None = None
+
+    def set_observing(self, enabled: bool):
+        """Collect attention reads only while the X-ray or game tint is visible."""
+        if enabled == self.observing:
+            return
+        self.observing = enabled
+        self.cpu_frames.clear()
+        self.read_heat.heat.fill(0)
+        self._xray_snapshot = None
+        if self.cpu_xray is not None:
+            self.cpu_xray.engine.xray_take()
+            self.cpu_xray.engine.xray_reads(enabled)
 
     def note_frame(self, seconds: float):
         # Called once per emulated frame: the CPU counters are taken here,
         # not per display refresh (which can come between frames).
-        if self.cpu_xray is not None:
+        if self.observing and self.cpu_xray is not None:
             self.cpu_frames.append(self.cpu_xray.take_paths())
             self.read_heat.add(self.cpu_xray.take_reads())
         self._xray_snapshot = None

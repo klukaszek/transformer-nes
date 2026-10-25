@@ -105,7 +105,8 @@ The engine routes execution through several equivalent paths:
 
 1. A ROM-independent shape library recognizes polling and counter loops.
    Shapes fold once with symbolic PC and operand bytes; dispatch rechecks their
-   instruction bytes and budgets against live memory.
+   instruction bytes and budgets against live memory. Four bounded counter
+   experts compute additional iterations, X/Y, flags and elapsed cycles in weights.
 2. Per-opcode and interrupt experts compute compact architectural receipts:
    registers, flags, ordered writes, next PC and exact cycles.
 3. The union model supplies the complete fallback and diagnostic trace.
@@ -113,7 +114,8 @@ The engine routes execution through several equivalent paths:
 The production runtime always compiles the actual expert layer weights into one fixed
 Inductor bank. FX expands sparse matrix coefficients into integer tensor
 operations; Inductor performs constant propagation and fusion. Its generated
-kernels bind directly to the engine's residual and RAM, with stack scratch.
+kernels read the engine's residual and RAM, returning only packed live readouts
+with stack scratch. The native caller decodes that packed packet directly.
 The bank is independent of the ROM and loads before the first frame. There is
 no runtime learner, mutable window program, weight tensor pool or background
 attachment queue. The standalone exported checkpoint runners remain separate

@@ -53,7 +53,6 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
     # instead and has its harness serve those 16 bit inputs, trading a wider
     # token contract for less depth -- a different model, exported nowhere.
     rt = Cpu6502Graph(bcd=bcd)
-    dim_by_id = {d.id: d for d in rt.all_dims}
     pg = rt.program_graph()
     sched = asap_schedule(pg)
     model, tok_to_idx, info = build_model(program_graph=pg, schedule=sched)
@@ -69,11 +68,6 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
         "head": to_fixed_point(head, "head"),
     }
     layer_heads, layer_ffn = [], []
-    # Consumers that can exploit the generated engine's structural fusion
-    # need the classifications after pruning.  Keeping these in the
-    # artifact makes the optimization available to standalone runners too;
-    # old artifacts simply omit them and retain the generic path.
-    layer_head_kinds, layer_ffn_kinds = [], []
     n_clear = 0
     for li in range(info.n_layers):
         ip, op, fi, fo, heads, units = prune_layer(
@@ -91,12 +85,6 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
             raise AssertionError(f"L{li}: kept an FFN unit classified unused")
         layer_heads.append(len(heads))
         layer_ffn.append(len(units))
-        layer_head_kinds.append([
-            int(model.head_kinds[li][h]) for h in heads
-        ])
-        layer_ffn_kinds.append([
-            int(model.ffn_kinds[li][j]) for j in units
-        ])
         ip_kept, clear_rows, clear_cols = split_clear_gates(
             rescale_head_queries(ip, len(heads)))
         csr_tensors(f"L{li}.in_proj", ip_kept, tensors)
@@ -142,12 +130,10 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
         "n_layers": int(info.n_layers),
         "layer_heads": layer_heads,
         "layer_ffn": layer_ffn,
-        "layer_head_kinds": layer_head_kinds,
-        "layer_ffn_kinds": layer_ffn_kinds,
-        "one_slot": int(info.slot_of[rt.one]),
+        "one_slot": int(info.slot_of[pg.one]),
         "input_slots": input_slots,
         "readout_slots": {
-            name: int(info.slot_of[dim_by_id[rt.dim_id_by_name[name]]])
+            name: int(info.slot_of[rt.dim_of_name[name]])
             for name in RUNTIME_READ_DIMS
         },
         "state_row": int(tok_to_idx["STATE"]),
@@ -177,10 +163,6 @@ def _expert_metadata(expert: dict, index: int) -> dict:
         "layer_ffn": [int(w.weight.shape[0] // 2) for w in model.ff_in],
         "layer_head_kinds": [list(map(int, kinds))
                              for kinds in model.head_kinds],
-        "layer_ffn_kinds": [list(map(int, kinds))
-                            for kinds in model.ffn_kinds],
-        "head_memory_groups": [list(map(int, groups))
-                                for groups in model.head_memory_groups],
         "head_memory_outputs": [
             [None if outputs is None else list(outputs) for outputs in layer]
             for layer in model.head_memory_outputs
@@ -237,6 +219,7 @@ def export_experts(
 
     meta = {
         "format": "6502 folded opcode execution experts",
+        "execution_abi": 3,
         "dtype": "int32",
         "scale_bits": SCALE_BITS,
         "accumulator": "int32",  # memory reads are structural: no scores

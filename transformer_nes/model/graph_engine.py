@@ -1,34 +1,9 @@
-"""Compile constructed transformer graphs with PyTorch Inductor.
+"""Compile token graphs and folded experts into a shared-memory Inductor bank.
 
-The shared Torch compiler expands the actual attention and ReGLU matrices.
-Structural memory reads are licensed by the graph fold before scheduling;
-Inductor specializes constants and routing. Execution uses raw buffers and
-one fixed byte image, with no framework dispatch or growing KV cache.
-
-An engine hosts one or more token graphs over one memory (the PPU's:
-the tile slot, and the sprite unit's evaluation and fetch).  Each comes
-as its full model plus optional folded experts (graph/fold.py): the
-graph partially evaluated under pinned conditions, rebuilt with its
-memory reads served structurally (one exact read in place of the
-grouped attention fabric), scheduled and constructed as its own smaller
-weights.  Model 0 is the primary graph's full model and its experts
-follow; then each further graph's.  The caller picks the model per
-token and must only pick an expert whose pins hold.
-
-The engine exposes per-token calls to Python (``write``, ``step``) and
-the same calls as raw C function pointers (``abi``) so native code can
-run the transformer with no Python in the loop:
-
-    void write(void* engine, int addr, int value);
-    void step(void* engine, int model, const int* inputs, int* outputs);
-    void trace(void* engine, const int* inputs, int* residual);
-
-``inputs``/``outputs`` follow the model's graph's named order (an input a
-model folded away is ignored).  ``trace`` runs model 0 on a copy of the engine
-and writes its residual stream after the embedding and after each layer
-(the X-ray, nes/xray.py); ``ablate`` forces one of model 0's residual
-slots to a constant after the layer that computes it.
-model/inference.py is the float64 reference these engines agree with.
+Model 0 is the primary graph; callers select experts whose pinned inputs hold.
+Named token inputs/outputs define the raw ABI: int32 pointers for discrete
+banks, float pointers for memory-free float32 banks. Trace and ablation operate
+on the primary graph's residual stream.
 """
 
 from __future__ import annotations
@@ -78,7 +53,14 @@ def generate_graph_source(models: list[dict], memory_size: int = 0x10000) -> tup
     table.extend(f"{{{len(m['input_slots'])}, {len(m['output_slots'])}}}," for m in models)
     table.append("};")
     adapter = Path(__file__).with_name("native").joinpath("graph.cpp").read_text()
+    decode = """
+        for (int i = 0; i < tokens[model].n_out; ++i) {
+            if (result[i] & ((1 << @F_BITS@) - 1)) throw std::runtime_error("fractional readout value");
+            out[i] = result[i] >> @F_BITS@;
+        }
+    """ if f_bits else ""
     for key, value in {
+        "@DECODE@": decode,
         "@TOKEN_TABLE@": "\n".join(table),
         "@MEMORY@": str(memory_size),
         "@F_BITS@": str(f_bits),
@@ -124,9 +106,9 @@ DEBUG_ADAPTER = r"""
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("kernel", [] { return py::make_tuple(
         reinterpret_cast<std::uintptr_t>(circuits[0].run), circuits[0].aux); });
-    m.def("evaluate", [](py::array_t<int, py::array::c_style | py::array::forcecast> x,
+    m.def("evaluate", [](py::array_t<Scalar, py::array::c_style | py::array::forcecast> x,
                           std::uintptr_t ram) {
-        py::array_t<int> out({@ROWS@, circuits[0].width / @ROWS@});
+        py::array_t<Scalar> out({@ROWS@, circuits[0].width / @ROWS@});
         std::vector<int32_t> aux(std::max(1, circuits[0].aux));
         invoke(circuits[0].run, x.data(), reinterpret_cast<const uint8_t*>(ram),
                out.mutable_data(), aux.data());
@@ -137,17 +119,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 class CompiledGraph:
-    """Token graphs (and folded experts of them) compiled to weights and
-    then to one native engine over one memory.  The first graph is the
-    primary: its full model is model 0 (the one ``trace`` and ``ablate``
-    see, described by ``slot_of``/``lives``) and its experts, named by
-    ``expert_names``, are models 1..n; ``model_id`` finds any model.
+    """Cached token bank with Python and raw-buffer interfaces.
 
-    `build_graphs` builds the token graphs.  The engine is cached under
-    `tag`, keyed by the code of `sources` (model/sources.py): a hit loads it
-    without building any graph, and only ``slot_of``/``lives`` build the
-    primary graph again (the X-ray's, on first use).  ``graphs`` gives
-    each token graph's inputs and outputs, in the caller's order."""
+    Cache hits load compiled kernels; graph construction is deferred until
+    compilation or diagnostic slot/liveness inspection.
+    """
 
     def __init__(
         self,
@@ -156,7 +132,11 @@ class CompiledGraph:
         tag: str,
         sources: tuple[str, ...],
         memory_size: int = 0x10000,
+        dtype: str = "int32",
     ):
+        if dtype not in ("int32", "float32"):
+            raise ValueError("unsupported graph numeric type")
+        self.dtype = np.dtype(dtype)
         self.build_graphs = build_graphs
         self.memory_size = memory_size
         from pathlib import Path
@@ -172,17 +152,19 @@ class CompiledGraph:
             entry is not None
             and entry.get("sources") == code
             and entry.get("memory_size") == memory_size
+            and entry.get("dtype", "int32") == dtype
         ):
             with artifact_lock(entry["digest"]):
                 path = os.path.join(CACHE_DIR, f"graph_{entry['digest']}.cpp")
                 if os.path.exists(path):
                     module = load_module(f"graph_gen_{entry['digest']}", entry["digest"], [path])
         if module is None:
-            generated, source = self._generate(build_graphs(), memory_size)
+            generated, source = self._generate(build_graphs(), memory_size, dtype=dtype)
             entry = {
                 "kind": "graph",
                 "sources": code,
                 "memory_size": memory_size,
+                "dtype": dtype,
                 **generated,
             }
             with artifact_lock(entry["digest"]):
@@ -204,7 +186,7 @@ class CompiledGraph:
         self.engine.set_debug_loader(lambda trace: owner._debug_kernel(trace))
 
     @staticmethod
-    def _generate(graphs: Mapping[str, TokenGraph], memory_size: int) -> tuple[dict, str]:
+    def _generate(graphs: Mapping[str, TokenGraph], memory_size: int, *, dtype="int32") -> tuple[dict, str]:
         """Compile every graph and expert to weights and emit the engine's
         source; what the cache records of it."""
         model_ids, models = [], []
@@ -215,7 +197,7 @@ class CompiledGraph:
             ).fold({}, label=name)
             models.append(
                 CompiledGraph._compile(
-                    token, full.program_graph, list(full.dim_of_name.values()), full.union_lookup_of
+                    token, full.program_graph, list(full.dim_of_name.values()), dtype=dtype
                 )
             )
             if token.experts:
@@ -232,7 +214,7 @@ class CompiledGraph:
                             token,
                             fold.program_graph,
                             list(fold.dim_of_name.values()),
-                            fold.union_lookup_of,
+                            dtype=dtype,
                         )
                     )
         source, f_bits = generate_graph_source(models, memory_size)
@@ -269,7 +251,7 @@ class CompiledGraph:
         return self.model_ids[graph, expert]
 
     @staticmethod
-    def _compile(token: TokenGraph, program_graph, dims, union_lookup_of) -> dict:
+    def _compile(token: TokenGraph, program_graph, dims, *, dtype="int32") -> dict:
         model, _idx, info = construct(program_graph)
         by_name = {}
         for d in dims:
@@ -277,9 +259,10 @@ class CompiledGraph:
         inputs = {d.name: d for d in program_graph.all_dims if isinstance(d, InputDimension)}
         return {
             "model": model,
+            "dtype": dtype,
             # Integer coefficients preserve integer residuals. Fractional
             # projections need the same half-unit encoding as the CPU.
-            "fraction_bits": int(any(
+            "fraction_bits": int(dtype == "int32" and any(
                 (weight.weight != np.rint(weight.weight)).any()
                 for weight in [
                     *model.ff_in, *model.ff_out,
@@ -288,12 +271,10 @@ class CompiledGraph:
             )),
             "n_layers": info.n_layers,
             "d_model": info.d_model,
-            "one_slot": info.slot_of[program_graph.one],
             "input_slots": [
                 info.slot_of.get(inputs[n], -1) if n in inputs else -1 for n in token.inputs
             ],
             "output_slots": [info.slot_of[by_name[n]] for n in token.outputs],
-            "union_lookup_of": union_lookup_of,
         }
 
     def _debug_kernel(self, trace: bool):
@@ -315,7 +296,7 @@ class CompiledGraph:
                 token.program_graph, root_names=list(token.outputs), structural_reads=True
             ).fold({}, label="primary")
             model = self._compile(
-                token, fold.program_graph, list(fold.dim_of_name.values()), fold.union_lookup_of
+                token, fold.program_graph, list(fold.dim_of_name.values()), dtype=self.dtype.name
             )
             model["fraction_bits"] = self.f_bits
             adapter = DEBUG_ADAPTER.replace("@ROWS@", str(model["n_layers"] + 1 if trace else 1))
@@ -336,7 +317,7 @@ class CompiledGraph:
         self.engine.write(addr, value)
 
     def step(self, inputs, model: int = 0) -> np.ndarray:
-        return self.engine.step(model, np.asarray(inputs, dtype=np.int32))
+        return self.engine.step(model, np.asarray(inputs, dtype=self.dtype))
 
     def abi(self) -> tuple:
         """(engine, write, step, trace, trace rows, trace width) for native

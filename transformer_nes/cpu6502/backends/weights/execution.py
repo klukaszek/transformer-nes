@@ -9,14 +9,11 @@ from __future__ import annotations
 
 import contextlib
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Literal
 
 from transformer_nes.cpu6502.backends.weights.proofs import const_root, interval_of
-from transformer_nes.cpu6502.backends.weights.shapes import SEQUENCE_WRITERS
 from transformer_nes.cpu6502.spec import (
-    BRANCH_CONDITIONS,
-    BRANCH_OPERATIONS,
     FLAG_B,
     FLAG_C,
     FLAG_D,
@@ -29,8 +26,6 @@ from transformer_nes.cpu6502.spec import (
 from transformer_nes.graph.core import Dimension, Expression, ProgramGraph, project_program_graph
 from transformer_nes.graph.fold import linear_input_form
 
-STACK_CONTROL_OPERATIONS = SEQUENCE_WRITERS - {"sax"}
-
 
 @dataclass(frozen=True)
 class MemoryWrite:
@@ -38,6 +33,7 @@ class MemoryWrite:
     order: int
     address: Dimension
     value: Dimension
+    original: Dimension | None = None
 
 
 @dataclass(frozen=True)
@@ -58,25 +54,11 @@ class ArchitecturalOutput:
 
 
 @dataclass(frozen=True)
-class ControlFlow:
-    predicate: Dimension | None
-    fallthrough: int
-    target: int
-    target_dimension: Dimension | None = None
-    relative_to_head: bool = False
-    relative_operand_offset: int | None = None
-    absolute_operand_offset: int | None = None
-    flag_mask: int = 0
-    flag_value: bool = True
-
-
-@dataclass(frozen=True)
 class ExecutionGraph:
     program_graph: ProgramGraph
     n_steps: int
     memory_writes: tuple[MemoryWrite, ...]
     outputs: tuple[ArchitecturalOutput, ...]
-    control: ControlFlow
     halt_dimension: Dimension | None
     # Each step's cycle count: folded to a constant, or a model output;
     # and an upper bound on each.
@@ -111,6 +93,11 @@ INPUT_SLOT_NAMES = {
     "halted": "in_halted",
     "nmi": "in_nmi",
     "irq": "in_irq",
+    "read_addr_lo": "in_read_addr_lo",
+    "read_addr_hi": "in_read_addr_hi",
+    "read_cycles": "in_read_cycles",
+    "loop_limit": "in_loop_limit",
+    "loop_cycles": "in_loop_cycles",
 }
 P_FLAG_NAMES = (
     ("in_p_c", FLAG_C),
@@ -154,6 +141,7 @@ SEQUENCE_FLAG_DIMS = (
 )
 
 STATE_FIELDS = (
+    ("new_pc", "next_pc", None),
     ("new_a", "new_a", "in_a"),
     ("new_x", "new_x", "in_x"),
     ("new_y", "new_y", "in_y"),
@@ -178,6 +166,8 @@ SEQUENCE_ROOT_DIMS = (
     "new_halted",
     "branch_taken",
     "cycles",
+    "rmw_write",
+    "write_original_out",
     *(name for receipt in WRITE_RECEIPTS for name in receipt),
 )
 
@@ -189,7 +179,7 @@ def architectural_outputs(fold_result, n_steps: int) -> tuple[ArchitecturalOutpu
     for name, final, input_name in STATE_FIELDS:
         dimension = by_name[f"{final}__s{n_steps - 1}"]
         form = linear_input_form(dimension.as_expr())
-        if form == {by_name[input_name]: 1.0}:
+        if input_name is not None and form == {by_name[input_name]: 1.0}:
             output = ArchitecturalOutput(name)
         elif all(source is one for source in form):
             output = ArchitecturalOutput(name, constant=int(round(form.get(one, 0.0))))
@@ -202,7 +192,6 @@ def architectural_outputs(fold_result, n_steps: int) -> tuple[ArchitecturalOutpu
 def project_sequence_execution(
     fold_result,
     n_steps: int,
-    control: ControlFlow,
     halt_dimension: Dimension | None = None,
 ) -> ExecutionGraph:
     """Replace the proof graph's per-step trace ABI with its execution ABI.
@@ -229,9 +218,15 @@ def project_sequence_execution(
                 continue
             address = fold_result.dim_of_name[f"{addr}__s{k}"]
             write_value = fold_result.dim_of_name[f"{value}__s{k}"]
-            writes.append(MemoryWrite(k, order, address, write_value))
+            rmw = const_root(fold_result, "rmw_write", k, fold_result.label)
+            if rmw not in (0, 1):
+                raise RuntimeError(f"{fold_result.label} s{k}: RMW kind is not boolean")
+            original = fold_result.dim_of_name[f"write_original_out__s{k}"] if order == 0 and rmw else None
+            writes.append(MemoryWrite(k, order, address, write_value, original))
             output_tokens[f"write:{k}:{order}:address"] = Expression({address: 1})
             output_tokens[f"write:{k}:{order}:value"] = Expression({write_value: 1})
+            if original is not None:
+                output_tokens[f"write:{k}:{order}:original"] = Expression({original: 1})
 
     # Each step's cycles: folded to a constant where the pins decide them
     # (most opcodes), else a model output (taken branches, page crosses).
@@ -254,18 +249,8 @@ def project_sequence_execution(
         except RuntimeError:
             bounds.append(9)
 
-    if control.predicate is not None and not control.flag_mask:
-        output_tokens["control:branch"] = Expression({control.predicate: 1})
-    if control.target_dimension is not None:
-        output_tokens["control:target"] = Expression(
-            {
-                control.target_dimension: 1,
-            }
-        )
     if halt_dimension is not None:
         output_tokens["halt"] = Expression({halt_dimension: 1})
-    execution_control = replace(control, predicate=None) if control.flag_mask else control
-
     program_graph = project_program_graph(
         fold_result.program_graph,
         output_tokens,
@@ -279,7 +264,6 @@ def project_sequence_execution(
         n_steps=n_steps,
         memory_writes=tuple(writes),
         outputs=tuple(outputs),
-        control=execution_control,
         halt_dimension=halt_dimension,
         cycles=tuple(cycles),
         cycle_bounds=tuple(bounds),
@@ -310,26 +294,10 @@ def lower_execution(execution: ExecutionGraph, info) -> dict:
     writes = [[] for _ in range(execution.n_steps)]
     for write in execution.memory_writes:
         writes[write.step].append(
-            (
-                info.slot_of[write.address],
-                info.slot_of[write.value],
-            )
+            {"address": info.slot_of[write.address], "value": info.slot_of[write.value],
+             "original": None if write.original is None else info.slot_of[write.original]}
         )
     spec["sequence_writes"] = writes
-    control = execution.control
-    spec["sequence_control"] = {
-        "predicate": (None if control.predicate is None else info.slot_of[control.predicate]),
-        "fallthrough": control.fallthrough,
-        "target": control.target,
-        "target_dimension": (
-            None if control.target_dimension is None else info.slot_of[control.target_dimension]
-        ),
-        "relative_to_head": control.relative_to_head,
-        "relative_operand_offset": control.relative_operand_offset,
-        "absolute_operand_offset": control.absolute_operand_offset,
-        "flag_mask": control.flag_mask,
-        "flag_value": control.flag_value,
-    }
     spec["sequence_cycles"] = {
         "constant": sum(c for c in execution.cycles if isinstance(c, int)),
         "model": [info.slot_of[c] for c in execution.cycles if not isinstance(c, int)],
@@ -340,74 +308,17 @@ def lower_execution(execution: ExecutionGraph, info) -> dict:
     return spec
 
 
-def shape_sequence_control(
-    fold_result,
-    n_steps: int,
-    ops,
-    offsets,
-    length: int,
-    self_target: bool,
-) -> ControlFlow:
-    if self_target:
-        return ControlFlow(
-            predicate=None,
-            fallthrough=0,
-            target=0,
-            relative_to_head=True,
-        )
-    op = ops[-1]
-    if op.operation in BRANCH_OPERATIONS:
-        return ControlFlow(
-            predicate=fold_result.dim_of_name[f"branch_taken__s{n_steps - 1}"],
-            fallthrough=length,
-            target=0,
-            relative_to_head=True,
-            relative_operand_offset=offsets[-1] + 1,
-            flag_mask=BRANCH_CONDITIONS[op.operation][0],
-            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
-        )
-    if op.operation in STACK_CONTROL_OPERATIONS or op.operation == "jmp":
-        raise RuntimeError(f"shape final control {op.mnemonic} is not host-resolvable")
-    return ControlFlow(
-        predicate=None,
-        fallthrough=length,
-        target=length,
-        relative_to_head=True,
-    )
-
-
-def opcode_execution_control(fold_result, op) -> ControlFlow:
-    """Control ABI for one opcode whose operands remain runtime bytes."""
-    if op.operation in BRANCH_OPERATIONS:
-        return ControlFlow(
-            predicate=fold_result.dim_of_name["branch_taken__s0"],
-            fallthrough=op.length,
-            target=0,
-            relative_to_head=True,
-            relative_operand_offset=1,
-            flag_mask=BRANCH_CONDITIONS[op.operation][0],
-            flag_value=bool(BRANCH_CONDITIONS[op.operation][1]),
-        )
-    if op.operation in {"jmp", "jsr"} and op.mode == "abs":
-        return ControlFlow(
-            predicate=None,
-            fallthrough=0,
-            target=0,
-            absolute_operand_offset=1,
-        )
-    if op.operation in {"jmp", "rts", "rti", "brk"}:
-        return ControlFlow(
-            predicate=None,
-            fallthrough=0,
-            target=0,
-            target_dimension=fold_result.dim_of_name["next_pc__s0"],
-        )
-    return ControlFlow(
-        predicate=None,
-        fallthrough=op.length,
-        target=op.length,
-        relative_to_head=True,
-    )
+def readout_slots(spec: dict) -> tuple[int, ...]:
+    """Physical kernel outputs, in the order the native caller decodes them."""
+    slots = set(spec.get("outputs", {}).values())
+    if "sequence_final" in spec:
+        slots.update(spec["sequence_final"]["model"].values())
+        slots.update(s for writes in spec["sequence_writes"] for write in writes
+                     for s in write.values() if s is not None)
+        slots.update(spec["sequence_cycles"]["model"])
+        if spec["sequence_halt"] is not None:
+            slots.add(spec["sequence_halt"])
+    return tuple(sorted(slots))
 
 
 def shape_timing(execution: ExecutionGraph, spin: bool) -> dict:

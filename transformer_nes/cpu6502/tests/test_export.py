@@ -128,5 +128,13 @@ def test_routed_experts_pass_nestest(tmp_path, attention):
     from transformer_nes.cpu6502.backends.weights.export import export_experts
     from transformer_nes.cpu6502.examples.nestest import NESTEST_LOG, NESTEST_ROM
 
-    export_experts(str(tmp_path))
+    assert export_experts(str(tmp_path))["execution_abi"] == 3
     assert nestest(str(tmp_path), NESTEST_ROM, NESTEST_LOG, attention=attention) == 8991
+
+
+def test_old_expert_control_abi_is_rejected_before_loading_weights(tmp_path):
+    from transformer_nes.cpu6502.backends.weights.expert_runner import Cpu
+
+    (tmp_path / "experts.json").write_text(json.dumps({"experts": []}))
+    with pytest.raises(ValueError, match="export a new checkpoint"):
+        Cpu(str(tmp_path), bytes(65536), 0x8000)

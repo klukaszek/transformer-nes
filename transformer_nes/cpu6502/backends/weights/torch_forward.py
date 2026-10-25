@@ -19,6 +19,7 @@ from pathlib import Path
 import torch
 
 from transformer_nes.cpu6502.backends.weights import native
+from transformer_nes.cpu6502.backends.weights.execution import readout_slots
 from transformer_nes.files import write_atomic
 from transformer_nes.model.build import (
     CACHE_DIR,
@@ -75,7 +76,8 @@ def compile_bank(bcd: bool):
 
             union = Cpu6502TransformerMachine.__new__(Cpu6502TransformerMachine)
             union.bcd = bcd
-            models = experts + [{"model": union.model, "step_spec": union.step_spec()}]
+            spec = union.step_spec()
+            models = experts + [{"model": union.model, "step_spec": spec, "output_slots": readout_slots(spec)}]
             source = os.path.join(CACHE_DIR, f"build_{digest}.cpp")
             write_atomic(source, bank_source(models, native.source("torch_hook.cpp")).encode())
             load_module(name, digest, [source], extra_cflags=BANK_CFLAGS)
@@ -133,6 +135,7 @@ class TorchForwards:
                         )
         if not hasattr(self, "_trace_module"):
             model = {"model": self.machine.model, "step_spec": self.machine.step_spec()}
+            model["output_slots"] = readout_slots(model["step_spec"])
             source = bank_source(
                 [model],
                 DEBUG_ADAPTER.replace("@ROWS@", str(len(self.machine.model.attn) + 1)),

@@ -17,9 +17,7 @@ from transformer_nes.graph.core import (
     Expression,
     InputDimension,
     LookUp,
-    LookUpDimension,
     MemoryRead,
-    MemoryReadDimension,
     PersistDimension,
     ReGLUDimension,
 )
@@ -28,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 
 ATTENTION_OPS = (LookUp, MemoryRead)
-ATTENTION_DIMS = (LookUpDimension, MemoryReadDimension)
 
 
 def build_graph(program_graph):

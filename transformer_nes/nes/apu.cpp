@@ -1,8 +1,8 @@
-// Native NES APU (2A03): MMIO registers, channel state, frame sequencer,
+// NES APU (2A03): neural frame/channel control and digital levels,
 // sample generation, and DMC memory reads on the CPU-clock timeline.
 
 #include <algorithm>
-#include <utility>
+#include <bit>
 
 #include "nes/apu.h"
 
@@ -11,320 +11,277 @@ namespace transformer_nes::nes {
 // Device protocol ($4000-$4017)
 
 int Apu::read(int addr) {
-  if ((addr & 0xFFFF) == 0x4015) {
-    int v = 0;
-    if (pulse[0].length > 0)
-      v |= 0x01;
-    if (pulse[1].length > 0)
-      v |= 0x02;
-    if (triangle.length > 0)
-      v |= 0x04;
-    if (noise.length > 0)
-      v |= 0x08;
-    if (dmc.bytes_remaining > 0)
-      v |= 0x10;
-    if (frame_irq)
-      v |= 0x40;
-    if (dmc.irq)
-      v |= 0x80;
-    frame_irq = false; // reading $4015 clears the frame IRQ
-    return v;
-  }
-  return 0x40; // open bus (also serves controller-2 reads at $4017)
+  return access((addr & 0xFFFF) - 0x4000, 0, false).read_value;
 }
 
-void Apu::write(int addr, int value) {
-  value &= 0xFF;
-  switch (addr & 0xFFFF) {
-  case 0x4000:
-  case 0x4004: {
-    Pulse& p = pulse[(addr >> 2) & 1];
-    p.duty = value >> 6;
-    p.length_halt = value & 0x20;
-    p.env.loop = value & 0x20;
-    p.env.constant = value & 0x10;
-    p.env.period = value & 0x0F;
-    break;
+bool Apu::write(int addr, int value) {
+  return access((addr & 0xFFFF) - 0x4000, value & 0xFF, true).dmc_moved;
+}
+
+Apu::AccessResult Apu::access(int port, int value, bool writing) {
+  if (!engine_.ctx)
+    throw std::logic_error("APU transformer engine is required");
+  const auto channels = channel_inputs(0);
+  int in[59];
+  int* field = std::copy(channels.begin() + 1, channels.end(), in);
+  for (const int data : {int(noise.mode), noise.period, port, value, int(writing),
+                         dmc.bytes_remaining, int(dmc.irq), int(frame_irq)})
+    *field++ = data;
+  int out[57];
+  const int model = writing && port >= 0 && port < 24 ?
+      engine_.program_writes[static_cast<size_t>(port)] : engine_.program;
+  engine_.step(engine_.ctx, model, in, out);
+  load_program_state(out);
+  if (out[54])
+    frame_event(FrameEvent::Write, value);
+  if (out[55])
+    frame_event(FrameEvent::Read);
+  if (out[56])
+    dmc_event(DmcEvent::Write, port, value);
+  return {out[53], out[56] != 0};
+}
+
+void Apu::load_program_state(const int* field) {
+  auto envelope = [&field](Envelope& e) {
+    e.start = *field++ != 0;
+    e.loop = *field++ != 0;
+    e.constant = *field++ != 0;
+    e.period = *field++;
+    e.divider = *field++;
+    e.decay = *field++;
+  };
+  for (auto& p : pulse) {
+    p.timer = *field++;
+    p.length = *field++;
+    p.enabled = *field++ != 0;
+    p.sweep_enable = *field++ != 0;
+    p.sweep_period = *field++;
+    p.sweep_negate = *field++ != 0;
+    p.sweep_shift = *field++;
+    p.sweep_reload = *field++ != 0;
+    p.sweep_divider = *field++;
+    p.seq_pos = static_cast<uint8_t>(*field++);
+    p.duty = static_cast<uint8_t>(*field++);
+    envelope(p.env);
   }
-  case 0x4001:
-  case 0x4005: {
-    Pulse& p = pulse[(addr >> 2) & 1];
-    p.sweep_enable = value & 0x80;
-    p.sweep_period = (value >> 4) & 7;
-    p.sweep_negate = value & 0x08;
-    p.sweep_shift = value & 7;
-    p.sweep_reload = true;
-    break;
-  }
-  case 0x4002:
-  case 0x4006: {
-    Pulse& p = pulse[(addr >> 2) & 1];
-    p.timer = (p.timer & 0x700) | value;
-    break;
-  }
-  case 0x4003:
-  case 0x4007: {
-    Pulse& p = pulse[(addr >> 2) & 1];
-    p.timer = (p.timer & 0xFF) | ((value & 7) << 8);
-    if (p.enabled)
-      p.length = length_table[value >> 3];
-    p.seq_pos = 0;
-    p.env.start = true;
-    break;
-  }
-  case 0x4008:
-    triangle.length_halt = value & 0x80;
-    triangle.linear_reload_value = value & 0x7F;
-    break;
-  case 0x400A:
-    triangle.timer = (triangle.timer & 0x700) | value;
-    break;
-  case 0x400B:
-    triangle.timer = (triangle.timer & 0xFF) | ((value & 7) << 8);
-    if (triangle.enabled)
-      triangle.length = length_table[value >> 3];
-    triangle.linear_reload = true;
-    break;
-  case 0x400C:
-    noise.length_halt = value & 0x20;
-    noise.env.loop = value & 0x20;
-    noise.env.constant = value & 0x10;
-    noise.env.period = value & 0x0F;
-    break;
-  case 0x400E:
-    noise.mode = value & 0x80;
-    noise.period = noise_periods[value & 0x0F];
-    break;
-  case 0x400F:
-    if (noise.enabled)
-      noise.length = length_table[value >> 3];
-    noise.env.start = true;
-    break;
-  case 0x4010:
-    dmc.irq_enabled = value & 0x80;
-    dmc.loop = value & 0x40;
-    dmc.period = dmc_periods[value & 0x0F];
-    if (!dmc.irq_enabled)
-      dmc.irq = false;
-    break;
-  case 0x4011:
-    dmc.output_level = value & 0x7F;
-    break;
-  case 0x4012:
-    dmc.sample_address = static_cast<uint16_t>(0xC000 | (value << 6));
-    break;
-  case 0x4013:
-    dmc.sample_length = (value << 4) | 1;
-    break;
-  case 0x4015:
-    pulse[0].enabled = value & 0x01;
-    pulse[1].enabled = value & 0x02;
-    triangle.enabled = value & 0x04;
-    noise.enabled = value & 0x08;
-    if (!pulse[0].enabled)
-      pulse[0].length = 0;
-    if (!pulse[1].enabled)
-      pulse[1].length = 0;
-    if (!triangle.enabled)
-      triangle.length = 0;
-    if (!noise.enabled)
-      noise.length = 0;
-    if (!(value & 0x10))
-      dmc.bytes_remaining = 0;
-    else if (dmc.bytes_remaining == 0)
-      dmc.restart();
-    dmc.irq = false;
-    break;
-  case 0x4017:
-    five_step = value & 0x80;
-    irq_inhibit = value & 0x40;
-    if (irq_inhibit)
-      frame_irq = false;
-    seq_cycle = 0;
-    seq_step = 0;
-    if (five_step) { // 5-step immediately clocks env + length
-      clock_quarter();
-      clock_half();
-    }
-    break;
-  default:
-    break; // $4009/$400D unused
-  }
+  auto& t = triangle;
+  t.timer = *field++;
+  t.length = *field++;
+  t.length_halt = *field++ != 0;
+  t.enabled = *field++ != 0;
+  t.linear_reload_value = *field++;
+  t.linear_reload = *field++ != 0;
+  t.linear_counter = *field++;
+  t.seq_pos = static_cast<uint8_t>(*field++);
+  noise.length = *field++;
+  noise.enabled = *field++ != 0;
+  noise.lfsr[0] = *field++;
+  envelope(noise.env);
+  noise.mode = *field++ != 0;
+  noise.period = *field;
+}
+
+void Apu::dmc_event(DmcEvent event, int port, int value) {
+  static_assert(sizeof(int) == 4 && sizeof(Dmc) == 14 * sizeof(int));
+  const auto state = std::bit_cast<array<int, 14>>(dmc);
+  int in[17];
+  std::copy(state.begin(), state.end(), in);
+  in[14] = static_cast<int>(event);
+  in[15] = port;
+  in[16] = value;
+  int out[20];
+  const int model = event == DmcEvent::Write && port >= 0 && port < 24 ?
+      engine_.dmc_writes[static_cast<size_t>(port)] : engine_.dmc[static_cast<size_t>(event)];
+  engine_.step(engine_.ctx, model, in, out);
+  array<int, 14> next;
+  std::copy_n(out, next.size(), next.begin());
+  dmc = std::bit_cast<Dmc>(next);
+  dmc_fetch_due_ = out[14] != 0;
+  dmc_dma_active_ = out[15] != 0;
+  dmc_tail_ = out[16];
+  if (out[17])
+    dmc_timer_ = out[18];
+  dma_stall += out[19];
 }
 
 void Apu::fill_dmc_buffer() {
-  if (!dmc.buffer_empty || dmc.bytes_remaining == 0 || !memory)
-    return;
-  dmc.sample_buffer = memory(dmc.current_address) & 0xFF;
-  dmc.buffer_empty = false;
-  dma_stall += 4;
-  dmc.current_address = dmc.current_address == 0xFFFF ? 0x8000 : uint16_t(dmc.current_address + 1);
-  if (--dmc.bytes_remaining == 0) {
-    if (dmc.loop)
-      dmc.restart();
-    else if (dmc.irq_enabled)
-      dmc.irq = true;
-  }
+  if (dmc_fetch_due_ && memory)
+    dmc_event(DmcEvent::Fetch, 0, memory(dmc.current_address) & 0xFF);
 }
 
 int64_t Apu::cycles_until_dmc_dma() const {
-  if (dmc.bytes_remaining == 0)
+  if (!dmc_dma_active_)
     return -1;
-  if (dmc.buffer_empty)
-    return 1;
-  return static_cast<int64_t>(dmc.timer_counter) + 2 +
-         static_cast<int64_t>(dmc.bits_remaining - 1) * dmc.period;
+  return dmc_fetch_due_ ? 1 : static_cast<int64_t>(dmc_timer_) + dmc_tail_;
 }
 
 void Apu::clock_dmc() {
   fill_dmc_buffer();
-  if (dmc.timer_counter-- > 0)
-    return;
-  dmc.timer_counter = dmc.period - 1;
-  if (!dmc.silence) {
-    if (dmc.shift_register & 1) {
-      if (dmc.output_level <= 125)
-        dmc.output_level += 2;
-    } else if (dmc.output_level >= 2) {
-      dmc.output_level -= 2;
-    }
+  if (dmc_timer_-- <= 0)
+    dmc_event(DmcEvent::Clock);
+}
+
+// Neural frame/modulation transitions (nes/audio.py).
+
+void Apu::set_engine(Engine engine) {
+  if (!engine.ctx || !engine.step || !engine.sample_step)
+    throw std::invalid_argument("APU transformer engine is required");
+  engine_ = engine;
+  frame_event(FrameEvent::Observe);
+  dmc_event(DmcEvent::Observe);
+}
+
+array<int, Apu::channel_input_count> Apu::channel_inputs(int event) const {
+  array<int, channel_input_count> in{};
+  int* field = in.data();
+  *field++ = event;
+  for (const auto& p : pulse) {
+    const int values[]{p.timer, p.length, p.enabled, p.sweep_enable, p.sweep_period,
+                       p.sweep_negate, p.sweep_shift, p.sweep_reload, p.sweep_divider,
+                       p.seq_pos, p.duty, p.env.start, p.env.loop, p.env.constant,
+                       p.env.period, p.env.divider, p.env.decay};
+    field = std::copy(std::begin(values), std::end(values), field);
   }
-  dmc.shift_register >>= 1;
-  if (--dmc.bits_remaining == 0) {
-    dmc.bits_remaining = 8;
-    if (dmc.buffer_empty) {
-      dmc.silence = true;
-    } else {
-      dmc.silence = false;
-      dmc.shift_register = dmc.sample_buffer;
-      dmc.buffer_empty = true;
-    }
+  const auto& t = triangle;
+  const auto& n = noise;
+  const int values[]{t.timer, t.length, t.length_halt, t.enabled, t.linear_reload_value,
+                     t.linear_reload, t.linear_counter, t.seq_pos,
+                     n.length, n.enabled, n.lfsr[0], n.env.start, n.env.loop, n.env.constant,
+                     n.env.period, n.env.divider, n.env.decay};
+  std::copy(std::begin(values), std::end(values), field);
+  return in;
+}
+
+void Apu::channel_event(int event) {
+  const auto in = channel_inputs(event);
+  int out[channel_output_count];
+  engine_.step(engine_.ctx, engine_.control[static_cast<size_t>(event)], in.data(), out);
+  const int* field = out;
+  auto envelope = [&field](Envelope& e) {
+    e.start = *field++ != 0;
+    e.divider = *field++;
+    e.decay = *field++;
+  };
+  for (auto& p : pulse) {
+    envelope(p.env);
+    p.length = *field++;
+    p.timer = *field++;
+    p.sweep_reload = *field++ != 0;
+    p.sweep_divider = *field++;
   }
+  triangle.length = *field++;
+  triangle.linear_reload = *field++ != 0;
+  triangle.linear_counter = *field++;
+  envelope(noise.env);
+  noise.length = *field;
 }
 
-// Frame sequencer
-
-void Apu::clock_quarter() { // envelopes + triangle linear counter
-  pulse[0].env.clock();
-  pulse[1].env.clock();
-  noise.env.clock();
-  triangle.clock_linear();
+void Apu::frame_event(FrameEvent event, int value) {
+  if (!engine_.ctx)
+    throw std::logic_error("APU transformer engine is required");
+  const int in[]{five_step, irq_inhibit, frame_irq, seq_step, static_cast<int>(event), value};
+  int out[8];
+  engine_.step(engine_.ctx, engine_.frame[static_cast<size_t>(event)], in, out);
+  five_step = out[0] != 0;
+  irq_inhibit = out[1] != 0;
+  frame_irq = out[2] != 0;
+  seq_step = out[3];
+  if (out[4])
+    seq_cycle = 0;
+  frame_deadline = out[7];
+  if (out[5] || out[6])
+    channel_event(out[5] && out[6] ? 2 : out[6] ? 1 : 0);
 }
-void Apu::clock_half() { // length counters + sweeps
-  pulse[0].clock_length();
-  pulse[1].clock_length();
-  triangle.clock_length();
-  noise.clock_length();
-  pulse[0].clock_sweep();
-  pulse[1].clock_sweep();
-}
 
-// Advance the sequencer by one CPU cycle, firing its steps at the NTSC
-// trigger cycles (expressed in CPU cycles = 2x the APU-cycle values).
 void Apu::clock_frame_sequencer() {
-  const auto& events = five_step ? five_step_cycles : four_step_cycles;
-  if (++seq_cycle != events[seq_step])
-    return;
-  clock_quarter();
-  if (seq_step == 1 || seq_step == 3)
-    clock_half();
-  if (seq_step != 3) {
-    ++seq_step;
-    return;
-  }
-  if (!five_step && !irq_inhibit)
-    frame_irq = true;
-  seq_cycle = 0;
-  seq_step = 0;
+  if (++seq_cycle == frame_deadline)
+    frame_event(FrameEvent::Clock);
 }
 
-// Mixing (2A03 nonlinear DAC + DC blocker)
-
-// Raw mixed level in ~[0, 1] from the two nonlinear DAC groups.
-double Apu::mix_level() const {
-  const int p = pulse[0].output() + pulse[1].output();
-  const int t = triangle.output();
-  const int n = noise.output();
-  double pulse_out = 0.0, tnd_out = 0.0;
-  if (p)
-    pulse_out = 95.88 / (8128.0 / p + 100.0);
-  const double tnd = t / 8227.0 + n / 12241.0 + dmc.output_level / 22638.0;
-  if (tnd > 0.0)
-    tnd_out = 159.79 / (1.0 / tnd + 100.0);
-  return pulse_out + tnd_out;
-}
-
-// One-pole high-pass (the 2A03's own DC blocking): removes the DAC's
-// large DC offset so the signal is centered, then scale to line level.
+// The float32 sample token owns digital levels, DAC mixing, filter state
+// and clipping. The host transports its recurrent state and PCM result.
 float Apu::sample() {
-  const double in = mix_level();
-  const double out = in - hp_prev_in + 0.9995 * hp_prev_out;
-  hp_prev_in = in;
-  hp_prev_out = out;
-  double s = out * 2.0;
-  if (s > 1.0)
-    s = 1.0;
-  else if (s < -1.0)
-    s = -1.0;
-  return static_cast<float>(std::clamp(s, -1.0, 1.0));
+  const auto channels = channel_inputs(0);
+  float in[55];
+  std::copy(channels.begin(), channels.end(), in);
+  in[52] = dmc.output_level;
+  in[53] = hp_prev_in;
+  in[54] = hp_prev_out;
+  float out[3];
+  engine_.sample_step(engine_.sample_ctx, engine_.sample_model, in, out);
+  hp_prev_in = out[0];
+  hp_prev_out = out[1];
+  return out[2];
 }
 
-// Advance every channel by one CPU cycle (triangle each cycle; the
-// others at APU rate, every other cycle).
-void Apu::clock_cycle() {
-  triangle.clock_timer();
-  clock_dmc();
-  apu_tick = !apu_tick;
-  if (apu_tick) {
-    pulse[0].clock_timer();
-    pulse[1].clock_timer();
-    noise.clock_timer();
+// Oscillator spans are bounded by DMC deadlines. All timer expiries,
+// parity, phase advancement and the noise recurrence come from weights.
+void Apu::advance_oscillators(int cycles) {
+  int in[15] = {cycles, apu_tick};
+  int* field = in + 2;
+  for (const auto& p : pulse) {
+    *field++ = p.timer;
+    *field++ = p.timer_counter;
+    *field++ = p.seq_pos;
   }
-  clock_frame_sequencer();
+  for (const int value : {triangle.timer, triangle.timer_counter, int(triangle.seq_pos),
+                          triangle.length, triangle.linear_counter, noise.period,
+                          noise.timer_counter})
+    *field++ = value;
+  int out[9];
+  engine_.step(engine_.ctx, engine_.oscillators[cycles == 1], in, out);
+  apu_tick = out[0] != 0;
+  field = out + 1;
+  for (auto& p : pulse) {
+    p.timer_counter = *field++;
+    p.seq_pos = static_cast<uint8_t>(*field++);
+  }
+  triangle.timer_counter = *field++;
+  triangle.seq_pos = static_cast<uint8_t>(*field++);
+  noise.timer_counter = *field++;
+  // Dispatch only the state update requested by the clock circuit.
+  if (const int steps = *field; steps > 0) {
+    int noise_in[17] = {steps, int(noise.mode)};
+    std::copy(noise.lfsr.begin(), noise.lfsr.end(), noise_in + 2);
+    engine_.step(engine_.ctx, engine_.noise[steps == 1][noise.mode],
+                 noise_in, noise.lfsr.data());
+  }
 }
 
-// Runs to `cpu_cycle` in spans with nothing but counting in them: each
-// ends before the next sample, frame-sequencer step, DMC timer expiry or
-// DMC fetch, and those cycles run one at a time through clock_cycle.  A
-// span's timers advance arithmetically, exactly as cycle-by-cycle.
+// Batch through the next sample/event boundary. Oscillators share one
+// transition; DMC and frame effects commit on the final cycle. Their
+// memory transport does not read oscillator state.
 void Apu::advance_to(int64_t cpu_cycle) {
+  if (!engine_.ctx)
+    throw std::logic_error("APU transformer engine is required");
   while (clocked_cycles < cpu_cycle) {
-    const auto& events = five_step ? five_step_cycles : four_step_cycles;
-    int64_t span = cpu_cycle - clocked_cycles;
-    span = std::min<int64_t>(span, events[seq_step] - seq_cycle - 1);
-    span = std::min<int64_t>(span, dmc.timer_counter);
-    // The cycle whose count reaches a sample runs singly.
+    int64_t span = cpu_cycle - clocked_cycles - 1;
+    span = std::min<int64_t>(span, frame_deadline - seq_cycle - 1);
+    span = std::min<int64_t>(span, dmc_timer_);
+    // Finish at the next candidate sample boundary.
     span = std::min<int64_t>(span, static_cast<int64_t>(cycles_per_sample - sample_accum - 1.0));
-    if (dmc.buffer_empty && dmc.bytes_remaining > 0)
+    if (dmc_fetch_due_)
       span = 0; // a fetch is due this cycle
-    if (span <= 0) {
-      clock_cycle();
-      if (++sample_accum >= cycles_per_sample) {
-        sample_accum -= cycles_per_sample;
-        pending_samples.push_back(sample());
-      }
-      ++clocked_cycles;
-      continue;
-    }
-    const int n = static_cast<int>(span);
-    triangle.advance(n);
-    dmc.timer_counter -= n;
-    const int apu_ticks = apu_tick ? n / 2 : (n + 1) / 2;
-    apu_tick = apu_tick != ((n & 1) != 0);
-    pulse[0].advance(apu_ticks);
-    pulse[1].advance(apu_ticks);
-    noise.advance(apu_ticks);
+    const int n = static_cast<int>(std::max<int64_t>(span, 0));
+    advance_oscillators(n + 1);
+    // Preserve the sample accumulator's original span-then-clock adds.
+    dmc_timer_ -= n;
     seq_cycle += n;
     sample_accum += n;
     clocked_cycles += n;
+    clock_dmc();
+    clock_frame_sequencer();
+    if (++sample_accum >= cycles_per_sample) {
+      sample_accum -= cycles_per_sample;
+      pending_samples.push_back(sample());
+    }
+    ++clocked_cycles;
   }
 }
 
-vector<float> Apu::take_samples() {
-  vector<float> out;
+void Apu::take_samples(vector<float>& out) {
   out.swap(pending_samples);
-  return out;
+  pending_samples.clear(); // recycle the previous frame's capacity
 }
-
 
 } // namespace transformer_nes::nes

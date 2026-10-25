@@ -75,7 +75,9 @@ Run a ROM without `--tape` to open the interactive emulator window:
 uv run nes-run path/to/rom.nes
 ```
 
-The default CPU backend is `weights`. Its transformer layers always run through PyTorch Inductor, as do the PPU graphs. Compilation finishes before play and is cached across ROMs. Use `--backend reference` to run the plain-Python CPU instead. The PPU always runs as transformer weights. Add `--xray` to open the overlay on the transformer X-ray.
+The default CPU backend is `weights`. Its transformer layers always run through PyTorch Inductor, as do the PPU graphs. Compilation finishes before play and is cached across ROMs. Use `--backend reference` to run the plain-Python CPU instead. The PPU, controller protocol, MMC1/MMC3/MMC2/MMC4/MMC5 banking and MMC3/MMC5 IRQ transitions always run as transformer weights. Add `--xray` to open the overlay on the transformer X-ray.
+
+APU register programming, frame control, envelopes, counters, sweeps, oscillator spans, noise recurrence, digital levels and DMC transitions also run as weights. A float32 ReGLU circuit computes nonlinear DAC mixing, the recurrent DC filter and sample clipping. The host schedules events, delivers DMA bytes and plays the returned samples.
 
 | Key | NES control |
 |-----|-------------|
@@ -129,7 +131,7 @@ The [`transformer_nes/cpu6502/README.md`](transformer_nes/cpu6502/README.md) doc
 | `transformer_nes/graph/` | Machine-independent graph DSL: Input/ReGLU/Persist/LookUp dimensions, arithmetic and memory idioms (`ops.py`), direct evaluation (`evaluate.py`), partial evaluation and rebuilding (`fold.py`) |
 | `transformer_nes/cpu6502/` | The pure 6502: opcode spec, graph construction, trace format, `backends/reference.py`, the weights compiler/runtime in `backends/weights/` (`engine.py` emits model-specific dispatch into the C++ runtime template in `native/engine.cpp`), the self-contained checkpoint exporter and runners (`export.py`, `checkpoint_runner.py`, `expert_runner.py`), and `examples/klaus/` (harness + binary) |
 | `transformer_nes/nes/` | Native C++ NES hardware: bus, cartridge, mapper/MMC headers, PPU, APU, console, tape replay, and the window with its debug overlay; `app.py` builds it, adapts a CPU backend, and launches it; `xray.py` reads the engines for the overlay |
-| `transformer_nes/ppu2c02/` | The PPU as computation graphs: its memory layout (`space.py`), the register file (`registers.py`), background rendering and compositing with its folded experts (`render.py`), and sprite selection, overflow and fetch (`sprites.py`), and the shared transformer engine (`machine.py`) |
+| `transformer_nes/ppu2c02/` | The PPU graphs: memory layout (`space.py`), register transitions (`registers.py`), background rendering and compositing (`render.py`), sprite selection, overflow and fetch (`sprites.py`), timing/bus/view effects and sprite-line composition (`control.py`), and the shared engine (`machine.py`) |
 | `transformer_nes/model/` | Transformer machinery: layer scheduling (`schedule.py`), analytical weight construction (`weights.py`), shared Torch weight layout and compilation (`torch_layout.py`, `torch_codegen.py`), the generic token-graph engine (`graph_engine.py`), native build/cache support (`build.py`), exact CSR checkpoint serialization (`artifacts.py`), and reference inference (`inference.py`) |
 
 The dependency direction is one-way: `nes/` depends on the NES-independent CPU package; the CPU construction depends on `graph/`, while its weights backend also uses `model/` for scheduling and code generation. The entire generic `model/` package imports without loading the CPU package; a test enforces this. Machine-specific checkpoint export and standalone runners live in `cpu6502/backends/weights/`. The `6502-export`, `6502-checkpoint`, and `6502-experts` commands remain the public entry points.
@@ -146,8 +148,11 @@ folds without sharing a mutable construction registry.
 
 The CPU's union graph computes the next registers, ordered writes, interrupts,
 and instruction cycles. Partial evaluation produces smaller opcode and shape
-experts. Fixed polling and counter shapes can advance through a proven
-recurrence after a forward confirms their state change. All paths share the
+experts. Every execution expert computes its next PC in weights, including
+fallthrough, conditional branches, jumps and returns. Fixed polling and counter
+shapes can advance through a proven recurrence after a forward confirms their
+state change. Bounded counter experts compute the additional iterations,
+registers, flags and elapsed cycles in weights. All paths share the
 native run loop's device watches and cycle budgets. The CPU core is independent
 of the ROM: it needs no learned instruction windows or online compiler.
 
@@ -156,8 +161,8 @@ attention and ReGLU matrices into a fixed bank compiled by Inductor. The graph
 fold licenses direct reads over the latest-written byte image before scheduling;
 there are no separate nearest-address or register caches. C++ owns dispatch,
 architectural readout and devices. Constant coefficients and sparse routing are
-specialized before play; execution allocates no weight tensors or per-call Tensor
-wrappers. The standalone union and expert checkpoint runners remain independent
+specialized before play; CPU kernels return packed live readouts, and execution
+allocates no weight tensors or per-call Tensor wrappers. The standalone union and expert checkpoint runners remain independent
 checks, including ordinary softmax attention.
 
 The first launch compiles the fixed CPU and PPU banks before play. This is
@@ -186,9 +191,11 @@ Automated tests run the transformer CPU and PPU through blargg's `ppu_vbl_nmi` (
 
 These token graphs share one engine and memory (`model/graph_engine.py`). Partial evaluation (`graph/fold.py`) produces exact experts for each register and direction, rendering mode, sprite size and fetch count. One blank-state expert removes inactive fetch circuitry while retaining palette output. The host selects an expert whose pins hold, or the full graph. Timing previews project the transformer down to bus or status readouts, removing unused pixel and CHR work before compilation. C++ advances the clock and restores the live register, latch and line-buffer state afterwards.
 
-Every production console attaches this PPU automatically. C++ retains the clock, NMI/status races, mapper bus events and output buffers. The conventional PPU algorithms live under `nes/tests/ppu_reference.*` and build only into the independent test oracle; they are excluded from the production extension.
+An eight-lane *composition* token merges fetched sprite rows into the line state, preserving first-opaque-pixel priority, clipping the right edge and marking occupied tiles. It reuses the bounded line buffer across ordinary fetches, unlimited-sprite batches and status previews.
 
-Frames stay pixel-identical to the native PPU on every mapper the console supports (NROM, MMC1, MMC3, MMC2/MMC4, MMC5), checked over game captures and synthetic carts that sweep every register path. `model/inference.py` runs constructed graphs exactly in float64 as the reference the compiled engines match.
+Every production console attaches this PPU automatically. Neural control tokens resolve NMI/status races, filtered A12 edges, register-side latch effects and MMC5 view selection. C++ advances the absolute clock, delivers bus effects and stores output buffers. The conventional PPU algorithms live under `nes/tests/ppu_reference.*` and build only into the independent test oracle; they are excluded from the production extension.
+
+Frames stay pixel-identical to the native PPU on every mapper the console supports (NROM, MMC1, MMC3, MMC2/MMC4, MMC5), checked over game captures and synthetic carts that sweep every register path. `model/inference.py` runs constructed graphs exactly in float64 as the verification reference: discrete circuits match exactly, while real-valued audio circuits use measured error tolerances.
 
 ## Development
 

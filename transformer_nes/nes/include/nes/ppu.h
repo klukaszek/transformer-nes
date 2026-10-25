@@ -1,24 +1,14 @@
 #pragma once
 
-// NES PPU (2C02) as a catch-up machine on an absolute dot clock (3 dots
-// per CPU cycle).  The PPU runs lazily: every register access, mapper
-// write, and console event first catches it up to the access's dot, so
-// everything the CPU wrote is ordered against rendering by time rather
-// than reconstructed afterwards.  Rendering follows the hardware's
-// loopy v/t/x/w scroll registers at tile-slot (8-dot) resolution:
-//
-//   dots   1-256  32 background fetches (tiles 2..33) + pixel output
-//   dot      256  vertical increment of v
-//   dot      257  horizontal t->v copy, sprite evaluation + 8 sprite fetches
-//   dots 280-304  vertical t->v copy (pre-render line only)
-//   dots 321-336  first two background tiles of the next line
-//
-// Mappers observe the PPU bus through PpuWatcher events (A12 rises for
-// MMC3, scanline starts for MMC5), delivered in time order.
+// 2C02 catch-up machine: CPU accesses and mapper writes carry absolute dots.
+// Per rendered line: slots at 1..256, sprites/horizontal copy at 257,
+// vertical copy at 280..304 (pre-render), and prefetch at 321..336.
 
 #include "nes/chr.h"
 
+#include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -47,9 +37,8 @@ struct PpuEvent {
   int line;
 };
 
-// Receives PPU bus events.  A mapper is the live watcher; a probe (a
-// copy of a mapper's IRQ counter) watches a dry-run preview instead and
-// reports the dot its IRQ would fire.
+// Receives PPU bus events. A mapper is the live watcher; a probe consumes
+// its private IRQ-effect horizon during a dry run and reports the fire dot.
 class PpuWatcher {
 public:
   virtual ~PpuWatcher() = default;
@@ -83,6 +72,8 @@ public:
   // status change a dry run finds before `horizon`.
   [[nodiscard]] optional<int> read_lease(int address, int64_t horizon);
   [[nodiscard]] int64_t lease_expiry() const { return lease_expiry_; }
+  // Neural source/stall request; destination state is sampled at delivery.
+  [[nodiscard]] array<int, 2> dma_request(int page, int parity) const;
   void oam_dma(span<const uint8_t, 256> page, int64_t dot);
 
   // ── Clock ──
@@ -122,14 +113,9 @@ public:
 
   // ── Graph memory (ppu2c02/space.py) ──
   //
-  // What the PPU graphs read, as a view over PPU state in one physical
-  // space: the CHR window $0000 (under MMC2/MMC4, the FD-latch banks),
-  // the nametable source pages $2000 + page * $400 (CIRAM 0, CIRAM 1,
-  // MMC5 ExRAM as the PPU sees it, MMC5 fill mode), palette $3F00, OAM
-  // $4000, the FE-latch CHR window $5000, and for MMC5 the whole CHR ROM
-  // at $10000.  The engine receives only the bytes that changed since its
-  // last sync, and every byte it can read has been written (the graphs'
-  // dense reads rely on that).
+  // Graph byte image: CHR $0000, nametables $2000, palette $3F00,
+  // OAM $4000, alternate CHR $5000, MMC5 whole-CHR $10000.
+  // Epochs/dirty chunks track delivery; -1 shadow bytes have not been sent.
   struct GraphMemorySync {
     array<int16_t, 0x1000 + 0x20 + 0x100> shadow; // pages, palette, OAM; -1 unsent
     array<size_t, 16> chr_source;                 // per 1 KiB CHR slot: source offset
@@ -170,14 +156,8 @@ public:
   // Whole-CHR bytes the PPU graphs need mapped (MMC5), else 0.
   [[nodiscard]] size_t graph_chr_full() const { return mmc5.active() ? chr.size() : 0; }
 
-  // Run the PPU as one compiled transformer called through its ABI
-  // (model/graph_engine.py, built by ppu2c02/machine.py): a token per
-  // register access (ppu2c02/registers.py), per visible or prefetch tile
-  // slot (render.py), and per visible line's sprite evaluation and fetch
-  // (sprites.py), all over one WRITE log that follows the graph-memory
-  // view. Overflow selection and dry-run previews use these tokens too.
-  // The host owns the clock, status races, bus edges and line buffers.
-  // Each token selects an exact folded expert when its pins hold.
+  // Token/expert IDs from ppu2c02/machine.py and control.py.
+  // The host owns clocks and storage; neural readouts define state/effects.
   struct RenderDispatch {
     array<array<uint8_t, 8>, 2> inner{}; // per background table, fine x
     uint8_t sprites = 0;
@@ -204,19 +184,32 @@ public:
     int trace_rows = 0, trace_width = 0;
     array<RenderDispatch, 2> dispatch{}; // [CHR latches active]
     SpriteDispatch sprites{};
+    int compose_model = 0;
     vector<int> render_status;
     array<array<uint8_t, 8>, 2> registers{}; // [is_write][register]
+    void* control_ctx = nullptr;
+    void (*control_step)(void*, int, const int*, int*) = nullptr;
+    array<int, 6> control_models{};
+    array<int, 3> bus_models{};
+    int background_span_model = 0;
+    array<array<int, 8>, 2> access_bus_models{};
+    int view_model = 0;
+    int access_delay_model = 0;
+    int dma_request_model = 0, dma_transfer_model = 0;
   };
   // The render graph's token layout (ppu2c02/render.py INPUTS, OUTPUTS).
   static constexpr int render_inputs = 43, render_outputs = 31;
   static constexpr int in_bg = 19, in_sprites = 35;
   static constexpr int out_tile = 8, out_v = 16, out_fetched = 20, out_hit = 21, out_latch = 29;
   // The register graph's (ppu2c02/registers.py INPUTS, OUTPUTS).
-  static constexpr int access_inputs = 35, access_outputs = 20;
+  static constexpr int access_inputs = 35, access_outputs = 21;
   static constexpr int in_access_banks = 13, in_access_state = 21;
+  // Finite event control (ppu2c02/control.py INPUTS, OUTPUTS).
+  static constexpr int control_inputs = 23, control_outputs = 15, out_control_skip = 13;
   // The sprite graphs' (ppu2c02/sprites.py EVALUATE_*, FETCH_*).
   static constexpr int evaluate_inputs = 4, evaluate_outputs = 9;
   static constexpr int fetch_inputs = 23, fetch_outputs = 90;
+  static constexpr int compose_inputs = 19, compose_outputs = 10;
   static constexpr int in_index = 4, in_latch = 12, in_banks = 15;
   static constexpr int out_sprite_x = 64, out_sprite_fetch = 72, out_sprite_a12 = 80,
                        out_sprite_latch = 88;
@@ -259,7 +252,8 @@ public:
   }
   void set_mmc5_state(int exram_mode, int nametable_map, int fill_tile, int fill_color,
                       int chr_upper) {
-    mmc5.configure(exram_mode, nametable_map, fill_tile, fill_color, chr_upper);
+    mmc5.configure(exram_mode, fill_tile, fill_color, chr_upper);
+    refresh_mmc5_view();
     mirroring = nametable_map;
     mark_pages();
   }
@@ -318,6 +312,7 @@ private:
     int dot;
     Ev ev;
     int slot;
+    int run = 1; // consecutive background slots in this immutable timeline
   };
 
   // Everything rendering mutates: the dry-run preview snapshots and
@@ -345,9 +340,12 @@ private:
     array<uint8_t, 34 * 8 + 8> bg{};
     // Next line's sprite pixels: bits 0-4 palette index (16+palette*4+
     // value), bit 6 behind background, bit 7 sprite 0; 0 = transparent.
-    array<uint8_t, 256> sprites{};
-    bool any_sprites = false, sprite0_on_line = false;
-    uint32_t sprite_slots = 0; // tile slots with any sprite pixel
+    // Padding transports right-edge rows without a native clipping rule.
+    array<uint8_t, 256 + 8> sprites{};
+    array<uint8_t, 33> sprite_slots{}; // occupied tiles, plus a zero sentinel
+#ifdef TRANSFORMER_NES_PPU_REFERENCE
+    bool sprite0_on_line = false;
+#endif
     // Sprite evaluation (dot 65) for the next line: OAM indices in order.
     array<uint8_t, 64> selected{};
     int selected_count = 0;
@@ -365,17 +363,18 @@ private:
   };
   struct RegisterResult {
     int read_value = 0;
-    int mem_addr = -1; // a graph-memory write the access made, or -1
-    int mem_value = 0;
+    bool clear_vblank = false, nmi_rise = false, nmi_fall = false;
   };
+  enum class ControlEvent { Access, VerticalCopy, SpriteLine, OddSkip, VBlank, Clear };
+  bool control(ControlEvent event, int64_t dot, const RegisterResult& effects);
   int access(int reg, int value, bool is_write, int64_t dot);
   RegisterResult graph_transition(const RegisterAccess& request, const RegisterFile& before);
-  void access_effects(const RegisterAccess& request, const RegisterFile& before, int64_t dot);
+  void access_effects(const RegisterAccess& request, const RegisterFile& before,
+                      const RegisterResult& result, int64_t dot);
   void write_physical(int addr, int value);
   bool rendering_line() const { return r_.line < 240 || r_.line == prerender_line; }
-  static size_t palette_index(int addr);
   const size_t* bg_banks() const {
-    return mmc5.active() ? mmc5.live_background_banks(ctrl) : chr_bank.data();
+    return mmc5.active() ? mmc5.live_background_banks() : chr_bank.data();
   }
   const size_t* sprite_banks() const {
     return mmc5.active() ? mmc5.sprite_banks() : chr_bank.data();
@@ -386,13 +385,25 @@ private:
   void process(const EventAt& e);
   void advance_line();
   void emit(PpuEvent::Kind kind, int64_t dot);
-  bool a12(bool high, int64_t dot);
+  enum class BusEvent { Pin, Background, Sprite };
+  bool bus_event(BusEvent event, bool high, int64_t dot);
+  bool a12(bool high, int64_t dot) { return bus_event(BusEvent::Pin, high, dot); }
+  void refresh_mmc5_view();
   bool start_sprite_line();
-  void draw_sprite_row(int x, span<const uint8_t, 8> row);
+  void compose_sprite_rows(const int* fetched, int count);
   // The sprite unit as graph steps (engine_.sprites).
   void evaluate_sprites_graph(int64_t dot);
   void load_sprites_graph(int64_t dot);
   void mark_status_change(int64_t dot);
+
+  // Selection is a neural function of line, OAM and control inputs. Share
+  // its first batch across live rendering and both kinds of lookahead.
+  struct SpriteRows {
+    array<array<uint8_t, evaluate_outputs>, frame_height> rows{};
+    std::bitset<frame_height> valid;
+    uint64_t oam_epoch = ~0ULL;
+    int model = -1;
+  } sprite_rows_;
 
   Render r_;
   Frame frame_{};
@@ -433,8 +444,8 @@ private:
   void graph_step(int model, const int* in, int* out);
   void render_slot(int slot, int64_t dot);
   void background_bus(int64_t dot);
+  int preview_background(int count, int64_t dot);
   RegisterFile register_file() const;
-  int32_t graph_address(int addr) const;
   bool schedule_changed_ = false;
 #ifdef TRANSFORMER_NES_PPU_REFERENCE
 #include "tests/ppu_reference.h"

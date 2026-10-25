@@ -151,7 +151,7 @@ def eval_over_heads(fold_result, dim, length):
 
 
 def check_reads_licensed(fold_result, ops, label: str) -> None:
-    """Only the first read is shadow-checked; later reads must avoid devices.
+    """Only the first read crosses the request boundary; later reads must avoid devices.
 
     Fixed shapes contain no stores, so reads cannot depend on uncommitted
     writes from an earlier instruction in the same forward.

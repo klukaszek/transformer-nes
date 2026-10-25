@@ -1074,6 +1074,14 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     is_store = mux(is_int, 1, is_store)
     is_store = persist(is_store, name="is_store")
 
+    # Typed write effect: retain the byte actually read by memory RMWs.
+    # Devices consume this operand directly rather than decoding an opcode
+    # or reconstructing a first write from memory after the CPU has committed.
+    rmw = persist(mux(is_int, 0, family["inc"] + family["dec"] + shifts_mem
+                      + family["dcp"] + family["isb"] + family["slo"]
+                      + family["rla"] + family["sre"] + family["rra"]), name="rmw_write")
+    persist(mux(rmw, operand, -1), name="write_original_out")
+
     write_addr = mux(
         family["store_a"] + family["store_x"] + family["store_y"] + family["inc"] + family["dec"] + shifts_mem + unofficial_store,
         ea,

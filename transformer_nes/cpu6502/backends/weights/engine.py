@@ -12,6 +12,7 @@ import os
 from collections.abc import Callable
 
 from transformer_nes.cpu6502.backends.weights import native
+from transformer_nes.cpu6502.backends.weights.execution import readout_slots
 from transformer_nes.cpu6502.spec import (
     MODE_ABSOLUTE,
     MODE_ABSOLUTE_X,
@@ -26,7 +27,6 @@ from transformer_nes.cpu6502.spec import (
     MODE_ZERO_PAGE_X,
     MODE_ZERO_PAGE_Y,
     OPCODES,
-    READS_MEMORY,
 )
 from transformer_nes.model.build import (
     CACHE_DIR,
@@ -57,7 +57,7 @@ def engine_config_key(*, bcd: bool, union_only: bool = False, mirror_cpu_ram: bo
     return hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
-READ_MODE_CODE = {
+ADDRESS_MODE_CODE = {
     MODE_ZERO_PAGE: 1,
     MODE_ZERO_PAGE_X: 2,
     MODE_ZERO_PAGE_Y: 3,
@@ -69,20 +69,12 @@ READ_MODE_CODE = {
 }
 
 
-def read_mode_table() -> tuple[int, ...]:
-    """Opcode-to-addressing-mode codes used by MMIO shadow decoding."""
-    table = [0] * 256
-    for byte, op in OPCODES.items():
-        if op.operation in READS_MEMORY:
-            table[byte] = READ_MODE_CODE.get(op.mode, 0)
-    return tuple(table)
-
-
-TRACE_MODE_CODE = READ_MODE_CODE | {
+TRACE_MODE_CODE = ADDRESS_MODE_CODE | {
     MODE_IMMEDIATE: 11,
     MODE_INDIRECT: 9,
     MODE_RELATIVE: 10,
 }
+
 
 def trace_mode_table() -> tuple[int, ...]:
     table = [0] * 256
@@ -96,8 +88,6 @@ def trace_length_table() -> tuple[int, ...]:
     for byte, op in OPCODES.items():
         table[byte] = op.length
     return tuple(table)
-
-
 
 
 def trace_data_table() -> tuple[int, ...]:
@@ -122,10 +112,11 @@ def trace_data_table() -> tuple[int, ...]:
     table = [0] * 256
     for byte, op in OPCODES.items():
         table[byte] = (
-            6 if op.mode == MODE_ACCUMULATOR else 5
-        ) if op.operation in {"asl", "lsr", "rol", "ror"} else codes.get(op.operation, 0)
+            (6 if op.mode == MODE_ACCUMULATOR else 5)
+            if op.operation in {"asl", "lsr", "rol", "ror"}
+            else codes.get(op.operation, 0)
+        )
     return tuple(table)
-
 
 
 def shape_run_cpp(exp) -> str:
@@ -145,13 +136,19 @@ def generate_source(
     Core ``experts`` are compact opcode, interrupt or canonical shape models.
     """
     experts = experts or []
-    if any(e.get("kind") not in {"exec_opcode", "shape", "exec_int"} for e in experts):
-        raise RuntimeError("core experts must be compact opcodes, shapes or interrupts")
+    if any(
+        e.get("kind") not in {"exec_opcode", "shape", "exec_int", "exec_loop", "read_request"}
+        for e in experts
+    ):
+        raise RuntimeError("core expert has an unsupported execution contract")
 
     d_model = model.tok.weight.shape[1]
     # The step_core variants share one residual buffer; an expert model may
     # schedule wider than the union (e.g. PLP), so size it for the widest.
     xbuf_size = max([d_model] + [e["model"].tok.weight.shape[1] for e in experts])
+    readout_size = max(
+        len(readout_slots(spec)) for spec in [step_spec] + [e["step_spec"] for e in experts]
+    )
 
     lines: list[str] = []
     emit = lines.append
@@ -164,9 +161,6 @@ def generate_source(
     def sc(v, e=elem):
         return f"(({e})({v}) << F)"
 
-    def rdv(slot):
-        return f"shr2(x[{slot}])"
-
     def emit_step_core(
         fn_name,
         mdl,
@@ -174,16 +168,19 @@ def generate_source(
         *,
         stage_writes=False,
         embed_only=False,
-        probe=False,
+        request=False,
         hook_id=None,
     ):
         # One model forward over persistent st_* state. The union emits one
         # diagnostic receipt; execution models emit only final state, control
         # and ordered effects. embed_only prepares the diagnostic input;
-        # probe=True returns the
-        # instruction's cycles and commits nothing (no interrupt may be
-        # pending: the embed would take it).
+        # request=True emits only the address/timing packet and commits nothing.
         ins = spec["inputs"]
+        positions = {slot: index for index, slot in enumerate(readout_slots(spec))}
+
+        def rdv(slot):
+            return f"shr2(readouts[{positions[slot]}])"
+
         sequence_final = spec.get("sequence_final")
         if stage_writes and sum(map(len, spec["sequence_writes"])) > 3:
             raise RuntimeError("compact execution exceeds three staged writes")
@@ -192,17 +189,15 @@ def generate_source(
             or bool(mdl.attn)
             or bool(sequence_final["model"])
             or any(spec["sequence_writes"])
-            or spec["sequence_control"]["predicate"] is not None
-            or spec["sequence_control"]["target_dimension"] is not None
             or spec["sequence_halt"] is not None
         )
         if not needs_x and (ins or spec["p_flags"]):
             raise RuntimeError("zero-work execution model retained live inputs")
 
         args = ""
-        if not sequence_final and not probe and not embed_only:
+        if not sequence_final and not request and not embed_only:
             args += (", " if args else "") + "long long* out"
-        returns = "long long" if probe else "void"
+        returns = "ReadRequest" if request else "void"
         emit(f"    {returns} {fn_name}({args}) {{")
         if needs_x:
             emit(f"        {elem}* x = xbuf;")
@@ -230,33 +225,46 @@ def generate_source(
         embed("ea_hi", sc("(st_ea >> 8) & 0xFF"))
         embed("data", sc("st_data"))
         embed("halted", sc("st_halted ? 1 : 0"))
+        embed("read_addr_lo", sc("pending_read.address & 0xFF"))
+        embed("read_addr_hi", sc("(pending_read.address >> 8) & 0xFF"))
+        embed("read_cycles", sc("pending_read.cycles"))
+        embed("loop_limit", sc("loop_limit"))
+        embed("loop_cycles", sc("loop_cycles"))
         for bit in range(8):
             embed(f"a_bit{bit}", sc(f"(st_a >> {bit}) & 1"))
         if "nmi" in ins:
-            embed("nmi", sc("nmi_pending ? 1 : 0"))
+            emit("        const bool take_nmi = nmi_pending && pending_read.address < 0;")
+            embed("nmi", sc("take_nmi ? 1 : 0"))
             if not embed_only:
-                emit("        nmi_pending = false;")
+                emit("        if (take_nmi) nmi_pending = false;")
         if "irq" in ins:
-            emit("        const bool take_irq = irq_ready();")
+            emit("        const bool take_irq = irq_ready() && pending_read.address < 0;")
             embed("irq", sc("take_irq ? 1 : 0"))
             if not embed_only:
                 emit("        if (take_irq) irq_pending = false;")
         if embed_only:
             emit("    }")
             return
-        emit("        ++seq;")
+        if not request:
+            emit("        ++seq;")
         if needs_x:
-            emit(f"        if (!forward_hook || !forward_hook(forward_hook_ctx, {hook_id}, x))")
+            emit(
+                f"        if (!forward_hook || !forward_hook(forward_hook_ctx, {hook_id}, x, readouts))"
+            )
             emit('            throw std::runtime_error("Torch transformer bank is not attached");')
-        if probe:
-            emit("        --seq;")
-            emit(f"        return {rdv(spec['outputs']['cycles'])} & 0xFF;")
+        if request:
+            outs = spec["outputs"]
+            emit(
+                f"        return {{(int){rdv(outs['address'])}, (int){rdv(outs['cycles'])}, "
+                f"(int){rdv(outs['oplo'])}, (int){rdv(outs['ophi'])}}};"
+            )
             emit("    }")
             return
         if sequence_final:
             outs = sequence_final["model"]
             constants = sequence_final["constant"]
             fields = {
+                "new_pc": ("st_pc", 0xFFFF),
                 "new_a": ("st_a", 0xFF),
                 "new_x": ("st_x", 0xFF),
                 "new_y": ("st_y", 0xFF),
@@ -287,55 +295,19 @@ def generate_source(
                 else:
                     continue
                 emit(f"        st_p = (st_p & ~0x{mask:X}) | ({value});")
-            control = spec["sequence_control"]
-            if control["target_dimension"] is not None:
-                target = rdv(control["target_dimension"])
-                fallthrough = target
-            elif control["absolute_operand_offset"] is not None:
-                offset = control["absolute_operand_offset"]
-                target = (
-                    f"(ram[(st_pc + {offset}) & 0xFFFF] | "
-                    f"(ram[(st_pc + {offset + 1}) & 0xFFFF] << 8))"
-                )
-                fallthrough = target
-            elif control["relative_to_head"]:
-                fallthrough = f"(st_pc + {control['fallthrough']})"
-                target = f"(st_pc + {control['target']})"
-            else:
-                fallthrough = str(control["fallthrough"])
-                target = str(control["target"])
-            operand_offset = control["relative_operand_offset"]
-            if operand_offset is not None:
-                target = (
-                    f"(st_pc + {control['fallthrough']} + "
-                    f"(int)(std::int8_t)ram[(st_pc + {operand_offset}) & 0xFFFF])"
-                )
-            predicate = control["predicate"]
-            if control["flag_mask"]:
-                mask = control["flag_mask"]
-                expected = f"0x{mask:X}" if control["flag_value"] else "0"
-                condition = f"(st_p & 0x{mask:X}) == {expected}"
-            elif predicate is not None:
-                condition = f"({rdv(predicate)} & 1)"
-            else:
-                condition = None
-            successor = (
-                fallthrough if condition is None else f"({condition} ? {target} : {fallthrough})"
-            )
-            emit(f"        st_pc = (int)({successor} & 0xFFFF);")
             cycles = spec["sequence_cycles"]
             emit(
                 "        seq_cycles = "
-                + " + ".join(
-                    [str(cycles["constant"])]
-                    + [f"({rdv(slot)} & 0xFF)" for slot in cycles["model"]]
-                )
+                + " + ".join([str(cycles["constant"])] + [rdv(slot) for slot in cycles["model"]])
                 + ";"
             )
+            if "iterations" in spec.get("outputs", {}):
+                emit(f"        loop_iterations = (int){rdv(spec['outputs']['iterations'])};")
             if spec["sequence_halt"] is not None:
                 emit(f"        st_halted = ({rdv(spec['sequence_halt'])} & 1) != 0;")
             for step_writes in spec["sequence_writes"]:
-                for addr_slot, value_slot in step_writes:
+                for write in step_writes:
+                    addr_slot, value_slot = write["address"], write["value"]
                     if stage_writes:
                         emit(
                             f"        exec_write_addr[exec_n_writes] = "
@@ -345,6 +317,8 @@ def generate_source(
                             f"        exec_write_value[exec_n_writes] = "
                             f"(int)({rdv(value_slot)} & 0xFF);"
                         )
+                        original = "-1" if write["original"] is None else f"(int){rdv(write['original'])}"
+                        emit(f"        exec_write_original[exec_n_writes] = {original};")
                         emit("        ++exec_n_writes;")
                     else:
                         emit(
@@ -385,6 +359,7 @@ def generate_source(
             emit("        }")
         emit("        out[14] = n_writes;")
         emit(f"        out[21] = {rdv(outs['cycles'])} & 0xFF;")
+        emit(f"        out[22] = {rdv(outs['write_original_out'])};")
         emit("        for (long long i = 0; i < n_writes; ++i)")
         emit("            insert_write((int)out[15 + 2 * i], (int)out[16 + 2 * i], seq + 1);")
         emit("        }")
@@ -403,7 +378,6 @@ def generate_source(
     emit("")
     emit_step_core("embed_union", model, step_spec, embed_only=True)
     emit("")
-    emit_step_core("union_cycles", model, step_spec, probe=True, hook_id=union_id)
     for j, exp in enumerate(experts):
         emit("")
         emit_step_core(
@@ -411,7 +385,8 @@ def generate_source(
             exp["model"],
             exp["step_spec"],
             stage_writes=exp.get("kind") in ("exec_opcode", "exec_int"),
-            hook_id=j,
+            request=exp.get("kind") == "read_request",
+            hook_id=exp.get("hook_id", j),
         )
 
     forwards = "\n".join(lines) + "\n\n"
@@ -424,29 +399,32 @@ def generate_source(
     emit("")
     emit("    // Ordered writes staged for the device boundary.")
     emit("    int exec_n_writes = 0;")
-    emit("    int exec_write_addr[3], exec_write_value[3];")
+    emit("    int exec_write_addr[3], exec_write_value[3], exec_write_original[3];")
     # Compact per-opcode dispatch; an opcode with no case returns false
     # and the run loop takes the union step_core.
-    emit("    bool execution_step(unsigned char opcode) {")
+    emit("    bool execution_step(unsigned char opcode, [[maybe_unused]] bool read_serviced) {")
     emit("        exec_n_writes = 0;")
     if exec_op_experts:
         emit("        switch (opcode) {")
         for exp in exec_op_experts:
-            emit(f"            case 0x{exp['byte']:02X}: step_core__{exp['name']}(); return true;")
+            emit(f"            case 0x{exp['byte']:02X}:")
+            if exp.get("external_only"):
+                emit("                if (!read_serviced) return false;")
+            emit(f"                step_core__{exp['name']}(); return true;")
         emit("        }")
     emit("        return false;")
     emit("    }")
     emit("")
-    emit("    // The next instruction's cycles without running it (a watched")
-    emit("    // read's stamp): its expert's forward on saved state, else the")
-    emit("    // union's.  No interrupt is pending when a read pauses.")
-    emit("    long probe_cycles() {")
-    emit(
-        "        const auto saved = std::tuple{st_pc, st_a, st_x, st_y, st_s, st_p, st_halted, seq};"
-    )
-    emit("        const bool ran = execution_step(ram[st_pc]);")
-    emit("        std::tie(st_pc, st_a, st_x, st_y, st_s, st_p, st_halted, seq) = saved;")
-    emit("        return ran ? seq_cycles : union_cycles();")
+    emit("    ReadRequest request_read() {")
+    emit("        read_ir = ram[st_pc];")
+    emit("        switch (read_ir) {")
+    for exp in experts:
+        if exp.get("kind") == "read_request":
+            for byte in exp["bytes"]:
+                emit(f"        case 0x{byte:02X}:")
+            emit(f"            return step_core__{exp['name']}();")
+    emit("        }")
+    emit("        return {-1, 0, 0, 0};")
     emit("    }")
 
     int_experts = {e["nmi"]: e for e in experts if e.get("kind") == "exec_int"}
@@ -460,6 +438,16 @@ def generate_source(
         cond = "nmi" if is_nmi else "!nmi"
         emit(f"        if ({cond}) {{ step_core__{exp['name']}(); return true; }}")
     emit("        return false;")
+    emit("    }")
+
+    emit("    void counter_recurrence(int reg, int delta, int limit, int cycles) {")
+    emit("        loop_limit = limit; loop_cycles = cycles;")
+    for exp in experts:
+        if exp.get("kind") == "exec_loop":
+            emit(f"        if (reg == {exp['reg']} && delta == {exp['delta']}) {{")
+            emit(f"            step_core__{exp['name']}(); return;")
+            emit("        }")
+    emit('        throw std::runtime_error("counter recurrence transformer is missing");')
     emit("    }")
 
     # Canonical shape windows are compiled once and revalidated against RAM.
@@ -487,6 +475,13 @@ def generate_source(
     if n_shapes:
         emit("        const int sid = shape_of_pc[st_pc];")
         emit("        if (!sid || nmi_pending || irq_ready() || stop_on_trap) return 0;")
+        emit("        // A device reply may have changed instruction bytes. The")
+        emit("        // first instruction must still match its retained prefix.")
+        emit("        if (pending_read.address >= 0 && (ram[st_pc] != read_ir ||")
+        emit("            ram[st_pc + 1] != pending_read.oplo ||")
+        emit(
+            "            (TRACE_LENGTH[read_ir] > 2 && ram[st_pc + 2] != pending_read.ophi))) return 0;"
+        )
         emit("        switch (sid) {")
         for j, exp in enumerate(shape_experts):
             # add_window guarantees head + length <= 0x10000: no wrap.
@@ -517,10 +512,10 @@ def generate_source(
         "@MIRROR_CPU_RAM@": "true" if mirror_cpu_ram else "false",
         "@D_MODEL@": str(d_model),
         "@XBUF_SIZE@": str(xbuf_size),
+        "@READOUT_SIZE@": str(readout_size),
         "@FORWARDS@": forwards,
         "@DISPATCH@": dispatch,
         "@SHAPE_RUNS@": "".join(f"        {{ {shape_run_cpp(exp)} }}\n" for exp in shape_experts),
-        "@READ_MODE@": ", ".join(map(str, read_mode_table())),
         "@TRACE_MODE@": ", ".join(map(str, trace_mode_table())),
         "@TRACE_LENGTH@": ", ".join(map(str, trace_length_table())),
         "@TRACE_DATA@": ", ".join(map(str, trace_data_table())),
@@ -582,7 +577,9 @@ class GeneratedWeightsEngine:
         source = source.replace("ENGINE_T", f"Engine_{digest}")
         n_shards = native.compile_shards()
         with artifact_lock(digest):
-            sources = native.write_shards(CACHE_DIR, f"engine_{digest}", f"Engine_{digest}", source, n_shards)
+            sources = native.write_shards(
+                CACHE_DIR, f"engine_{digest}", f"Engine_{digest}", source, n_shards
+            )
             module = load_module(f"weights_gen_{digest}", digest, sources)
             if cache_key is not None:
                 manifest_put(
