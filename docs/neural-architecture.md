@@ -407,7 +407,9 @@ specializes the clock and noise circuits once at setup.
 Bounded restoring division returns exact timer expiries and remaining counts,
 including when a period write leaves the current counter above its new reload.
 The same token computes CPU/APU parity and pulse/triangle phase advances.
-A one-clock construction removes general division.
+A one-clock construction removes general division. Sample deadlines round the
+remaining fractional distance up to a CPU cycle, avoiding a separate one-clock
+forward immediately before each sample.
 
 Noise carries fifteen binary residual lanes between forwards. Its transition
 is linear over GF(2): construction squares the tap-1 and tap-6 matrices to
@@ -622,7 +624,8 @@ Total forwards fell from 48,114 to 38,504 per frame. The structural changes are:
   and the first-pair stamp for early IRQ stops. Precomputed event-run lengths
   let the scheduler clip at the requested horizon and skip completed runs.
   Background traversal changes from O(HT) to O(H) per lookahead, with T tiles
-  per line. Live rendering and status prediction still process tiles.
+  per line. Live rendering also composes bus runs, while retaining each tile's
+  pixel, scroll and CHR-latch transition. Status prediction still processes tiles.
 - **Shared selection:** a 240-row table retains the first neural selection
   batch across rendering and previews. OAM generation, evaluation expert and
   engine replacement govern invalidation. For N=64 sprites, K=8 indices,
@@ -658,10 +661,15 @@ workload produced the following windowed emulation times. Each phase lasted
 | Frames 930–1199 | On | 0.454 ms |
 
 Reversing the order measured 0.457 / 2.501 / 1.141 / 2.742 ms for on/off/on/off.
-This supports processor frequency or core scheduling as a cause of the large
-timing swings; the test does not identify the exact macOS mechanism. Audio
-filter probes found no subnormal inputs or outputs during a slow run. Activity
-and thread-priority hints did not reliably restore the faster timing.
+Core and process-counter probes subsequently sampled the slow frames on the
+M4 Pro's efficiency cores (0–3): about 10.7 million instructions and 3.2 million
+cycles in 3.3 ms. Uncapped execution sampled performance cores (9–11), averaging
+10.9 million instructions and 1.58 million cycles in 0.383 ms. This identifies
+core placement and execution throughput as material contributors even on an
+idle machine; it does not establish why macOS chooses that placement. Audio
+filter probes found no subnormal inputs or outputs during a slow run. Activity,
+thread-priority, foreground-role and application-bundle experiments did not
+reliably restore the faster timing. These experiments remain outside the runtime.
 
 The extra load was a temporary diagnostic, not part of the runtime. Compare
 revisions in interleaved runs at matched load and report processor operating
@@ -669,6 +677,16 @@ conditions alongside wall time. Cache warmup, compiler activity and per-kernel
 profiling can change those conditions; a warm cache alone does not normalize
 live performance. Retired-instruction and cycle counts help distinguish added
 work from a change in execution throughput.
+
+Two subsequent scheduling changes reduce actual neural work: live rendering
+uses the background-bus span circuit already used by IRQ previews, and audio
+oscillators reach each sample deadline in one transition. Separate-process
+Mega Man 6 checks (120 warmup frames, 600 measured) reduced instructions from
+12.60 to 10.92 million per frame (13.3%) and cycles from 1.80 to 1.58 million.
+Four interleaved 900-frame idle window runs measured 3.5 / 3.1 / 2.9 / 3.3 ms
+for before / after / after / before. The large operating-state difference
+remains. Pixels, audio, CPU state, cycles and final RAM match over all 13,129
+gameplay tape frames; all 264 tests pass.
 
 | Storage | Size |
 | --- | ---: |

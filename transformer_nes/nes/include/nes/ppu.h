@@ -446,9 +446,9 @@ private:
   void sync_graph_memory();
   int page_byte(int page, int offset) const;
   void graph_step(int model, const int* in, int* out);
-  void render_slot(int slot, int64_t dot);
+  void render_slot(int slot, int64_t dot, bool clock_bus = true);
   void background_bus(int64_t dot);
-  int preview_background(int count, int64_t dot);
+  int clock_background(int count, int64_t dot);
   RegisterFile register_file() const;
   bool schedule_changed_ = false;
 #ifdef TRANSFORMER_NES_PPU_REFERENCE

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 
 #include "nes/apu.h"
 
@@ -267,8 +268,8 @@ void Apu::advance_to(int64_t cpu_cycle) {
     int64_t span = cpu_cycle - clocked_cycles - 1;
     span = std::min<int64_t>(span, frame_deadline - seq_cycle - 1);
     span = std::min<int64_t>(span, dmc_timer_);
-    // Finish at the next candidate sample boundary.
-    span = std::min<int64_t>(span, static_cast<int64_t>(cycles_per_sample - sample_accum - 1.0));
+    // Reach the sample boundary in one oscillator transition.
+    span = std::min<int64_t>(span, static_cast<int64_t>(std::ceil(cycles_per_sample - sample_accum)) - 1);
     if (dmc_fetch_due_)
       span = 0; // a fetch is due this cycle
     const int n = static_cast<int>(std::max<int64_t>(span, 0));

@@ -278,7 +278,7 @@ void Ppu::background_bus(int64_t dot) {
 }
 
 // Neural run composition retains the first-pair stamp for an early IRQ stop.
-int Ppu::preview_background(int count, int64_t dot) {
+int Ppu::clock_background(int count, int64_t dot) {
   if (!rendering_enabled() || !wants_a12_)
     return count;
   const int age = static_cast<int>(std::clamp<int64_t>(dot - r_.a12_low_since, -1, 11));
@@ -297,11 +297,11 @@ int Ppu::preview_background(int count, int64_t dot) {
   return count;
 }
 
-void Ppu::render_slot(int slot, int64_t dot) {
+void Ppu::render_slot(int slot, int64_t dot, bool clock_bus) {
   // IRQ probes observe fetch clocks, not pixels or scroll readouts.
   // The background pattern table is a control pin, independent of CHR.
   if (dry_ && (!track_status_ || r_.hit_dot != NEVER || (mask & 0x18) != 0x18)) {
-    if (rendering_enabled())
+    if (clock_bus && rendering_enabled())
       background_bus(dot);
     return;
   }
@@ -373,7 +373,8 @@ void Ppu::render_slot(int slot, int64_t dot) {
       }
   }
   if (out[out_fetched]) { // the tile, v, the latches, and the fetch's A12 edge
-    background_bus(dot);
+    if (clock_bus)
+      background_bus(dot);
     const int index = visible ? slot + 2 : slot - 32;
     for (int c = 0; c < 8; ++c)
       r_.bg[static_cast<size_t>(index * 8 + c)] = static_cast<uint8_t>(out[out_tile + c]);
@@ -499,13 +500,19 @@ void Ppu::catch_up(int64_t dot) {
         return;
       }
       r_.pos = at;
-      bool span = dry_ && !track_status_ && e.ev == Ev::Slot;
+      bool span = e.ev == Ev::Slot &&
+          (dry_ ? !track_status_ : !force_full_render);
 #ifdef TRANSFORMER_NES_PPU_REFERENCE
       span = span && engine_.ctx; // keep the independent literal-clock oracle
 #endif
       if (span) {
         const int count = static_cast<int>(std::min<int64_t>(e.run, 1 + (dot - at - 1) / 8));
-        const int consumed = preview_background(count, at);
+        const int consumed = clock_background(count, at);
+        if (!dry_)
+          for (int i = 0; i < consumed; ++i) {
+            r_.pos = at + 8 * i;
+            render_slot(e.slot + i, r_.pos, false);
+          }
         r_.next_event += consumed;
         r_.pos = at + 8 * (consumed - 1);
       } else {
