@@ -2,7 +2,8 @@
 
 Writes ``weights.safetensors`` (per-matrix CSR of ragged per-layer
 matrices: dead heads/FFN units are pruned exactly and the remaining
-weights are still ~99% zeros; coefficients are exact int32 fixed point)
+weights are still ~99% zeros; coefficients are exact fixed-point integers,
+stored losslessly per tensor as int8, int16 or int32 and widened for inference)
 plus ``machine.json`` (the machine protocol: input slot map, readout slots, output-head rows, per-layer dims).  The artifact is
 self-contained: a standalone runner needs only these two files and the
 execution semantics documented in the JSON -- softmax attention over a
@@ -34,6 +35,7 @@ from transformer_nes.graph.core import InputDimension
 from transformer_nes.model.artifacts import (
     ATTENTION_TEMPERATURE,
     SCALE_BITS,
+    compact_integer_tensors,
     csr_tensors,
     prune_layer,
     rescale_head_queries,
@@ -103,7 +105,8 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
     meta = {
         "format": (
             "Analytically constructed 6502 decoder, no training, normalization or positional encoding. "
-            "Dense tok/head and CSR matrices (data/indices/indptr int32). Per layer H=layer_heads, "
+            "Dense tok/head and CSR matrices, stored losslessly as per-tensor int8/int16/int32; "
+            "widen data to int32 and indices/indptr to int64 before inference. Per layer H=layer_heads, "
             "F=layer_ffn, D=d_model: in_proj (6H,D) packs Q (2H), "
             "K (2H), V (2H); out_proj (D,2H), ff_in (2F,D), ff_out (D,F). "
             "Insert before query, one KV entry per distinct key, replacing equal keys with the "
@@ -120,6 +123,7 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
             "complete token contract. Constant-key heads return the current token's value."
         ),
         "dtype": "int32",
+        "storage": "lossless-per-tensor-signed-integer",
         "scale_bits": SCALE_BITS,
         "accumulator": "int32",
         "score_accumulator": "int64",
@@ -141,7 +145,7 @@ def export_model(out_dir: str, *, bcd: bool = False) -> dict:
     }
 
     os.makedirs(out_dir, exist_ok=True)
-    save_file(tensors, os.path.join(out_dir, "weights.safetensors"))
+    save_file(compact_integer_tensors(tensors), os.path.join(out_dir, "weights.safetensors"))
     with open(os.path.join(out_dir, "machine.json"), "w") as f:
         json.dump(meta, f, indent=1, sort_keys=True)
     return meta
@@ -221,6 +225,7 @@ def export_experts(
         "format": "6502 folded opcode execution experts",
         "execution_abi": 3,
         "dtype": "int32",
+        "storage": "lossless-per-tensor-signed-integer",
         "scale_bits": SCALE_BITS,
         "accumulator": "int32",  # memory reads are structural: no scores
         "bcd": bcd,
@@ -228,7 +233,7 @@ def export_experts(
         "experts": metadata,
     }
     os.makedirs(out_dir, exist_ok=True)
-    save_file(tensors, os.path.join(out_dir, "expert_weights.safetensors"))
+    save_file(compact_integer_tensors(tensors), os.path.join(out_dir, "expert_weights.safetensors"))
     with open(os.path.join(out_dir, "experts.json"), "w") as f:
         json.dump(meta, f, indent=1, sort_keys=True)
     return meta

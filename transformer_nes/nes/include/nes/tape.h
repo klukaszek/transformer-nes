@@ -32,6 +32,8 @@ struct TapeBenchmark {
   int frames = 0;
   double seconds = 0.0;
   bool halted = false;
+  vector<double> frame_seconds;
+  vector<double> frame_cpu_seconds;
 };
 
 TapeBenchmark replay_tape(Console& console, const InputTape& tape, int tail_frames = 120,

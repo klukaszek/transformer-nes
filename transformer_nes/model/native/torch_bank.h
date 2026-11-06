@@ -1,4 +1,4 @@
-// Raw-buffer adapter for fused Inductor kernels. Neural arithmetic stays in Torch.
+// Raw-buffer adapter for native kernels derived from transformer weights.
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -20,9 +20,7 @@ struct Circuit {
 static const Circuit circuits[] = {@ENTRIES@};
 static void invoke(Kernel kernel, const Scalar* x, const uint8_t* ram,
                    Scalar* out, int32_t* aux) {
-    auto* previous = inductor_cpu_integer_div_error_flag;
     kernel(x, ram, out, aux);
-    inductor_cpu_integer_div_error_flag = previous;
 }
 static void invoke(const Circuit& circuit, const Scalar* x, const uint8_t* ram,
                    Scalar* out, int32_t* aux) {

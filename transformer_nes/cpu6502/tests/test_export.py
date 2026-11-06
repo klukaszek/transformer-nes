@@ -5,8 +5,31 @@ import json
 import pytest
 
 
+def test_lossless_integer_storage_keeps_values_shapes_and_range_boundaries():
+    import numpy as np
+
+    from transformer_nes.model.artifacts import compact_integer_tensors
+
+    tensors = {
+        "empty": np.empty((0, 3), dtype=np.int32),
+        "byte": np.array([-128, 0, 127], dtype=np.int32),
+        "short": np.array([-129, 32767], dtype=np.int32),
+        "wide": np.array([-32769, 32768, -2**31, 2**31 - 1], dtype=np.int32),
+    }
+    packed = compact_integer_tensors(tensors)
+    assert [a.dtype for a in packed.values()] == [np.int8, np.int8, np.int16, np.int32]
+    for name, source in tensors.items():
+        np.testing.assert_array_equal(packed[name].astype(np.int32), source)
+        assert packed[name].shape == source.shape
+    with pytest.raises(TypeError, match="signed integer"):
+        compact_integer_tensors({"float": np.array([0.5])})
+    with pytest.raises(OverflowError, match="int32"):
+        compact_integer_tensors({"large": np.array([2**31], dtype=np.int64)})
+
+
 @pytest.mark.slow
 def test_exported_weights_are_self_describing(tmp_path):
+    import numpy as np
     from safetensors.numpy import load_file
 
     from transformer_nes.cpu6502.backends.weights.export import export_model
@@ -21,6 +44,16 @@ def test_exported_weights_are_self_describing(tmp_path):
     assert tensors["head"].shape[1] == meta["d_model"]
     assert len(meta["layer_heads"]) == meta["n_layers"]
     assert "byte_value" in meta["input_slots"]
+    assert meta["dtype"] == "int32"  # computation precision, separate from storage
+    assert meta["storage"] == "lossless-per-tensor-signed-integer"
+    assert any(tensor.dtype.itemsize < 4 for tensor in tensors.values())
+    # Keep real circuit and storage reductions independently of each other.
+    nonzero = sum(
+        np.count_nonzero(tensor) for name, tensor in tensors.items()
+        if name in ("tok", "head") or name.endswith(".data")
+    )
+    assert nonzero < 28_000
+    assert (tmp_path / "weights.safetensors").stat().st_size < 300 * 1024
 
 
 @pytest.fixture(scope="module")
@@ -109,6 +142,31 @@ def test_sparse_memory_and_repeated_writes(checkpoint):
     assert cpu.step() == 4 and cpu.state["a"] == 0
 
 
+def test_compact_status_extractor_matches_every_pulled_byte(checkpoint):
+    from transformer_nes.cpu6502.backends import reference
+    from transformer_nes.cpu6502.backends.weights.checkpoint_runner import Cpu, Transformer
+
+    # LDA #value; PHA; PLP; PHP; PLA exercises status extraction and repacking.
+    image = bytearray(65536)
+    image[0x8000:0x8007] = bytes([0xA9, 0, 0x48, 0x28, 0x08, 0x68, 0])
+    cpu = Cpu(Transformer(checkpoint), image, 0x8000)
+    for byte in range(256):
+        cpu.write(0x8001, byte)
+        cpu.state.update(pc=0x8000, s=0xFD, p=0x24, halted=0)
+        reference_image = bytearray(image)
+        reference_image[0x8001] = byte
+        ref = reference.Cpu6502(memory=reference_image, bcd_enabled=False)
+        ref.pc = 0x8000
+        ref.s = 0xFD
+        ref.p = 0x24
+        for _ in range(5):
+            opcode = reference.opcode_for(ref.read_memory(ref.pc))
+            cycles = reference.instruction_cycles(ref, opcode, ref.pc, ref.x, ref.y, ref.p)
+            row = ref.step()
+            assert cpu.step() == cycles
+            assert (cpu.state["a"], cpu.state["s"], cpu.state["p"], cpu.state["pc"]) == (
+                row.state.a, row.state.s, row.state.p, ref.pc,
+            ), f"pulled status {byte:02X}"
 
 @pytest.mark.slow
 def test_checkpoint_matches_the_nestest_golden_log(checkpoint):

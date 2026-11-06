@@ -4,6 +4,27 @@ import numpy as np
 import scipy.sparse as sp
 
 
+def compact_integer_tensors(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Store exact integers in the narrowest signed type, without quantization.
+
+    Checkpoint readers widen data to int32 and indices to int64 on load.
+    Tensor shapes, fixed-point units and every integer value stay intact.
+    """
+    packed = {}
+    for name, array in tensors.items():
+        if array.dtype.kind != "i":
+            raise TypeError(f"{name}: expected signed integer checkpoint tensor")
+        lo, hi = int(array.min(initial=0)), int(array.max(initial=0))
+        for dtype in (np.int8, np.int16, np.int32):
+            bounds = np.iinfo(dtype)
+            if bounds.min <= lo and hi <= bounds.max:
+                packed[name] = array.astype(dtype, copy=False)
+                break
+        else:
+            raise OverflowError(f"{name}: coefficient or index exceeds int32")
+    return packed
+
+
 def csr_tensors(name: str, mat: np.ndarray, out: dict) -> None:
     m = sp.csr_matrix(mat)
     m.sort_indices()

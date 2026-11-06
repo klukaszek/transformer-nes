@@ -1,4 +1,4 @@
-"""Run a fixed transformer bank compiled by PyTorch Inductor.
+"""Run a fixed transformer bank lowered from Torch FX through scalar SSA.
 
 Compilation happens in a child process before play. Cache hits load one
 immutable extension: no runtime weight tensors, online specialization or
@@ -36,7 +36,7 @@ BANK_CFLAGS = ("-O3",)
 
 @functools.cache
 def bank_code_digest() -> str:
-    """Compiler identity as source data; never import Inductor on cache hits."""
+    """Compiler identity as source data, available without loading weights."""
     sources = source_digest(
         "transformer_nes.model.torch_codegen",
         "transformer_nes.cpu6502.backends.weights.runner",
@@ -67,7 +67,7 @@ def compile_bank(bcd: bool):
     name = f"torch_bank_{digest}"
     with artifact_lock(digest):
         if not os.path.exists(bank_path(bcd)):
-            logger.info("compiling the fixed transformer bank with PyTorch Inductor")
+            logger.info("compiling the fixed transformer bank through scalar SSA")
             experts, _ = cached_fold(
                 f"core_bcd{int(bcd)}",
                 lambda: build_core_experts(Cpu6502Graph(bcd=bcd, wide_bits=True).program_graph()),
@@ -87,14 +87,19 @@ def compile_bank(bcd: bool):
 
 def bank_module(bcd: bool):
     digest = bank_digest(bcd)
+    name = f"torch_bank_{digest}"
+    if (module := sys.modules.get(name)) is not None:
+        # A mapped extension outlives its pruned disk artifacts. Reuse it
+        # when constructing another CPU in the same process.
+        return module
     # Check under the artifact lock: a concurrent publisher may prune the
     # file between a cache snapshot and load. Compile outside the lock so
     # the child can acquire it, then retry the cache read.
     while True:
         with artifact_lock(digest):
             if os.path.exists(bank_path(bcd)):
-                return load_module(f"torch_bank_{digest}", digest, [])
-        subprocess.run([sys.executable, "-m", __name__, str(int(bcd))], check=True)
+                return load_module(name, digest, [])
+        subprocess.run([sys.executable, "-m", __name__, str(int(bcd)), digest], check=True)
 
 
 class TorchForwards:
@@ -114,7 +119,7 @@ class TorchForwards:
         engine.set_forward_hook(self.hook.forward_address(), self.ctx.address)
         # The engine's raw context pointer must live for the machine's lifetime.
         machine._torch_forwards = self
-        logger.info("PyTorch runs every expert's forwards (fixed transformer bank)")
+        logger.info("native SSA runs every expert's transformer forward (fixed bank)")
 
     def trace_union(self):
         import numpy as np
@@ -160,4 +165,7 @@ if __name__ == "__main__":
 
     exit_with_parent()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    compile_bank(bool(int(sys.argv[1])))
+    bcd = bool(int(sys.argv[1]))
+    if len(sys.argv) > 2 and sys.argv[2] != bank_digest(bcd):
+        raise SystemExit("transformer compiler sources changed during startup; restart the process")
+    compile_bank(bcd)

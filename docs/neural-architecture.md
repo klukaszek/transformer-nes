@@ -39,7 +39,7 @@ flowchart LR
 | CPU effects | [`weights/execution.py`](../transformer_nes/cpu6502/backends/weights/execution.py) | Project a licensed graph to final state, ordered writes, control and cycles. Lower graph dimensions to residual slots after scheduling. |
 | Expert construction | [`weights/experts.py`](../transformer_nes/cpu6502/backends/weights/experts.py) | Orchestrate folding, validation, projection and construction in stable dispatch order. |
 | Layers and weights | [`model/schedule.py`](../transformer_nes/model/schedule.py), [`model/weights.py`](../transformer_nes/model/weights.py) | Schedule attention/linear/FFN phases and construct their actual matrices. |
-| Torch lowering | [`model/torch_layout.py`](../transformer_nes/model/torch_layout.py), [`model/torch_codegen.py`](../transformer_nes/model/torch_codegen.py) | Expand the matrices into integer or float32 FX operations and compile fixed kernels with Inductor. |
+| Weight lowering | [`model/torch_layout.py`](../transformer_nes/model/torch_layout.py), [`model/torch_codegen.py`](../transformer_nes/model/torch_codegen.py), [`model/scalar_ir.py`](../transformer_nes/model/scalar_ir.py), [`model/outline.py`](../transformer_nes/model/outline.py) | Expand the matrices into integer or float32 FX operations, lower compact scalar SSA and compile fixed native kernels. |
 | CPU runtime | [`weights/native/engine.cpp`](../transformer_nes/cpu6502/backends/weights/native/engine.cpp), [`weights/engine.py`](../transformer_nes/cpu6502/backends/weights/engine.py) | Embed live inputs, dispatch kernels and commit licensed effects within device and cycle budgets. |
 
 The graph and model packages are independent of the CPU package. The neural
@@ -115,13 +115,39 @@ lowering, compilation, tracing and ablation machinery, with a typed float
 input/output ABI. Memory lookup heads are explicitly rejected in this mode;
 CPU and discrete device banks keep their existing integer contract.
 
+The graph itself also exploits declared integer domains. Boolean-gated products
+use one ReGLU regardless of the payload's sign. Selecting between constants is
+affine in the control bit. Integer opcode equality uses unit tents, sharing
+hinges between neighboring comparisons; the same formula remains valid for
+16-bit interrupt-vector checks. Byte extractors reuse their final 0/1 remainder,
+and low-nibble thresholds omit hinges known to be identity or zero. Pulled
+status bits use the 14-unit serial extractor without extending the CPU union's
+critical path. These changes reduce actual analytic matrices before native
+lowering.
+
+Checkpoint storage is separate from arithmetic precision. Exported coefficient,
+embedding and CSR routing tensors use the smallest exact signed integer type
+per tensor (int8, int16 or int32). On load, both standalone runners widen data
+to int32 and indices to int64. No rounding, quantization or changed fixed-point
+scale is involved. The CPU union's nonzero coefficient count falls from 40,824
+to 27,536; its checkpoint falls from 850 KiB to 593 KiB through circuit changes,
+then to 281 KiB through storage packing. The CPU union and PPU expert bank
+represent different circuits; size comparisons must cover the same bank.
+
 ## What executes as neural work
 
-CPU, PPU and mapper graphs share the Torch compiler. It expands their actual attention and
+CPU, PPU and mapper graphs share the weight compiler. It expands their actual attention and
 ReGLU matrices; it is not supplied handwritten opcode or rendering formulas.
-Inductor specializes constant coefficients, removes dead residual slots and
-fuses arithmetic. Large graphs may use several kernels connected through stack
-scratch. Equivalent FX graphs share a kernel within a bank.
+The scalar SSA lowering specializes constant coefficients, shares affine forms
+and emits each surviving value once. Integer cancellation preserves wraparound
+and stops at shifts and nonlinear operations; float32 arithmetic stays ordered.
+Hot tile graphs preserve their projection grouping. Equivalent SSA programs share
+a kernel within a bank. A bank-level outlining pass shares repeated fragments,
+specializes constants and argument identities common to their calls, and exports
+only their live results. Helpers always inline into the native kernels. The
+scalar argument/result arrays disappear during native optimization. Tile residual
+clears are cancelled without flattening their other projection expressions.
+Lowering does not import Inductor or Dynamo, and emits no fusion-phase buffers.
 
 CPU kernels return only their live architectural readouts, packed contiguously.
 The CPU caller decodes that packet directly, using a layout derived from its

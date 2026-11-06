@@ -180,11 +180,14 @@ class GraphEvaluator:
         def products(d):
             return (getattr(d, "multiply_of", None) if structural_reads else None) or (Expression(),) * 2
 
+        def zero_guard(d):
+            return getattr(d, "zero_when", Expression())
+
         def reads(d) -> list[Expression]:
             if isinstance(d, ReGLUDimension):
                 return [d.a_expr, d.b_expr]
             if isinstance(d, PersistDimension):
-                return [d.expr, *products(d)]
+                return [d.expr, *products(d), zero_guard(d)]
             return []
 
         depth: dict = {}
@@ -213,7 +216,8 @@ class GraphEvaluator:
             self.stacks.append(self.stack(
                 [d.a_expr for d in regs] + [d.b_expr for d in regs]
                 + [d.expr for d in persists]
-                + [products(d)[0] for d in persists] + [products(d)[1] for d in persists],
+                + [products(d)[0] for d in persists] + [products(d)[1] for d in persists]
+                + [zero_guard(d) for d in persists],
                 int(self.level_start[k])))
         self.lookups = list(pg.all_lookups)
         self.lookup_rows, row = {}, 0  # lookup -> (its first row, its query/key/value counts)
@@ -235,6 +239,7 @@ class GraphEvaluator:
             for d in ordered])
         self.has_product = np.array([structural_reads and getattr(d, "multiply_of", None) is not None
                                      for d in ordered])
+        self.has_zero_guard = np.array([hasattr(d, "zero_when") for d in ordered])
         self.hazards: dict = {}  # GraphFolder.insert_hazards, by pin names
 
     def stack(self, exprs, width: int) -> sparse.csr_matrix:
@@ -282,7 +287,7 @@ class GraphEvaluator:
                 return slice(i, i + m)
 
             a, b_ = block(0, n_regs), block(n_regs, n_regs)
-            e, ma, mb = (block(2 * n_regs + i * n_persists) for i in range(3))
+            e, ma, mb, z = (block(2 * n_regs + i * n_persists) for i in range(4))
             regs, persists = slice(0, n_regs), slice(n_regs, len(level))
             source = np.full(len(level), -1)  # the stacked row each row takes, scaled
             scale = np.zeros(len(level))
@@ -303,6 +308,7 @@ class GraphEvaluator:
             p_frozen = frozen_dims[dims]
             open_ = ~p_frozen & ~pinned[dims]
             p_const = np.where(open_, 0.0, pin_value[dims])
+            open_ &= ~(self.has_zero_guard[dims] & is_const[z] & (value[z] == 0))
             product = self.has_product[dims] & open_
             by_ma = product & is_const[ma]
             by_mb = product & ~is_const[ma] & is_const[mb]

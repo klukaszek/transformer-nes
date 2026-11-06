@@ -54,6 +54,7 @@ from transformer_nes.graph.core import (
 from transformer_nes.graph.ops import (
     extract_bits,
     extract_bits_wide,
+    gate,
     grouped_read,
     match_byte,
     memory_site,
@@ -110,22 +111,13 @@ def bitwise_nz(bits_msb_first) -> tuple[ExprLike, ExprLike]:
 
 
 def pulled_flag_bits(value: ExprLike, name: str) -> dict[int, Expression]:
-    """All eight bits of an 8-bit value from ONE shared threshold ladder.
+    """Extract the pulled status byte using fourteen threshold neurons.
 
-    ge[k] = step(value >= k) for k in 1..255; every bit is then a linear
-    telescoping run sum over the ladder (eq_k = ge_k - ge_{k+1}), so eight
-    extractions share 255 parallel stepglus at depth one."""
-    one = graph.current_graph().one
-    ge = {k: stepglu(one, value - k) for k in range(1, 256)}
-    bits: dict[int, Expression] = {}
-    for b in range(8):
-        result = Expression()
-        for start in range(1 << b, 256, 1 << (b + 1)):
-            result = result + ge[start]
-            if start + (1 << b) < 256:
-                result = result - ge[start + (1 << b)]
-        bits[1 << b] = persist(result, name=f"{name}_bit{b}")
-    return bits
+    This path has enough scheduling slack for a serial byte extractor;
+    a parallel 255-threshold table needlessly repeats the same byte logic.
+    The runtime wide-bit contract serves these bits directly instead.
+    """
+    return {1 << b: bit for b, bit in zip(range(7, -1, -1), extract_bits(value, name + "_"), strict=True)}
 
 
 # ── Main graph builder ─────────────────────────────────────────────
@@ -335,9 +327,9 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     mode_gates: dict[str, ExprLike] = {m: 0 for m in all_modes}
     op_family_gates: dict[str, ExprLike] = {op.operation: 0 for op in OPCODES.values()}
     for op in OPCODES.values():
-        gate = opcode_gates[op.byte]
-        mode_gates[op.mode] = mode_gates[op.mode] + gate
-        op_family_gates[op.operation] = op_family_gates[op.operation] + gate
+        opcode_gate = opcode_gates[op.byte]
+        mode_gates[op.mode] = mode_gates[op.mode] + opcode_gate
+        op_family_gates[op.operation] = op_family_gates[op.operation] + opcode_gate
 
     is_imm = persist(mode_gates[MODE_IMMEDIATE], name="is_imm")
     is_zpg = persist(mode_gates[MODE_ZERO_PAGE], name="is_zpg")
@@ -520,8 +512,8 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         oplo_bits = read_bits(fetched_operand_lo, "oplosrv", site_of=oplo_read)
         is_mem_operand = 1 - is_imm - is_acc
         operand_bits = [
-            multiply(is_imm, oplo_bits[j]) + multiply(is_acc, a_bits[j])
-            + multiply(is_mem_operand, opmem_bits[j])
+            gate(is_imm, oplo_bits[j]) + gate(is_acc, a_bits[j])
+            + gate(is_mem_operand, opmem_bits[j])
             for j in range(8)
         ]
     else:
@@ -636,7 +628,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     for i in range(8):
         a_bit = a_bits[7 - i]
         m_bit = operand_bits[7 - i]
-        bit_and = multiply(a_bit, m_bit)
+        bit_and = gate(a_bit, m_bit)
         bit_or = a_bit + m_bit - bit_and
         bit_xor = a_bit + m_bit - 2 * bit_and
         and_bit_list[7 - i] = bit_and
@@ -687,7 +679,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     x_bits = bits_of(current_x, "x")
     sax_result = 0
     for j in range(8):
-        sax_result = sax_result + (1 << (7 - j)) * multiply(a_bits[j], x_bits[j])
+        sax_result = sax_result + (1 << (7 - j)) * gate(a_bits[j], x_bits[j])
     sax_result = persist(sax_result, name="sax_result")
 
     # SLO/RLA/SRE combine A with the shifted memory value.  The shifted
@@ -706,14 +698,14 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         if asl_bits[j] is None:
             slo_result = slo_result + weight * a_bit
         else:
-            both = multiply(a_bit, asl_bits[j])
+            both = gate(a_bit, asl_bits[j])
             slo_result = slo_result + weight * (a_bit + asl_bits[j] - both)
         if rla_bits[j] is not None:
-            rla_result = rla_result + weight * multiply(a_bit, rla_bits[j])
+            rla_result = rla_result + weight * gate(a_bit, rla_bits[j])
         if lsr_bits[j] is None:
             sre_result = sre_result + weight * a_bit
         else:
-            both = multiply(a_bit, lsr_bits[j])
+            both = gate(a_bit, lsr_bits[j])
             sre_result = sre_result + weight * (a_bit + lsr_bits[j] - 2 * both)
     slo_result = persist(slo_result, name="slo_result")
     rla_result = persist(rla_result, name="rla_result")
@@ -753,28 +745,28 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     writes_a = (family["load_a"] + family["lax"] + family["and"] + family["ora"] + family["eor"] + family["pla"]
                 + family["txa"] + is_acc + arith_a)
     shift_acc_result = (
-        multiply(family["asl"], asl_result)
-        + multiply(family["lsr"], lsr_result)
-        + multiply(family["rol"], rol_result)
-        + multiply(family["ror"], ror_result)
+        gate(family["asl"], asl_result)
+        + gate(family["lsr"], lsr_result)
+        + gate(family["rol"], rol_result)
+        + gate(family["ror"], ror_result)
     )
     new_a = (
-        multiply(family["load_a"] + family["lax"], operand)
-        + multiply(family["and"], and_result)
-        + multiply(family["ora"], ora_result)
-        + multiply(family["eor"], eor_result)
-        + multiply(family["adc"], decimal_adc)
-        + multiply(family["sbc"], decimal_sbc)
-        + multiply(family["pla"], stack_pull_byte)
-        + multiply(family["txa"], current_x)
-        + multiply(family["tya"], current_y)
-        + multiply(family["slo"], slo_result)
-        + multiply(family["rla"], rla_result)
-        + multiply(family["sre"], sre_result)
-        + multiply(family["rra"], rra_result)
-        + multiply(family["isb"], isb_result)
-        + multiply(is_acc, shift_acc_result)
-        + multiply(1 - writes_a, current_a)
+        gate(family["load_a"] + family["lax"], operand)
+        + gate(family["and"], and_result)
+        + gate(family["ora"], ora_result)
+        + gate(family["eor"], eor_result)
+        + gate(family["adc"], decimal_adc)
+        + gate(family["sbc"], decimal_sbc)
+        + gate(family["pla"], stack_pull_byte)
+        + gate(family["txa"], current_x)
+        + gate(family["tya"], current_y)
+        + gate(family["slo"], slo_result)
+        + gate(family["rla"], rla_result)
+        + gate(family["sre"], sre_result)
+        + gate(family["rra"], rra_result)
+        + gate(family["isb"], isb_result)
+        + gate(is_acc, shift_acc_result)
+        + gate(1 - writes_a, current_a)
     )
     new_a = mux(is_int, current_a, new_a)
     new_a = persist(new_a, name="new_a")
@@ -788,22 +780,22 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         ror_bit_list = [carry_in] + operand_bits[:-1]
         for j in range(8):
             shift_sel = (
-                multiply(family["rol"], rla_bits[j]) + multiply(family["ror"], ror_bit_list[j])
+                gate(family["rol"], rla_bits[j]) + gate(family["ror"], ror_bit_list[j])
             )
             if asl_bits[j] is not None:
-                shift_sel = shift_sel + multiply(family["asl"], asl_bits[j])
+                shift_sel = shift_sel + gate(family["asl"], asl_bits[j])
             if lsr_bits[j] is not None:
-                shift_sel = shift_sel + multiply(family["lsr"], lsr_bits[j])
+                shift_sel = shift_sel + gate(family["lsr"], lsr_bits[j])
             expr = (
-                multiply(family["load_a"] + family["lax"], operand_bits[j])
-                + multiply(family["and"], and_bit_list[j])
-                + multiply(family["ora"], or_bit_list[j])
-                + multiply(family["eor"], xor_bit_list[j])
-                + multiply(family["pla"], pull_srv_bits[j])
-                + multiply(family["txa"], x_bits[j])
-                + multiply(is_acc, shift_sel)
-                + multiply(arith_a, arith_a_bits[j])
-                + multiply(1 - writes_a, a_bits[j])
+                gate(family["load_a"] + family["lax"], operand_bits[j])
+                + gate(family["and"], and_bit_list[j])
+                + gate(family["ora"], or_bit_list[j])
+                + gate(family["eor"], xor_bit_list[j])
+                + gate(family["pla"], pull_srv_bits[j])
+                + gate(family["txa"], x_bits[j])
+                + gate(is_acc, shift_sel)
+                + gate(arith_a, arith_a_bits[j])
+                + gate(1 - writes_a, a_bits[j])
             )
             persist(mux(is_int, a_bits[j], expr), name=f"new_a_bit{7 - j}")
 
@@ -811,23 +803,23 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     # unchanged-register default, so each is one parallel stage.
     writes_x = family["load_x"] + family["lax"] + family["inx"] + family["dex"] + family["tax"] + family["tsx"]
     new_x = (
-        multiply(family["load_x"] + family["lax"], operand)
-        + multiply(family["inx"], inx_result)
-        + multiply(family["dex"], dex_result)
-        + multiply(family["tax"], current_a)
-        + multiply(family["tsx"], current_s)
-        + multiply(1 - writes_x, current_x)
+        gate(family["load_x"] + family["lax"], operand)
+        + gate(family["inx"], inx_result)
+        + gate(family["dex"], dex_result)
+        + gate(family["tax"], current_a)
+        + gate(family["tsx"], current_s)
+        + gate(1 - writes_x, current_x)
     )
     new_x = mux(is_int, current_x, new_x)
     new_x = persist(new_x, name="new_x")
 
     writes_y = family["load_y"] + family["iny"] + family["dey"] + family["tay"]
     new_y = (
-        multiply(family["load_y"], operand)
-        + multiply(family["iny"], iny_result)
-        + multiply(family["dey"], dey_result)
-        + multiply(family["tay"], current_a)
-        + multiply(1 - writes_y, current_y)
+        gate(family["load_y"], operand)
+        + gate(family["iny"], iny_result)
+        + gate(family["dey"], dey_result)
+        + gate(family["tay"], current_a)
+        + gate(1 - writes_y, current_y)
     )
     new_y = mux(is_int, current_y, new_y)
     new_y = persist(new_y, name="new_y")
@@ -835,14 +827,14 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     writes_s = (family["pha"] + family["php"] + family["jsr"] + family["brk"] + family["pla"] + family["plp"]
                 + family["rts"] + family["rti"] + family["txs"])
     new_s = (
-        multiply(family["pha"] + family["php"], wrap8(current_s - 1))
-        + multiply(family["jsr"], wrap8(current_s - 2))
-        + multiply(family["brk"], wrap8(current_s - 3))
-        + multiply(family["pla"] + family["plp"], wrap8(current_s + 1))
-        + multiply(family["rts"], wrap8(current_s + 2))
-        + multiply(family["rti"], wrap8(current_s + 3))
-        + multiply(family["txs"], current_x)
-        + multiply(1 - writes_s, current_s)
+        gate(family["pha"] + family["php"], wrap8(current_s - 1))
+        + gate(family["jsr"], wrap8(current_s - 2))
+        + gate(family["brk"], wrap8(current_s - 3))
+        + gate(family["pla"] + family["plp"], wrap8(current_s + 1))
+        + gate(family["rts"], wrap8(current_s + 2))
+        + gate(family["rti"], wrap8(current_s + 3))
+        + gate(family["txs"], current_x)
+        + gate(1 - writes_s, current_s)
     )
     # NMI pushes three bytes, exactly like BRK.
     new_s = mux(is_int, wrap8(current_s - 3), new_s)
@@ -854,13 +846,13 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     # it anyway), and non-flag-setting families report 0, so the source is a
     # parallel gated sum rather than a nested select.
     nz_alu = (
-        multiply(
+        gate(
             family["load_a"] + family["adc"] + family["sbc"] + family["pla"] + family["txa"] + family["tya"]
             + family["lax"] + family["slo"] + family["rla"] + family["sre"] + family["rra"] + family["isb"],
             new_a,
         )
-        + multiply(family["load_x"] + family["inx"] + family["dex"] + family["tax"] + family["tsx"], new_x)
-        + multiply(family["load_y"] + family["iny"] + family["dey"] + family["tay"], new_y)
+        + gate(family["load_x"] + family["inx"] + family["dex"] + family["tax"] + family["tsx"], new_x)
+        + gate(family["load_y"] + family["iny"] + family["dey"] + family["tay"], new_y)
     )
     nz_alu = persist(nz_alu, name="nz_alu")
     n_alu = stepglu(one, nz_alu - 128)
@@ -890,14 +882,14 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     direct_writers = sum(family[name] for name in direct_nz)
 
     # Branch/flag ops
-    bpl_taken = multiply(1 - current_p_n, family["bpl"])
-    bmi_taken = multiply(current_p_n, family["bmi"])
-    bvc_taken = multiply(1 - current_p_v, family["bvc"])
-    bvs_taken = multiply(current_p_v, family["bvs"])
-    bcc_taken = multiply(1 - current_p_c, family["bcc"])
-    bcs_taken = multiply(current_p_c, family["bcs"])
-    bne_taken = multiply(1 - current_p_z, family["bne"])
-    beq_taken = multiply(current_p_z, family["beq"])
+    bpl_taken = gate(1 - current_p_n, family["bpl"])
+    bmi_taken = gate(current_p_n, family["bmi"])
+    bvc_taken = gate(1 - current_p_v, family["bvc"])
+    bvs_taken = gate(current_p_v, family["bvs"])
+    bcc_taken = gate(1 - current_p_c, family["bcc"])
+    bcs_taken = gate(current_p_c, family["bcs"])
+    bne_taken = gate(1 - current_p_z, family["bne"])
+    beq_taken = gate(current_p_z, family["beq"])
     branch_taken = (
         bpl_taken + bmi_taken + bvc_taken + bvs_taken
         + bcc_taken + bcs_taken + bne_taken + beq_taken
@@ -910,24 +902,24 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         + family["clc"] + family["sec"] + family["dcp"] + family["slo"] + family["rla"] + family["sre"] + family["rra"] + family["isb"]
     )
     new_p_c = (
-        multiply(current_p_c, 1 - carry_op)
-        + multiply(family["adc"], decimal_adc_carry)
-        + multiply(family["sbc"], decimal_sbc_carry)
-        + multiply(family["cmp"], cmp_carry)
-        + multiply(family["cpx"], cpx_carry)
-        + multiply(family["cpy"], cpy_carry)
-        + multiply(family["asl"], asl_carry)
-        + multiply(family["lsr"], lsr_carry)
-        + multiply(family["rol"], rol_carry)
-        + multiply(family["ror"], ror_carry)
-        + multiply(family["clc"], 0)
-        + multiply(family["sec"], 1)
-        + multiply(family["dcp"], dcp_carry)
-        + multiply(family["slo"], asl_carry)
-        + multiply(family["rla"], rol_carry)
-        + multiply(family["sre"], lsr_carry)
-        + multiply(family["rra"], rra_carry)
-        + multiply(family["isb"], isb_carry)
+        gate(current_p_c, 1 - carry_op)
+        + gate(family["adc"], decimal_adc_carry)
+        + gate(family["sbc"], decimal_sbc_carry)
+        + gate(family["cmp"], cmp_carry)
+        + gate(family["cpx"], cpx_carry)
+        + gate(family["cpy"], cpy_carry)
+        + gate(family["asl"], asl_carry)
+        + gate(family["lsr"], lsr_carry)
+        + gate(family["rol"], rol_carry)
+        + gate(family["ror"], ror_carry)
+        + gate(family["clc"], 0)
+        + gate(family["sec"], 1)
+        + gate(family["dcp"], dcp_carry)
+        + gate(family["slo"], asl_carry)
+        + gate(family["rla"], rol_carry)
+        + gate(family["sre"], lsr_carry)
+        + gate(family["rra"], rra_carry)
+        + gate(family["isb"], isb_carry)
     )
     new_p_c = persist(new_p_c, name="new_p_c")
 
@@ -943,31 +935,31 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     nz_writers = (writes_z + family["cmp"] + family["cpx"] + family["cpy"] + family["dcp"]
                   + family["and"] + family["ora"] + family["eor"])
     new_p_z = (
-        multiply(writes_z - direct_writers, z_alu)
-        + sum(multiply(family[name], z) for name, (_n, z) in direct_nz.items())
-        + multiply(family["cmp"], cmp_z)
-        + multiply(family["cpx"], cpx_z)
-        + multiply(family["cpy"], cpy_z)
-        + multiply(family["dcp"], dcp_z)
-        + multiply(family["and"], and_z)
-        + multiply(family["ora"], ora_z)
-        + multiply(family["eor"], eor_z)
-        + multiply(1 - nz_writers, current_p_z)
+        gate(writes_z - direct_writers, z_alu)
+        + sum(gate(family[name], z) for name, (_n, z) in direct_nz.items())
+        + gate(family["cmp"], cmp_z)
+        + gate(family["cpx"], cpx_z)
+        + gate(family["cpy"], cpy_z)
+        + gate(family["dcp"], dcp_z)
+        + gate(family["and"], and_z)
+        + gate(family["ora"], ora_z)
+        + gate(family["eor"], eor_z)
+        + gate(1 - nz_writers, current_p_z)
     )
     new_p_z = persist(new_p_z, name="new_p_z")
 
     # Negative flag updates
     new_p_n = (
-        multiply(writes_z - direct_writers, n_alu)
-        + sum(multiply(family[name], n) for name, (n, _z) in direct_nz.items())
-        + multiply(family["cmp"], cmp_n)
-        + multiply(family["cpx"], cpx_n)
-        + multiply(family["cpy"], cpy_n)
-        + multiply(family["dcp"], dcp_n)
-        + multiply(family["and"], and_n)
-        + multiply(family["ora"], ora_n)
-        + multiply(family["eor"], eor_n)
-        + multiply(1 - nz_writers, current_p_n)
+        gate(writes_z - direct_writers, n_alu)
+        + sum(gate(family[name], n) for name, (n, _z) in direct_nz.items())
+        + gate(family["cmp"], cmp_n)
+        + gate(family["cpx"], cpx_n)
+        + gate(family["cpy"], cpy_n)
+        + gate(family["dcp"], dcp_n)
+        + gate(family["and"], and_n)
+        + gate(family["ora"], ora_n)
+        + gate(family["eor"], eor_n)
+        + gate(1 - nz_writers, current_p_n)
     )
     new_p_n = persist(new_p_n, name="new_p_n")
 
@@ -1008,7 +1000,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
 
     # PLP/RTI update all flags from the pulled byte (B cleared, U set).
     # wide_bits: the flag bits are the mem_A read's served bits -- the
-    # 255-step shared ladder (and its fan-out width) never builds.
+    # status-byte extractor never builds on that runtime contract.
     op_pull_p = family["plp"] + family["rti"]
     if wide_bits:
         pull_bits = {1 << b: pull_srv_bits[7 - b] for b in range(8)}
@@ -1154,30 +1146,30 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     # *parallel* gated sum (depth 2), not a mux chain; families with
     # data == 0 are simply absent.
     data_ref = (
-        multiply(family["store_a"] + family["pha"], current_a)
-        + multiply(family["store_x"], current_x)
-        + multiply(family["store_y"], current_y)
-        + multiply(family["php"], current_p)
-        + multiply(family["inc"] + family["isb"], inc_result)
-        + multiply(family["dec"] + family["dcp"], dec_result)
-        + multiply(family["asl"] + family["slo"], asl_result)
-        + multiply(family["lsr"] + family["sre"], lsr_result)
-        + multiply(family["rol"] + family["rla"], rol_result)
-        + multiply(family["ror"] + family["rra"], ror_result)
-        + multiply(family["sax"], sax_result)
-        + multiply(
+        gate(family["store_a"] + family["pha"], current_a)
+        + gate(family["store_x"], current_x)
+        + gate(family["store_y"], current_y)
+        + gate(family["php"], current_p)
+        + gate(family["inc"] + family["isb"], inc_result)
+        + gate(family["dec"] + family["dcp"], dec_result)
+        + gate(family["asl"] + family["slo"], asl_result)
+        + gate(family["lsr"] + family["sre"], lsr_result)
+        + gate(family["rol"] + family["rla"], rol_result)
+        + gate(family["ror"] + family["rra"], ror_result)
+        + gate(family["sax"], sax_result)
+        + gate(
             family["load_a"] + family["lax"] + family["adc"] + family["sbc"] + family["and"] + family["ora"] + family["eor"]
             + family["pla"] + family["txa"] + family["tya"],
             new_a,
         )
-        + multiply(family["load_x"] + family["inx"] + family["dex"] + family["tax"] + family["tsx"], new_x)
-        + multiply(family["load_y"] + family["iny"] + family["dey"] + family["tay"], new_y)
-        + multiply(family["txs"], new_s)
-        + multiply(family["plp"], new_p)
-        + multiply(family["cmp"], cmp_result)
-        + multiply(family["cpx"], cpx_result)
-        + multiply(family["cpy"], cpy_result)
-        + multiply(family["bit"], operand)
+        + gate(family["load_x"] + family["inx"] + family["dex"] + family["tax"] + family["tsx"], new_x)
+        + gate(family["load_y"] + family["iny"] + family["dey"] + family["tay"], new_y)
+        + gate(family["txs"], new_s)
+        + gate(family["plp"], new_p)
+        + gate(family["cmp"], cmp_result)
+        + gate(family["cpx"], cpx_result)
+        + gate(family["cpy"], cpy_result)
+        + gate(family["bit"], operand)
     )
     data_out = mux(is_int, 0, data_ref)
     data_out = persist(data_out, name="data_out")
@@ -1211,8 +1203,8 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     # ── Halt ────────────────────────────────────────────────────────
     # BRK halts only if the IRQ vector is 0 (uninitialized memory).  An
     # interrupt never halts, even if the interrupted byte happens to be $00.
-    halted_now = multiply(family["brk"], match_byte(irq_vector, 0))
-    halted_now = multiply(halted_now, 1 - is_int)
+    halted_now = gate(family["brk"], match_byte(irq_vector, 0))
+    halted_now = gate(halted_now, 1 - is_int)
     new_halted = current_halted + halted_now
     new_halted = persist(new_halted, name="new_halted")
 

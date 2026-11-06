@@ -65,9 +65,19 @@ uv run nes-run path/to/rom.nes
 
 # Replay a captured controller tape headlessly and benchmark it uncapped:
 uv run nes-run path/to/rom.nes --tape tapes/game_tape
+
+# Save frame timing samples and setup time for repeated comparisons:
+uv run nes-run path/to/rom.nes --tape tapes/game_tape --benchmark-json timings.json
 ```
 
 Game ROMs and tape captures are local inputs; the repository includes the nestest verification ROM and log. The `6502-nestest` command expects `nestest.nes` at `transformer_nes/nes/examples/nestest.nes`; `nes-run` accepts a local ROM path and tape path directly.
+
+Tape benchmarks report p1, p50 and p99 frame times for wall time and, where
+available, thread CPU time. Wall time includes preemption; thread CPU time
+excludes time off the CPU, but still varies with core placement and frequency.
+Use the same tape, frame limit and audio rate for comparisons. Setup and
+compilation are excluded from frame samples; JSON records setup separately.
+These uncapped replay measurements do not reproduce display-paced scheduling.
 
 ## Interactive Emulator
 
@@ -77,7 +87,7 @@ Run a ROM without `--tape` to open the interactive emulator window:
 uv run nes-run path/to/rom.nes
 ```
 
-The default CPU backend is `weights`. Its transformer layers always run through PyTorch Inductor, as do the PPU graphs. Compilation finishes before play and is cached across ROMs. Use `--backend reference` to run the plain-Python CPU instead. The PPU, controller protocol, MMC1/MMC3/MMC2/MMC4/MMC5 banking and MMC3/MMC5 IRQ transitions always run as transformer weights. Add `--xray` to open the overlay on the transformer X-ray.
+The default CPU backend is `weights`. Its transformer layers and the PPU graphs run through the shared scalar SSA compiler. Compilation finishes before play and is cached across ROMs. Use `--backend reference` to run the plain-Python CPU instead. The PPU, controller protocol, MMC1/MMC3/MMC2/MMC4/MMC5 banking and MMC3/MMC5 IRQ transitions always run as transformer weights. Add `--xray` to open the overlay on the transformer X-ray.
 
 APU register programming, frame control, envelopes, counters, sweeps, oscillator spans, noise recurrence, digital levels and DMC transitions also run as weights. A float32 ReGLU circuit computes nonlinear DAC mixing, the recurrent DC filter and sample clipping. The host schedules events, delivers DMA bytes and plays the returned samples.
 
@@ -134,7 +144,7 @@ The [`transformer_nes/cpu6502/README.md`](transformer_nes/cpu6502/README.md) doc
 | `transformer_nes/cpu6502/` | The pure 6502: opcode spec, graph construction, trace format, `backends/reference.py`, the weights compiler/runtime in `backends/weights/` (`engine.py` emits model-specific dispatch into the C++ runtime template in `native/engine.cpp`), the self-contained checkpoint exporter and runners (`export.py`, `checkpoint_runner.py`, `expert_runner.py`), and `examples/klaus/` (harness + binary) |
 | `transformer_nes/nes/` | Native C++ NES hardware: bus, cartridge, mapper/MMC headers, PPU, APU, console, tape replay, and the window with its debug overlay; `app.py` builds it, adapts a CPU backend, and launches it; `xray.py` reads the engines for the overlay |
 | `transformer_nes/ppu2c02/` | The PPU graphs: memory layout (`space.py`), register transitions (`registers.py`), background rendering and compositing (`render.py`), sprite selection, overflow and fetch (`sprites.py`), scanline timelines (`clock.py`), timing/bus/view effects and sprite-line composition (`control.py`), and the shared engine (`machine.py`) |
-| `transformer_nes/model/` | Transformer machinery: layer scheduling (`schedule.py`), analytical weight construction (`weights.py`), shared Torch weight layout and compilation (`torch_layout.py`, `torch_codegen.py`), the generic token-graph engine (`graph_engine.py`), native build/cache support (`build.py`), exact CSR checkpoint serialization (`artifacts.py`), and reference inference (`inference.py`) |
+| `transformer_nes/model/` | Transformer machinery: layer scheduling (`schedule.py`), analytical weight construction (`weights.py`), shared weight layout and compilation (`torch_layout.py`, `torch_codegen.py`, `scalar_ir.py`, `outline.py`), the generic token-graph engine (`graph_engine.py`), native build/cache support (`build.py`), exact CSR checkpoint serialization (`artifacts.py`), and reference inference (`inference.py`) |
 
 The dependency direction is one-way: `nes/` depends on the NES-independent CPU package; the CPU construction depends on `graph/`, while its weights backend also uses `model/` for scheduling and code generation. The entire generic `model/` package imports without loading the CPU package; a test enforces this. Machine-specific checkpoint export and standalone runners live in `cpu6502/backends/weights/`. The `6502-export`, `6502-checkpoint`, and `6502-experts` commands remain the public entry points.
 
@@ -158,8 +168,10 @@ registers, flags and elapsed cycles in weights. All paths share the
 native run loop's device watches and cycle budgets. The CPU core is independent
 of the ROM: it needs no learned instruction windows or online compiler.
 
-Both CPU and PPU use the same Torch compiler. It expands their actual
-attention and ReGLU matrices into a fixed bank compiled by Inductor. The graph
+Both CPU and PPU use the same weight compiler. It expands their actual
+attention and ReGLU matrices into Torch FX, then lowers a compact scalar SSA
+representation to native kernels. Each surviving value is emitted once; there
+are no fusion-phase buffers or cloned expression trees. The graph
 fold licenses direct reads over the latest-written byte image before scheduling;
 there are no separate nearest-address or register caches. C++ owns dispatch,
 architectural readout, event scheduling and byte transport. Constant coefficients and sparse routing are
@@ -167,8 +179,31 @@ specialized before play; CPU kernels return packed live readouts, and execution
 allocates no weight tensors or per-call Tensor wrappers. The standalone union and expert checkpoint runners remain independent
 checks, including ordinary softmax attention.
 
+The graph construction uses single-unit Boolean gates, shared opcode-equality
+hinges and bounded byte extractors. The standalone CPU union has 27,536 nonzero
+coefficients, down from 40,824. Its checkpoint stores each tensor in the smallest
+exact signed integer type and widens it for inference: 281 KiB instead of
+850 KiB, with no quantization. The
+[architecture notes](docs/neural-architecture.md) describe the construction and
+storage contracts.
+
 The first launch compiles the fixed execution banks before play; later launches
 load cached binaries. No compiler runs in the background during emulation.
+
+Bank rebuilds reuse individual circuits by their canonical SSA, numeric type,
+memory extent and compiler identity. The source cache in
+`model/_engine_cache/kernels/` is bounded to 256 MiB and evicts the oldest unused
+entries. New circuits lower directly without importing Inductor or Dynamo; a
+changed bank still needs native compilation. Build logs report reused and newly
+lowered circuits separately. Integer affine cancellation respects overflow and
+stops at half-unit shifts and nonlinear operations. Float32 arithmetic retains
+its original order. Hot tile circuits cancel explicit residual clears while
+preserving their measured projection grouping. Repeated SSA fragments share
+a definition across experts; constants common to every call are embedded once,
+and only live results cross a fragment boundary. Native inlining removes the
+argument/result arrays, retaining compiled execution.
+Fixed-address circuits can also share their lowering across memory layouts when
+all their live reads fit both buffers; dynamic reads retain their full extent.
 
 See [the CPU design](transformer_nes/cpu6502/README.md) for construction and
 execution contracts, [the source walkthrough](docs/neural-architecture.md)
@@ -189,6 +224,12 @@ Automated tests run the transformer CPU and PPU through blargg's `ppu_vbl_nmi` (
 - **The register file** (`registers.py`, 12 layers): one token per CPU access to `$2000-$2007`, carrying the access and loopy `t`/`v` as their fields (coarse x, coarse y, nametable, fine y). It computes the register file after the access, the value a read returns, and the memory write it makes; `$2007` reads see CHR through the MMC2/MMC4 latches or MMC5's banks.
 - **Background rendering and compositing** (`render.py`, 20 layers without extended CHR): one step per 8-pixel tile slot. It reads the nametable, attribute, pattern and palette bytes, fetches the next tile, steps `v`, composites the sprite line by priority, finds sprite-0 hits, and drives the MMC2/MMC4 latches; MMC5's extended attributes read the whole CHR ROM.
 - **The sprite unit** (`sprites.py`), in the hardware's two phases per line. *Evaluation* reads all 64 OAM Y bytes through attention and picks the first eight sprites covering the line in OAM order without sorting: with P_i the covering sprites among 0..i, the k-th pick is the number of i with P_i <= k. *Fetch* reads the picked sprites' OAM bytes and pattern rows (vertical and horizontal flips, 8x16 tiles, the MMC2/MMC4 latches each fetch flips in order, MMC5's sprite banks). It returns each row as 8 screen-ordered pixels for the render graph to composite, and the pattern table of every fetch for the mapper's A12 edges. An *overflow* token reads the hardware's diagonal OAM scan and reports its first match. Unlimited-sprite mode repeats selection and fetch in batches of eight, with extra rows prevented from changing CHR latches or the mapper bus.
+
+Sprite rows combine visibility and transparency in two parallel ReGLUs per
+pixel, then flip through four controlled swaps. Each swap shares one gated
+difference between its two outputs. The eight-sprite fetch expert uses 256
+ReGLUs across eight layers. A domain proof lets partial evaluation remove
+disabled rows without retaining their pattern or transparency circuitry.
 
 These token graphs share one engine and memory (`model/graph_engine.py`). Partial evaluation (`graph/fold.py`) produces exact experts for each register and direction, rendering mode, sprite size and fetch count. One blank-state expert removes inactive fetch circuitry while retaining palette output. The host selects an expert whose pins hold, or the full graph. Timing previews project the transformer down to bus or status readouts, removing unused pixel and CHR work before compilation. C++ advances the clock and restores the live register, latch and line-buffer state afterwards.
 

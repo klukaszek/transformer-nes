@@ -160,7 +160,7 @@ def load_module(
     if os.path.exists(baton):
         os.unlink(baton)
     build_start = time.perf_counter()
-    cflags = ["-O2", "-std=c++17", "-fwrapv", *extra_cflags]
+    cflags = ["-O2", "-std=c++17", "-fwrapv", "-ffp-contract=off", *extra_cflags]
     old_max_jobs = os.environ.get("MAX_JOBS")
     if old_max_jobs is None:
         os.environ["MAX_JOBS"] = str(

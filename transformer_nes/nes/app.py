@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import time
 from collections import deque
+from pathlib import Path
+
+import numpy as np
 
 from transformer_nes.nes.backends import backend_factory
 from transformer_nes.nes.build import load_frontend, load_hardware
@@ -97,6 +101,9 @@ def main():
     parser.add_argument("--record")
     parser.add_argument("--tape")
     parser.add_argument(
+        "--benchmark-json", help="write tape timings, including individual frame samples, to JSON"
+    )
+    parser.add_argument(
         "--tail", type=int, default=120, help="frames to run after the final tape event"
     )
     parser.add_argument("--debug", action="store_true")
@@ -109,6 +116,9 @@ def main():
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO, format="%(message)s")
     if args.tape and args.record:
         parser.error("--tape and --record cannot be used together")
+    if args.benchmark_json and not args.tape:
+        parser.error("--benchmark-json requires --tape")
+    setup_start = time.perf_counter()
     hardware = load_hardware()
     cart = hardware.Cartridge.load(args.rom)
 
@@ -121,8 +131,18 @@ def main():
 
     if args.tape:
         console = hardware.Console(cart, build_backend, 44100.0)
+        setup_seconds = time.perf_counter() - setup_start
         result = console.run_tape(args.tape, args.tail, args.frames)
+        result.update(setup_seconds=setup_seconds, rom=args.rom, tape=args.tape, backend=args.backend)
         logger.info("%(frames)d frames in %(seconds).3fs: %(fps).1f fps, %(cycles)d cycles", result)
+        for field, label in (("frame_seconds", "wall"), ("frame_cpu_seconds", "thread CPU")):
+            samples = result[field]
+            if samples:
+                p1, p50, p99 = np.percentile(samples, [1, 50, 99]) * 1e3
+                result[f"{field}_percentiles_ms"] = dict(p1=p1, p50=p50, p99=p99)
+                logger.info("%s ms/frame: p1 %.3f, p50 %.3f, p99 %.3f", label, p1, p50, p99)
+        if args.benchmark_json:
+            Path(args.benchmark_json).write_text(json.dumps(result, indent=2) + "\n")
         return
     frontend = load_frontend()
     rate = frontend.audio_setup()

@@ -26,6 +26,64 @@ from transformer_nes.graph.fold import GraphFolder
 from transformer_nes.graph.ops import extract_bits, extract_bits_wide, match_zero, wrap8, wrapped_nz
 
 
+@pytest.mark.parametrize("simplify_correction", [False, True])
+def test_nonzero_mask_handles_unsigned_values_signed_payloads_and_half_units(simplify_correction):
+    import torch
+
+    from transformer_nes.graph.ops import gate_nonzero, nonzero
+    from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+    from transformer_nes.model.torch_codegen import weight_module
+
+    @construction
+    def circuit():
+        enabled, value, payload = (InputDimension(n) for n in ("enabled", "value", "payload"))
+        masked = persist(gate_nonzero(
+            enabled, value, 0.5 * payload,
+            zero_payload=0.5 * payload - value if simplify_correction else None,
+        ), name="masked")
+        flag = persist(nonzero(value), name="flag")
+        pg = current_graph().capture(
+            {"VALUE": enabled + value + payload}, {"READOUT": masked + flag}
+        )
+        return TokenGraph(pg, ("enabled", "value", "payload"), ("masked", "flag"))
+
+    token = circuit()
+    expert = CompiledGraph._compile(token, token.program_graph, token.program_graph.all_dims)
+    forward = weight_module(expert, memory_size=1)
+    assert forward.f_bits == 1
+    g, v, p = np.meshgrid([0, 1], np.arange(256), [-511, -255, -1, 0, 1, 255, 511], indexing="ij")
+    inputs = torch.tensor(np.stack([g.ravel(), v.ravel(), p.ravel()]), dtype=torch.int32)
+    result, _ = forward(inputs, torch.zeros(1, dtype=torch.uint8))
+    np.testing.assert_array_equal(result[0].numpy(), np.where((g.ravel() != 0) & (v.ravel() != 0), p.ravel(), 0))
+    np.testing.assert_array_equal(result[1].numpy(), 2 * (v.ravel() != 0))
+
+
+@pytest.mark.parametrize("structural", [False, True])
+def test_transparency_mask_proof_survives_folding_and_removes_disabled_rows(structural):
+    from transformer_nes.graph.ops import gate_nonzero
+
+    with GraphContext().activate() as ctx:
+        g, v, p = (InputDimension(n) for n in ("g", "v", "p"))
+        enabled = persist(g, name="enabled")
+        out = persist(gate_nonzero(enabled, v, p), name="out")
+        pg = ctx.capture({"VALUE": g + v + p}, {"READOUT": out})
+    # Copy the union first: its domain proof must survive materialization.
+    copied = GraphFolder(pg, structural_reads=structural).fold({}).program_graph
+    folder = GraphFolder(copied, structural_reads=structural)
+    disabled = folder.fold({"enabled": 0}).program_graph
+    assert not any(isinstance(d, ReGLUDimension) for d in disabled.all_dims)
+    assert not disabled.output_tokens["READOUT"].terms or all(
+        isinstance(d, PersistDimension) and not d.expr.terms
+        for d in disabled.output_tokens["READOUT"].terms
+    )
+    # Explicit output pins and freezing still take precedence over proofs.
+    result = folder.evaluate({"enabled": 0, "out": 7})
+    assert result.val[folder.by_name["out"]].terms == {copied.one: 7}
+    assert folder.evaluate({"enabled": 0}, frozen={"enabled"}).status(
+        folder.by_name["enabled"]
+    ) == ABSENT
+
+
 def test_interleaved_contexts_keep_ids_constants_and_interning_local():
     left, right = GraphContext(), GraphContext()
     with left.activate():
@@ -302,15 +360,53 @@ def test_zero_mask_does_not_square_a_full_address_difference():
     np.testing.assert_array_equal(evaluate(mask), domain == 0)
 
 
-@pytest.mark.parametrize("extract", [extract_bits, extract_bits_wide])
+@pytest.mark.parametrize(("extract", "neurons"), [(extract_bits, 14), (extract_bits_wide, 49)])
 @construction
-def test_byte_bit_extraction_is_exact_for_every_byte(extract):
+def test_byte_bit_extraction_is_exact_for_every_byte(extract, neurons):
     value = InputDimension("byte")
     bits = extract(value, "result")
+    assert sum(isinstance(d, ReGLUDimension) for d in current_graph().dims) == neurons
     domain = np.arange(256, dtype=np.int32)
     evaluate = circuit_values(value, domain)
     for index, bit in enumerate(bits):
         np.testing.assert_array_equal(evaluate(bit), (domain >> (7 - index)) & 1)
+
+
+@construction
+def test_shared_opcode_tents_cover_all_bytes_and_full_address_zero():
+    from transformer_nes.graph.ops import match_byte
+
+    value = InputDimension("value")
+    gates = [match_byte(value, byte) for byte in range(256)]
+    assert sum(isinstance(d, ReGLUDimension) for d in current_graph().dims) == 258
+    domain = np.arange(-65535, 65536, dtype=np.int32)
+    evaluate = circuit_values(value, domain)
+    for byte, result in enumerate(gates):
+        np.testing.assert_array_equal(evaluate(result), domain == byte)
+
+
+def test_boolean_selection_is_affine_for_constants_and_exact_for_signed_halves():
+    import torch
+
+    from transformer_nes.graph.ops import gate, mux, select
+    from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+    from transformer_nes.model.torch_codegen import weight_module
+
+    with GraphContext().activate() as ctx:
+        enabled, value = InputDimension("enabled"), InputDimension("value")
+        outputs = [persist(mux(enabled, value, -value), name="signed"),
+                   persist(select(enabled, 3, 7), name="constant"),
+                   persist(gate(enabled, 0.5 * value), name="half")]
+        pg = ctx.capture({"VALUE": enabled + value}, {"READOUT": sum(outputs)})
+        assert sum(isinstance(d, ReGLUDimension) for d in ctx.dims) == 2
+    token = TokenGraph(pg, ("enabled", "value"), ("signed", "constant", "half"))
+    expert = CompiledGraph._compile(token, pg, pg.all_dims)
+    forward = weight_module(expert, memory_size=1)
+    g, x = np.meshgrid([0, 1], np.arange(-512, 512), indexing="ij")
+    actual, _ = forward(torch.tensor(np.stack([g.ravel(), x.ravel()]), dtype=torch.int32),
+                        torch.zeros(1, dtype=torch.uint8))
+    expected = np.stack([2 * np.where(g, x, -x), 2 * np.where(g, 3, 7), np.where(g, x, 0)])
+    np.testing.assert_array_equal(actual.numpy(), expected.reshape(3, -1))
 
 
 @pytest.mark.parametrize("lo,hi", [(-256, 511), (-1, 254), (1, 256), (0, 511)])

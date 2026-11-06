@@ -31,7 +31,7 @@ from transformer_nes.graph.core import (
     stepglu,
     to_expr,
 )
-from transformer_nes.graph.ops import both, either, equals, extract_bits, gate, select
+from transformer_nes.graph.ops import both, either, equals, extract_bits, gate, gate_nonzero, select
 from transformer_nes.ppu2c02.render import low_bits
 from transformer_nes.ppu2c02.space import (
     BASE_GROUPS,
@@ -200,6 +200,25 @@ def build_overflow(chr_full: int = 0):
     return _tokens("OVERFLOW", inp, memory_inputs, {"index": result})
 
 
+def _encode_row(lo, hi, flip_h, shown, meta):
+    """Encode eight binary pattern lanes, then optionally reverse the row.
+
+    Pattern bits, flip_h and shown are 0/1. A transparent pixel remains zero;
+    opaque pixels carry the same palette/priority/sprite-zero metadata.
+    """
+    pixels = []
+    for low, high in zip(lo, hi, strict=True):
+        value = low + 2 * high  # 0..3
+        pixels.append(gate_nonzero(shown, value, meta + value, zero_payload=meta))
+    result = [None] * 8
+    # One gated difference supplies both sides of a controlled swap.
+    for c in range(4):
+        opposite = 7 - c
+        delta = gate(flip_h, pixels[opposite] - pixels[c])
+        result[c], result[opposite] = pixels[c] + delta, pixels[opposite] - delta
+    return result
+
+
 def build_fetch(chr_full: int = 0):
     """`chr_full`: bytes of whole-CHR memory (MMC5, whose sprites fetch
     through their own banks from it), or 0 for the CHR windows."""
@@ -268,12 +287,8 @@ def build_fetch(chr_full: int = 0):
         sprite0 = both(present, equals(inp["index0"], 0)) if k == 0 else 0
         meta = 16 + 8 * attr_bits[6] + 4 * attr_bits[7] + 64 * behind + 128 * sprite0
         shown = both(draw, valid)
-        for c in range(8):
-            # Screen pixel c is bit 7-c of the pattern bytes, bit c when
-            # flipped (bits are MSB first).
-            value = select(flip_h, lo[7 - c] + 2 * hi[7 - c], lo[c] + 2 * hi[c])
-            opaque = stepglu(one, value - 1)
-            outputs[f"sprite{k}_pixel{c}"] = gate(both(shown, opaque), meta + value)
+        for c, pixel in enumerate(_encode_row(lo, hi, flip_h, shown, meta)):
+            outputs[f"sprite{k}_pixel{c}"] = pixel
         outputs[f"sprite{k}_x"] = x
         # A selected sprite fetches when valid; the empty slots past the
         # count fetch a dummy tile from $1000 under 8x16 or table 1.

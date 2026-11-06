@@ -23,8 +23,8 @@ from transformer_nes.graph.core import (
 
 
 def match_byte(value: ExprLike, byte: int) -> Expression:
-    """Return a 0/1 gate: 1 iff value == byte."""
-    return match_zero(value - byte)
+    """Return a 0/1 gate for integer equality, sharing adjacent hinges."""
+    return equals(value, byte)
 
 
 def match_zero(value: ExprLike) -> Expression:
@@ -41,7 +41,7 @@ def multiply(a, b) -> Expression:
 
 def mux(gate: ExprLike, if_one: ExprLike, if_zero: ExprLike) -> Expression:
     """Select between two linear expressions using a 0/1 gate."""
-    return if_zero + multiply(if_one - if_zero, gate)
+    return select(gate, if_one, if_zero)
 
 
 def remainder(value, modulus: int, maximum: int):
@@ -109,7 +109,8 @@ def extract_bits(value: ExprLike, name: str) -> list[Expression]:
     bits = []
     remaining = value
     for i, place in enumerate((128, 64, 32, 16, 8, 4, 2, 1)):
-        bit = stepglu(one, remaining - place)
+        # After seven thresholds the remainder is already exactly 0 or 1.
+        bit = remaining if place == 1 else stepglu(one, remaining - place)
         bit = persist(bit, name=f"{name}bit{7 - i}")
         bits.append(bit)
         remaining = remaining - place * bit
@@ -203,7 +204,7 @@ def memory_site(result: Expression, address, byte_value, write_addr, is_write) -
 
 
 def extract_bits_wide(value: ExprLike, name: str) -> list[Expression]:
-    """Extract an integer byte's bits with 51 ReGLUs in three stages.
+    """Extract an integer byte's bits with 49 ReGLUs in three stages.
 
     The thresholds at multiples of 16 supply both the high nibble's value
     and its bits. Only the low nibble needs another threshold ladder.
@@ -213,7 +214,13 @@ def extract_bits_wide(value: ExprLike, name: str) -> list[Expression]:
     v = to_expr(value)
     high = {k: reglu(1, v - (16 * k - 1)) - reglu(1, v - 16 * k) for k in range(1, 16)}
     lo = reglu(v - 16 * sum(high.values(), Expression()), 1)
-    low = {k: reglu(1, lo - (k - 1)) - reglu(1, lo - k) for k in range(1, 16)}
+    # lo is in [0,15]: relu(lo)=lo and relu(lo-15)=0. The endpoint
+    # thresholds share the same interior hinges as the other low bits.
+    low = {
+        k: (lo if k == 1 else reglu(1, lo - (k - 1)))
+        - (0 if k == 15 else reglu(1, lo - k))
+        for k in range(1, 16)
+    }
 
     def nibble_bits(ge):
         out = []
@@ -259,27 +266,66 @@ def read_bits(
 
 def gate(g: ExprLike, value: ExprLike) -> Expression:
     """value when the 0/1 gate g is 1, else 0."""
+    g, value = to_expr(g), to_expr(value)
+    if set(g.terms) <= {g.one}:
+        return max(0, sum(g.terms.values())) * value
+    if set(value.terms) <= {value.one}:
+        # Selecting between fixed values is affine in the control bit.
+        return sum(value.terms.values()) * g
     return reglu(value, g)
+
+
+def nonzero(value: ExprLike) -> Expression:
+    """0/1 for a nonnegative integer, using one ReGLU hinge."""
+    value = to_expr(value)
+    return value - reglu(1, value - 1)
+
+
+def gate_nonzero(
+    g: ExprLike, value: ExprLike, payload: ExprLike, *, zero_payload: ExprLike | None = None,
+) -> Expression:
+    """payload when g=1 and value>0, else zero.
+
+    g must be 0/1 and value a nonnegative integer. relu(g-value) is one
+    exactly when g=1,value=0. Subtracting that case masks transparency
+    with two parallel neurons, without materializing an opacity flag.
+    payload may be signed and may depend on value.
+    zero_payload may simplify the correction's operand: it must equal
+    payload whenever value=0 (e.g. the metadata in metadata+value).
+    """
+    g = to_expr(g)
+    if not g.terms:
+        return g
+    correction = payload if zero_payload is None else zero_payload
+    masked = reglu(payload, g) - reglu(correction, g - value)
+    if set(g.terms) <= {g.one}:
+        return masked
+    out = persist(masked)
+    # The domain contract proves zero even when the folder cannot infer
+    # that -value is nonpositive. Preserve that proof for specialization.
+    next(iter(out.terms)).zero_when = g
+    return out
 
 
 def both(a: ExprLike, b: ExprLike) -> Expression:
     """a AND b for 0/1 values."""
-    return reglu(a, b)
+    return gate(b, a)
 
 
 def either(a: ExprLike, b: ExprLike) -> Expression:
     """a OR b for 0/1 values."""
-    return to_expr(a) + to_expr(b) - reglu(a, b)
+    return to_expr(a) + to_expr(b) - gate(b, a)
 
 
 def select(g: ExprLike, if_one: ExprLike, if_zero: ExprLike) -> Expression:
     """if_one when the 0/1 gate g is 1, else if_zero."""
-    return to_expr(if_zero) + reglu(to_expr(if_one) - to_expr(if_zero), g)
+    return to_expr(if_zero) + gate(g, to_expr(if_one) - to_expr(if_zero))
 
 
 def equals(value: ExprLike, k: int) -> Expression:
     """1 iff the integer `value` equals k: relu(d+1) - 2 relu(d) + relu(d-1)
-    for d = value - k is the unit tent -- three units, one layer, no
-    persist (match_byte spends four across three layers)."""
+    for d = value - k is the unit tent: three units in one layer.
+    Adjacent comparisons share their hinges through graph interning.
+    """
     d = to_expr(value) - k
     return reglu(1, d + 1) - 2 * reglu(1, d) + reglu(1, d - 1)

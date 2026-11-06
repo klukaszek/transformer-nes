@@ -20,8 +20,8 @@ in [`transformer_nes/nes/`](../nes/).
 | `trace.py` | Instruction-level state and memory-write records shared by both backends. |
 | `backends/reference.py` | Straightforward Python implementation used as the behavioral oracle. |
 | `backends/weights/runner.py` | Builds, caches, and runs the transformer-weights backend. |
-| `backends/weights/engine.py` | Emits model-specific embedding, readout and dispatch into the CPU runtime template. All neural layers run in the shared Torch compiler. |
-| `backends/weights/export.py` | Exports the self-contained union or folded experts as exact int32 safetensors and machine metadata. |
+| `backends/weights/engine.py` | Emits model-specific embedding, readout and dispatch into the CPU runtime template. All neural layers run in the shared scalar SSA compiler. |
+| `backends/weights/export.py` | Exports the self-contained union or folded experts as losslessly packed integer safetensors and machine metadata. |
 | `backends/weights/checkpoint_runner.py` | Standalone PyTorch union runner, importing only the standard library, Torch and safetensors. |
 | `backends/weights/expert_runner.py` | Independent routed expert runner for exported checkpoints and runtime verification. |
 | `backends/weights/experts.py` | Orchestrates folding, dispatch proofs, effect projection, scheduling and ABI lowering. |
@@ -112,10 +112,10 @@ The engine routes execution through several equivalent paths:
 3. The union model supplies the complete fallback and diagnostic trace.
 
 The production runtime always compiles the actual expert layer weights into one fixed
-Inductor bank. FX expands sparse matrix coefficients into integer tensor
-operations; Inductor performs constant propagation and fusion. Its generated
-kernels read the engine's residual and RAM, returning only packed live readouts
-with stack scratch. The native caller decodes that packed packet directly.
+native bank. FX expands sparse matrix coefficients into integer operations;
+scalar SSA shares surviving values and folds integer affine routing while
+preserving half-unit rounding. Kernels read the engine's residual and RAM,
+returning only packed live readouts without fusion scratch buffers. The native caller decodes that packed packet directly.
 The bank is independent of the ROM and loads before the first frame. There is
 no runtime learner, mutable window program, weight tensor pool or background
 attachment queue. The standalone exported checkpoint runners remain separate
@@ -127,6 +127,21 @@ folding and emission work. The optional standalone safetensors export is a
 self-contained `wide_bits=False` union model; the generated runtime uses a
 `wide_bits=True` build to reduce depth while its harness supplies the extra
 byte-bit inputs.
+
+Graph construction exploits its integer domains before scheduling. A Boolean
+product needs one ReGLU even when the payload is signed; selecting a constant
+payload needs only an affine expression. Opcode equality uses unit tents whose
+neighboring comparisons share ReLU hinges. Pulled status bytes use the serial
+14-unit bit extractor within the existing critical path. The final bit is the
+remaining 0/1 value, so it needs no extra threshold.
+
+The standalone union has residual width 536, 57 layers, 4,019 live FFN units
+and 27,536 nonzero coefficients. Its `weights.safetensors` is 287,810 bytes.
+Serialization uses per-tensor int8/int16/int32 according to the exact value
+range, including CSR indices and row pointers. `machine.json` describes logical
+int32 fixed-point arithmetic separately from this storage format. Both
+standalone runners widen coefficients to int32 and indices to int64 on load;
+the values, shapes and fixed-point units are unchanged by packing.
 
 ## Compilation pipeline
 
@@ -141,7 +156,7 @@ The weights backend follows this sequence:
 4. `graph/fold.py` partially evaluates the union graph to build licensed
    opcode, interrupt, shape, and sequence models.
 5. `model/torch_layout.py` and `model/torch_codegen.py` compile the actual
-   matrices with PyTorch Inductor, shared with the PPU. The graph fold exposes
+   matrices through scalar SSA, shared with the PPU. The graph fold exposes
    licensed indexed reads before scheduling. `backends/weights/engine.py`
    supplies embedding, architectural readout and the native run loop;
    `model/build.py` builds and caches the extensions.

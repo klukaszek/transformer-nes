@@ -31,7 +31,16 @@ from transformer_nes.graph.core import (
     stepglu,
     to_expr,
 )
-from transformer_nes.graph.ops import both, either, equals, extract_bits, gate, select
+from transformer_nes.graph.ops import (
+    both,
+    either,
+    equals,
+    extract_bits,
+    gate,
+    gate_nonzero,
+    nonzero,
+    select,
+)
 from transformer_nes.ppu2c02.space import (
     BASE_GROUPS,
     CHR,
@@ -148,11 +157,11 @@ def dispatch(names: list[str]) -> list[dict]:
 
 
 def low_bits(value, width: int) -> list[Expression]:
-    """Bits width-1..0 of a small non-negative integer, MSB first."""
+    """Bits width-1..0 of an integer in [0, 2**width), MSB first."""
     one = graph.current_graph().one
     bits, rest = [], to_expr(value)
     for b in range(width - 1, -1, -1):
-        bit = stepglu(one, rest - (1 << b))
+        bit = rest if b == 0 else stepglu(one, rest - (1 << b))
         bits.append(bit)
         rest = rest - (1 << b) * bit
     return bits
@@ -240,7 +249,8 @@ def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expressio
     lo_bits = memory.bits(memory.read(pattern_addr, groups, "pattern_lo"), "pattern_lo")
     hi_bits = memory.bits(memory.read(pattern_addr + 8, groups, "pattern_hi"), "pattern_hi")
     tile = [
-        lo_bits[c] + 2 * hi_bits[c] + 4 * gate(either(lo_bits[c], hi_bits[c]), palette_select)
+        lo_bits[c] + 2 * hi_bits[c]
+        + 4 * gate_nonzero(1, lo_bits[c] + 2 * hi_bits[c], palette_select)
         for c in range(8)
     ]
     # Latch triggers: the high byte of tile $FD/$FE sets FD/FE; MMC2's low
@@ -282,12 +292,12 @@ def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expressio
     pixels, hits = [], []
     for i in range(8):
         bg = gate(bg_gate, window[i])
-        bg_opaque = stepglu(one, bg - 1)
+        bg_opaque = nonzero(bg)
         sprite = persist(inp[f"sprite{i}"], name=f"sprite_pixel{i}")
         s_b7 = stepglu(one, sprite - 128)
         s_b6 = stepglu(one, sprite - 128 * s_b7 - 64)
         sprite_index = sprite - 128 * s_b7 - 64 * s_b6
-        shown = both(sprite_gate, stepglu(one, sprite - 1))
+        shown = both(sprite_gate, nonzero(sprite))
         wins = shown - both(shown, both(s_b6, bg_opaque))
         index = select(rendering, bg + gate(wins, sprite_index - bg), backdrop)
         # Sprite 0 hits on opaque-over-opaque, never at x=255.

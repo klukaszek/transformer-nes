@@ -1,29 +1,31 @@
-"""Compile a fixed bank of transformer weights with PyTorch Inductor.
+"""Compile fixed transformer weights through a compact scalar SSA.
 
 The FX graph is a scalar expansion of the checkpoint's attention and ReGLU
-matrices, including integer rounding points or float32 residual arithmetic. Inductor folds immutable
-coefficients, removes dead residual slots and fuses each expert. No opcode
+matrices, including integer rounding points or float32 residual arithmetic. The scalar IR folds immutable
+coefficients, removes dead residual slots and shares each surviving value. No opcode
 semantics are supplied to this compiler.
 """
 
-import ast
-import math
+import logging
 import operator
 import re
+import time
 
 import torch
 from torch.fx import Graph, GraphModule
 
+from transformer_nes.model import kernel_cache, outline, scalar_ir
 from transformer_nes.model.torch_layout import layer_arrays
 
 INT = torch.int32
+logger = logging.getLogger(__name__)
 
 
 def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     """Expand actual matrices at their exact residual scale.
 
     Byte/flag masks state the native embedding's exact input domain. They
-    let Inductor simplify the transformer's arithmetic on valid inputs.
+    let the compiler simplify the transformer's arithmetic on valid inputs.
     Only declared ABI readouts escape; other residual slots are dead.
     """
     model, spec = expert["model"], expert.get("step_spec")
@@ -38,14 +40,71 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     x = g.placeholder("x")
     ram = g.placeholder("memory")
     constants = {}
+    constant_values = {}
+    expressions = {}
+
+    def wrap32(value):
+        return (value + 2**31) % 2**32 - 2**31
+
+    def freeze(value):
+        if isinstance(value, (tuple, list)):
+            return tuple(freeze(v) for v in value)
+        if isinstance(value, slice):
+            return (slice, value.start, value.stop, value.step)
+        return value
+
+    def const(v, numeric_type=dtype):
+        key = (v, numeric_type)
+        if key not in constants:
+            node = g.call_function(torch.full, ((1,), v), {"dtype": numeric_type})
+            constants[key] = node
+            constant_values[node] = v
+        return constants[key]
 
     def op(f, *args, **kwargs):
-        return g.call_function(f, args, kwargs)
-
-    def const(v):
-        if v not in constants:
-            constants[v] = op(torch.full, (1,), v, dtype=dtype)
-        return constants[v]
+        # Preserve the int32 rounding/overflow boundary at every operation.
+        # Simplifying while expanding the sparse matrices also preserves the
+        # identity of the constant query channel, avoiding needless divides.
+        # Float circuits retain their original IEEE arithmetic (including NaNs
+        # and signed zero), without algebraic identity rewrites.
+        if not floating:
+            values = tuple(constant_values.get(v, v) if isinstance(v, torch.fx.Node) else v for v in args)
+            if len(args) == 2:
+                left, right = values
+                if f in (
+                    operator.add, operator.mul, operator.and_, operator.lshift, operator.rshift
+                ) and all(isinstance(v, int) for v in values):
+                    value = f(left, right)
+                    return const(value, torch.bool) if isinstance(value, bool) else const(wrap32(value))
+                if f is operator.add:
+                    if left == 0:
+                        return args[1]
+                    if right == 0:
+                        return args[0]
+                if f is operator.mul:
+                    if left == 0 or right == 0:
+                        return const(0)
+                    if left == 1:
+                        return args[1]
+                    if right == 1:
+                        return args[0]
+                if f in (operator.lshift, operator.rshift) and right == 0:
+                    return args[0]
+                if f in (operator.eq, operator.gt, operator.ge, operator.lt) and all(
+                    isinstance(v, int) for v in values
+                ):
+                    return const(f(left, right), torch.bool)
+            if f is torch.where and isinstance(values[0], (bool, int)):
+                selected = args[1] if values[0] else args[2]
+                return const(selected) if isinstance(selected, int) else selected
+            if f is torch.clamp and len(values) == 3 and all(
+                type(v) is int and -(2**31) <= v < 2**31 for v in values
+            ):
+                return const(min(max(values[0], values[1]), values[2]))
+        key = (f, freeze(args), tuple(kwargs.items()))
+        if key not in expressions:
+            expressions[key] = g.call_function(f, args, kwargs)
+        return expressions[key]
 
     zero = const(0)
     one = const(scale)
@@ -83,6 +142,90 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
             if halves is not None and halves[i].any():
                 value = op(operator.add, value, op(operator.rshift, dot(halves[i], values), 1))
             result.append(value)
+        return result
+
+    affine_forms = {}
+
+    def affine(value):
+        """Collect integer linear terms modulo 2**32, stopping at every
+        nonlinear operation, shift and memory read. In particular, never
+        move coefficients across the half-weight rounding points."""
+        if not isinstance(value, torch.fx.Node):
+            return {None: value}
+        if value not in affine_forms:
+            if value in constant_values:
+                form = {None: constant_values[value]}
+            elif value.op == "call_function" and value.target is operator.add:
+                form = dict(affine(value.args[0]))
+                for term, coefficient in affine(value.args[1]).items():
+                    form[term] = form.get(term, 0) + coefficient
+            elif value.op == "call_function" and value.target is operator.mul:
+                left, right = value.args
+                lc = constant_values.get(left, left) if isinstance(left, torch.fx.Node) else left
+                rc = constant_values.get(right, right) if isinstance(right, torch.fx.Node) else right
+                if isinstance(lc, int):
+                    form = {term: lc * c for term, c in affine(right).items()}
+                elif isinstance(rc, int):
+                    form = {term: rc * c for term, c in affine(left).items()}
+                else:
+                    form = {value: 1}
+            else:
+                form = {value: 1}
+            affine_forms[value] = {
+                term: wrap32(c) for term, c in form.items() if wrap32(c)
+            }
+        return affine_forms[value]
+
+    def accumulate(*values):
+        # Slot reuse emits old + (-old + new). Cancel the cleared stream
+        # before lowering chooses which intermediates to materialize.
+        if floating or not expert.get("reassociate_residuals", True):
+            old = values[0]
+            delta = op(operator.add, values[1], values[2]) if len(values) == 3 else values[1]
+            if not floating:
+                memo = {}
+
+                def strip(value):
+                    # Treat the old value as an opaque atom. Only remove
+                    # its explicit linear clear; preserve the grouping of
+                    # every other projection, shift and nonlinear value.
+                    if value is old:
+                        return zero, 1
+                    if not isinstance(value, torch.fx.Node):
+                        return value, 0
+                    if value in memo:
+                        return memo[value]
+                    result = value, 0
+                    if value.op == "call_function" and value.target is operator.add:
+                        a, na = strip(value.args[0])
+                        b, nb = strip(value.args[1])
+                        result = op(operator.add, a, b), na + nb
+                    elif value.op == "call_function" and value.target is operator.mul:
+                        a, b = value.args
+                        ac, bc = constant_values.get(a, a), constant_values.get(b, b)
+                        if type(ac) is int and ac in (-1, 1):
+                            rest, n = strip(b)
+                            result = op(operator.mul, rest, ac), n * ac
+                        elif type(bc) is int and bc in (-1, 1):
+                            rest, n = strip(a)
+                            result = op(operator.mul, rest, bc), n * bc
+                    memo[value] = result
+                    return result
+
+                rest, coefficient = strip(delta)
+                if coefficient == -1:
+                    return rest
+            return op(operator.add, old, delta)
+        form = {}
+        for value in values:
+            for term, c in affine(value).items():
+                form[term] = form.get(term, 0) + c
+        result = zero
+        for term, c in form.items():
+            c = wrap32(c)
+            if c:
+                value = const(c) if term is None else op(operator.mul, term, c)
+                result = op(operator.add, result, value)
         return result
 
     reads, snapshots = [], []
@@ -138,7 +281,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
         read = linear(a["w_out"][:, :nvalues], served, hread)
         value = linear(a["w_out"][:, nvalues:], projected[qrows:], hvalue)
         for slot, r, v in zip(a["out_slots"], read, value, strict=True):
-            state[slot] = op(operator.add, state[slot], op(operator.add, r, v))
+            state[slot] = accumulate(state[slot], r, v)
         projected = linear(a["w_ff"], [state[s] for s in a["ff_in_slots"]], a.get("h_ff"))
         nff = a["w_down"].shape[1]
         acts = []
@@ -156,7 +299,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
             acts.append(act)
         down = linear(a["w_down"], acts, a.get("h_down"))
         for slot, v in zip(a["ff_out_slots"], down, strict=True):
-            state[slot] = op(operator.add, state[slot], v)
+            state[slot] = accumulate(state[slot], v)
         if ablation:
             control = D if spec else len(expert["input_slots"])
             selected = op(operator.getitem, x, slice(control, control + 1))
@@ -188,234 +331,81 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     module.readout_slots = readout_slots
     module.f_bits = f_bits
     module.dtype = dtype
+    module.canonical_affine = expert.get("reassociate_residuals", True)
+    # Fixed-address reads (e.g. all 64 OAM Y bytes) have the same raw-buffer
+    # circuit across RAM layouts. Prove the required prefix after DCE; any
+    # dynamic index conservatively retains the complete memory extent.
+    module.memory_extent = 0
+    for user in ram.users:
+        index = (
+            constant_values.get(user.args[1])
+            if user.op == "call_function" and user.target is operator.getitem
+            and isinstance(user.args[1], torch.fx.Node) else None
+        )
+        if type(index) is not int or not 0 <= index < memory_size:
+            module.memory_extent = memory_size
+            break
+        module.memory_extent = max(module.memory_extent, index + 1)
     return module
 
 
-def extract_kernel(source, index, *, scalar="int32_t"):
-    """Parse a fused kernel's typed buffers and fixed slice aliases.
-
-    Input pointers bind to residual/RAM; returned buffers bind to out/reads;
-    intermediate buffers get local stack storage. Reject unfamiliar layouts
-    rather than executing an incompletely bound generated kernel.
-    """
-    tree = ast.parse(source)
-    kernels = {}
-    for n in ast.walk(tree):
-        if (
-            isinstance(n, ast.Assign)
-            and isinstance(n.value, ast.Call)
-            and isinstance(n.value.func, ast.Attribute)
-            and n.value.func.attr == "cpp_pybinding"
-        ):
-            assert len(n.targets) == 1 and isinstance(n.targets[0], ast.Name)
-            kernels[n.targets[0].id] = (
-                ast.literal_eval(n.value.args[0]),
-                ast.literal_eval(n.value.args[1]),
-            )
-    functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "call"]
-    calls = [
-        n
-        for fn in functions
-        for n in ast.walk(fn)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in kernels
-    ]
-    assert calls, ("kernel calls", index)
-    fn = next(fn for fn in functions if calls[0] in ast.walk(fn))
-    assert all(call in ast.walk(fn) for call in calls)
-    assert not any(
-        isinstance(n, ast.Attribute)
-        and isinstance(n.value, ast.Name)
-        and n.value.id == "extern_kernels"
-        for n in ast.walk(fn)
-    )
-    ret = next(n for n in ast.walk(fn) if isinstance(n, ast.Return))
-    returned = [n.id for n in ret.value.elts]
-    assert len(returned) == 2
-    buffers = {}
-    sizes, types = {}, {}
-    arguments = {}
-    for n in ast.walk(fn):
-        if (
-            isinstance(n, ast.Assign)
-            and len(n.targets) == 1
-            and isinstance(n.targets[0], (ast.List, ast.Tuple))
-            and isinstance(n.value, ast.Name)
-            and n.value.id == "args"
-        ):
-            arguments = {
-                v.id: name for v, name in zip(n.targets[0].elts, ("x", "ram"), strict=True)
-            }
-        if (
-            not isinstance(n, ast.Assign)
-            or len(n.targets) != 1
-            or not isinstance(n.targets[0], ast.Name)
-        ):
-            continue
-        name = n.targets[0].id
-        v = n.value
-        if isinstance(v, ast.Call) and isinstance(v.func, ast.Name):
-            if v.func.id == "empty_strided_cpu":
-                size = math.prod(ast.literal_eval(v.args[0]))
-                sizes[name] = size
-                assert isinstance(v.args[2], ast.Attribute)
-                types[name] = {"int32": "int32_t", "int64": "int64_t", "bool": "bool", "float32": "float"}[
-                    v.args[2].attr
-                ]
-                buffers[name] = (name, 0)
-            elif v.func.id == "reinterpret_tensor":
-                base = v.args[0].id
-                offset = ast.literal_eval(v.args[3]) if len(v.args) > 3 else 0
-                assert all(s == 1 for s in ast.literal_eval(v.args[2]))
-                buffers[name] = (base, offset)
-        elif isinstance(v, ast.Name):
-            buffers[name] = (v.id, 0)
-
-    def resolve(name):
-        delta = 0
-        seen = set()
-        while name in buffers:
-            base, offset = buffers[name]
-            delta += offset
-            if base == name:
-                break
-            assert name not in seen
-            seen.add(name)
-            name = base
-        return name, delta
-
-    out, read = map(lambda n: resolve(n)[0], returned)
-    assert out in sizes and read in sizes
-    declarations = [
-        f"    {types[name]} scratch_{name}[{max(1, size)}];"
-        for name, size in sizes.items()
-        if name not in (out, read)
-    ]
-    includes, helpers, dispatch = [], [], []
-    for phase, call in enumerate(calls):
-        kinds, body = kernels[call.func.id]
-        match = re.search(r'extern\s+"C"\s+void\s+kernel\s*\((.*?)\)\s*\{', body, re.S)
-        assert match
-        params = [p.strip() for p in match.group(1).split(",")]
-        assert len(params) == len(kinds) == len(call.args)
-        values = []
-        for _param, kind, arg in zip(params, kinds, call.args, strict=True):
-            assert isinstance(arg, ast.Name), (index, ast.dump(arg))
-            base, offset = resolve(arg.id)
-            if base in sizes:
-                value = "out" if base == out else "reads" if base == read else f"scratch_{base}"
-            elif base in arguments:
-                value = arguments[base]
-            else:
-                raise ValueError((index, kind, arg.id, base))
-            if offset:
-                value += f" + {offset}"
-            values.append(value)
-        prefix = body[: match.start()]
-        includes.extend(re.findall(r"^\s*#include[^\n]+", prefix, re.M))
-        assert not re.sub(r"^\s*#include[^\n]+", "", prefix, flags=re.M).strip()
-        if len(calls) == 1:
-            for param, value in zip(params, values, strict=True):
-                declarations.append(f"    {param} = {value};")
-            dispatch.append(body[match.end() :])
-        else:
-            name = f"phase_{index}_{phase}"
-            helpers.append(
-                f"static __attribute__((always_inline)) void {name}("
-                + ", ".join(params)
-                + ") {"
-                + body[match.end() :]
-            )
-            dispatch.append(f"    {name}({', '.join(values)});")
-    generated = "\n".join(helpers) + (
-        f"\nvoid circuit_{index}(const {scalar}* x, const uint8_t* ram, {scalar}* out, int32_t* reads) {{\n"
-        + "\n".join(declarations)
-        + "\n"
-        + "\n".join(dispatch)
-        + ("\n}" if len(calls) > 1 else "")
-    )
-    return generated, includes, dict(
-        width=sizes[out], reads=sizes[read], arguments=len(calls),
-        checks_division="inductor_cpu_integer_div_error_flag" in generated,
-    )
-
-
-INDUCTOR_CONFIG = {
-    "cpp.threads": 1,
-    "cpp.vec_isa_ok": False,
-    "memory_planning": False,
-    "fx_graph_cache": False,
-    # Materialize shared scalar expressions before fusion duplicates their
-    # text across consumers. Clang can still inline the resulting phases.
-    "realize_cpu_opcount_threshold": 5,
-    "realize_cpu_acc_reads_threshold": 2,
-    "realize_opusers_threshold": 2,
-    "max_fusion_size": 16,
-}
-
-
 def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=False):
-    """Fuse the actual layer weights, retaining Inductor's arithmetic bodies.
+    """Lower weight-derived arithmetic once per value to compact native SSA.
 
-    Inductor normally wraps each output slice in a Tensor. The native ABI
-    already provides contiguous residual/read buffers, so extract_kernel
-    binds those same slice pointers directly and allocates scratch on stack.
-    Unsupported compiler layouts fail here, before a hook can be installed.
+    The IR cancels integer residual clears, shares affine forms and treats
+    half shifts, ReGLUs and memory loads as explicit arithmetic boundaries.
+    Float32 circuits retain the original order of every arithmetic operation.
     """
-    from torch._inductor.compile_fx import compile_fx
-    from torch._inductor.utils import get_code
-
-    bodies, metadata, includes = [], [], set()
+    bodies, metadata, programs, indices = [], [], [], []
     dtypes = {expert.get("dtype", "int32") for expert in experts}
     if len(dtypes) != 1 or not dtypes <= {"int32", "float32"}:
         raise ValueError("a weight bank requires one numeric type")
     scalar = "float" if dtypes == {"float32"} else "int32_t"
     compiled = {}
+    cache_hits = 0
+    start = time.perf_counter()
     for index, expert in enumerate(experts):
         module = weight_module(expert, memory_size=memory_size, trace=trace, ablation=ablation)
-        nodes = {node: i for i, node in enumerate(module.graph.nodes)}
-
-        def freeze(value, nodes=nodes):
-            if isinstance(value, torch.fx.Node):
-                return ("node", nodes[value])
-            if isinstance(value, (tuple, list)):
-                return tuple(freeze(v) for v in value)
-            if isinstance(value, dict):
-                return tuple((k, freeze(v)) for k, v in value.items())
-            if isinstance(value, slice):
-                return ("slice", value.start, value.stop, value.step)
-            return value
-
-        key = (
-            module.input_width,
-            tuple((n.op, n.target, freeze(n.args), freeze(n.kwargs)) for n in module.graph.nodes),
+        program = scalar_ir.encode(module)
+        key = (program["inputs"], tuple(
+            (name, program[name].dtype.str, program[name].shape, program[name].tobytes())
+            for name in ("code", "terms", "registers", "outputs", "reads")
+        ))
+        digest = kernel_cache.fingerprint(
+            key, {}, memory_size=module.memory_extent,
+            scalar=scalar, extractor=scalar_ir.emit_cpp,
         )
-        if key in compiled:
-            metadata.append(compiled[key])
+        if digest in compiled:
+            metadata.append(compiled[digest])
             continue
-        example = (
-            torch.zeros(module.input_width, dtype=module.dtype),
-            torch.zeros(memory_size, dtype=torch.uint8),
+
+        body, _headers, meta, hit = kernel_cache.get_kernel(
+            digest, lambda program=program: scalar_ir.emit_cpp(program, scalar=scalar),
         )
-        with torch._inductor.config.patch(INDUCTOR_CONFIG):
-            wrappers = [
-                code
-                for code in get_code(
-                    lambda module=module, example=example: compile_fx(module.eval(), list(example))
-                )
-                if code.strip()
-            ]
-        if len(wrappers) != 1:
-            raise RuntimeError(f"expert {index}: expected one fused Inductor wrapper")
-        try:
-            body, headers, meta = extract_kernel(wrappers[0], index, scalar=scalar)
-        except (AssertionError, ValueError, AttributeError, StopIteration) as error:
-            raise RuntimeError(f"expert {index}: unsupported Inductor buffer layout") from error
-        bodies.append(body)
+        cache_hits += hit
+        bodies.append(re.sub(r"\bcircuit_0\b", f"circuit_{index}", body))
+        programs.append(program)
+        indices.append(index)
         meta["circuit"] = index
         meta["input_width"] = module.input_width
-        compiled[key] = meta
+        compiled[digest] = meta
         metadata.append(meta)
-        includes.update(header.strip() for header in headers)
+    logger.info(
+        "weight circuits: %d unique, %d reused, %d lowered in %.1fs",
+        len(compiled), cache_hits, len(compiled) - cache_hits, time.perf_counter() - start,
+    )
+    helpers, plans = outline.share(programs, scalar=scalar)
+    shared_bodies = list(bodies)
+    for i, plan in enumerate(plans):
+        if plan:
+            shared_bodies[i] = scalar_ir.emit_cpp(programs[i], indices[i], scalar=scalar, blocks=plan)[0]
+    # The planner estimates call costs. Verify the complete bank too: longer
+    # references to fragment results can outweigh a small local text saving.
+    if len(helpers) + 1 + sum(map(len, shared_bodies)) < sum(map(len, bodies)):
+        bodies = shared_bodies
+    else:
+        helpers = ""
+    logger.info("shared %d compiled fragments", helpers.count("always_inline"))
     entries = ",\n".join(
         f"{{circuit_{m['circuit']}, {m['width']}, {m['reads']}, {str(m['checks_division']).lower()}}}"
         for m in metadata
@@ -432,4 +422,5 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
         "@INPUT_WIDTHS@": ", ".join(str(meta["input_width"]) for meta in metadata),
     }.items():
         hook = hook.replace(name, value)
-    return "\n".join(sorted(includes)) + "\n" + "\n".join(bodies) + "\n" + hook
+    shared = helpers + "\n" if helpers else ""
+    return scalar_ir.CPP_PREAMBLE + f"using V = {scalar};\n" + shared + "\n".join(bodies) + "\n" + hook

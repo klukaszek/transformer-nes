@@ -434,3 +434,370 @@ def test_constant_one_survives_implicit_linear_gates(gate, input_value):
         torch.tensor([input_value], dtype=torch.int32), torch.zeros(65536, dtype=torch.uint8)
     )
     assert result.tolist() == [(1 << forward.f_bits) * 2**16]
+
+
+@pytest.mark.parametrize("reassociate_residuals", [False, True])
+def test_integer_expansion_preserves_memory_bounds_and_half_rounding(reassociate_residuals):
+    import numpy as np
+    import torch
+
+    from transformer_nes.graph.fold import GraphFolder
+    from transformer_nes.ppu2c02.space import Memory
+
+    @construction
+    def graphs():
+        address = InputDimension("address")
+        offset = InputDimension("offset")
+        write, mem_address, mem_value = (InputDimension(n) for n in ("write", "mem_address", "mem_value"))
+        memory = Memory(write, mem_address, mem_value)
+        byte = memory.read(address, (0,), "byte")
+        low = memory.bits(byte, "byte")[7]
+        result = persist(0.5 * (byte - low) + reglu(offset, 1), name="result")
+        graph = current_graph().capture(
+            {"VALUE": address + offset, "WRITE": write + mem_address + mem_value}, {"READOUT": result}
+        )
+        return {"read": TokenGraph(
+            graph, ("address", "offset"), ("result",),
+            reassociate_residuals=reassociate_residuals,
+        )}
+
+    engine = CompiledGraph(
+        graphs, tag=f"integer_read_test_{reassociate_residuals}", sources=(), memory_size=256
+    )
+    for address in range(256):
+        engine.write(address, address)
+    # Exercise both the FX and native paths, including negative half products,
+    # invalid addresses and the fixed-point rescaling at the raw ABI.
+    token = graphs()["read"]
+    folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
+    expert = CompiledGraph._compile(token, folded.program_graph, list(folded.dim_of_name.values()))
+    from transformer_nes.model.torch_codegen import weight_module
+
+    forward = weight_module(expert, memory_size=256)
+    memory = torch.arange(256, dtype=torch.int32).to(torch.uint8)
+    for address in (-1, *range(256), 256):
+        for offset in (-3, 0, 5):
+            expected = [((address >> 1) if 0 <= address < 256 else 0) + offset]
+            np.testing.assert_array_equal(engine.step([address, offset]), expected)
+            output, _ = forward(torch.tensor([address, offset], dtype=torch.int32), memory)
+            assert output.tolist() == [v << forward.f_bits for v in expected]
+
+
+def test_integer_residual_simplification_preserves_int32_overflow():
+    @construction
+    def graphs():
+        value = InputDimension("value")
+        result = persist(reglu(value, value) + 17 * value, name="result")
+        graph = current_graph().capture({"VALUE": value.as_expr()}, {"READOUT": result})
+        return {"overflow": TokenGraph(graph, ("value",), ("result",))}
+
+    engine = CompiledGraph(graphs, tag="integer_overflow_test", sources=(), memory_size=1)
+    for value in (-2**31, -65536, -1, 0, 1, 46341, 65536, 2**31 - 1):
+        expected = (value * max(0, value) + 17 * value + 2**31) % 2**32 - 2**31
+        assert engine.step([value]).tolist() == [expected]
+
+
+def _cached_body():
+    return "void circuit_0() {}", ["#include <cstdint>"], dict(
+        width=1, reads=0, arguments=1, checks_division=False,
+    )
+
+
+def _identity_extractor(source, index, *, scalar="int32_t"):
+    return source, scalar, index + 1
+
+
+def test_kernel_identity_tracks_code_not_source_locations():
+    import types
+
+    from transformer_nes.model.kernel_cache import fingerprint
+
+    def key(extractor, **overrides):
+        return fingerprint(
+            ("graph",), overrides.pop("config", {"cpp.threads": 1}),
+            **(dict(memory_size=256, scalar="int32_t", extractor=extractor) | overrides),
+        )
+
+    moved = types.FunctionType(
+        _identity_extractor.__code__.replace(co_filename="moved.py", co_firstlineno=900), globals(),
+    )
+    moved.__kwdefaults__ = _identity_extractor.__kwdefaults__
+    changed = types.FunctionType(
+        _identity_extractor.__code__.replace(
+            co_consts=tuple(2 if type(c) is int and c == 1 else c for c in _identity_extractor.__code__.co_consts)
+        ), globals(),
+    )
+    changed.__kwdefaults__ = _identity_extractor.__kwdefaults__
+    assert key(moved) == key(_identity_extractor)
+    assert key(changed) != key(_identity_extractor)
+    assert key(moved, memory_size=512) != key(moved)
+    assert key(moved, scalar="float") != key(moved)
+    assert key(moved, config={"cpp.threads": 2}) != key(moved)
+
+
+def test_kernel_cache_recovers_corrupt_entries_and_evicts_old_sources(cache, monkeypatch):
+    from transformer_nes.model import kernel_cache
+
+    lowered = []
+
+    def lower():
+        lowered.append(1)
+        return _cached_body()
+
+    first, second = "a" * 64, "b" * 64
+    assert kernel_cache.get_kernel(first, lower)[-1] is False
+    assert kernel_cache.get_kernel(first, lower)[-1] is True
+    path = cache / "kernels" / f"{first}.json"
+    size = path.stat().st_size
+    path.write_text('{"body": "truncated')
+    assert kernel_cache.get_kernel(first, lower)[-1] is False
+    assert len(lowered) == 2
+    monkeypatch.setattr(kernel_cache, "MAX_BYTES", size + 1)
+    assert kernel_cache.get_kernel(second, lower)[-1] is False
+    assert not path.exists()
+    assert kernel_cache.get_kernel(second, lower)[-1] is True
+
+
+def _shared_kernel(root, may_compile, connection):
+    from transformer_nes.model import kernel_cache
+
+    _configure(root)
+    connection.send("started")
+
+    def lower():
+        assert may_compile, "the second process must reuse the completed kernel"
+        connection.send("lowering")
+        assert connection.recv() == "finish"
+        return _cached_body()
+
+    body, headers, meta, hit = kernel_cache.get_kernel("c" * 64, lower)
+    connection.send((body, headers, meta, hit))
+
+
+def test_kernel_cache_owns_compilation_across_processes(cache):
+    with _worker(_shared_kernel, cache, True) as (first, _):
+        assert _receive(first) == "started"
+        assert _receive(first) == "lowering"
+        with _worker(_shared_kernel, cache, False) as (second, _):
+            assert _receive(second) == "started"
+            assert not second.poll(0.2)
+            first.send("finish")
+            a, b = _receive(first), _receive(second)
+            assert a[:-1] == b[:-1] == _cached_body()
+            assert a[-1] is False and b[-1] is True
+
+
+def test_cached_circuits_relocate_between_banks_without_lowering(cache, monkeypatch):
+    from transformer_nes.model import kernel_cache as compiler
+
+    monkeypatch.setattr(graph_engine, "CACHE_DIR", str(cache))
+
+    @construction
+    def graphs(reverse=False, changed=False):
+        value = InputDimension("value")
+        doubled = persist(2 * value, name="doubled")
+        square = persist(reglu(value, value) + (value if changed else 0), name="square")
+        graph = current_graph().capture(
+            {"VALUE": value.as_expr()}, {"READOUT": doubled + square}
+        )
+        tokens = {
+            "double": TokenGraph(graph, ("value",), ("doubled",)),
+            "square": TokenGraph(graph, ("value",), ("square",)),
+        }
+        return dict(reversed(list(tokens.items()))) if reverse else tokens
+
+    original = CompiledGraph(graphs, tag="kernel_original", sources=(), memory_size=1)
+    assert original.step([7], original.model_id("double")).tolist() == [14]
+    assert original.step([7], original.model_id("square")).tolist() == [49]
+
+    real_compile = compiler.get_kernel
+
+    def unexpected_lowering(*args, **kwargs):
+        result = real_compile(*args, **kwargs)
+        assert result[-1], "identical SSA circuits must survive a new bank identity"
+        return result
+
+    monkeypatch.setattr(compiler, "get_kernel", unexpected_lowering)
+    # Different graph order/model ids, token-bank identity and unused RAM
+    # extent: bind each cached body's circuit name to its new index.
+    reordered = CompiledGraph(
+        lambda: graphs(True), tag="kernel_reordered", sources=(), memory_size=4096,
+    )
+    for value in (-7, 0, 11):
+        assert reordered.step([value], reordered.model_id("double")).tolist() == [2 * value]
+        assert reordered.step([value], reordered.model_id("square")).tolist() == [value * max(0, value)]
+
+    calls = []
+    def count_lowering(*args, **kwargs):
+        result = real_compile(*args, **kwargs)
+        if not result[-1]:
+            calls.append(1)
+        return result
+
+    monkeypatch.setattr(compiler, "get_kernel", count_lowering)
+    changed = CompiledGraph(lambda: graphs(changed=True), tag="kernel_changed", sources=(), memory_size=1)
+    assert len(calls) == 1
+    assert changed.step([7], changed.model_id("double")).tolist() == [14]
+    assert changed.step([7], changed.model_id("square")).tolist() == [56]
+
+
+def test_fixed_read_cache_shares_valid_extents_and_keeps_out_of_bounds_zero(cache, monkeypatch):
+    from transformer_nes.model import kernel_cache as compiler
+    from transformer_nes.ppu2c02.space import Memory
+
+    monkeypatch.setattr(graph_engine, "CACHE_DIR", str(cache))
+
+    @construction
+    def graphs():
+        offset = InputDimension("offset")
+        write, address, value = (InputDimension(n) for n in ("write", "address", "value"))
+        byte = Memory(write, address, value).read(7, (0,), "byte")
+        result = persist(byte + 2 * offset, name="result")
+        graph = current_graph().capture(
+            {"VALUE": offset.as_expr(), "WRITE": write + address + value}, {"READOUT": result}
+        )
+        return {"read": TokenGraph(graph, ("offset",), ("result",))}
+
+    real_compile, calls = compiler.get_kernel, []
+
+    def count_lowering(*args, **kwargs):
+        result = real_compile(*args, **kwargs)
+        if not result[-1]:
+            calls.append(1)
+        return result
+
+    monkeypatch.setattr(compiler, "get_kernel", count_lowering)
+    large = CompiledGraph(graphs, tag="fixed_large", sources=(), memory_size=256)
+    large.write(7, 215)
+    assert large.step([3]).tolist() == [221]
+    assert len(calls) == 1
+    small = CompiledGraph(graphs, tag="fixed_small", sources=(), memory_size=8)
+    small.write(7, 13)
+    assert small.step([3]).tolist() == [19]
+    assert len(calls) == 1
+    outside = CompiledGraph(graphs, tag="fixed_outside", sources=(), memory_size=4)
+    assert outside.step([3]).tolist() == [6]
+    assert len(calls) == 2
+
+
+def test_shared_neurons_emit_once_without_importing_inductor(cache, monkeypatch):
+    import builtins
+
+    monkeypatch.setattr(graph_engine, "CACHE_DIR", str(cache))
+    original_import = builtins.__import__
+
+    def no_inductor(name, *args, **kwargs):
+        if name.startswith(("torch._inductor", "torch._dynamo")):
+            raise AssertionError(f"scalar lowering imported {name}")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_inductor)
+
+    @construction
+    def graphs():
+        x = InputDimension("x")
+        shared = reglu(x, x)
+        outputs = [persist(shared + (i + 1) * x, name=f"out{i}") for i in range(64)]
+        graph = current_graph().capture({"VALUE": x.as_expr()}, {"READOUT": sum(outputs)})
+        return {"fanout": TokenGraph(graph, ("x",), tuple(f"out{i}" for i in range(64)))}
+
+    engine = CompiledGraph(graphs, tag="ssa_fanout", sources=(), memory_size=1)
+    source = (cache / f"graph_{engine.digest}.cpp").read_text()
+    assert source.count(" > 0 ?") == 1
+    assert "scratch_" not in source and "phase_" not in source
+    for value in (-65536, -1, 0, 1, 46341, 65536):
+        expected = [
+            (value * max(0, value) + (i + 1) * value + 2**31) % 2**32 - 2**31
+            for i in range(64)
+        ]
+        assert engine.step([value]).tolist() == expected
+
+
+def test_standard_ppu_source_stays_under_two_and_a_quarter_mebibytes():
+    from transformer_nes.ppu2c02.machine import ppu_engine
+
+    engine = ppu_engine()
+    meta, source = CompiledGraph._generate(engine.build_graphs(), engine.memory_size)
+    assert meta["digest"] == engine.digest
+    # Real rendering, fetch, status and register experts previously emitted
+    # over 20 MiB, then 4.1 MiB with scalar SSA. Preserve the shared-fragment
+    # and compact scalar representation (currently about 2.05 MiB).
+    assert len(source.encode()) < 9 * 1024**2 // 4
+
+
+def test_float32_ssa_matches_fx_bits_at_rounding_boundaries():
+    import numpy as np
+    import torch
+
+    from transformer_nes.graph.fold import GraphFolder
+    from transformer_nes.model.torch_codegen import weight_module
+
+    @construction
+    def graphs():
+        x = InputDimension("x")
+        y = persist(reglu(1.0000001192092896 * x + 2**-24, x + 2) - 0.9995 * x, name="y")
+        pg = current_graph().capture({"VALUE": x.as_expr()}, {"READOUT": y})
+        return {"real": TokenGraph(pg, ("x",), ("y",))}
+
+    engine = CompiledGraph(graphs, tag="ssa_float_bits", sources=(), memory_size=1, dtype="float32")
+    token = graphs()["real"]
+    folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
+    model = CompiledGraph._compile(token, folded.program_graph, list(folded.dim_of_name.values()), dtype="float32")
+    forward = weight_module(model, memory_size=1)
+    values = np.concatenate([
+        np.array([-0.0, 0.0, -2, 2**-24, 1, np.nextafter(np.float32(1), np.float32(2))], dtype=np.float32),
+        np.random.default_rng(819).uniform(-100, 100, 256).astype(np.float32),
+    ])
+    expected, _ = forward(torch.from_numpy(values.reshape(1, -1)), torch.zeros(1, dtype=torch.uint8))
+    actual = np.array([engine.step([x])[0] for x in values], dtype=np.float32)
+    np.testing.assert_array_equal(actual.view(np.uint32), expected.numpy().ravel().view(np.uint32))
+
+
+@pytest.mark.parametrize("dtype", ["int32", "float32"])
+def test_shared_fragments_preserve_bound_values_and_projection_grouping(dtype):
+    import numpy as np
+    import torch
+
+    @construction
+    def graphs():
+        x, y = InputDimension("x"), InputDimension("y")
+        value = x
+        for _ in range(24):
+            value = persist(reglu(value + 2, y + 1))
+        result = persist(value, name="result")
+        graph = current_graph().capture({"VALUE": x + y}, {"READOUT": result})
+        return {
+            "xy": TokenGraph(graph, ("x", "y"), ("result",), reassociate_residuals=False),
+            "yx": TokenGraph(graph, ("y", "x"), ("result",), reassociate_residuals=False),
+        }
+
+    engine = CompiledGraph(graphs, tag=f"shared_grouping_{dtype}", sources=(), memory_size=1, dtype=dtype)
+    source = (Path(graph_engine.CACHE_DIR) / f"graph_{engine.digest}.cpp").read_text()
+    assert "always_inline" in source
+    pairs = [(-0.0, -1), (0, 0), (1, 1), (-7, 1), (46341, 2), (2**31 - 1, 0)]
+    if dtype == "int32":
+        def wrap(value):
+            return (int(value) + 2**31) % 2**32 - 2**31
+
+        expected = []
+        for x, y in pairs:
+            for _ in range(24):
+                x = wrap(wrap(x + 2) * wrap(y + 1)) if wrap(y + 1) > 0 else 0
+            expected.append(x)
+    else:
+        from transformer_nes.graph.fold import GraphFolder
+        from transformer_nes.model.torch_codegen import weight_module
+
+        token = graphs()["xy"]
+        folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
+        model = CompiledGraph._compile(token, folded.program_graph, list(folded.dim_of_name.values()), dtype=dtype)
+        forward = weight_module(model, memory_size=1)
+        result, _ = forward(torch.tensor(np.array(pairs).T, dtype=torch.float32), torch.zeros(1, dtype=torch.uint8))
+        expected = result.numpy().ravel()
+    for name in ("xy", "yx"):
+        actual = np.array([engine.step(pair if name == "xy" else pair[::-1], engine.model_id(name))[0]
+                           for pair in pairs], dtype=np.dtype(dtype))
+        if dtype == "float32":
+            np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+        else:
+            np.testing.assert_array_equal(actual, expected)

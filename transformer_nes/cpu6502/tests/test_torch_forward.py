@@ -289,6 +289,38 @@ def test_machine_keeps_hook_context_alive_without_a_separate_handle():
     assert machine._torch_forwards.counts == (1, 0)
 
 
+def test_loaded_bank_survives_pruned_files_when_constructing_another_cpu(tmp_path, monkeypatch):
+    from transformer_nes.cpu6502.backends.weights import torch_forward
+
+    first = Cpu6502TransformerMachine()
+    hook = bank_module(False)
+    monkeypatch.setattr(torch_forward, "CACHE_DIR", str(tmp_path))
+
+    def unexpected_child(*args, **kwargs):
+        raise AssertionError("a loaded extension must not require a new compiler child")
+
+    monkeypatch.setattr(torch_forward.subprocess, "run", unexpected_child)
+    second = Cpu6502TransformerMachine()
+    assert first._torch_forwards.hook is second._torch_forwards.hook is hook
+    image = bytearray(65536)
+    image[0x8000:0x8002] = bytes((0xA9, 0x42))
+    second.load_image(image, start_pc=0x8000)
+    second.run(1, trace=False)
+    assert second.get_state()["a"] == 0x42
+
+
+def test_compiler_child_rejects_stale_source_identity():
+    from transformer_nes.cpu6502.backends.weights import torch_forward
+
+    result = subprocess.run(
+        [sys.executable, "-m", torch_forward.__name__, "0", "obsolete-source-digest"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert "compiler sources changed" in result.stderr
+    assert "restart the process" in result.stderr
+
+
 def test_torch_engine_requires_its_bank_instead_of_falling_back():
     machine = Cpu6502TransformerMachine()
     image = bytearray(65536)

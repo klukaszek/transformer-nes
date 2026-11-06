@@ -11,6 +11,53 @@ def engine():
     return ppu_engine()
 
 
+def test_row_circuit_exhausts_patterns_flip_visibility_and_metadata():
+    import torch
+
+    from transformer_nes.graph.core import InputDimension, construction, current_graph, persist
+    from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+    from transformer_nes.model.torch_codegen import weight_module
+    from transformer_nes.ppu2c02.sprites import _encode_row
+
+    @construction
+    def row():
+        names = [*(f"lo{i}" for i in range(8)), *(f"hi{i}" for i in range(8)), "flip", "shown", "meta"]
+        values = [InputDimension(n) for n in names]
+        result = _encode_row(values[:8], values[8:16], *values[16:])
+        outputs = [persist(v, name=f"pixel{i}") for i, v in enumerate(result)]
+        graph = current_graph().capture({"ROW": sum(values)}, {"READOUT": sum(outputs)})
+        return TokenGraph(graph, names, [f"pixel{i}" for i in range(8)])
+
+    token = row()
+    expert = CompiledGraph._compile(token, token.program_graph, token.program_graph.all_dims)
+    forward = weight_module(expert, memory_size=1)
+    pairs = np.arange(65536, dtype=np.int32)
+    low, high = pairs & 255, pairs >> 8
+    bits = np.stack([*((low >> b) & 1 for b in range(7, -1, -1)),
+                     *((high >> b) & 1 for b in range(7, -1, -1))])
+    x = torch.zeros((19, len(pairs)), dtype=torch.int32)
+    x[:16] = torch.from_numpy(bits)
+    values = bits[:8] + 2 * bits[8:]
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        for palette in range(4):
+            for priority in range(2):
+                for sprite_zero in range(2):
+                    meta = 16 + 4 * palette + 64 * priority + 128 * sprite_zero
+                    x[18] = meta
+                    encoded = np.where(values != 0, meta + values, 0)
+                    for flip in range(2):
+                        x[16] = flip
+                        for shown in range(2):
+                            x[17] = shown
+                            actual, _ = forward(x, torch.zeros(1, dtype=torch.uint8))
+                            expected = (encoded[::-1] if flip else encoded) * shown
+                            np.testing.assert_array_equal(actual.numpy(), expected << forward.f_bits)
+    finally:
+        torch.set_num_threads(threads)
+
+
 def test_composition_executes_exact_weights_and_ordered_clipped_updates():
     from transformer_nes.graph.core import InputDimension
     from transformer_nes.model.graph_engine import construct

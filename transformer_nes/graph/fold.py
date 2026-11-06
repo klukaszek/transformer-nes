@@ -135,6 +135,9 @@ def walk_live(
             else:
                 (e,) = folded[d]
                 deps = set(e.terms)
+                guard = getattr(d, "zero_when", None)
+                if guard is not None:
+                    deps |= set(subst(guard, val).terms)
         elif isinstance(d, LookUpDimension):
             fx = lookup_exprs[d.lookup]
             for e in fx["query"] + fx["key"] + fx["values"]:
@@ -222,6 +225,9 @@ class GraphMaterializer:
                     continue
                 (e,) = folded[d]
                 nd = PersistDimension(tr(e), name=name_of(d.name))
+                guard = getattr(d, "zero_when", None)
+                if guard is not None:
+                    nd.zero_when = tr(subst(guard, val))
                 sub[d] = Expression({nd: 1})
             elif isinstance(d, LookUpDimension):
                 lu = d.lookup

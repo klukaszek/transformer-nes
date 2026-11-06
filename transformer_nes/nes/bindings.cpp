@@ -730,6 +730,8 @@ public:
     out["fps"] = result.seconds > 0.0 ? result.frames / result.seconds : 0.0;
     out["halted"] = result.halted;
     out["cycles"] = console_->cycles;
+    out["frame_seconds"] = result.frame_seconds;
+    out["frame_cpu_seconds"] = result.frame_cpu_seconds;
     return out;
   }
   Console& console() { return *console_; }

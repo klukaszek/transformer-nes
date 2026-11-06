@@ -127,7 +127,12 @@ def ppu_engine(chr_full: int = 0) -> PpuEngine:
     graph: model 0, the one the X-ray traces and ablates."""
 
     def graphs() -> dict[str, TokenGraph]:
-        tile = TokenGraph(render_graph(chr_full), render.INPUTS, render.OUTPUTS, render.EXPERTS)
+        # Preserve the hot tile path's projection grouping: collecting its
+        # residual terms changes fusion and regresses measured frame latency.
+        tile = TokenGraph(
+            render_graph(chr_full), render.INPUTS, render.OUTPUTS, render.EXPERTS,
+            reassociate_residuals=False,
+        )
         access = TokenGraph(
             register_graph(chr_full), registers.INPUTS, registers.OUTPUTS, registers.EXPERTS
         )

@@ -10,7 +10,7 @@ The persist/output phase is a linear projection. For each output slot:
 
 The weights live in plain numpy arrays (WeightModel). model/inference.py
 runs an exact reference forward; model/torch_codegen.py lowers their matrix
-operations through PyTorch Inductor for CPU and PPU execution.
+operations through scalar SSA for CPU and PPU execution.
 """
 
 import logging

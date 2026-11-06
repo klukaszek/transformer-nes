@@ -1,4 +1,4 @@
-"""Compile token graphs and folded experts into a shared-memory Inductor bank.
+"""Compile token graphs and folded experts into a shared-memory native bank.
 
 Model 0 is the primary graph; callers select experts whose pinned inputs hold.
 Named token inputs/outputs define the raw ABI: int32 pointers for discrete
@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import logging
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
@@ -36,6 +38,8 @@ from transformer_nes.model.schedule import asap_schedule
 from transformer_nes.model.sources import source_digest
 from transformer_nes.model.torch_codegen import bank_source
 from transformer_nes.model.weights import build_model
+
+logger = logging.getLogger(__name__)
 
 
 def construct(program_graph: ProgramGraph):
@@ -83,6 +87,9 @@ class TokenGraph:
     inputs: Sequence[str]
     outputs: Sequence[str]
     experts: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    # Reassociation is exact for int32, but changes native register allocation.
+    # Hot tokens can retain their measured projection grouping.
+    reassociate_residuals: bool = True
 
     def project(self, outputs: Sequence[str]) -> TokenGraph:
         """Compile only the dependency closure of selected readouts."""
@@ -159,7 +166,14 @@ class CompiledGraph:
                 if os.path.exists(path):
                     module = load_module(f"graph_gen_{entry['digest']}", entry["digest"], [path])
         if module is None:
+            start = time.perf_counter()
+            logger.info("building weight bank %s", tag)
             generated, source = self._generate(build_graphs(), memory_size, dtype=dtype)
+            logger.info(
+                "generated %s: %d circuits, %.1f MiB source in %.1fs",
+                tag, len(generated["model_ids"]), len(source.encode()) / 2**20,
+                time.perf_counter() - start,
+            )
             entry = {
                 "kind": "graph",
                 "sources": code,
@@ -260,6 +274,7 @@ class CompiledGraph:
         return {
             "model": model,
             "dtype": dtype,
+            "reassociate_residuals": token.reassociate_residuals,
             # Integer coefficients preserve integer residuals. Fractional
             # projections need the same half-unit encoding as the CPU.
             "fraction_bits": int(dtype == "int32" and any(
