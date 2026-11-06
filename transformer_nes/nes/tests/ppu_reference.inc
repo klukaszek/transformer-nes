@@ -1,3 +1,56 @@
+const vector<Ppu::EventAt>& Ppu::reference_events_for(int line) {
+  static const auto tables = [] {
+    array<vector<EventAt>, 5> t{};
+    auto slots = [](vector<EventAt>& v, bool scanline) {
+      for (int k = 0; k < 32; ++k) {
+        v.push_back({1 + 8 * k, Ev::Slot, k});
+        if (k == 0 && scanline)
+          v.push_back({3, Ev::Scanline, 0});
+      }
+      v.push_back({257, Ev::Sprites, 0});
+    };
+    slots(t[0], true); // visible
+    t[0].insert(t[0].begin() + 9, {65, Ev::Evaluate, 0}); // after slot 7 (dot 57)
+    t[0].push_back({321, Ev::Prefetch, 0});
+    t[1].push_back({0, Ev::FrameDone, 0});
+    t[2].push_back({1, Ev::VBlank, 0});
+    t[4].push_back({1, Ev::Clear, 0}); // pre-render
+    slots(t[4], false);
+    t[4].push_back({280, Ev::VCopy, 0});
+    t[4].push_back({321, Ev::Prefetch, 0});
+    t[4].push_back({339, Ev::OddSkip, 0});
+    for (auto& table : t)
+      for (int i = static_cast<int>(table.size()) - 2; i >= 0; --i) {
+        auto& e = table[static_cast<size_t>(i)];
+        const auto& next = table[static_cast<size_t>(i + 1)];
+        if (e.ev == Ev::Slot && next.ev == Ev::Slot && next.dot == e.dot + 8)
+          e.run = next.run + 1;
+      }
+    return t;
+  }();
+  if (line < 240)
+    return tables[0];
+  if (line == 240)
+    return tables[1];
+  if (line == vblank_line)
+    return tables[2];
+  if (line == prerender_line)
+    return tables[4];
+  return tables[3];
+}
+
+void Ppu::reference_advance_line() {
+  r_.line_start += r_.line_len;
+  r_.line_len = dots_per_line;
+  r_.next_event = 0;
+  if (++r_.line == 262) {
+    r_.line = 0;
+    r_.frame_start = r_.line_start;
+    r_.odd = !r_.odd;
+  }
+  r_.events = &events_for(r_.line);
+}
+
 // Independent conventional PPU oracle, compiled only by test targets.
 // Production registers, rendering and sprite computation use transformer tokens.
 

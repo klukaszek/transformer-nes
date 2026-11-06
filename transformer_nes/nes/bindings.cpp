@@ -684,6 +684,12 @@ public:
         throw std::invalid_argument("engine is not the PPU bus graphs");
     }
     api.background_span_model = control.attr("model_id")("background_span").cast<int>();
+    const py::object clock = graphs_control["clock"];
+    if (clock.attr("inputs").cast<vector<string>>() != fields({"line", "index"}) ||
+        clock.attr("outputs").cast<vector<string>>() !=
+            fields({"next_line", "wrap", "table", "count", "dot", "event", "slot", "run"}))
+      throw std::invalid_argument("engine is not the PPU clock graph");
+    api.clock_model = control.attr("model_id")("clock").cast<int>();
     const array<const char*, 3> bus_events{"pin", "background", "sprite"};
     for (size_t i = 0; i < bus_events.size(); ++i)
       api.bus_models[i] = control.attr("model_id")("bus", bus_events[i]).cast<int>();

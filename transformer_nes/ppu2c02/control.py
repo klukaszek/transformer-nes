@@ -10,6 +10,7 @@ from functools import cache
 from transformer_nes.graph.core import InputDimension, construction, current_graph, persist, stepglu
 from transformer_nes.graph.ops import both, either, equals, extract_bits, gate, remainder, select
 from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+from transformer_nes.ppu2c02 import clock
 from transformer_nes.ppu2c02.registers import LOOPY_FIELDS
 
 EVENTS = ("access", "vertical_copy", "sprite_line", "odd_skip", "vblank", "clear")
@@ -367,6 +368,7 @@ def control_engine():
             "dma": dma,
             "dma_request": dma.project(DMA_REQUEST),
             "dma_transfer": dma.project(DMA_TRANSFER),
+            "clock": TokenGraph(clock.clock_graph(), clock.INPUTS, clock.OUTPUTS),
         }
 
     return CompiledGraph(

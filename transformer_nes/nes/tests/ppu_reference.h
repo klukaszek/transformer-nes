@@ -1,4 +1,6 @@
 // Private declarations for the test-only conventional PPU oracle.
+  static const vector<EventAt>& reference_events_for(int line);
+  void reference_advance_line();
   static size_t palette_index(int address);
   bool reference_latch_fetch(size_t address);
   void reference_oam_dma(span<const uint8_t, 256> page);

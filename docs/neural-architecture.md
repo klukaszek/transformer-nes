@@ -222,6 +222,26 @@ conditional tile-fetch effects. Payloads are zero when `fetched` is clear, and
 the host consumes them only when it is set. Folding can therefore remove the
 inactive circuitry.
 
+[`ppu2c02/clock.py`](../transformer_nes/ppu2c02/clock.py) constructs the bounded
+scanline clock. Given a line and event index, its weights return the next line,
+frame-wrap effect, timeline identity, event count, dot, action, tile slot and
+contiguous run length. It preserves ordering at tied dots: sprite evaluation
+precedes the dot-65 tile, and pre-render clearing precedes the dot-1 tile.
+Run lengths stop at intervening actions, so IRQ previews retain their batching
+boundary. Tests enumerate every line and event and also compare compiled
+execution with the constructed matrices.
+
+The construction uses seven layers and 38 residual slots; its layer matrices
+contain 507 nonzero coefficients.
+
+Clock descriptors depend only on fixed geometry. At engine attachment the
+host evaluates the circuit for 262 line transitions and the five shared
+timelines: 333 forwards in total, with a 3,144-byte transition table and 75
+event packets. During play both live execution and previews consume these
+immutable readouts, with no extra neural forward per tile or dot. The literal
+timeline and rollover formulas exist only in the test oracle. Absolute clock
+addition and storage remain host operations.
+
 A blank-state expert pins both rendering enables off while retaining palette
 addressing and greyscale behavior. Other experts pin verified control states.
 Timing previews project graphs to bus/status readouts before scheduling, so
@@ -563,6 +583,7 @@ The remaining opportunities extend the existing transition and effect contracts:
 
 | Candidate | Current boundary | Proposed construction and constraint |
 |---|---|---|
+| Cross-device event arbitration | The PPU's local timeline comes from weights, but `Console::run_until` and `Apu::advance_to` still coordinate CPU budgets, DMC stalls, frame-sequencer deadlines and PCM sampling. | A bounded deadline token emits the next span and ordered effects from relative clock distances. Keep absolute timestamps on the host and preserve access ordering and PCM phase at boundary ties. |
 | Ordered bus effects | Operand-read continuations retain addresses and timing; OAM DMA emits neural bulk-transfer descriptors. Instruction, pointer, stack and vector reads still use the neural memory image directly. | Extend the effect contract to ordered bus requests, including intermediate RMW writes, DMA arbitration and precise access cycles. Preserve the single-commit continuation contract. |
 | Banked memory attention | Mapper accesses select physical ROM/RAM addresses through weights. Instruction fetches still use copied PRG windows; [`sync_graph_memory`](../transformer_nes/nes/ppu.cpp) delivers mapped CHR views. | Extend physical bank addressing to instruction/fetch attention while storing ROM once. Measure copying first: adding translation to every read can cost more than copying on a switch. |
 
@@ -627,7 +648,8 @@ RAM matched over 13,129 frames across SMB3, CV3, Mega Man 6 and Zelda.
 | CPU byte image / shape index | 64 KiB each |
 | CPU residual and readout buffers | 2,296 bytes |
 | Host lease table | 64 bytes |
-| PPU inline state | 155,344 bytes |
+| PPU inline state, including neural clock metadata | 158,616 bytes |
+| Clock line transitions / materialized event readouts | 3,144 bytes inline / 1,200 bytes in vectors |
 | Sprite-row table within PPU state | 2,208 bytes |
 | PPU synchronization metadata within PPU state | 8,968 bytes plus CHR dirty bits |
 | Ordinary PPU graph byte image | 28 KiB; MMC5 variants grow with CHR geometry |

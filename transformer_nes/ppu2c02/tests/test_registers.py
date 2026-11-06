@@ -12,13 +12,13 @@ from transformer_nes.ppu2c02 import registers, space
 from transformer_nes.ppu2c02.machine import ppu_engine, register_graph
 
 
-@pytest.mark.parametrize("token", ["bus", "background_span", "access_bus", "view", "dma"])
+@pytest.mark.parametrize("token", ["bus", "background_span", "access_bus", "view", "dma", "clock"])
 def test_bus_effect_tokens_execute_exact_weights(token):
-    from transformer_nes.ppu2c02 import control
+    from transformer_nes.ppu2c02 import clock, control
 
     engine = control.control_engine()
     graph = {"bus": control.bus_graph, "background_span": control.background_span_graph, "access_bus": control.access_bus_graph,
-             "view": control.view_graph, "dma": control.dma_graph}[token]()
+             "view": control.view_graph, "dma": control.dma_graph, "clock": clock.clock_graph}[token]()
     model, _, info = construct(graph)
     eager = ExactInference(model)
     dims = {d.name: d for d in graph.all_dims}
@@ -28,7 +28,7 @@ def test_bus_effect_tokens_execute_exact_weights(token):
               "old_mask": 256, "new_mask": 256, "new_v_fy": 8,
               "old_v_cx": 32, "old_v_cy": 32, "old_v_nt": 4, "old_v_fy": 8,
               "exram_mode": 4, "fill_tile": 256, "fill_color": 4,
-              "page": 256, "oam_addr": 256}
+              "page": 256, "oam_addr": 256, "line": 262, "index": 37}
     for _ in range(256):
         x = {n: int(rng.integers(limits.get(n, 2))) for n in io.inputs}
         if token in ("bus", "background_span"):
@@ -52,6 +52,47 @@ def test_bus_effect_tokens_execute_exact_weights(token):
             name = (control.BUS_EVENTS[x["event"]] if token == "bus"
                     else f"{'write' if x['is_write'] else 'read'}{x['reg']}")
             np.testing.assert_array_equal(engine.step(packet, engine.model_id(token, name)), expected)
+
+
+def test_clock_covers_every_scanline_and_preserves_tied_events_and_batch_limits():
+    from transformer_nes.ppu2c02 import clock, control
+
+    engine = control.control_engine()
+    model = engine.model_id("clock")
+    for line in range(262):
+        expected = []
+        if line < 240 or line == 261:
+            if line == 261:
+                expected.append((1, "clear", 0))
+            for slot in range(32):
+                if line < 240 and slot == 8:
+                    expected.append((65, "evaluate", 0))
+                expected.append((1 + 8 * slot, "slot", slot))
+                if line < 240 and slot == 0:
+                    expected.append((3, "scanline", 0))
+            expected.append((257, "sprites", 0))
+            if line == 261:
+                expected.append((280, "vertical_copy", 0))
+            expected.append((321, "prefetch", 0))
+            if line == 261:
+                expected.append((339, "odd_skip", 0))
+        elif line == 240:
+            expected.append((0, "frame_done", 0))
+        elif line == 241:
+            expected.append((1, "vblank", 0))
+        for index in range(max(1, len(expected))):
+            out = engine.step([line, index], model).tolist()
+            assert out[:2] == [(line + 1) % 262, int(line == 261)]
+            assert out[2] == {240: 1, 241: 2, 261: 4}.get(line, 0 if line < 240 else 3)
+            assert out[3] == len(expected)
+            if not expected:
+                continue
+            dot, event, slot = expected[index]
+            run = 1
+            if event == "slot":
+                while index + run < len(expected) and expected[index + run] == (dot + 8 * run, "slot", slot + run):
+                    run += 1
+            assert out[4:] == [dot, clock.EVENTS.index(event), slot, run]
 
 
 def test_dma_descriptors_partition_every_destination_and_keep_projections_independent():

@@ -191,6 +191,7 @@ public:
     array<int, 6> control_models{};
     array<int, 3> bus_models{};
     int background_span_model = 0;
+    int clock_model = 0;
     array<array<int, 8>, 2> access_bus_models{};
     int view_model = 0;
     int access_delay_model = 0;
@@ -295,7 +296,7 @@ public:
   bool force_full_render = false;
 
 private:
-  enum class Ev : uint8_t {
+  enum class Ev : int {
     Slot,
     Scanline,
     Sprites,
@@ -380,7 +381,11 @@ private:
   }
   int status(int64_t dot) const;
 
-  static const vector<EventAt>& events_for(int line);
+  struct LineClock { int next; bool wrap; int table; };
+  array<LineClock, 262> line_clocks_{};
+  array<vector<EventAt>, 5> timelines_;
+  void build_timelines();
+  const vector<EventAt>& events_for(int line) const;
   void process(const EventAt& e);
   void advance_line();
   void emit(PpuEvent::Kind kind, int64_t dot);
