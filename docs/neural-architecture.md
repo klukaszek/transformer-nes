@@ -423,12 +423,16 @@ level before adding feedback. Both changes preserve the real-arithmetic
 filter and reduce coefficient bias and cancellation in float32. Long
 constant-level decay and recurrent random inputs check the resulting error.
 
-The fixed 55-value sample input includes digital channel state, the DMC level
-and two feedback values. Its three outputs are the new mixed level, filtered
-level and clipped PCM sample, all float32. C++ stores the returned feedback
-and delivers the sample directly for playback. The bank also exposes level and DAC
-projections for inspection and numerical verification. All three projections
-use the same constructions; playback runs one combined sample forward.
+A control-rate token derives four channel gains after register or frame-sequencer
+updates. The host retains these 16 bytes until the next control update; waveform
+phases, noise and DMC state stay live. Sweep/envelope eligibility work scales
+with control updates; waveform and mixer work scales with PCM samples.
+
+The sample token receives 13 values: gains, duties, phases, the noise bit, DMC
+level and two feedback values. Its three float32 outputs are the new mixed level,
+filtered level and clipped PCM sample. C++ retains the feedback and delivers PCM
+for playback. Level and DAC projections share the same constructions for
+inspection and numerical verification.
 
 The host retains scheduling, DMA transport and sample delivery. Independent
 conventional register, DMC, modulation, frame and DAC oracles live in the native

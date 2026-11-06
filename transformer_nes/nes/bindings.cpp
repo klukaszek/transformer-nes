@@ -501,14 +501,21 @@ public:
     const py::object sample_token = sample_engine_.attr("graphs")["sample"];
     if (sample_token.attr("inputs").cast<vector<string>>() != audio.attr("SAMPLE_INPUTS").cast<vector<string>>() ||
         sample_token.attr("outputs").cast<vector<string>>() != audio.attr("SAMPLE_OUTPUTS").cast<vector<string>>() ||
-        py::len(sample_token.attr("inputs")) != 55 || py::len(sample_token.attr("outputs")) != 3 ||
+        py::len(sample_token.attr("inputs")) != Apu::sample_input_count || py::len(sample_token.attr("outputs")) != 3 ||
         sample_engine_.attr("dtype").attr("name").cast<string>() != "float32")
       throw std::invalid_argument("engine is not the float32 APU sample graph");
+    const py::object parameters = sample_engine_.attr("graphs")["parameters"];
+    if (parameters.attr("inputs").cast<vector<string>>() != audio.attr("PARAMETER_INPUTS").cast<vector<string>>() ||
+        parameters.attr("outputs").cast<vector<string>>() != audio.attr("PARAMETER_OUTPUTS").cast<vector<string>>() ||
+        py::len(parameters.attr("inputs")) != Apu::channel_input_count - 1 ||
+        py::len(parameters.attr("outputs")) != Apu::sample_parameter_count)
+      throw std::invalid_argument("engine is not the float32 APU parameter graph");
     const auto sample_abi = sample_engine_.attr("abi")().cast<py::tuple>();
     audio_api.sample_ctx = reinterpret_cast<void*>(sample_abi[0].cast<std::uintptr_t>());
     audio_api.sample_step = reinterpret_cast<void (*)(void*, int, const float*, float*)>(
         sample_abi[2].cast<std::uintptr_t>());
     audio_api.sample_model = sample_engine_.attr("model_id")("sample").cast<int>();
+    audio_api.parameter_model = sample_engine_.attr("model_id")("parameters").cast<int>();
     console_->apu.set_engine(audio_api);
     controller_engine_ = py::module_::import("transformer_nes.nes.controller")
                              .attr("controller_engine")();

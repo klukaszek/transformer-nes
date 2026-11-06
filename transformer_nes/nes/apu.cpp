@@ -32,6 +32,7 @@ Apu::AccessResult Apu::access(int port, int value, bool writing) {
       engine_.program_writes[static_cast<size_t>(port)] : engine_.program;
   engine_.step(engine_.ctx, model, in, out);
   load_program_state(out);
+  sample_parameters_dirty_ |= writing;
   if (out[54])
     frame_event(FrameEvent::Write, value);
   if (out[55])
@@ -127,6 +128,7 @@ void Apu::set_engine(Engine engine) {
   if (!engine.ctx || !engine.step || !engine.sample_step)
     throw std::invalid_argument("APU transformer engine is required");
   engine_ = engine;
+  sample_parameters_dirty_ = true;
   frame_event(FrameEvent::Observe);
   dmc_event(DmcEvent::Observe);
 }
@@ -174,6 +176,7 @@ void Apu::channel_event(int event) {
   triangle.linear_counter = *field++;
   envelope(noise.env);
   noise.length = *field;
+  sample_parameters_dirty_ = true;
 }
 
 void Apu::frame_event(FrameEvent event, int value) {
@@ -201,12 +204,18 @@ void Apu::clock_frame_sequencer() {
 // The float32 sample token owns digital levels, DAC mixing, filter state
 // and clipping. The host transports its recurrent state and PCM result.
 float Apu::sample() {
-  const auto channels = channel_inputs(0);
-  float in[55];
-  std::copy(channels.begin(), channels.end(), in);
-  in[52] = dmc.output_level;
-  in[53] = hp_prev_in;
-  in[54] = hp_prev_out;
+  if (sample_parameters_dirty_) {
+    const auto channels = channel_inputs(0);
+    float in[channel_input_count - 1];
+    std::copy(channels.begin() + 1, channels.end(), in);
+    engine_.sample_step(engine_.sample_ctx, engine_.parameter_model, in, sample_parameters_.data());
+    sample_parameters_dirty_ = false;
+  }
+  const float in[sample_input_count] = {
+      sample_parameters_[0], float(pulse[0].duty), float(pulse[0].seq_pos),
+      sample_parameters_[1], float(pulse[1].duty), float(pulse[1].seq_pos),
+      sample_parameters_[2], float(triangle.seq_pos), sample_parameters_[3], float(noise.lfsr[0]),
+      float(dmc.output_level), hp_prev_in, hp_prev_out};
   float out[3];
   engine_.sample_step(engine_.sample_ctx, engine_.sample_model, in, out);
   hp_prev_in = out[0];

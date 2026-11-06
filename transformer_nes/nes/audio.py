@@ -4,7 +4,6 @@ The float32 sample circuit owns digital levels, DAC mixing and filtering.
 The host schedules deadlines, transports DMA bytes and plays returned samples.
 """
 
-from dataclasses import replace
 from functools import cache
 
 from transformer_nes.graph.core import (
@@ -320,12 +319,23 @@ def sweep_target(p, first):
     return target, muted
 
 
-def build_channels():
+def pulse_level(gain, duty, pos):
+    high = (
+        gate(equals(duty, 0), equals(pos, 1))
+        + gate(equals(duty, 1), both(stepglu(1, pos - 1), 1 - stepglu(1, pos - 3)))
+        + gate(equals(duty, 2), both(stepglu(1, pos - 1), 1 - stepglu(1, pos - 5)))
+        + gate(equals(duty, 3), either(equals(pos, 0), stepglu(1, pos - 3)))
+    )
+    return gate(high, gain)
+
+
+@construction
+def channel_graph():
     x = {name: InputDimension(name) for name in INPUTS}
     event = persist(x["event"], name="event_tag")
     quarter = 1 - equals(event, 1)
     half = 1 - equals(event, 0)
-    state, levels = {}, {}
+    state = {}
 
     def channel(prefix, fields):
         return {f: x[f"{prefix}_{f}"] for f in fields}
@@ -341,7 +351,6 @@ def build_channels():
         state[f"{prefix}_env_decay"] = select(
             quarter, select(p["env_start"], 15, select(zero, decay, p["env_decay"])), p["env_decay"]
         )
-        return select(p["env_constant"], p["env_period"], p["env_decay"])
 
     def length(prefix, p, halt):
         state[f"{prefix}_length"] = p["length"] - both(
@@ -351,7 +360,7 @@ def build_channels():
     for i in range(2):
         prefix = f"pulse{i}"
         p = channel(prefix, PULSE)
-        volume = envelope(prefix, p)
+        envelope(prefix, p)
         length(prefix, p, p["env_loop"])
         target, muted = sweep_target(p, i == 0)
         zero = equals(p["sweep_divider"], 0)
@@ -372,15 +381,6 @@ def build_channels():
             select(either(zero, p["sweep_reload"]), p["sweep_period"], p["sweep_divider"] - 1),
             p["sweep_divider"],
         )
-        pos = p["seq_pos"]
-        duty = (
-            gate(equals(p["duty"], 0), equals(pos, 1))
-            + gate(equals(p["duty"], 1), both(stepglu(1, pos - 1), 1 - stepglu(1, pos - 3)))
-            + gate(equals(p["duty"], 2), both(stepglu(1, pos - 1), 1 - stepglu(1, pos - 5)))
-            + gate(equals(p["duty"], 3), either(equals(pos, 0), stepglu(1, pos - 3)))
-        )
-        active = both(p["enabled"], both(stepglu(1, p["length"] - 1), both(1 - muted, duty)))
-        levels[f"{prefix}_level"] = gate(active, volume)
 
     t = channel("triangle", TRIANGLE)
     length("triangle", t, t["length_halt"])
@@ -392,36 +392,23 @@ def build_channels():
         select(t["linear_reload"], t["linear_reload_value"], reglu(1, t["linear_counter"] - 1)),
         t["linear_counter"],
     )
-    active = both(
-        t["enabled"],
-        both(
-            stepglu(1, t["length"] - 1),
-            both(stepglu(1, t["linear_counter"] - 1), stepglu(1, t["timer"] - 2)),
-        ),
-    )
-    levels["triangle_level"] = gate(
-        active, reglu(1, 15 - t["seq_pos"]) + reglu(1, t["seq_pos"] - 16)
-    )
     n = channel("noise", NOISE)
-    volume = envelope("noise", n)
+    envelope("noise", n)
     length("noise", n, n["env_loop"])
-    low = n["bit0"]
-    levels["noise_level"] = gate(
-        both(n["enabled"], both(stepglu(1, n["length"] - 1), 1 - low)), volume
-    )
     outputs = {
         name: persist(state[f], name=name) for name, f in zip(OUTPUTS, STATE_OUTPUTS, strict=True)
     }
-    outputs.update({name: persist(levels[name], name=name) for name in LEVELS})
-    return {"STATE": sum(x.values())}, outputs
+    return current_graph().capture({"STATE": sum(x.values())}, outputs)
 
 
-@construction
-def channel_graph():
-    return current_graph().capture(*build_channels())
-
-
-SAMPLE_INPUTS = (*INPUTS, "dmc_output", "previous_mix", "previous_filter")
+PARAMETER_INPUTS = INPUTS[1:]
+PARAMETER_OUTPUTS = ("pulse0_gain", "pulse1_gain", "triangle_gain", "noise_gain")
+SAMPLE_INPUTS = (
+    "pulse0_gain", "pulse0_duty", "pulse0_seq_pos",
+    "pulse1_gain", "pulse1_duty", "pulse1_seq_pos",
+    "triangle_gain", "triangle_seq_pos", "noise_gain", "noise_bit0",
+    "dmc_output", "previous_mix", "previous_filter",
+)
 SAMPLE_OUTPUTS = ("mixed", "filtered", "sample")
 DAC_INPUTS = ("pulse", "triangle", "noise", "dmc")
 
@@ -446,25 +433,57 @@ def mixed_level(pulse, triangle, noise, dmc):
 
 
 @construction
+def parameter_graph():
+    x = {name: InputDimension(name) for name in PARAMETER_INPUTS}
+    gains = {}
+    for i in range(2):
+        p = {f: x[f"pulse{i}_{f}"] for f in PULSE}
+        _, muted = sweep_target(p, i == 0)
+        active = both(p["enabled"], both(stepglu(1, p["length"] - 1), 1 - muted))
+        gains[f"pulse{i}_gain"] = gate(
+            active, select(p["env_constant"], p["env_period"], p["env_decay"])
+        )
+    t = {f: x[f"triangle_{f}"] for f in TRIANGLE}
+    n = {f: x[f"noise_{f}"] for f in NOISE}
+    gains["triangle_gain"] = both(
+        t["enabled"],
+        both(stepglu(1, t["length"] - 1),
+             both(stepglu(1, t["linear_counter"] - 1), stepglu(1, t["timer"] - 2))),
+    )
+    gains["noise_gain"] = gate(
+        both(n["enabled"], stepglu(1, n["length"] - 1)),
+        select(n["env_constant"], n["env_period"], n["env_decay"]),
+    )
+    outputs = {name: persist(gains[name], name=name) for name in PARAMETER_OUTPUTS}
+    return current_graph().capture({"CONTROL": sum(x.values())}, outputs)
+
+
+@construction
 def sample_graph():
-    tokens, levels = build_channels()
-    extra = {name: InputDimension(name) for name in SAMPLE_INPUTS[len(INPUTS):]}
+    x = {name: InputDimension(name) for name in SAMPLE_INPUTS}
+    levels = {
+        **{f"pulse{i}_level": pulse_level(x[f"pulse{i}_gain"], x[f"pulse{i}_duty"],
+                                          x[f"pulse{i}_seq_pos"]) for i in range(2)},
+        "triangle_level": gate(x["triangle_gain"], reglu(1, 15 - x["triangle_seq_pos"])
+                               + reglu(1, x["triangle_seq_pos"] - 16)),
+        "noise_level": gate(1 - x["noise_bit0"], x["noise_gain"]),
+    }
+    levels = {name: persist(value, name=name) for name, value in levels.items()}
     mixed = mixed_level(
         levels["pulse0_level"] + levels["pulse1_level"],
-        levels["triangle_level"], levels["noise_level"], extra["dmc_output"],
+        levels["triangle_level"], levels["noise_level"], x["dmc_output"],
     )
-    previous = extra["previous_filter"]
+    previous = x["previous_filter"]
     # Small leakage avoids rounding the pole coefficient near one. Stage the
     # signed difference through ReGLUs before adding feedback so residual
     # projections cannot lose it by summing the larger terms first.
     leak = reglu(0.0005, previous) - reglu(0.0005, -previous)
-    difference = mixed - extra["previous_mix"]
+    difference = mixed - x["previous_mix"]
     delta = reglu(1, difference) - reglu(1, -difference)
     filtered = persist(previous - leak + delta, name="filtered")
     line = 2 * filtered
     sample = persist(line - reglu(1, line - 1) + reglu(1, -1 - line), name="sample")
-    tokens["STATE"] += sum(extra.values())
-    return current_graph().capture(tokens, {
+    return current_graph().capture({"SAMPLE": sum(x.values())}, {
         "mixed": mixed, "filtered": filtered, "sample": sample,
         **{n: levels[n] for n in LEVELS},
     })
@@ -484,6 +503,7 @@ def sample_engine():
         return {
             "sample": full.project(SAMPLE_OUTPUTS), "levels": full.project(LEVELS),
             "dac": TokenGraph(dac_graph(), DAC_INPUTS, ("mixed",)),
+            "parameters": TokenGraph(parameter_graph(), PARAMETER_INPUTS, PARAMETER_OUTPUTS),
         }
 
     return CompiledGraph(graphs, tag="apu_sample", sources=(__name__,), memory_size=1, dtype="float32")
@@ -526,7 +546,6 @@ def audio_engine(maximum=MAX_CYCLES):
     def graphs():
         from transformer_nes.nes import oscillators
 
-        token = TokenGraph(channel_graph(), INPUTS, OUTPUTS + LEVELS)
         experts = {
             **{f"mode{i}": {"noise_mode_tag": i} for i in range(2)},
             **{f"tick_mode{i}": {"noise_mode_tag": i, "noise_steps_tag": 1} for i in range(2)},
@@ -538,9 +557,9 @@ def audio_engine(maximum=MAX_CYCLES):
                                oscillators.CLOCK_OUTPUTS),
             "noise": TokenGraph(oscillators.noise_graph(maximum), oscillators.NOISE_INPUTS,
                                 oscillators.NOISE_OUTPUTS, experts),
-            "control": replace(
-                token.project(OUTPUTS),
-                experts={name: {"event_tag": i} for i, name in enumerate(EVENTS)},
+            "control": TokenGraph(
+                channel_graph(), INPUTS, OUTPUTS,
+                {name: {"event_tag": i} for i, name in enumerate(EVENTS)},
             ),
             "frame": TokenGraph(
                 frame_graph(),

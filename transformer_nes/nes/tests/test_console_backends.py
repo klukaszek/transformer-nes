@@ -19,16 +19,35 @@ SCRIPT = {30: 0x08, 33: 0x00, 45: 0x08, 48: 0x00, 60: 0x81}
 FRAMES = 90
 
 
-@pytest.mark.parametrize("token", ["control", "levels", "sample", "dac", "frame", "program", "dmc", "oscillate", "tick", "noise"])
+def reference_channel_gains(state):
+    gains = []
+    for i in range(2):
+        p = {field: state[f"pulse{i}_{field}"] for field in (
+            "timer", "sweep_shift", "sweep_negate", "enabled", "length",
+            "env_constant", "env_period", "env_decay",
+        )}
+        shift = p["timer"] >> p["sweep_shift"]
+        target = p["timer"] - shift - (i == 0) if p["sweep_negate"] else p["timer"] + shift
+        active = p["enabled"] and p["length"] > 0 and p["timer"] >= 8 and target < 2048
+        gains.append((p["env_period"] if p["env_constant"] else p["env_decay"]) if active else 0)
+    gains.append(int(state["triangle_enabled"] and state["triangle_length"] > 0
+                     and state["triangle_linear_counter"] > 0 and state["triangle_timer"] >= 2))
+    active = state["noise_enabled"] and state["noise_length"] > 0
+    gains.append((state["noise_env_period"] if state["noise_env_constant"] else state["noise_env_decay"])
+                 if active else 0)
+    return gains
+
+
+@pytest.mark.parametrize("token", ["control", "parameters", "levels", "sample", "dac", "frame", "program", "dmc", "oscillate", "tick", "noise"])
 def test_audio_tokens_execute_the_constructed_weights(token):
     from transformer_nes.graph.core import InputDimension
     from transformer_nes.model.graph_engine import construct
     from transformer_nes.model.inference import ExactInference
     from transformer_nes.nes import audio, oscillators
 
-    floating = token in ("sample", "levels", "dac")
+    floating = token in ("parameters", "sample", "levels", "dac")
     engine = audio.sample_engine() if floating else audio.audio_engine(41)
-    graph = {"control": audio.channel_graph, "levels": audio.sample_graph,
+    graph = {"control": audio.channel_graph, "parameters": audio.parameter_graph, "levels": audio.sample_graph,
              "sample": audio.sample_graph, "dac": audio.dac_graph,
              "frame": audio.frame_graph, "program": audio.program_graph,
              "dmc": audio.dmc_graph, "oscillate": lambda: oscillators.clock_graph(41),
@@ -53,6 +72,7 @@ def test_audio_tokens_execute_the_constructed_weights(token):
     ranges.update(cycles=2 if token == "tick" else 42, triangle_period=2048,
                   triangle_counter=2048, triangle_pos=32, triangle_linear=128, noise_counter=4069)
     ranges.update(steps=22, pulse=31, triangle=16, noise=16, dmc=128, dmc_output=128)
+    ranges.update(pulse0_gain=16, pulse1_gain=16, noise_gain=16)
     for i in range(2):
         ranges.update({f"pulse{i}_period": 2048, f"pulse{i}_counter": 2048, f"pulse{i}_pos": 8})
     if token in ("frame", "dmc"):
@@ -74,7 +94,9 @@ def test_audio_tokens_execute_the_constructed_weights(token):
                     for name in io.outputs]
         packet = [values[name] for name in io.inputs]
         np.testing.assert_allclose(engine.step(packet, engine.model_id(token)), expected, rtol=0, atol=5e-7 if floating else 0)
-        if token in ("control", "frame"):
+        if token == "parameters":
+            np.testing.assert_array_equal(expected, reference_channel_gains(values))
+        elif token in ("control", "frame"):
             events = audio.FRAME_EVENTS if token == "frame" else audio.EVENTS
             np.testing.assert_array_equal(
                 engine.step(packet, engine.model_id(token, events[values["event"]])), expected
@@ -104,11 +126,7 @@ def test_neural_audio_filter_tracks_the_nonlinear_reference_and_clips():
 
     engine = audio.sample_engine()
     x = dict.fromkeys(audio.SAMPLE_INPUTS, 0)
-    for prefix in ("pulse0", "pulse1"):
-        x.update({f"{prefix}_{n}": v for n, v in dict(timer=128, length=1, enabled=1,
-                  seq_pos=1, env_constant=1).items()})
-    x.update(triangle_timer=8, triangle_length=1, triangle_enabled=1,
-             triangle_linear_counter=1, noise_length=1, noise_enabled=1, noise_env_constant=1)
+    x.update(pulse0_seq_pos=1, pulse1_seq_pos=1, triangle_gain=1)
     rng = np.random.default_rng(89)
     previous_mix, previous_filter = 0.0, 0.0
     clipped = False
@@ -120,8 +138,8 @@ def test_neural_audio_filter_tracks_the_nonlinear_reference_and_clips():
         values = (15, 15, 15, 15, 127) if i < 8192 else ((0,) * 5 if i < 16384 else
                   (*rng.integers(16, size=4), int(rng.integers(128))))
         p0, p1, t, n, d = values
-        x.update(pulse0_env_period=p0, pulse1_env_period=p1, triangle_seq_pos=15-t,
-                 noise_env_period=n, dmc_output=d)
+        x.update(pulse0_gain=p0, pulse1_gain=p1, triangle_seq_pos=15-t,
+                 noise_gain=n, dmc_output=d)
         p = p0 + p1
         tnd = t / 8227 + n / 12241 + d / 22638
         mixed = (95.88 / (8128 / p + 100) if p else 0) + (159.79 / (1 / tnd + 100) if tnd else 0)
@@ -287,9 +305,12 @@ def test_audio_joint_clock_reloads_and_distinct_pulse_negation():
     expected = [0, 3, 15, 1, 49, 0, 7, 0, 3, 15, 1, 50, 0, 7, 1, 0, 127, 0, 3, 15, 2]
     np.testing.assert_array_equal(out, expected)
     x.update(zip(audio.STATE_OUTPUTS, out.tolist(), strict=True))
+    samples = audio.sample_engine()
+    gains = samples.step([x[n] for n in audio.PARAMETER_INPUTS], samples.model_id("parameters"))
+    x.update(zip(audio.PARAMETER_OUTPUTS, gains.tolist(), strict=True))
+    x.update(dmc_output=0, previous_mix=0, previous_filter=0)
     np.testing.assert_array_equal(
-        audio.sample_engine().step([x[n] for n in audio.INPUTS] + [0, 0, 0],
-                                   audio.sample_engine().model_id("levels")), [15, 15, 15, 15]
+        samples.step([x[n] for n in audio.SAMPLE_INPUTS], samples.model_id("levels")), [15, 15, 15, 15]
     )
 
 

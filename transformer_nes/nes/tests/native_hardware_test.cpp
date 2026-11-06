@@ -751,6 +751,9 @@ static void reference_audio_noise(const int* in, int* out) {
 
 // Independent conventional APU modulation/frame/DAC oracle. These rules
 // are absent from the production host, which attaches nes/audio.py.
+static constexpr int pulse_duty[4][8]{{0,1,0,0,0,0,0,0}, {0,1,1,0,0,0,0,0},
+                                    {0,1,1,1,1,0,0,0}, {1,0,0,1,1,1,1,1}};
+
 static void reference_audio(void*, int model, const int* in, int* out) {
   if (model == 15) {
     reference_audio_noise(in, out);
@@ -817,8 +820,6 @@ static void reference_audio(void*, int model, const int* in, int* out) {
     result[0] = start; result[1] = divider; result[2] = decay;
   };
   const bool quarter = model == 0 || model == 2, half = model == 1 || model == 2;
-  constexpr int duty[4][8]{{0,1,0,0,0,0,0,0}, {0,1,1,0,0,0,0,0},
-                          {0,1,1,1,1,0,0,0}, {1,0,0,1,1,1,1,1}};
   for (int i = 0; i < 2; ++i) {
     const int* p = in + 1 + i * 17;
     int timer = p[0], divider = p[8];
@@ -826,7 +827,7 @@ static void reference_audio(void*, int model, const int* in, int* out) {
     const int target = p[5] ? timer - change - (i == 0) : timer + change;
     const bool muted = timer < 8 || target > 2047;
     if (model == 3) {
-      out[i] = p[2] && p[1] && !muted && duty[p[10]][p[9]] ? (p[13] ? p[14] : p[16]) : 0;
+      out[i] = p[2] && p[1] && !muted && pulse_duty[p[10]][p[9]] ? (p[13] ? p[14] : p[16]) : 0;
       continue;
     }
     int* result = out + i * 7;
@@ -855,23 +856,41 @@ static void reference_audio(void*, int model, const int* in, int* out) {
   out[20] = n[0] - (half && n[0] > 0 && !n[4]);
 }
 
-static void reference_sample(void* context, int, const float* in, float* out) {
-  int channels[52], levels[4];
-  std::copy_n(in, 52, channels);
-  reference_audio(context, 3, channels, levels);
-  const int p = levels[0] + levels[1];
+static void reference_sample(void* context, int model, const float* in, float* out) {
+  if (model == 1) {
+    int channels[52]{}, gains[4];
+    std::copy_n(in, 51, channels + 1);
+    // Unit waveform phases expose the control-only gains in the oracle.
+    channels[10] = channels[27] = 1;
+    channels[11] = channels[28] = channels[45] = 0;
+    channels[42] = 14;
+    reference_audio(context, 3, channels, gains);
+    std::copy_n(gains, 4, out);
+    return;
+  }
+  const int p = in[0] * pulse_duty[int(in[1])][int(in[2])] +
+                in[3] * pulse_duty[int(in[4])][int(in[5])];
+  const int pos = in[7];
+  const double triangle = in[6] * (pos < 16 ? 15 - pos : pos - 16);
+  const double noise = in[8] * (1 - in[9]);
   const double pulse = p ? 95.88 / (8128.0 / p + 100.0) : 0.0;
-  const double tnd = levels[2] / 8227.0 + levels[3] / 12241.0 + in[52] / 22638.0;
+  const double tnd = triangle / 8227.0 + noise / 12241.0 + in[10] / 22638.0;
   out[0] = pulse + (tnd > 0.0 ? 159.79 / (1.0 / tnd + 100.0) : 0.0);
-  out[1] = out[0] - in[53] + 0.9995 * in[54];
+  out[1] = out[0] - in[11] + 0.9995 * in[12];
   out[2] = std::clamp(2.0 * out[1], -1.0, 1.0);
 }
 
-static void attach_audio(Apu& apu) {
+static void attach_audio(Apu& apu, array<int, 2>* sample_calls = nullptr) {
   Apu::Engine engine;
   engine.ctx = &apu; engine.step = reference_audio;
   engine.control = {0, 1, 2}; engine.frame = {4, 5, 6, 7};
-  engine.sample_ctx = &apu; engine.sample_step = reference_sample;
+  engine.sample_ctx = sample_calls;
+  engine.sample_step = [](void* context, int model, const float* in, float* out) {
+    if (context)
+      ++(*static_cast<array<int, 2>*>(context))[static_cast<size_t>(model)];
+    reference_sample(nullptr, model, in, out);
+  };
+  engine.parameter_model = 1;
   engine.program = 8;
   engine.program_writes.fill(8);
   engine.dmc = {9, 10, 11, 12};
@@ -879,6 +898,25 @@ static void attach_audio(Apu& apu) {
   engine.oscillators = {13, 14};
   engine.noise = {{{15, 15}, {15, 15}}};
   apu.set_engine(engine);
+}
+
+static void test_apu_sample_parameters() {
+  Apu apu(44'100.0);
+  array<int, 2> calls{};
+  attach_audio(apu, &calls);
+  apu.advance_to(1000);
+  assert(calls[0] > 20 && calls[1] == 1);
+  apu.advance_to(2000);
+  assert(calls[1] == 1);
+  apu.write(0x4000, 0x1F);
+  apu.write(0x4002, 128);
+  apu.advance_to(3000);
+  assert(calls[1] == 2);
+  apu.read(0x4015);
+  apu.advance_to(4000);
+  assert(calls[1] == 2);
+  apu.advance_to(8000);
+  assert(calls[1] == 3); // quarter-frame control update at cycle 7457
 }
 
 static void test_apu() {
@@ -1011,6 +1049,7 @@ int main() {
   test_bus_and_controller();
   test_ppu();
   test_apu();
+  test_apu_sample_parameters();
   test_tape();
   test_frame_clock();
 }

@@ -101,6 +101,7 @@ public:
   enum class FrameEvent { Clock, Write, Read, Observe };
   enum class DmcEvent { Write, Fetch, Clock, Observe };
   static constexpr int channel_input_count = 52, channel_output_count = 21;
+  static constexpr int sample_input_count = 13, sample_parameter_count = 4;
   struct Engine {
     void* ctx = nullptr;
     void (*step)(void*, int, const int*, int*) = nullptr;
@@ -115,6 +116,7 @@ public:
     void* sample_ctx = nullptr;
     void (*sample_step)(void*, int, const float*, float*) = nullptr;
     int sample_model = 0;
+    int parameter_model = 0;
   };
   void set_engine(Engine engine);
 
@@ -173,6 +175,8 @@ private:
   void frame_event(FrameEvent event, int value = 0);
   void clock_frame_sequencer();
   float sample();
+  array<float, sample_parameter_count> sample_parameters_{};
+  bool sample_parameters_dirty_ = true;
   void advance_oscillators(int cycles);
 };
 
