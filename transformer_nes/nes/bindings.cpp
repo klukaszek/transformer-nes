@@ -20,6 +20,7 @@
 #include <string_view>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 
@@ -771,7 +772,7 @@ PYBIND11_MODULE(nes_hardware, m) {
       .def("set_sprite_limit", &ConsoleHost::set_sprite_limit, py::arg("enabled"))
       .def("ppu_expert_map", &ConsoleHost::ppu_expert_map,
            "Which render model drew each 8-pixel slot of the last frame "
-           "(240x32 bytes: 0 full graph, k expert k, 255 native)")
+           "(240x32 bytes: 0 full graph, k expert k, 255 no output yet)")
       .def("set_ppu_engine", &ConsoleHost::set_ppu_engine, py::arg("engine"))
       .def_property_readonly("ppu_engine", &ConsoleHost::ppu_engine)
       .def("request_ppu_slot_trace", &ConsoleHost::request_ppu_slot_trace, py::arg("line"),

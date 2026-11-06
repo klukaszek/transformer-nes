@@ -159,7 +159,7 @@ void draw_expert_map(const XrayFrame& frame) {
   if (x < 0 || x >= slots_per_line || y < 0 || y >= frame_height)
     return;
   const int id = static_cast<unsigned char>(frame.expert_map[static_cast<size_t>(y * slots_per_line + x)]);
-  const char* name = id == 255 ? "native"
+  const char* name = id == 255 ? "no output yet"
                      : id == 0 ? "full render graph"
                                : frame.expert_names[static_cast<size_t>(id - 1)].c_str();
   ImGui::SetTooltip("line %d, pixels %d-%d: %s", y, x * 8, x * 8 + 7, name);
@@ -262,7 +262,7 @@ void draw_dissection(const char* id, const Dissection& d,
 
 // Near black -> purple -> orange -> pale yellow, by intensity (0 = unread).
 constexpr uint32_t heat_rgba(unsigned char v) {
-  static constexpr float stops[4][3] = {
+  constexpr float stops[4][3] = {
       {0.10f, 0.05f, 0.25f}, {0.55f, 0.10f, 0.55f}, {0.95f, 0.45f, 0.10f}, {1.0f, 0.95f, 0.6f}};
   if (v == 0)
     return 0xFF0A0A0Au;

@@ -164,10 +164,10 @@ The CPU remains unaware of PPU, APU, controller, and mapper implementations.
 The native NES bus connects those devices to the CPU protocol:
 
 - CPU stores are returned as write records and dispatched to mapped devices.
-- Before a device read, the bus uses the shared opcode metadata to identify
-  the memory-reading instruction, watches its target, and injects the device's
-  value into the CPU memory model. The CPU then performs an ordinary memory
-  read.
+- A neural read-request expert emits the operand address and timing before
+  committing the instruction. The bus serves a watched device read, and a
+  retained neural continuation consumes the reply and commits once. The
+  reference backend uses opcode metadata to preview the equivalent read.
 - Idempotent device reads may provide a read lease, allowing the native run
   loop to serve repeated polls without returning to Python on every read.
 - Mapper bank changes can replace mapped ROM bytes in the engine's address

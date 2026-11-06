@@ -43,6 +43,12 @@ def test_dissection_follows_an_instruction_through_the_layers():
     # It ran on a copy: the machine has not moved.
     assert machine.engine.get_run_state() == before
 
+    image = bytearray(0x10000)
+    image[0x8000:0x8003] = b"\x4c\x00\x00"  # JMP $0000
+    machine.load_image(image, start_pc=0x8000)
+    steps = {name: value for _, _, name, _, value in xray.dissect()["steps"]}
+    assert steps["next_pc"] == 0
+
 
 def test_path_counters_cover_every_instruction():
     # LDX #3; loop: DEX; BNE loop; BRK

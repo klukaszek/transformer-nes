@@ -20,7 +20,7 @@ PY_INCLUDE := $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_paths(
 
 CXX ?= c++
 CC ?= cc
-CXXFLAGS := -O2 -std=c++26 -Wall -Wextra -Wpedantic -fPIC -fvisibility=hidden
+CXXFLAGS := -O2 -std=c++20 -Wall -Wextra -Wpedantic -fPIC -fvisibility=hidden
 NES_INCLUDES := -I$(NES) -I$(NES)/include
 PY_INCLUDES := -I$(VENDOR)/pybind11/include -I$(PY_INCLUDE)
 UI_INCLUDES := -I$(VENDOR)/sokol -I$(VENDOR)/imgui
@@ -55,24 +55,24 @@ $(REF_OBJ):
 	mkdir -p $(REF_OBJ)
 
 # The conventional PPU exists only as an independent test oracle.
-$(REF_OBJ)/%.o: $(NES)/%.cpp | $(REF_OBJ)
+$(REF_OBJ)/%.o: $(NES)/%.cpp Makefile | $(REF_OBJ)
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) -DTRANSFORMER_NES_PPU_REFERENCE -MMD -MP -c $< -o $@
 
-$(OBJ)/%.o: $(NES)/%.cpp | $(OBJ)
+$(OBJ)/%.o: $(NES)/%.cpp Makefile | $(OBJ)
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) -MMD -MP -c $< -o $@
 
-$(OBJ)/app.o: $(NES)/app.cpp | $(OBJ)
+$(OBJ)/app.o: $(NES)/app.cpp Makefile | $(OBJ)
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) $(UI_INCLUDES) -MMD -MP -c $< -o $@
 
-$(OBJ)/debug_ui.o: $(NES)/ui/debug_ui.cpp | $(OBJ)
+$(OBJ)/debug_ui.o: $(NES)/ui/debug_ui.cpp Makefile | $(OBJ)
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(UI_INCLUDES) -MMD -MP -c $< -o $@
 
 # Vendored code builds warning-silent; its style is not ours to fix.
 # (Plain % rule: make only applies it where the vendor source exists.)
-$(OBJ)/%.o: $(VENDOR)/imgui/%.cpp | $(OBJ)
-	$(CXX) -O2 -std=c++26 -fPIC -w -I$(VENDOR)/imgui -c $< -o $@
+$(OBJ)/%.o: $(VENDOR)/imgui/%.cpp Makefile | $(OBJ)
+	$(CXX) -O2 -std=c++20 -fPIC -w -I$(VENDOR)/imgui -c $< -o $@
 
-$(OBJ)/sokol_impl.o: $(NES)/sokol_impl.m $(NES)/ui/sokol_platform.h | $(OBJ)
+$(OBJ)/sokol_impl.o: $(NES)/sokol_impl.m $(NES)/ui/sokol_platform.h Makefile | $(OBJ)
 	$(CC) -std=c17 -O2 -fPIC -w -x $(SOKOL_LANG) -I$(VENDOR)/sokol -I$(NES) -c $< -o $@
 
 $(BIN)/nes_hardware.so: $(HW_OBJS)
@@ -84,7 +84,7 @@ $(BIN)/nes_hardware_reference.so: $(REF_OBJS)
 $(BIN)/nes_app.so: $(FRONTEND_OBJS)
 	$(LDSHARED) $^ -o $@ $(FRONTEND_LIBS)
 
-$(BIN)/native_hardware_test: $(NES)/tests/native_hardware_test.cpp $(NES)/ui/frame_clock.h \
+$(BIN)/native_hardware_test: $(NES)/tests/native_hardware_test.cpp $(NES)/ui/frame_clock.h Makefile \
 		$(REF_OBJ)/bus.o $(REF_OBJ)/ppu.o $(REF_OBJ)/apu.o $(REF_OBJ)/console.o $(REF_OBJ)/tape.o
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) -DTRANSFORMER_NES_PPU_REFERENCE $(filter %.cpp %.o,$^) -o $@
 

@@ -143,8 +143,7 @@ def main() -> None:
     parser.add_argument(
         "--union-only",
         action="store_true",
-        help="build the weights engine with no experts, so every opcode "
-        "executes on the union proof model",
+        help="run instructions on the union proof model, retaining device-read continuations",
     )
     args = parser.parse_args()
 

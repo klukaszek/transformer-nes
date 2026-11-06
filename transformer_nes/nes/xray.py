@@ -52,8 +52,7 @@ _HEADLINE = (
     "new_x",
     "new_y",
     "new_s",
-    "new_pc_lo",
-    "new_pc_hi",
+    "next_pc",
 )
 
 

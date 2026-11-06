@@ -93,6 +93,7 @@ def test_rmw_receipt_uses_the_serviced_reply_after_code_changes(union_only, trac
 def test_transformer_weights_match_reference():
     machine = Cpu6502TransformerMachine(bcd=False)
     image = verify_program()
+    assert len(image) == 0x10000
     trace = machine.run_image(image, start_pc=VERIFY_START, max_steps=30)
     assert len(trace.rows) == 30
     lockstep_vs_reference(trace, image)

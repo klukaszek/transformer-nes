@@ -373,7 +373,7 @@ static void test_mappers() {
   // The IRQ counter is clocked by the PPU's A12 rises: a clock reloads
   // it from the latch at 0 (or after a $C001 clear), otherwise
   // decrements, and reaching 0 with IRQs enabled asserts the line.
-  const PpuEvent rise{PpuEvent::A12Rise, 0, 0};
+  const PpuEvent rise{PpuEvent::A12Rise, 0};
   mmc3.write(0xC000, 2);
   mmc3.write(0xC001, 0);
   mmc3.write(0xE001, 0);
@@ -386,7 +386,7 @@ static void test_mappers() {
   assert(irq.sources == IRQ_MAPPER);
   // The probe replays the same counter without touching the mapper.
   for (int i = 0; i < 3; ++i)
-    probe->ppu_event({PpuEvent::A12Rise, 100 + i, 0});
+    probe->ppu_event({PpuEvent::A12Rise, 100 + i});
   assert(probe->fire_dot == 102);
   mmc3.write(0xE000, 0); // $E000 disable also acks the line
   assert(irq.sources == 0 && !mmc3.irq_probe());

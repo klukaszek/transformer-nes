@@ -26,9 +26,6 @@ Ppu::Ppu(vector<uint8_t> chr_data, bool writable, bool vertical_mirroring)
     chr_bank[i] = i * 0x400;
 }
 
-// ── Memory ──
-
-
 int Ppu::status(int64_t dot) const {
   return (r_.vblank ? 0x80 : 0) | (r_.hit_dot <= dot ? 0x40 : 0) |
          (r_.overflow_dot <= dot ? 0x20 : 0);
@@ -38,8 +35,7 @@ int Ppu::status(int64_t dot) const {
 
 int Ppu::read(int addr, int64_t dot) {
   catch_up(dot);
-  const int value = access((addr - 0x2000) & 7, 0, false, dot);
-  return value;
+  return access((addr - 0x2000) & 7, 0, false, dot);
 }
 
 void Ppu::write(int addr, int value, int64_t dot) {
@@ -849,7 +845,7 @@ void Ppu::emit(PpuEvent::Kind kind, int64_t dot) {
   PpuWatcher* watcher = dry_ ? probe_ : watcher_;
   if (!watcher)
     return;
-  watcher->ppu_event({kind, dot, r_.line});
+  watcher->ppu_event({kind, dot});
   if (dry_ && probe_->fire_dot >= 0 && dry_stop_ < 0)
     dry_stop_ = probe_->fire_dot;
 }

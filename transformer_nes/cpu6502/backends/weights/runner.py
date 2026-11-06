@@ -41,7 +41,6 @@ class Cpu6502TransformerMachine:
         mirror_cpu_ram: bool = False,
     ):
         self.bcd = bool(bcd)
-        self.union_only = bool(union_only)
         self.mirror_cpu_ram = bool(mirror_cpu_ram)
         # The shell embeds inputs and commits neural readouts. The complete
         # immutable Torch bank is attached before the machine can execute.
@@ -114,17 +113,13 @@ class Cpu6502TransformerMachine:
     @functools.cached_property
     def built(self) -> tuple:
         """(the union model, its token rows, its build info)."""
-        start = time.perf_counter()
         graph = self.execution_fold.program_graph
         sched = asap_schedule(graph)
-        model, tok_to_idx, info = build_model(program_graph=graph, schedule=sched)
-        self.build_seconds = time.perf_counter() - start
-        return model, tok_to_idx, info
+        return build_model(program_graph=graph, schedule=sched)
 
     model = property(lambda self: self.built[0])
     slot_of = property(lambda self: self.built[2].slot_of)
     lives = property(lambda self: self.built[2].lives)  # residual live ranges (nes/xray.py)
-    n_layers = property(lambda self: self.built[2].n_layers)
 
     def core_experts(self) -> tuple[list[dict], list[dict]]:
         """The core engine's experts in its build order (the forward hook's
@@ -291,7 +286,7 @@ class Cpu6502TransformerMachine:
         return dict(self.engine.get_run_state())
 
 
-# ── Verification program (low addresses; see numerics caveat above) ──
+# ── CLI verification program ────────────────────────────────────
 
 VERIFY_START = 0x0400
 
@@ -299,50 +294,27 @@ VERIFY_START = 0x0400
 def verify_program() -> bytes:
     """Loop + rewrites + stack + subroutine + arithmetic, all below $0500."""
     image = bytearray(0x10000)
-    code = bytes(
-        [
-            0xA9,
-            0x05,  # LDA #$05
-            0x85,
-            0x10,  # STA $10
-            0xA2,
-            0x03,  # LDX #$03
-            0xE6,
-            0x10,  # loop: INC $10   (rewrites the same address)
-            0xCA,  # DEX
-            0xD0,
-            0xFB,  # BNE loop
-            0x20,
-            0x20,
-            0x04,  # JSR $0420
-            0xA5,
-            0x10,  # LDA $10
-            0x38,  # SEC
-            0xE9,
-            0x02,  # SBC #$02
-            0x85,
-            0x11,  # STA $11
-            0x69,
-            0x10,  # ADC #$10
-            0x48,  # PHA
-            0x68,  # PLA
-            0x85,
-            0x12,  # STA $12
-            0x4C,
-            0x1B,
-            0x04,  # trap: JMP trap ($041B)
-        ]
-    )
+    code = bytes([
+        0xA9, 0x05,        # LDA #$05
+        0x85, 0x10,        # STA $10
+        0xA2, 0x03,        # LDX #$03
+        0xE6, 0x10,        # loop: INC $10
+        0xCA,              # DEX
+        0xD0, 0xFB,        # BNE loop
+        0x20, 0x20, 0x04,  # JSR $0420
+        0xA5, 0x10,        # LDA $10
+        0x38,              # SEC
+        0xE9, 0x02,        # SBC #$02
+        0x85, 0x11,        # STA $11
+        0x69, 0x10,        # ADC #$10
+        0x48,              # PHA
+        0x68,              # PLA
+        0x85, 0x12,        # STA $12
+        0x4C, 0x1B, 0x04,  # trap: JMP $041B
+    ])
     image[VERIFY_START : VERIFY_START + len(code)] = code
-    image[0x0420:0x0426] = bytes(
-        [
-            0xA0,
-            0x07,  # LDY #$07
-            0x84,
-            0x13,  # STY $13
-            0x60,  # RTS
-        ]
-    )
+    subroutine = bytes([0xA0, 0x07, 0x84, 0x13, 0x60])  # LDY #7; STY $13; RTS
+    image[0x0420 : 0x0420 + len(subroutine)] = subroutine
     return bytes(image)
 
 
@@ -358,10 +330,8 @@ def main() -> None:
 
     machine = Cpu6502TransformerMachine(bcd=False)
     logger.info(
-        "transformer: d_model=%d n_layers=%d exact-int32 (%.1fs build)",
+        "transformer: d_model=%d exact-int32",
         machine.engine.d_model,
-        machine.n_layers,
-        machine.build_seconds,
     )
 
     image = verify_program()

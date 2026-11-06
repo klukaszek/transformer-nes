@@ -1,7 +1,7 @@
 [project]
 name = "transformer-nes"
 version = "0.1.0"
-description = "A MOS 6502 CPU expressed as an analytically-constructed transformer computation graph"
+description = "Analytically constructed transformer circuits for the NES CPU and devices"
 requires-python = ">=3.11"
 readme = "README.md"
 license = {text = "Apache-2.0"}

@@ -1,8 +1,8 @@
 # Transformer NES
 
-A MOS 6502 CPU expressed as a transformer computation graph, with the NES as the target application. One transformer step executes one 6502 instruction; CPU state lives in the residual stream, and memory is an append-only log read through attention.
+An NES emulator built from analytically constructed transformer circuits. CPU instructions, PPU rendering, audio, controller replies and mapper transitions execute in weights; the host schedules and transports their effects.
 
-The project was inspired by Percepta's [WASM-in-a-transformer experiment](https://www.percepta.ai/blog/can-llms-be-computers). The 6502 machine is built from the local graph DSL and executed by a plain-Python reference backend or an analytically generated transformer-weights backend.
+The project was inspired by Percepta's [WASM-in-a-transformer experiment](https://www.percepta.ai/blog/can-llms-be-computers). A local graph DSL constructs the attention and ReGLU weights. The full model reads a history of memory-write tokens; the compiled runtime serves the same licensed queries from a latest-written byte image.
 
 ## Emulator Gallery
 
@@ -31,7 +31,7 @@ These screenshots were captured from the NES emulator running on the compiled tr
 
 - **Python 3.11+**
 - **[uv](https://docs.astral.sh/uv/)** package manager
-- **C++26 compiler** for the native NES target; the generated 6502 engine is compiled as a C++17 PyTorch extension
+- **C++20 compiler** for the native NES target; the generated 6502 engine is compiled as a C++17 PyTorch extension
 
 ## Quick Start
 
@@ -101,7 +101,7 @@ The game keeps running and taking input while the overlay is open. It provides:
 - **Transformer X-ray** (`nes/xray.py`), read live from the running engines:
   - *CPU paths:* how each frame's instructions were retired -- proven loop recurrences, folded instruction shapes, per-opcode experts, interrupt experts, or the full model.
   - *CPU memory:* a 256x256 heatmap of the addresses the CPU's attention heads read.
-  - *Instruction dissection:* the next instruction through the full 56-layer model on a copy of the engine, every named value at the layer that computes it (memory reads with their addresses).
+  - *Instruction dissection:* the next instruction through the full CPU model on a copy of the engine, every named value at the layer that computes it (memory reads with their addresses).
   - *PPU experts:* which folded render expert drew each 8-pixel slot of the frame, optionally tinted over the game picture (the tint stays on with the overlay closed).
   - *Pixel dissection:* click any pixel to trace its tile slot through the full render graph -- the nametable, attribute, pattern and palette reads that produced its color.
   - *Ablation:* knock out any value in that dissection and the render transformer computes without it, in every slot, live.
@@ -160,13 +160,12 @@ Both CPU and PPU use the same Torch compiler. It expands their actual
 attention and ReGLU matrices into a fixed bank compiled by Inductor. The graph
 fold licenses direct reads over the latest-written byte image before scheduling;
 there are no separate nearest-address or register caches. C++ owns dispatch,
-architectural readout and devices. Constant coefficients and sparse routing are
+architectural readout, event scheduling and byte transport. Constant coefficients and sparse routing are
 specialized before play; CPU kernels return packed live readouts, and execution
 allocates no weight tensors or per-call Tensor wrappers. The standalone union and expert checkpoint runners remain independent
 checks, including ordinary softmax attention.
 
-The first launch compiles the fixed CPU and PPU banks before play. This is
-substantially slower than the former native layer emitter; later launches
+The first launch compiles the fixed execution banks before play; later launches
 load cached binaries. No compiler runs in the background during emulation.
 
 See [the CPU design](transformer_nes/cpu6502/README.md) for construction and
@@ -177,7 +176,7 @@ for the compilation stages, a worked instruction, runtime contracts and research
 
 The PPU host (`transformer_nes/nes/ppu.cpp`) is a catch-up machine on an absolute dot clock. It runs lazily: every register access, mapper write, and console event first catches it up to the dot of that access, so CPU writes are ordered against rendering by time instead of being reconstructed after the frame. Rendering follows the hardware's loopy `v`/`t`/`x`/`w` scroll registers at tile-slot (8-dot) resolution, which covers mid-frame scroll, `$2006` reloads, CHR bank switches, and rendering toggles without per-game split handling. Sprite-0 hits and sprite overflow are timed to the dot, MMC3 counts filtered A12 rises from the actual fetch pattern, MMC5 counts scanline starts, and MMC2/MMC4 latches see fetches in hardware order.
 
-The console loop runs the CPU only up to the next event that must interrupt it: vblank, the frame's end, or a mapper IRQ predicted by a dry run of the PPU. The same dry run tells the engine how long a `$2002` poll result stays valid, so polling loops remain native.
+The console loop runs the CPU only up to the next event that must interrupt it: vblank, the frame's end, or a mapper IRQ predicted by a dry run of the PPU. The same dry run tells the engine how long a `$2002` poll result stays valid, so polling loops stay inside the CPU run loop.
 
 Automated tests run the transformer CPU and PPU through blargg's `ppu_vbl_nmi` (10/10), `mmc3_test_2` (5/5 for the supported chip revision), and `oam_read`. See [`transformer_nes/nes/examples/testroms/`](transformer_nes/nes/examples/testroms/README.md).
 

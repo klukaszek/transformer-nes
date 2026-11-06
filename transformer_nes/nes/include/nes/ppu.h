@@ -34,7 +34,6 @@ struct PpuEvent {
   enum Kind : uint8_t { A12Rise, ScanlineStart, Idle };
   Kind kind;
   int64_t dot;
-  int line;
 };
 
 // Receives PPU bus events. A mapper is the live watcher; a probe consumes
