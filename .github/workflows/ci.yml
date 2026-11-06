@@ -5,42 +5,59 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --extra dev
-      - run: uv run ruff check .
-
-  test:
+  verify:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11", "3.12"]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: macos-latest
+            python: "3.13"
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked --extra dev
+      - name: Lint
+        if: runner.os == 'Linux'
+        run: uv run --locked ruff check .
+      - name: Linux window dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev libx11-dev libxi-dev libxcursor-dev libasound2-dev
       - run: ./vendor/install_deps.sh
-      - run: uv sync --extra dev
-      - run: uv run pytest -m "not slow" --tb=short
-
-  integration:
-    needs: test
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: ./vendor/install_deps.sh
-      - run: uv sync --extra dev
-      - run: uv run pytest -m "slow" --tb=short
+      - name: Build console, frontend and reference oracle
+        run: |
+          make all reference-hardware PYTHON="$(uv python find)"
+          uv run --locked python -c "from transformer_nes.nes.build import load_frontend; load_frontend()"
+      - name: Unit and synthetic console tests
+        run: uv run --locked pytest -m "not slow" --strict-markers --durations=15 --junitxml="$RUNNER_TEMP/unit-results.xml"
+      - name: Fetch pinned hardware ROM fixtures
+        if: runner.os == 'Linux'
+        run: uv run --locked python -m transformer_nes.nes.tests.test_ppu_roms
+      - name: Transformer equivalence and hardware ROM integration
+        if: runner.os == 'Linux'
+        run: uv run --locked pytest -m slow --strict-markers --durations=15 --junitxml="$RUNNER_TEMP/integration-results.xml"
+      - name: Test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.os }}-py${{ matrix.python }}
+          path: ${{ runner.temp }}/*-results.xml
+          if-no-files-found: ignore

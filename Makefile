@@ -32,7 +32,7 @@ FRONTEND_LIBS := -framework Cocoa -framework QuartzCore -framework Metal \
 SOKOL_LANG := objective-c
 else
 LDSHARED := $(CXX) -shared
-FRONTEND_LIBS := -lGL -lX11 -lXi -lXcursor -ldl -lpthread -lm
+FRONTEND_LIBS := -lGL -lX11 -lXi -lXcursor -lasound -ldl -lpthread -lm
 SOKOL_LANG := c
 endif
 
