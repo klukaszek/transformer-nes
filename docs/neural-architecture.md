@@ -640,6 +640,36 @@ p99 changed from 7.29–7.52 to 6.56 ms. Uncapped replay changed from 0.834 to
 does not establish display latency. Pixels, audio, CPU state, cycles and final
 RAM matched over 13,129 frames across SMB3, CV3, Mega Man 6 and Zelda.
 
+Warm-cache window timing also depends strongly on processor operating state.
+A subsequent Mega Man 6 startup check reproduced roughly 3 ms/frame on both
+the pre-cleanup revision (`7452b0a4`) and the neural-clock revision (`8b373c78`).
+Repeated 600-frame runs measured 2.3–2.6 ms on the former and 2.4–2.6 ms on the
+latter. These runs do not reproduce a sixfold cost increase from the clock.
+
+In a single unmodified neural-clock process, alternating a bounded second CPU
+workload produced the following windowed emulation times. Each phase lasted
+300 frames; averages exclude its first 30 frames. No scripted input was sent.
+
+| Phase | Additional CPU workload | Mean emulation time |
+| --- | --- | ---: |
+| Frames 30–299 | Off | 3.025 ms |
+| Frames 330–599 | On | 0.448 ms |
+| Frames 630–899 | Off | 2.790 ms |
+| Frames 930–1199 | On | 0.454 ms |
+
+Reversing the order measured 0.457 / 2.501 / 1.141 / 2.742 ms for on/off/on/off.
+This supports processor frequency or core scheduling as a cause of the large
+timing swings; the test does not identify the exact macOS mechanism. Audio
+filter probes found no subnormal inputs or outputs during a slow run. Activity
+and thread-priority hints did not reliably restore the faster timing.
+
+The extra load was a temporary diagnostic, not part of the runtime. Compare
+revisions in interleaved runs at matched load and report processor operating
+conditions alongside wall time. Cache warmup, compiler activity and per-kernel
+profiling can change those conditions; a warm cache alone does not normalize
+live performance. Retired-instruction and cycle counts help distinguish added
+work from a change in execution throughput.
+
 | Storage | Size |
 | --- | ---: |
 | CPU inline state, including watch bits | 414,912 bytes |
