@@ -12,7 +12,6 @@ import logging
 import operator
 import re
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -21,8 +20,6 @@ from torch.fx import Graph, GraphModule
 from transformer_nes import build
 from transformer_nes.model import ssa
 from transformer_nes.model.weights import rescale_head_queries, split_clear_gates, to_fixed_point
-
-NATIVE_DIR = Path(__file__).with_name("native")
 
 LOOKUP, PASSTHROUGH = 1, 2
 NO_MEMORY_GROUP = -1
@@ -58,8 +55,8 @@ def share_queries(w_in, w_out, read_kind):
 
 
 def layer_arrays(model, li: int, *, floating: bool = False) -> dict:
-    """Layer `li` of a folded model in expert_runner.layer's form (as
-    expert_runner.ExpertLayer cuts it from the exported checkpoint)."""
+    """Layer `li` of a folded model as dense blocks over the residual slots
+    it touches (construct.py stores them sparse)."""
     attn, heads = model.attn[li], model.attn[li].num_heads
     kinds, groups = model.head_kinds[li], model.head_memory_groups[li]
     if any(kinds[h] == LOOKUP and groups[h] == NO_MEMORY_GROUP for h in range(heads)):
@@ -153,18 +150,17 @@ def circuit_layers(expert) -> tuple[list[dict], int, int]:
     return layers, model.tok.weight.shape[1], model.one_slot
 
 
-def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
+def weight_module(expert, *, memory_size=65536, trace=False, ablation=False, report_reads=False):
     """Expand actual matrices at their exact residual scale.
 
     Byte/flag masks state the native embedding's exact input domain. They
     let the compiler simplify the transformer's arithmetic on valid inputs.
     Only declared ABI readouts escape; other residual slots are dead.
+    `report_reads` also returns every memory read's address (plus its layer
+    times the memory size), for the X-ray's read counts.
     """
-    spec = expert.get("step_spec")
     dtype = torch.float32 if expert.get("dtype") == "float32" else INT
     floating = dtype == torch.float32
-    if floating and spec is not None:
-        raise ValueError("float32 circuits require a graph token input contract")
     f_bits = expert.get("fraction_bits", 1)
     scale = 1 << f_bits
     layers, D, one_slot = circuit_layers(expert)
@@ -241,21 +237,10 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     zero = const(0)
     one = const(scale)
     state = [zero] * D
-    for name, slot in spec["inputs"].items() if spec else ():
-        if name == "is_state":
-            state[slot] = one
-        else:
-            bits = name.startswith("a_bit") or name in ("nmi", "irq", "halted")
-            state[slot] = op(
-                operator.and_, op(operator.getitem, x, slice(slot, slot + 1)), 2 if bits else 510
-            )
-    for slot, _mask in spec["p_flags"] if spec else ():
-        state[slot] = op(operator.and_, op(operator.getitem, x, slice(slot, slot + 1)), 2)
-    if spec is None:
-        for field, slot in enumerate(expert["input_slots"]):
-            if slot >= 0:
-                value = op(operator.getitem, x, slice(field, field + 1))
-                state[slot] = op(operator.mul, value, scale) if f_bits else value
+    for field, slot in enumerate(expert["input_slots"]):
+        if slot >= 0:
+            value = op(operator.getitem, x, slice(field, field + 1))
+            state[slot] = op(operator.mul, value, scale) if f_bits else value
     state[one_slot] = one
 
     def dot(weights, values):
@@ -388,7 +373,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
             masked = op(operator.mul, address, valid)
             queries.append((byte, masked))
             # Deduplicate within a layer while preserving reads across layers.
-            if spec is not None:
+            if report_reads:
                 reads.append(
                     op(torch.where, valid, op(operator.add, address, li * memory_size), -1)
                 )
@@ -432,21 +417,14 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
         for slot, v in zip(a["ff_out_slots"], down, strict=True):
             state[slot] = accumulate(state[slot], v)
         if ablation:
-            control = D if spec else len(expert["input_slots"])
+            control = len(expert["input_slots"])
             selected = op(operator.getitem, x, slice(control, control + 1))
             row = op(operator.getitem, x, slice(control + 1, control + 2))
             forced = op(operator.getitem, x, slice(control + 2, control + 3))
-            if spec is None:
-                forced = op(operator.mul, forced, scale) if f_bits else forced
-            control_scale = 2 if spec else 1
-            enabled = op(operator.eq, row, control_scale * (li + 1))
+            forced = op(operator.mul, forced, scale) if f_bits else forced
+            enabled = op(operator.eq, row, li + 1)
             state = [
-                op(
-                    torch.where,
-                    op(operator.and_, enabled, op(operator.eq, selected, control_scale * i)),
-                    forced,
-                    v,
-                )
+                op(torch.where, op(operator.and_, enabled, op(operator.eq, selected, i)), forced, v)
                 for i, v in enumerate(state)
             ]
         if trace:
@@ -458,7 +436,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     g.output((out, addresses))
     g.eliminate_dead_code()
     module = GraphModule({}, g)
-    module.input_width = (D if spec else len(expert["input_slots"])) + (3 if ablation else 0)
+    module.input_width = len(expert["input_slots"]) + (3 if ablation else 0)
     module.readout_slots = readout_slots
     module.f_bits = f_bits
     module.dtype = dtype
@@ -480,29 +458,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     return module
 
 
-def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=False):
-    """A bank's kernels with a native adapter appended (the CPU's banks)."""
-    kernels, metadata, scalar = bank_kernels(
-        experts, memory_size=memory_size, trace=trace, ablation=ablation
-    )
-    entries = ",\n".join(
-        f"{{circuit_{m['circuit']}, {m['width']}, {m['reads']}, {str(m['checks_division']).lower()}}}"
-        for m in metadata
-    )
-    runtime = (NATIVE_DIR / "torch_bank.h").read_text()
-    hook = runtime + "\n" + adapter
-    for name, value in {
-        "@ENTRIES@": entries,
-        "@SCALAR@": scalar,
-        "@MAX_WIDTH@": str(max(meta["width"] for meta in metadata)),
-        "@MAX_AUX@": str(max(1, max(meta["reads"] for meta in metadata))),
-        "@INPUT_WIDTHS@": ", ".join(str(meta["input_width"]) for meta in metadata),
-    }.items():
-        hook = hook.replace(name, value)
-    return ssa.CPP_PREAMBLE + kernels + "\n" + hook
-
-
-def bank_kernels(experts, *, memory_size=65536, trace=False, ablation=False) -> tuple[str, list[dict], str]:
+def bank_kernels(experts, *, memory_size=65536, trace=False, ablation=False, reads=False) -> tuple[str, list[dict], str]:
     """Lower weight-derived arithmetic once per value to compact native SSA.
 
     Returns (kernels, metadata per circuit, scalar type). The kernels need
@@ -522,7 +478,9 @@ def bank_kernels(experts, *, memory_size=65536, trace=False, ablation=False) -> 
     cache_hits = 0
     start = time.perf_counter()
     for index, expert in enumerate(experts):
-        module = weight_module(expert, memory_size=memory_size, trace=trace, ablation=ablation)
+        module = weight_module(
+            expert, memory_size=memory_size, trace=trace, ablation=ablation, report_reads=reads
+        )
         program = ssa.encode(module)
         key = (program["inputs"], tuple(
             (name, program[name].dtype.str, program[name].shape, program[name].tobytes())

@@ -1,8 +1,6 @@
-"""Build infrastructure shared by the CPU compiler and NES frontend.
-
-Paths and source identities come first, followed by artifact ownership and
-native loading, then reuse of individual scalar kernels. Cached artifacts
-are published atomically under process locks; no build work runs during play.
+"""Build infrastructure: paths, source identities, the native console
+extensions, and reuse of individual scalar kernels across builds (published
+atomically under process locks).
 """
 
 from __future__ import annotations
@@ -18,13 +16,9 @@ import marshal
 import os
 import pickle
 import platform
-import re
-import shutil
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 import types
 from contextlib import contextmanager
 from importlib.util import resolve_name
@@ -35,30 +29,15 @@ logger = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).parent
 PROJECT_DIR = PACKAGE_DIR.parent
 FIXTURES_DIR = PROJECT_DIR / "fixtures"
-# Generated kernels and native banks live beside the project, never in the package.
-CACHE_DIR = str(PROJECT_DIR / ".cache" / "engine")
+# The scalar compiler's reusable kernels (and their locks), beside the project.
+CACHE_DIR = str(PROJECT_DIR / ".cache" / "compiler")
 PACKAGE = "transformer_nes"
-ARTIFACT_RE = re.compile(r"^(?:engine|graph|build)_([0-9a-f]{16})(?:[_.].*)?$")
 MAX_KERNEL_BYTES = 256 * 1024**2
 KERNEL_CACHE_SCHEMA = 1
 # Limit concurrent compiler frontends independently of CPU source sharding.
-DEFAULT_COMPILE_JOBS = 2
 
 
 # Source files and build settings
-
-
-def positive_env_int(name: str, default: int) -> int:
-    """Read a positive integer build setting without leaking stringly typed
-    environment handling through the engine/cache paths."""
-    raw = os.environ.get(name)
-    try:
-        value = int(raw) if raw is not None else default
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a positive integer") from exc
-    if value < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
 
 
 def module_file(module: str) -> str | None:
@@ -162,118 +141,7 @@ def artifact_lock(name: str, *, blocking: bool = True):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def manifest_read() -> dict:
-    try:
-        with (Path(CACHE_DIR) / "manifest.json").open() as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
-
-def manifest_put(key: str, entry: dict, *, code: str | None = None) -> None:
-    """Record an artifact, replacing obsolete builds of the same kind.
-
-    A machine compiler supplies its source digest as ``code``. Graphs use
-    their own construction identities and are replaced by their tag.
-    """
-    with artifact_lock("manifest"):
-        manifest = manifest_read()
-        manifest[key] = {**entry, "code": code}
-        kind = entry.get("kind")
-        manifest = {
-            k: e for k, e in manifest.items() if e.get("kind") != kind or e.get("code") == code
-        }
-        write_atomic(Path(CACHE_DIR) / "manifest.json", json.dumps(manifest, indent=1, sort_keys=True).encode())
-        prune_artifacts({e["digest"] for e in manifest.values()})
-
-
-def prune_artifacts(live_digests: set[str]) -> None:
-    """Under the manifest lock, remove obsolete, inactive artifact groups."""
-    obsolete: dict[str, list[str]] = {}
-    for name in os.listdir(CACHE_DIR):
-        m = ARTIFACT_RE.match(name)
-        if m is None or m.group(1) in live_digests:
-            continue
-        obsolete.setdefault(m.group(1), []).append(os.path.join(CACHE_DIR, name))
-    for digest, paths in obsolete.items():
-        # Writers acquire artifact -> manifest. Never wait in the opposite
-        # order: an active writer may be about to publish its completed build.
-        with artifact_lock(digest, blocking=False) as acquired:
-            if not acquired:
-                continue
-            for path in paths:
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                else:
-                    os.unlink(path)
-
-
-# Native extension compilation and loading
-
-
-def load_module(
-    name: str,
-    digest: str,
-    sources: list[str],
-    *,
-    jobs: int | None = None,
-    extra_cflags: tuple[str, ...] = (),
-):
-    """Load a cached extension or compile it from ``sources``, `jobs`
-    compilers at once (default: the bound for core shards).
-
-    The caller holds ``artifact_lock(digest)`` through source writing, this
-    load, and manifest publication.
-    """
-    if name in sys.modules:
-        return sys.modules[name]
-    build_dir = os.path.join(CACHE_DIR, f"build_{digest}")
-    os.makedirs(build_dir, exist_ok=True)
-    so_path = os.path.join(build_dir, f"{name}.so")
-    if os.path.exists(so_path):
-        try:
-            spec = importlib.util.spec_from_file_location(name, so_path)
-            assert spec is not None and spec.loader is not None
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            sys.modules[name] = module
-            return module
-        except ImportError as exc:
-            # A cached extension can outlive the process that provided its
-            # dynamic-library search path (notably torch's libc10 on macOS).
-            logger.info("rebuilding unavailable cached engine %s: %s", name, exc)
-            os.unlink(so_path)
-
-    import torch
-    from torch.utils.cpp_extension import load
-
-    # Torch's file baton survives a killed compiler process. Our OS lock
-    # proves no other project builder owns this directory, so reclaim it.
-    baton = os.path.join(build_dir, "lock")
-    if os.path.exists(baton):
-        os.unlink(baton)
-    build_start = time.perf_counter()
-    cflags = ["-O2", "-std=c++17", "-fwrapv", "-ffp-contract=off", *extra_cflags]
-    old_max_jobs = os.environ.get("MAX_JOBS")
-    if old_max_jobs is None:
-        os.environ["MAX_JOBS"] = str(
-            jobs or positive_env_int("TRANSFORMER_NES_COMPILE_JOBS", DEFAULT_COMPILE_JOBS)
-        )
-    try:
-        module = load(
-            name=name,
-            sources=sources,
-            extra_cflags=cflags,
-            extra_ldflags=[f"-Wl,-rpath,{os.path.join(os.path.dirname(torch.__file__), 'lib')}"],
-            extra_include_paths=[CACHE_DIR],
-            build_directory=build_dir,
-            verbose=False,
-        )
-    finally:
-        if old_max_jobs is None:
-            del os.environ["MAX_JOBS"]
-    logger.info("compiled %s in %.1fs", name, time.perf_counter() - build_start)
-    return module
+# Native extensions
 
 
 def make(target: str) -> None:
@@ -298,18 +166,6 @@ def load_nes_extension(target: str):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def exit_with_parent(interval: float = 0.5) -> None:
-    """Exit this process, at once and quietly, when its parent does."""
-    parent = os.getppid()
-
-    def watch() -> None:
-        while os.getppid() == parent:
-            time.sleep(interval)
-        os._exit(0)
-
-    threading.Thread(target=watch, daemon=True).start()
 
 
 # Reuse of individual scalar kernels

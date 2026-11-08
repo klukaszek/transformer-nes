@@ -18,17 +18,13 @@ in [`transformer_nes/nes/`](../nes/).
 | `graph.py` | Builds the 6502 graph and exposes the named dimensions consumed by scheduling and code generation. |
 | `trace.py` | Instruction-level state and memory-write records shared by both backends. |
 | `reference.py` | Straightforward Python implementation used as the behavioral oracle. |
-| `runner.py` | Builds, caches, and runs the transformer-weights backend. |
-| `bank.py` | Compiles and attaches the immutable native forward bank; owns its context and diagnostic traces. |
-| `engine.py` | Emits model-specific embedding, readout and dispatch into the CPU runtime template. All neural layers run in the shared scalar SSA compiler. |
-| `checkpoint/export.py` | Exports the self-contained union or folded experts as losslessly packed integer safetensors and machine metadata. |
-| `checkpoint/dense_runner.py` | Standalone PyTorch union runner, importing only the standard library, Torch and safetensors. |
-| `checkpoint/expert_runner.py` | Independent routed expert runner for exported checkpoints and runtime verification. |
-| `experts.py` | Orchestrates folding, dispatch proofs, effect projection, scheduling and ABI lowering. |
-| `folds.py` | Opcode pins, sequence feedback/composition, cached expert construction, range proofs and symbolic-PC/read licenses. |
-| `execution.py` | Typed architectural effects, control/cycles, graph projection and lowering to residual slots. |
+| `chip.py` | The CPU as a chip of the NES model: the union circuit, every execution as a specialization with the same named outputs, read requests, and the run loop's dispatch tables. |
+| `runner.py` | The machine API over the native run loop (`native/console/cpu.cpp`). |
+| `eager.py` | Runs the saved model's CPU chip in eager PyTorch, importing only Torch, safetensors and `model/transformer.py`. |
+| `experts.py` | Orchestrates folding, dispatch proofs and effect projection. |
+| `folds.py` | Opcode pins, sequence feedback/composition, range proofs and symbolic-PC/read licenses. |
+| `execution.py` | Typed architectural effects, control/cycles and graph projection. |
 | `shapes.py` | Fixed shape templates, recurrence proofs and matching against live cartridge bytes. |
-| `native/engine.cpp` | CPU runtime template: watches, read leases, cycle budgets, tracing and console bindings. |
 | `conformance/klaus.py` | Harness for the Klaus Dormann functional test (binary in `fixtures/klaus/`). |
 | `conformance/nestest.py` | Harness for the nestest ROM and its Nintendulator golden log (in `fixtures/roms/`). |
 
@@ -110,22 +106,17 @@ The engine routes execution through several equivalent paths:
    registers, flags, ordered writes, next PC and exact cycles.
 3. The union model supplies the complete fallback and diagnostic trace.
 
-The production runtime always compiles the actual expert layer weights into one fixed
-native bank. FX expands sparse matrix coefficients into integer operations;
-scalar SSA shares surviving values and folds integer affine routing while
-preserving half-unit rounding. Kernels read the engine's residual and RAM,
-returning only packed live readouts without fusion scratch buffers. The native caller decodes that packed packet directly.
-The bank is independent of the ROM and loads before the first frame. There is
-no runtime learner, mutable window program, weight tensor pool or background
-attachment queue. The standalone exported checkpoint runners remain separate
-checks of ordinary transformer inference.
+The executions are the CPU chip's circuits, compiled with every other chip into
+the NES model's library. FX expands sparse matrix coefficients into integer
+operations; scalar SSA shares surviving values and folds integer affine routing
+while preserving half-unit rounding. Kernels read the chip's memory and return
+the step token's named outputs. The chip is independent of the ROM and loads
+before the first frame. There is no runtime learner, mutable window program,
+weight tensor pool or background attachment queue. `eager.py` runs the same
+weights in eager PyTorch, a separate check of ordinary transformer inference.
 
-The generated engine is cached by a digest of the source and construction
-configuration. A cache hit can load the compiled core without repeating the
-folding and emission work. The optional standalone safetensors export is a
-self-contained `wide_bits=False` union model; the generated runtime uses a
-`wide_bits=True` build to reduce depth while its harness supplies the extra
-byte-bit inputs.
+The CPU chip is saved and compiled with the rest of the NES model
+(`nes/model.py`): a cache hit loads it without repeating construction.
 
 Graph construction exploits its integer domains before scheduling. A Boolean
 product needs one ReGLU even when the payload is signed; selecting a constant
@@ -134,13 +125,11 @@ neighboring comparisons share ReLU hinges. Pulled status bytes use the serial
 14-unit bit extractor within the existing critical path. The final bit is the
 remaining 0/1 value, so it needs no extra threshold.
 
-The standalone union has residual width 536, 57 layers, 4,019 live FFN units
-and 27,536 nonzero coefficients. Its `weights.safetensors` is 287,810 bytes.
-Serialization uses per-tensor int8/int16/int32 according to the exact value
-range, including CSR indices and row pointers. `machine.json` describes logical
-int32 fixed-point arithmetic separately from this storage format. Both
-standalone runners widen coefficients to int32 and indices to int64 on load;
-the values, shapes and fixed-point units are unchanged by packing.
+The CPU chip has 55,587 nonzero weights: its union circuit 11,009, its 220
+executions 41,865 and its 15 read requests 1,887 (executions that fold alike
+share one circuit). The saved model packs each tensor into the smallest exact
+signed integer type; values, shapes and fixed-point units are unchanged by
+packing.
 
 ## Compilation pipeline
 
@@ -156,9 +145,9 @@ The weights backend follows this sequence:
    opcode, interrupt, shape, and sequence models.
 5. `model/compiler.py` expands the matrices into FX; `model/ssa.py` lowers and
    shares scalar arithmetic, shared with the PPU. The graph fold exposes
-   licensed indexed reads before scheduling. `engine.py`
-   supplies embedding, architectural readout and the native run loop;
-   `build.py` builds and caches the extensions.
+   licensed indexed reads before scheduling. `chip.py` gives the executions
+   one interface; the native run loop (`native/console/cpu.cpp`) embeds the
+   state, dispatches and commits.
 
 The run loop can execute for a step or cycle budget, stop at a HALT or
 jump-to-self trap, stream bounded trace arrays, and pause on watched device
@@ -188,10 +177,9 @@ The native NES bus connects those devices to the CPU protocol:
   structures without pretending that the CPU executed a write for every byte.
 
 Python boots the weights machine through `load_image` and installs device
-watches. During play the bus calls the shared native ABI in
-`native/machine_abi.h` for runs, writes, cartridge mapping,
-read leases and interrupts. The Python `run` and injection methods support
-verification harnesses.
+watches. During play the bus calls the native CPU (`native/include/nes/cpu.h`)
+directly for runs, writes, cartridge mapping, read leases and interrupts. The
+Python `run` and injection methods support verification harnesses.
 
 ## Verification
 

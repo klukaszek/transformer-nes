@@ -107,22 +107,23 @@ def circuit_description(chip: Chip, token: str, circuit: Transformer,
         "one_slot": circuit.one_slot,
         "input_slots": circuit.input_slots.tolist(),
         "output_slots": readout.tolist(),
-        "fraction_bits": chip.f_bits,
+        "fraction_bits": circuit.f_bits,
         "dtype": "int32" if chip.dtype == torch.int32 else "float32",
         "reassociate_residuals": chip.tokens[view.base if view else token].reassociate_residuals,
     }
 
 
-def chip_source(index: int, chip: Chip) -> str:
-    """One translation unit: the chip's kernels (internal to it) and its descriptor."""
+def chip_source(index: int, chip: Chip, *, observe: bool = False) -> str:
+    """One translation unit: the chip's kernels (internal to it) and its
+    descriptor; `observe` kernels also report their memory reads."""
     programs = chip.programs()
     kernels, metadata, scalar = bank_kernels(
         [circuit_description(chip, token, c, outputs) for token, _spec, c, outputs in programs],
-        memory_size=chip.memory_size,
+        memory_size=chip.memory_size, reads=observe,
     )
     entries = ",\n    ".join(
-        f"{{reinterpret_cast<const void*>(&circuit_{m['circuit']}), {m['width']}, {m['reads']}}}"
-        for m in metadata
+        f"{{reinterpret_cast<const void*>(&circuit_{m['circuit']}), {m['width']}, {m['reads']}, {c.f_bits}}}"
+        for m, (_token, _spec, c, _outputs) in zip(metadata, programs, strict=True)
     )
     tokens = ", ".join(
         f"{{{len(chip.io(token)[0])}, {len(chip.io(token)[1])}}}" for token, _spec, _c, _o in programs
@@ -140,7 +141,7 @@ def chip_source(index: int, chip: Chip) -> str:
         + "}  // namespace\n"
         + f"extern const transformer_nes_bank::Bank chip_{index} = {{\n"
         + f"    TRANSFORMER_NES_BANK_ABI, transformer_nes_bank::{kind}, {len(programs)}, circuits, tokens,\n"
-        + f"    {chip.memory_size}, {chip.f_bits}, {len(primary.layers) + 1}, {primary.d_model}}};\n"
+        + f"    {chip.memory_size}, {len(primary.layers) + 1}, {primary.d_model}}};\n"
     )
 
 
@@ -235,6 +236,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 """
 
 
+def observing_module(library: Path, name: str, chip: Chip):
+    """A library of one chip whose kernels report their memory reads (the
+    X-ray's read counts), built on first use beside `library`, which it is
+    pruned with. Its model ids are the chip's own."""
+    module_name = f"{library.name}_{name}_observe"
+    final = library.with_name(f"{library.name}.{name}_observe")
+    if module_name not in _LOADED:
+        so = final / f"{module_name}.so"
+        if so.exists():
+            _LOADED[module_name] = load_library(module_name, so)
+        else:
+            _LOADED[module_name] = build_extension(
+                module_name, final,
+                lambda: {"chip_0.cpp": chip_source(0, chip, observe=True), "chips.cpp": table_source([name])},
+                files=(RUNTIME_FILES[0],),
+            )
+    return _LOADED[module_name]
+
+
 def debug_kernel(library: Path, name: str, chip: Chip, trace: bool) -> tuple[int, int]:
     """(kernel address, reads) of a chip's model 0 compiled for diagnosis:
     taking an ablation (slot, row, value) after its inputs, and for `trace`
@@ -275,15 +295,16 @@ class CompiledModel:
         engine = self.module.engine(name)
         library = self.library
         engine.set_debug_loader(lambda trace: debug_kernel(library, name, chip, trace))
-        return CompiledChip(engine, chip)
+        return CompiledChip(engine, chip, lambda: CompiledChip(
+            observing_module(library, name, chip).engine(name), chip))
 
 
 class CompiledChip:
     """One chip's native engine: its own memory, running the chip's circuits
     by model id (token by token, each full circuit before its specializations)."""
 
-    def __init__(self, engine, chip: Chip):
-        self.engine, self.chip = engine, chip
+    def __init__(self, engine, chip: Chip, observing=None):
+        self.engine, self.chip, self._observing = engine, chip, observing
         # name -> TokenType or View (.inputs, .outputs)
         self.graphs = {**chip.tokens, **chip.views}
         self.model_ids = {(token, spec): i for i, (token, spec, _c, _o) in enumerate(chip.programs())}
@@ -299,10 +320,17 @@ class CompiledChip:
     def step(self, inputs, model: int = 0) -> np.ndarray:
         return self.engine.step(model, np.asarray(inputs, dtype=self.dtype))
 
+    def observing(self) -> CompiledChip:
+        """A new engine running this chip with kernels that count their
+        memory reads per address (``engine.take_reads()``)."""
+        if self._observing is None:
+            raise RuntimeError("this chip has no observing build")
+        return self._observing()
+
     def write(self, addr: int, value: int) -> None:
         self.engine.write(addr, value)
 
     def abi(self) -> tuple:
-        """(engine, write, step, trace, trace rows, trace width) for native
-        callers; this object must outlive them."""
+        """(engine, write, step, trace, trace rows, trace width, memory) for
+        native callers; this object must outlive them."""
         return self.engine.abi()

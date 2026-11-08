@@ -151,7 +151,7 @@ class PpuEngine:
 
     @property
     def f_bits(self) -> int:
-        return self.ppu.chip.f_bits
+        return self.ppu.chip.tokens["render"].general.f_bits
 
     @property
     def n_layers(self) -> int:

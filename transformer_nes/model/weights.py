@@ -2,7 +2,7 @@
 
 The schedule assigns residual slots; attention and ReGLU projections implement
 the graph, including residual clears at slot reuse. BuildInfo describes that
-layout. The final section provides lossless CSR checkpoint serialization.
+layout. The final section holds the fixed-point helpers the compiler shares.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 import numpy as np
-import scipy.sparse as sp
 
 from transformer_nes.graph.core import (
     MEMORY_GROUP_FUSED,
@@ -507,58 +506,6 @@ def build_model(program_graph, schedule, recycle_slots=True):
 
     info = BuildInfo(n_layers=n_layers, slot_of=slot_of, d_model=D, lives=layout.lives)
     return model, tok_to_idx_map, info
-
-
-def compact_integer_tensors(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Store exact integers in the narrowest signed type, without quantization.
-
-    Checkpoint readers widen data to int32 and indices to int64 on load.
-    Tensor shapes, fixed-point units and every integer value stay intact.
-    """
-    packed = {}
-    for name, array in tensors.items():
-        if array.dtype.kind != "i":
-            raise TypeError(f"{name}: expected signed integer checkpoint tensor")
-        lo, hi = int(array.min(initial=0)), int(array.max(initial=0))
-        for dtype in (np.int8, np.int16, np.int32):
-            bounds = np.iinfo(dtype)
-            if bounds.min <= lo and hi <= bounds.max:
-                packed[name] = array.astype(dtype, copy=False)
-                break
-        else:
-            raise OverflowError(f"{name}: coefficient or index exceeds int32")
-    return packed
-
-
-def csr_tensors(name: str, mat: np.ndarray, out: dict) -> None:
-    m = sp.csr_matrix(mat)
-    m.sort_indices()
-    out[f"{name}.data"] = to_fixed_point(m.data, f"{name}.data")
-    out[f"{name}.indices"] = m.indices.astype(np.int32)
-    out[f"{name}.indptr"] = m.indptr.astype(np.int32)
-
-
-def prune_layer(ip, op, fi, fo, num_heads, d_ffn):
-    """Drop dead heads and FFN units from one layer's matrices, exactly.
-
-    A head contributes 0 to the residual when its V rows or its out_proj
-    columns are all zero (zero Q/K with live V is a passthrough -- kept);
-    an FFN unit contributes 0 when its gate row, value row, or ff_out
-    column is all zero.  Returns ragged matrices plus the kept counts.
-    """
-    k_base, v_base = 2 * num_heads, 4 * num_heads
-    heads = [
-        h
-        for h in range(num_heads)
-        if ip[v_base + 2 * h : v_base + 2 * h + 2].any() and op[:, 2 * h : 2 * h + 2].any()
-    ]
-    hi = [r for h in heads for r in (2 * h, 2 * h + 1)]
-    ip = np.vstack([ip[hi], ip[[k_base + r for r in hi]], ip[[v_base + r for r in hi]]])
-    op = op[:, hi]
-    units = [j for j in range(d_ffn) if fi[j].any() and fi[d_ffn + j].any() and fo[:, j].any()]
-    fi = np.vstack([fi[units], fi[[d_ffn + j for j in units]]])
-    fo = fo[:, units]
-    return ip, op, fi, fo, heads, units
 
 
 def rescale_head_queries(in_proj: np.ndarray, num_heads: int) -> np.ndarray:

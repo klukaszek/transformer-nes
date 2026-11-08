@@ -7,7 +7,6 @@ reference/weights lockstep suites; this module only checks construction facts.
 
 import pytest
 
-from transformer_nes.cpu6502.engine import generate_source
 from transformer_nes.cpu6502.execution import (
     SEQUENCE_ROOT_DIMS,
     STATE_FIELDS,
@@ -26,7 +25,7 @@ from transformer_nes.cpu6502.folds import (
 )
 from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, build
 from transformer_nes.cpu6502.shapes import last_a_bit_step
-from transformer_nes.cpu6502.spec import FLAG_C, OPCODES
+from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.graph.core import (
     MEMORY_GROUP_FUSED,
     InputDimension,
@@ -300,22 +299,31 @@ def test_shape_absolute_store_is_rejected(union_pg):
         build_shape_experts(union_pg, [shape])
 
 
-def test_shape_execution_abi_contains_only_live_state(union_pg):
+def reads(execution) -> set[str]:
+    """The inputs an execution's circuit reads."""
+    graph = execution.program_graph
+    return {d.name for d in graph.all_dims if isinstance(d, InputDimension) and d is not graph.one}
+
+
+def computed(execution) -> set[str]:
+    """The architectural outputs its circuit computes (not folded or kept)."""
+    return {out.name for out in execution.outputs if out.source == "model"}
+
+
+def test_shape_execution_reads_only_live_state(union_pg):
     shape = ("dex_bne", bytes.fromhex("cad0fd"), 1)
     experts, _meta = build_shape_experts(union_pg, [shape])
-    spec = experts[0]["step_spec"]
+    execution = experts[0]["execution"]
 
-    # The PC feeds the closing branch's target and page-cross timing.
-    assert set(spec["inputs"]) == {"x", "pc_lo", "pc_hi"}
-    assert [mask for _slot, mask in spec["p_flags"]] == [FLAG_C]
-    assert {"p_z", "p_n"} <= set(spec["sequence_final"]["model"])
-    assert "new_pc" in spec["sequence_final"]["model"]
-    assert "sequence_control" not in spec
-    # DEX's 2 cycles fold; the closing BNE's are the model's (taken or
-    # not, across a page or not), read out after the forward.
+    # The PC feeds the closing branch's target and page-cross timing; the
+    # carry is P's only flag the window reads.
+    assert reads(execution) == {"in_x", "in_pc_lo", "in_pc_hi", "in_p_c"}
+    assert {"p_z", "p_n", "new_pc"} <= computed(execution)
+    # DEX's 2 cycles fold; the closing BNE's are the circuit's (taken or
+    # not, across a page or not).
     assert experts[0]["cycles_prefix"] == 2 and experts[0]["spin"] == 0
-    assert spec["sequence_cycles"]["constant"] == 2
-    assert len(spec["sequence_cycles"]["model"]) == 1
+    assert [c for c in execution.cycles if isinstance(c, int)] == [2]
+    assert sum(not isinstance(c, int) for c in execution.cycles) == 1
 
 
 def test_compact_opcode_experts_cover_stack_and_control(union_pg):
@@ -336,29 +344,15 @@ def test_compact_opcode_experts_cover_stack_and_control(union_pg):
         0x00,
     ]
     assert all(expert["kind"] == "exec_opcode" for expert in experts)
-    dex = experts[0]
-    assert set(dex["step_spec"]["inputs"]) == {"x", "pc_lo", "pc_hi"}
-    assert dex["step_spec"]["sequence_writes"] == [[]]
-    sta = experts[3]
-    assert len(sta["step_spec"]["sequence_writes"][0]) == 1
-    sax = experts[4]
-    assert len(sax["step_spec"]["sequence_writes"][0]) == 1
-    assert experts[5]["step_spec"]["sequence_writes"][0]
-    assert "new_pc" in experts[6]["step_spec"]["sequence_final"]["model"]
-    assert len(experts[7]["step_spec"]["sequence_writes"][0]) == 2
-    assert "new_pc" in experts[8]["step_spec"]["sequence_final"]["model"]
-    brk = experts[9]
-    assert len(brk["step_spec"]["sequence_writes"][0]) == 3
-    assert brk["step_spec"]["sequence_halt"] is not None
-
-    legacy = dict(experts[0])
-    legacy.pop("kind")
-    with pytest.raises(RuntimeError, match="unsupported execution contract"):
-        generate_source(
-            experts[0]["model"],
-            experts[0]["step_spec"],
-            experts=[legacy],
-        )
+    execution = [expert["execution"] for expert in experts]
+    dex, sta, sax, pha, jmp, jsr, rts, brk = (execution[i] for i in (0, 3, 4, 5, 6, 7, 8, 9))
+    assert {n for n in reads(dex) if not n.startswith("in_p_")} == {"in_x", "in_pc_lo", "in_pc_hi"}
+    assert not dex.memory_writes
+    assert len(sta.memory_writes) == len(sax.memory_writes) == 1
+    assert pha.memory_writes
+    assert "new_pc" in computed(jmp) and "new_pc" in computed(rts)
+    assert len(jsr.memory_writes) == 2
+    assert len(brk.memory_writes) == 3 and brk.halt_dimension is not None
 
 
 def test_shape_interior_branch_is_rejected(union_pg):

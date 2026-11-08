@@ -1,28 +1,16 @@
-"""Compiled transformer weights match eager layers and own no runtime tensor pool."""
+"""The CPU chip on its native host: it never needs the reference emulator,
+its loop circuits are exact, and device reads pause, resume and race
+interrupts as the hardware does."""
 
-import collections
-import ctypes
 import gc
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
-import torch
 
-from transformer_nes import build
-from transformer_nes.cpu6502.bank import bank_module
-from transformer_nes.cpu6502.checkpoint.expert_runner import (
-    HALVES,
-    WEIGHTS,
-    attention_read,
-    indexed_read,
-    layer,
-    share_queries,
-)
+from transformer_nes.cpu6502 import chip as cpu
 from transformer_nes.cpu6502.runner import Cpu6502TransformerMachine
-from transformer_nes.model.compiler import layer_arrays, weight_module
 
 
 def test_neural_pipeline_does_not_import_the_reference_emulator():
@@ -69,216 +57,40 @@ assert Cpu6502 is reference.Cpu6502 and run is reference.run
     )
 
 
-def test_cached_bank_identity_does_not_import_the_compiler():
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """
-import importlib.abc
-import sys
-from transformer_nes.cpu6502 import bank
-class NoCompiler(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path, target=None):
-        if fullname.startswith(('torch._inductor', 'torch._dynamo')):
-            raise AssertionError(f'cache lookup imported the compiler: {fullname}')
-sys.meta_path.insert(0, NoCompiler())
-assert bank.bank_path(False).endswith('.so')
-assert bank.bank_path(False) != bank.bank_path(True)
-""",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+def test_counter_loops_cover_every_licensed_state_and_limit():
+    """All nonzero byte counters and byte-sized budgets, against literal
+    steps: the loop circuits' new counter, N and Z, iterations and cycles."""
+    from transformer_nes.nes.model import compiled
 
-
-@pytest.mark.parametrize("read", [indexed_read, attention_read])
-def test_shared_queries_preserve_byte_bits_addresses_and_half_rounding(read):
-    """Many value heads share a query; differently scaled queries stay distinct."""
-    pair = torch.tensor([[0, 1, 0], [1, 0, 0]], dtype=torch.int32)
-    original = torch.cat([pair] * 5 + [2 * pair, torch.tensor([[0, 0, 1]], dtype=torch.int32)])
-    kinds = torch.tensor([[-1, -2], [0, 1], [2, 3], [4, 5], [6, -3], [-2, -1]])
-    memory = torch.arange(256, dtype=torch.uint8)
-    w_out = torch.eye(13, dtype=torch.int32)
-    w_out[-1, -1] = 0
-    halves = torch.zeros_like(w_out)
-    halves[-1, -1] = 1
-    projection, doubled, routes = share_queries(original, 2 * w_out + halves, kinds)
-    w_out, halves = doubled >> 1, doubled - 2 * (doubled >> 1)
-    assert projection.shape == (5, 3)
-    assert routes[:, 0].tolist() == [0] * 9 + [1] * 2
-    assert doubled.shape == (13, 12)  # the padded value contributes nothing
-    empty = torch.empty(0, dtype=torch.int32)
-    zero = torch.empty((0, 0), dtype=torch.int32)
-    for address in range(-1, 257):
-        x = torch.tensor([2, 2 * address, -3] + [0] * 13, dtype=torch.int32)
-        result, addresses = layer(
-            x,
-            memory,
-            1,
-            torch.arange(3),
-            projection,
-            routes,
-            torch.arange(3, 16),
-            w_out,
-            empty,
-            zero,
-            empty,
-            zero,
-            halves,
-            zero,
-            zero,
-            read=read,
-        )
-        valid = 0 <= address < 256
-        byte = address if valid else 0
-        expected = [byte, byte, *((byte >> b) & 1 for b in range(7)), 0, byte, byte]
-        assert result[3:].tolist() == [2 * v for v in expected] + [-2]
-        assert addresses.tolist() == [address if valid else -1] * 2
-
-
-def test_shared_value_columns_merge_before_half_rounding_and_ignore_padding():
-    query = torch.eye(2, dtype=torch.int32)
-    projection = torch.cat([query, query])
-    kinds = torch.tensor([[-1, -3], [-1, -2]])
-    weights = torch.tensor([[3, 999, -5, 0], [0, -999, 1, -3]], dtype=torch.int32)
-    shared, combined, routes = share_queries(projection, weights, kinds)
-    assert torch.equal(shared, query)
-    assert combined.tolist() == [[-2, 0], [1, -3]]
-    assert routes.tolist() == [[0, -1], [0, -2]]
-    with pytest.raises(ValueError, match="exceeds int32"):
-        share_queries(projection, torch.full((1, 4), 2**30, dtype=torch.int32), kinds)
-
-
-@pytest.mark.slow
-def test_fixed_bank_matches_every_transformer_expert_and_read_counts():
-    """Two native calling threads use distinct memory and stack scratch.
-
-    Check all ABI readouts against eager attention/ReGLU layers, including
-    half rounding and distinct reads of the same address in different layers.
-    """
-    machine = Cpu6502TransformerMachine()
-    experts, _ = machine.core_experts()
-    bank = bank_module(False)
-    assert bank.n_experts == len(experts)
-    prepared = []
-    for expert in experts:
-        layers = []
-        for li in range(len(expert["model"].attn)):
-            arrays = layer_arrays(expert["model"], li)
-            names = WEIGHTS + (HALVES if "h_out" in arrays else ())
-            layers.append(tuple(torch.from_numpy(arrays[name]) for name in names))
-        prepared.append(layers)
-
-    def run(seed):
-        rng = np.random.default_rng(seed)
-        memory = rng.integers(0, 256, 65536, dtype=np.uint8)
-        enabled = ctypes.c_bool(True)
-        counters = np.zeros(65536, dtype=np.uint32)
-        context = bank.Context(memory.ctypes.data, ctypes.addressof(enabled), counters.ctypes.data)
-        forward = ctypes.CFUNCTYPE(
-            ctypes.c_bool, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p
-        )(bank.forward_address())
-        calls = 0
-        for ident, (expert, layers) in enumerate(zip(experts, prepared, strict=True)):
-            model, spec = expert["model"], expert["step_spec"]
-            keep = set(spec.get("outputs", {}).values())
-            if "sequence_final" in spec:
-                keep.update(spec["sequence_final"]["model"].values())
-                keep.update(
-                    s for writes in spec["sequence_writes"] for write in writes
-                    for s in write.values() if s is not None
-                )
-                keep.update(spec["sequence_cycles"]["model"])
-                if spec["sequence_halt"] is not None:
-                    keep.add(spec["sequence_halt"])
-            for _ in range(8):
-                x = torch.zeros(model.tok.weight.shape[1], dtype=torch.int32)
-                x[model.one_slot] = 2
-                accumulator = int(rng.integers(0, 256))
-                for name, slot in spec["inputs"].items():
-                    if name == "is_state":
-                        value = 1
-                    elif name.startswith("a_bit"):
-                        value = (accumulator >> int(name[5:])) & 1
-                    elif name == "a":
-                        value = accumulator
-                    else:
-                        value = int(rng.integers(0, 2 if name in ("nmi", "irq", "halted") else 256))
-                    x[slot] = 2 * value
-                for slot, _mask in spec["p_flags"]:
-                    x[slot] = 2 * int(rng.integers(0, 2))
-                expected, reads = x.clone(), collections.Counter()
-                for weights in layers:
-                    expected, addresses = layer(expected, torch.from_numpy(memory), 1, *weights)
-                    reads.update(set(int(a) for a in addresses.tolist() if a >= 0))
-                counters.fill(0)
-                inputs = x.numpy().copy()
-                original = inputs.copy()
-                slots = expert["output_slots"]
-                actual = np.full(len(slots) + 1, 0x5A5A5A5A, dtype=np.int32)
-                assert forward(context.address, ident, inputs.ctypes.data, actual.ctypes.data)
-                calls += 1
-                assert slots == tuple(sorted(keep))
-                np.testing.assert_array_equal(actual[: len(slots)], expected[list(slots)].numpy())
-                assert actual[-1] == 0x5A5A5A5A
-                np.testing.assert_array_equal(inputs, original)
-                assert {int(a): int(counters[a]) for a in np.flatnonzero(counters)} == reads
-        assert context.counts == (calls, 0)
-        # Declining an invalid id does not touch the residual.
-        original = actual.copy()
-        assert not forward(context.address, bank.n_models, inputs.ctypes.data, actual.ctypes.data)
-        np.testing.assert_array_equal(actual, original)
-        assert context.counts == (calls, 1)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        list(pool.map(run, range(2)))
-
-
-def test_counter_transition_weights_cover_every_licensed_state_and_limit():
-    """All nonzero byte counters and byte-sized budgets, against literal steps.
-
-    The graph has no memory heads or table of outcomes. Batched eager FX
-    evaluates its actual matrices; the native bank is checked separately.
-    """
-    from transformer_nes.cpu6502.experts import build_counter_recurrence_experts
-
-    values, limits = np.meshgrid(np.arange(1, 256), np.arange(256), indexing="ij")
-    for expert in build_counter_recurrence_experts():
-        spec = expert["step_spec"]
-        register = "x" if expert["reg"] == 1 else "y"
-        expected, counts = [], []
+    engine = compiled().chip("cpu")
+    loops = {name: f for name, f in engine.chip.constants["executions"].items() if f["kind"] == "exec_loop"}
+    assert len(loops) == 4
+    field = {name: i for i, name in enumerate(cpu.INPUTS)}
+    out = {name: i for i, name in enumerate(cpu.STEP_OUTPUTS)}
+    for name, f in loops.items():
+        model = engine.model_id("step", name)
+        register = "x" if f["reg"] == 1 else "y"
         for value in range(1, 256):
             path = [value]
-            while (following := (path[-1] + expert["delta"]) & 255) != 0:
+            while (following := (path[-1] + f["delta"]) & 255) != 0:
                 path.append(following)
-            count = np.minimum(np.arange(256), len(path) - 1)
-            expected.extend(path[int(n)] for n in count)
-            counts.extend(count)
-        expected, counts = np.asarray(expected), np.asarray(counts)
-        forward = weight_module(expert)
-        positions = {slot: index for index, slot in enumerate(forward.readout_slots)}
-        assert len(positions) < forward.input_width
-        x = torch.zeros((forward.input_width, values.size), dtype=torch.int32)
-        x[spec["inputs"][register]] = torch.from_numpy(values.ravel().astype(np.int32)) * 2
-        x[spec["inputs"]["loop_limit"]] = torch.from_numpy(limits.ravel().astype(np.int32)) * 2
-        for cycles in (5, 6):
-            x[spec["inputs"]["loop_cycles"]] = 2 * cycles
-            result, addresses = forward(x, torch.zeros(65536, dtype=torch.uint8))
-            assert addresses.numel() == 0
-            result = result.numpy() >> 1
-            for slot, wanted in (
-                (spec["sequence_final"]["model"][f"new_{register}"], expected),
-                (spec["sequence_final"]["model"]["p_n"], expected >> 7),
-                (spec["sequence_final"]["model"]["p_z"], np.zeros_like(expected)),
-                (spec["outputs"]["iterations"], counts),
-                (spec["sequence_cycles"]["model"][0], counts * cycles),
-            ):
-                np.testing.assert_array_equal(result[positions[slot]], wanted)
+            for limit in range(256):
+                count = min(limit, len(path) - 1)
+                for cycles in (5, 6):
+                    inputs = np.zeros(len(cpu.INPUTS), dtype=np.int32)
+                    inputs[field["is_state"]] = 1
+                    inputs[field[f"in_{register}"]] = value
+                    inputs[field["in_loop_limit"]] = limit
+                    inputs[field["in_loop_cycles"]] = cycles
+                    result = engine.step(inputs, model)
+                    assert result[out[f"step_{register}"]] == path[count]
+                    assert result[out["step_p_n"]] == path[count] >> 7
+                    assert result[out["step_p_z"]] == 0
+                    assert result[out["step_iterations"]] == count
+                    assert result[out["step_cycles"]] == count * cycles
 
 
-def test_machine_keeps_hook_context_alive_without_a_separate_handle():
+def test_machine_keeps_its_chip_alive_without_a_separate_handle():
     machine = Cpu6502TransformerMachine()
     image = bytearray(65536)
     image[0x8000:0x8003] = bytes([0xA9, 0x42, 0xEA])
@@ -286,38 +98,6 @@ def test_machine_keeps_hook_context_alive_without_a_separate_handle():
     gc.collect()
     machine.run(1, trace=False)
     assert machine.get_state()["a"] == 0x42
-    assert machine.forwards.counts == (1, 0)
-
-
-def test_loaded_bank_outlives_its_pruned_files(tmp_path, monkeypatch):
-    """A mapped bank extension is reused once its files are gone: another CPU
-    in the same process gets the same bank and nothing is rebuilt."""
-    hook = Cpu6502TransformerMachine().forwards.hook
-    monkeypatch.setattr(build, "CACHE_DIR", str(tmp_path))  # a cache without the bank's files
-    assert bank_module(False) is hook
-    assert not any(tmp_path.iterdir())
-
-
-def test_compiler_child_rejects_stale_source_identity():
-    from transformer_nes.cpu6502 import bank
-
-    result = subprocess.run(
-        [sys.executable, "-m", bank.__name__, "0", "obsolete-source-digest"],
-        capture_output=True, text=True,
-    )
-    assert result.returncode != 0
-    assert "compiler sources changed" in result.stderr
-    assert "restart the process" in result.stderr
-
-
-def test_torch_engine_requires_its_bank_instead_of_falling_back():
-    machine = Cpu6502TransformerMachine()
-    image = bytearray(65536)
-    image[0x8000:0x8002] = bytes([0xA9, 0x42])
-    machine.load_image(image, start_pc=0x8000)
-    machine.engine.engine.set_forward_hook(0, 0)
-    with pytest.raises(RuntimeError, match="Torch transformer bank is not attached"):
-        machine.run(1, trace=False)
 
 
 @pytest.mark.parametrize("union_only", [False, True])
@@ -342,7 +122,7 @@ def test_read_requests_pause_without_committing_then_consume_the_reply(union_onl
             address = ref.resolve_ea(op, 255, 255)
             cycles = instruction_cycles(ref, op, ref.pc, ref.x, ref.y, ref.p)
             machine.load_image(image, start_pc=ref.pc)
-            machine.engine.engine.set_run_state(
+            machine.engine.set_run_state(
                 ref.pc, ref.a, ref.x, ref.y, ref.s, ref.p, 0, 0, 0, 0, 0, 0
             )
             machine.watch_read(0, 65535)
@@ -378,7 +158,7 @@ def test_read_continuation_retains_pointer_and_instruction_context(union_only):
     image[0x8000:0x8002] = bytes([0xB1, 0x20])  # LDA ($20),Y
     image[0x20:0x22] = bytes([0xFF, 0x40])
     machine.load_image(image, start_pc=0x8000)
-    machine.engine.engine.set_run_state(0x8000, 0, 0, 1, 0xFD, 0x24, 0, 0, 0, 0, 0, 0)
+    machine.engine.set_run_state(0x8000, 0, 0, 1, 0xFD, 0x24, 0, 0, 0, 0, 0, 0)
     machine.watch_read(0x4100, 0x4100)
     request = machine.run(1, trace=False)
     assert (request["read_addr"], request["read_cycles"]) == (0x4100, 6)
@@ -426,7 +206,7 @@ def test_read_continuation_finishes_before_an_interrupt_raised_by_the_reply(unio
     image[0x8000:0x8004] = bytes([0xAD, 0, 0x40, 0xEA])
     image[0xFFFA:0xFFFC] = image[0xFFFE:0x10000] = bytes([0, 0x90])
     machine.load_image(image, start_pc=0x8000)
-    machine.engine.engine.set_run_state(0x8000, 0, 0, 0, 0xFD, 0x20, 0, 0, 0, 0, 0, 0)
+    machine.engine.set_run_state(0x8000, 0, 0, 0, 0xFD, 0x20, 0, 0, 0, 0, 0, 0)
     machine.watch_read(0x4000, 0x4000)
     assert machine.run(1, trace=False)["reason"] == "watch_read"
     getattr(machine, f"set_{interrupt}")()

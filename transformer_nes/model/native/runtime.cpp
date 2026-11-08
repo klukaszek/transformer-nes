@@ -56,10 +56,14 @@ int max_aux(const Bank& bank) {
 
 void check_bounds(const Bank& bank) {
     if (max_aux(bank) > kMaxAux) throw std::invalid_argument("bank reports more reads than the runtime holds");
-    for (int i = 0; i < bank.n_circuits; ++i)
+    for (int i = 0; i < bank.n_circuits; ++i) {
         if (bank.circuits[i].width > kMaxValues || bank.tokens[i].n_in + 3 > kMaxValues ||
             bank.tokens[i].n_out > kMaxValues)
             throw std::invalid_argument("token wider than the runtime holds");
+        // Kernels write straight into the caller's output buffer.
+        if (bank.circuits[i].width != bank.tokens[i].n_out)
+            throw std::invalid_argument("a circuit's readouts are not its token's outputs");
+    }
 }
 
 // ── Chip engines ────────────────────────────────────────────────────
@@ -77,7 +81,8 @@ struct GraphEngine {
     const transformer_nes_bank::Token* tokens;
     uint8_t* memory;
     int n_models;
-    bool fixed_point;
+    // Reads per address, for kernels that report them (observing builds).
+    std::vector<uint32_t> read_counts;
     int ablate_slot = 0, ablate_row = -1;
     Scalar ablate_value = 0;
     py::object debug_loader;
@@ -86,8 +91,7 @@ struct GraphEngine {
 
     explicit GraphEngine(const Bank& bank_in)
         : bank(bank_in), ram(static_cast<size_t>(bank_in.memory)), circuits(bank_in.circuits),
-          tokens(bank_in.tokens), memory(ram.data()), n_models(bank_in.n_circuits),
-          fixed_point(std::is_integral_v<Scalar> && bank_in.f_bits != 0) {
+          tokens(bank_in.tokens), memory(ram.data()), n_models(bank_in.n_circuits) {
         if (n_models < 1) throw std::invalid_argument("a chip needs a circuit");
         check_bounds(bank);
     }
@@ -112,31 +116,42 @@ struct GraphEngine {
         }
         return kernel;
     }
-    void decode(const Scalar* result, Scalar* out, int n) const {
+    // A fixed-point circuit's readouts in whole units, in place.
+    static void decode(Scalar* out, int n, int f_bits) {
         if constexpr (std::is_integral_v<Scalar>) {
-            const Scalar mask = (Scalar(1) << bank.f_bits) - 1;
+            // Branch-free: shift every readout, then check their fractions once.
+            Scalar fractions = 0;
             for (int i = 0; i < n; ++i) {
-                if (result[i] & mask) throw std::runtime_error("fractional readout value");
-                out[i] = result[i] >> bank.f_bits;
+                fractions |= out[i];
+                out[i] >>= f_bits;
             }
+            if (fractions & ((Scalar(1) << f_bits) - 1))
+                throw std::runtime_error("fractional readout value");
         }
     }
     void step(int model, const Scalar* in, Scalar* out) {
         if ((unsigned)model >= (unsigned)n_models) throw std::out_of_range("no such model");
         if (model == 0 && ablate_row >= 0) return step_ablated(in, out);
         int32_t aux[kMaxAux];
-        if (!fixed_point) return kernel_of<Scalar>(circuits[model])(in, memory, out, aux);
-        Scalar result[kMaxValues];
-        kernel_of<Scalar>(circuits[model])(in, memory, result, aux);
-        decode(result, out, tokens[model].n_out);
+        const Circuit& circuit = circuits[model];
+        kernel_of<Scalar>(circuit)(in, memory, out, aux);
+        if (circuit.aux) count_reads(aux, circuit.aux);
+        if (circuit.f_bits) decode(out, tokens[model].n_out, circuit.f_bits);
+    }
+    // A reported read is its address plus its layer times the memory size,
+    // or -1 when it fell outside memory.
+    __attribute__((noinline)) void count_reads(const int32_t* reads, int n) {
+        if (read_counts.empty()) read_counts.assign(ram.size(), 0);
+        for (int i = 0; i < n; ++i)
+            if (reads[i] >= 0) ++read_counts[(size_t)reads[i] % ram.size()];
     }
     __attribute__((noinline)) void step_ablated(const Scalar* in, Scalar* out) {
-        Scalar x[kMaxValues], result[kMaxValues];
+        Scalar x[kMaxValues];
         debug_input(in, x);
         const auto kernel = debug(false);
         std::vector<int32_t> scratch(std::max(1, ablate_aux));
-        kernel(x, memory, fixed_point ? result : out, scratch.data());
-        if (fixed_point) decode(result, out, tokens[0].n_out);
+        kernel(x, memory, out, scratch.data());
+        if (circuits[0].f_bits) decode(out, tokens[0].n_out, circuits[0].f_bits);
     }
     void trace(const Scalar* in, Scalar* out) {
         Scalar input[kMaxValues];
@@ -171,6 +186,21 @@ void bind_engine(py::module_& m, const char* name) {
             e.step(model, in.data(), out.mutable_data());
             return out;
         })
+        .def("trace", [](E& e, Array in) {
+            // Model 0's residual stream after its embedding and each layer.
+            if (in.size() != (long)e.bank.tokens[0].n_in) throw std::invalid_argument("wrong input count");
+            py::array_t<Scalar> out({(py::ssize_t)e.bank.trace_rows, (py::ssize_t)e.bank.primary_width});
+            e.trace(in.data(), out.mutable_data());
+            return out;
+        })
+        .def("take_reads", [](E& e) {
+            // Reads per address since the last call (observing builds).
+            py::array_t<uint32_t> out((py::ssize_t)e.ram.size());
+            if (e.read_counts.empty()) std::fill_n(out.mutable_data(), out.size(), 0u);
+            else std::copy(e.read_counts.begin(), e.read_counts.end(), out.mutable_data());
+            std::fill(e.read_counts.begin(), e.read_counts.end(), 0u);
+            return out;
+        })
         .def("ablate", [](E& e, int slot, int row, Scalar value) {
             if (row >= 0) e.debug(false);
             e.ablate_slot = slot; e.ablate_row = row; e.ablate_value = value;
@@ -180,7 +210,8 @@ void bind_engine(py::module_& m, const char* name) {
                 reinterpret_cast<std::uintptr_t>(&E::abi_write),
                 reinterpret_cast<std::uintptr_t>(&E::abi_step),
                 reinterpret_cast<std::uintptr_t>(&E::abi_trace),
-                e.bank.trace_rows, e.bank.primary_width);
+                e.bank.trace_rows, e.bank.primary_width,
+                reinterpret_cast<std::uintptr_t>(e.memory));
         });
 }
 
@@ -198,7 +229,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("info", [](const std::string& name) {
         const Bank& b = chip_bank(name);
         return py::dict(py::arg("scalar") = b.scalar, py::arg("n_circuits") = b.n_circuits,
-                        py::arg("memory") = b.memory, py::arg("f_bits") = b.f_bits);
+                        py::arg("memory") = b.memory);
     });
     // A new engine, with its own zeroed memory, for the named chip.
     m.def("engine", [](const std::string& name) -> py::object {

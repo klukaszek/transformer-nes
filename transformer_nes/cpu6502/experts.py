@@ -1,8 +1,10 @@
-"""Construct the fixed opcode, interrupt and shape expert bank.
+"""Construct the CPU's executions: per opcode, the interrupts, fixed shapes
+of several instructions, counter loops and device-read requests.
 
-The stages are explicit: fold a candidate, prove its dispatch license,
-project architectural effects, schedule weights, then lower its runtime ABI.
-Execution contracts live in execution.py; folding and numerical licenses live together in folds.py.
+The stages are explicit: fold a candidate, prove its dispatch license, then
+project its architectural effects. Execution contracts live in execution.py,
+folding and numerical licenses in folds.py; chip.py gives each its named
+outputs as a specialization of the CPU chip.
 """
 
 from __future__ import annotations
@@ -18,11 +20,8 @@ from transformer_nes.cpu6502.execution import (
     WRITE_RECEIPTS,
     ArchitecturalOutput,
     ExecutionGraph,
-    lower_execution,
     project_sequence_execution,
-    readout_slots,
     shape_timing,
-    step_spec_base,
 )
 from transformer_nes.cpu6502.folds import (
     SEQUENCE_FEEDBACK,
@@ -42,7 +41,6 @@ from transformer_nes.cpu6502.shapes import (
 from transformer_nes.cpu6502.spec import BRANCH_OPERATIONS, MEMORY_MODES, OPCODES, READS_MEMORY
 from transformer_nes.graph.core import MemoryReadDimension
 from transformer_nes.graph.fold import GraphFolder, const_of, linear_input_form
-from transformer_nes.model.compiler import layer_arrays
 from transformer_nes.model.schedule import asap_schedule
 from transformer_nes.model.weights import build_model
 
@@ -134,18 +132,13 @@ def build_interrupt_experts(pg) -> list[dict]:
             raise RuntimeError(
                 f"{label}: pins reach insert-side expressions of {r.insert_side_hazards}"
             )
-        execution = project_sequence_execution(r, 1)
-        model, _tok_to_idx, info = schedule_and_build(execution)
-        spec = lower_execution(execution, info)
         experts.append(
             {
                 "kind": "exec_int",
                 "name": name,
                 "nmi": name == "int_nmi",
                 "n_steps": 1,
-                "model": model,
-                "step_spec": spec,
-                "output_slots": readout_slots(spec),
+                "execution": project_sequence_execution(r, 1),
             }
         )
     return experts
@@ -267,9 +260,7 @@ def build_execution_expert(
         (inlined[0], inlined[2]),
         label,
     ):
-        r, execution, materialized = inlined_r, inlined_execution, inlined
-    model, _tok_to_idx, info = materialized
-    spec = lower_execution(execution, info)
+        execution = inlined_execution
     expert = {
         "kind": "exec_opcode" if expert_kind == "exec_resume" else expert_kind,
         "read_resume": read_resume,
@@ -278,9 +269,7 @@ def build_execution_expert(
         "opcode_checks": checks,
         "length": len(template),
         "n_steps": n_steps,
-        "model": model,
-        "step_spec": spec,
-        "output_slots": readout_slots(spec),
+        "execution": execution,
         **shape_timing(execution, self_target),
     }
     metadata = {
@@ -337,14 +326,15 @@ def build_core_experts(pg) -> tuple[list[dict], list[dict]]:
 def build_read_request_experts(pg) -> list[dict]:
     """Project address and access timing from the instruction graph.
 
-    These weights run before an effectful read. They neither consume the
+    These circuits run before an effectful read. They neither consume the
     operand byte nor commit architectural state, writes or interrupts.
+    Opcodes whose requests fold alike share one circuit in the chip.
     """
     dims = {dim.name: dim for dim in pg.all_dims}
     fields = ("ea", "cycles", "fetched_operand_lo", "fetched_operand_hi")
     request = pg.with_outputs({"READ_REQUEST": sum(dims[name] for name in fields)})
     folder = GraphFolder(request, root_names=fields, structural_reads=True)
-    circuits = {}
+    experts = []
     for byte, op in sorted(OPCODES.items()):
         if op.operation not in READS_MEMORY or op.mode not in MEMORY_MODES:
             continue
@@ -352,43 +342,11 @@ def build_read_request_experts(pg) -> list[dict]:
         folded = folder.fold(pins, label=f"read_{byte:02X}", inline_linear=True)
         if "operand_mem" in folded.dim_of_name:
             raise RuntimeError(f"read {byte:02X}: timing depends on the unserved operand")
-        model, _, info = schedule_and_build(folded)
-
-        def slot(name, info=info, folded=folded):
-            return info.slot_of[folded.dim_of_name[name]]
-
-        spec = step_spec_base(slot)
-        spec["outputs"] = {
-            "address": slot("ea"),
-            "cycles": slot("cycles"),
-            "oplo": slot("fetched_operand_lo"),
-            "ophi": slot("fetched_operand_hi"),
-        }
-        # Share only byte-for-byte identical weights, read layouts and
-        # embedding/readout contracts; opcode names are not a proof.
-        signature = (
-            repr(spec),
-            model.one_slot,
-            model.tok.weight.shape[1],
-            tuple(
-                tuple(
-                    (name, array.shape, array.tobytes())
-                    for name, array in sorted(layer_arrays(model, i).items())
-                )
-                for i in range(len(model.attn))
-            ),
+        experts.append(
+            {"kind": "read_request", "name": f"read_{byte:02X}", "bytes": [byte],
+             "graph": folded.program_graph}
         )
-        if signature not in circuits:
-            circuits[signature] = {
-                "kind": "read_request",
-                "name": f"read_{byte:02X}",
-                "bytes": [],
-                "model": model,
-                "step_spec": spec,
-                "output_slots": readout_slots(spec),
-            }
-        circuits[signature]["bytes"].append(byte)
-    return list(circuits.values())
+    return experts
 
 
 def build_counter_recurrence_experts() -> list[dict]:
@@ -415,9 +373,6 @@ def build_counter_recurrence_experts() -> list[dict]:
             cycle_bounds=(255 * 255,),
             dim_of_name=dims,
         )
-        model, _rows, info = schedule_and_build(execution)
-        spec = lower_execution(execution, info)
-        spec["outputs"] = {"iterations": info.slot_of[dims["loop_iterations"]]}
         experts.append(
             {
                 "kind": "exec_loop",
@@ -425,9 +380,7 @@ def build_counter_recurrence_experts() -> list[dict]:
                 "n_steps": 0,
                 "reg": reg,
                 "delta": delta,
-                "model": model,
-                "step_spec": spec,
-                "output_slots": readout_slots(spec),
+                "execution": execution,
             }
         )
     return experts

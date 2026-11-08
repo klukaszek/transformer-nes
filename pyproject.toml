@@ -27,9 +27,7 @@ dev = [
 6502-klaus = "transformer_nes.cpu6502.conformance.klaus:main"
 6502-nestest = "transformer_nes.cpu6502.conformance.nestest:main"
 6502-transformer = "transformer_nes.cpu6502.runner:main"
-6502-export = "transformer_nes.cpu6502.checkpoint.export:main"
-6502-checkpoint = "transformer_nes.cpu6502.checkpoint.dense_runner:main"
-6502-experts = "transformer_nes.cpu6502.checkpoint.expert_runner:main"
+6502-eager = "transformer_nes.cpu6502.eager:main"
 nes-run = "transformer_nes.frontend.app:main"
 
 [build-system]

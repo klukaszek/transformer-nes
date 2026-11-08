@@ -61,6 +61,20 @@ class TokenGraph:
         return replace(self, program_graph=projected, outputs=tuple(outputs), experts=experts)
 
 
+@dataclass(frozen=True)
+class TokenFamily:
+    """A token type whose specializations are separately constructed
+    circuits (a CPU opcode's execution, a shape of several instructions)
+    sharing one named interface. Each circuit names every input it reads
+    and every output; it has no general circuit."""
+
+    inputs: Sequence[str]
+    outputs: Sequence[str]
+    members: Mapping[str, ProgramGraph]
+    reassociate_residuals: bool = True
+    experts: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+
+
 def construct(program_graph: ProgramGraph):
     """(weights, token rows, build info) of a scheduled program graph."""
     schedule = asap_schedule(program_graph, log=lambda _: None)
@@ -98,6 +112,9 @@ def circuits(name: str, token: TokenGraph, *, dtype: str = "int32") -> list[tupl
     Pins name persist dims; partial evaluation cannot fold an input or an
     unknown name, so such a specialization would be a copy of the full circuit.
     """
+    if isinstance(token, TokenFamily):
+        return [(spec, describe(token, graph, list(graph.all_dims), dtype=dtype))
+                for spec, graph in token.members.items()]
     persists = {d.name for d in token.program_graph.all_dims if d.kind == "persist"}
     named = Counter(d.name for d in token.program_graph.all_dims)
     if ambiguous := sorted(o for o in token.outputs if named[o] > 1):
@@ -163,6 +180,7 @@ def transformer(description: dict) -> Transformer:
         input_slots=torch.tensor(description["input_slots"]),
         output_slots=torch.tensor(description["output_slots"]),
         dtype=torch.float32 if floating else torch.int32,
+        f_bits=description["fraction_bits"],
     )
 
 
@@ -175,7 +193,7 @@ def circuit_key(circuit: Transformer) -> bytes:
     return h.digest()
 
 
-def construct_chip(tokens: Mapping[str, TokenGraph], *, memory_size: int, dtype: str = "int32",
+def construct_chip(tokens: Mapping[str, TokenGraph | TokenFamily], *, memory_size: int, dtype: str = "int32",
                    constants: Mapping[str, int] | None = None,
                    views: Mapping[str, Mapping] | None = None) -> Chip:
     """A chip's token types as one model.transformer.Chip. ``views`` name
@@ -183,7 +201,6 @@ def construct_chip(tokens: Mapping[str, TokenGraph], *, memory_size: int, dtype:
     ``outputs``, optionally the base ``specializations`` read): they are
     compiled from the base's weights and store none of their own."""
     described = {name: circuits(name, token, dtype=dtype) for name, token in tokens.items()}
-    f_bits = max(d["fraction_bits"] for cs in described.values() for _, d in cs)
     token_types = {}
     for name, token in tokens.items():
         # Different pins can fold to the same circuit (a projection drops the
@@ -202,7 +219,7 @@ def construct_chip(tokens: Mapping[str, TokenGraph], *, memory_size: int, dtype:
             same=same, reassociate_residuals=token.reassociate_residuals,
         )
     return Chip(
-        token_types, memory_size=memory_size, f_bits=f_bits,
+        token_types, memory_size=memory_size,
         dtype=torch.float32 if dtype == "float32" else torch.int32, constants=constants,
         views={name: {"base": v["base"], "outputs": list(v["outputs"]),
                       "specializations": v.get("specializations")} for name, v in (views or {}).items()},

@@ -35,11 +35,12 @@ flowchart LR
 | Graph language | [`graph/core.py`](../transformer_nes/graph/core.py), [`graph/ops.py`](../transformer_nes/graph/ops.py) | Inputs, attention lookups, ReGLUs, linear persists and captured graphs. A ReGLU computes `a * max(0, b)`. |
 | Partial evaluation | [`graph/evaluate.py`](../transformer_nes/graph/evaluate.py), [`graph/fold.py`](../transformer_nes/graph/fold.py) | Substitute licensed constants, remove dead work and rebuild a graph. Each construction has its own node identities and interning state. |
 | CPU composition and proofs | [`cpu6502/folds.py`](../transformer_nes/cpu6502/folds.py) | Chain instruction graphs with register feedback and symbolic PC offsets; bound reads, identify constants and check symbolic control flow before dispatch. |
-| CPU effects | [`cpu6502/execution.py`](../transformer_nes/cpu6502/execution.py) | Project a licensed graph to final state, ordered writes, control and cycles. Lower graph dimensions to residual slots after scheduling. |
+| CPU effects | [`cpu6502/execution.py`](../transformer_nes/cpu6502/execution.py) | Project a licensed graph to final state, ordered writes, control and cycles. |
 | Expert construction | [`cpu6502/experts.py`](../transformer_nes/cpu6502/experts.py) | Orchestrate folding, validation, projection and construction in stable dispatch order. |
 | Layers and weights | [`model/schedule.py`](../transformer_nes/model/schedule.py), [`model/weights.py`](../transformer_nes/model/weights.py) | Schedule attention/linear/FFN phases and construct their actual matrices. |
 | Weight lowering | [`model/compiler.py`](../transformer_nes/model/compiler.py), [`model/ssa.py`](../transformer_nes/model/ssa.py) | Expand the matrices into integer or float32 FX operations, lower compact scalar SSA and compile fixed native kernels. |
-| CPU runtime | [`cpu6502/native/engine.cpp`](../transformer_nes/cpu6502/native/engine.cpp), [`cpu6502/engine.py`](../transformer_nes/cpu6502/engine.py) | Embed live inputs, dispatch kernels and commit licensed effects within device and cycle budgets. |
+| CPU chip | [`cpu6502/chip.py`](../transformer_nes/cpu6502/chip.py) | Give every execution the step token's named outputs (constants and untouched state included) and compute the run loop's dispatch tables. |
+| CPU runtime | [`native/console/cpu.cpp`](../native/console/cpu.cpp) | Hold the state in the circuits' input layout, dispatch them and commit their effects within device and cycle budgets. |
 
 The graph and model packages are independent of the CPU package. The neural
 construction and runtime paths also import without loading the reference CPU
@@ -67,18 +68,15 @@ expert, not a model compiled for this instruction address or game.
    | Cycles | Constant two |
    | Writes | None |
 
-3. Scheduling assigns residual slots to the live dimensions. `lower_execution`
-   converts those dimensions to the slot-based specification consumed by the
-   runtime and standalone checkpoint runner. Slot indices are layout details;
-   the architectural effects above are the stable meaning.
-4. The runtime embeds PC, runs the expert's matrices against the current byte
-   image, and commits A=`$42`, Z=0, N=0 and the model's next PC. It retires two
-   cycles using the licensed constant effect.
+3. `cpu6502/chip.py` names the effects as the step token's outputs: model
+   values as themselves, constants and preserved values as outputs of their
+   own, so every execution has the same interface.
+4. The runtime runs the execution's matrices against the current byte image
+   and commits A=`$42`, Z=0, N=0, the model's next PC and its two cycles.
 
 `ArchitecturalOutput` represents a model dimension, a constant or preservation
 directly. Its source is derived from those fields. There is no intermediate
-classification dictionary of dimension names to decode again. The final slot
-specification remains a dictionary because it is also the checkpoint wire format.
+classification dictionary of dimension names to decode again.
 
 ## What the compiler specializes
 
@@ -124,14 +122,10 @@ status bits use the 14-unit serial extractor without extending the CPU union's
 critical path. These changes reduce actual analytic matrices before native
 lowering.
 
-Checkpoint storage is separate from arithmetic precision. Exported coefficient,
-embedding and CSR routing tensors use the smallest exact signed integer type
-per tensor (int8, int16 or int32). On load, both standalone runners widen data
-to int32 and indices to int64. No rounding, quantization or changed fixed-point
-scale is involved. The CPU union's nonzero coefficient count falls from 40,824
-to 27,536; its checkpoint falls from 850 KiB to 593 KiB through circuit changes,
-then to 281 KiB through storage packing. The CPU union and PPU expert bank
-represent different circuits; size comparisons must cover the same bank.
+Storage is separate from arithmetic precision. The saved model packs each
+tensor into the smallest exact signed integer type (int8, int16 or int32) and
+widens it on load. No rounding, quantization or changed fixed-point scale is
+involved.
 
 ## What executes as neural work
 
@@ -154,15 +148,12 @@ scalar argument/result arrays disappear during native optimization. Tile residua
 clears are cancelled without flattening their other projection expressions.
 Lowering does not import Inductor or Dynamo, and emits no fusion-phase buffers.
 
-CPU kernels return only their live architectural readouts, packed contiguously.
-The CPU caller decodes that packet directly, using a layout derived from its
-effect specification during compilation. Kernels write directly into the
-caller's separate output buffer; there is no copy or expansion back to a
-residual buffer. Inputs are embedded afresh for each call; unused output slots
-are not initialized. Full layer traces retain their complete
-residual layout. PPU kernels already return their named token outputs directly.
-The generic weight compiler consumes declared input/output slots; the CPU's
-effect schema and output ordering stay in its backend.
+Kernels return their token's named outputs directly into the caller's buffer;
+there is no copy or expansion back to a residual buffer. Fraction bits are a
+circuit's own: the 24 CPU executions with half-unit weights decode their
+readouts, the rest skip it. The CPU host keeps its state in the circuits' input
+layout, so a step's outputs commit straight into the next step's inputs. Full
+layer traces retain their complete residual layout.
 
 The graph fold licenses indexed reads over the latest-written byte image before
 scheduling. This replaces the declared memory attention's address-selection
@@ -174,8 +165,8 @@ Opcode, interrupt and instruction-shape experts expose their next PC as an archi
 alongside registers and flags. Its weights compute fallthrough, branch tests,
 signed relative targets, jumps and returns. The runtime commits the returned PC
 as a 16-bit field; it does not reread control operands or select branch targets.
-The exported expert checkpoint uses the same state-readout contract (execution
-ABI 3); its standalone runner also has no branch or jump implementation.
+The eager runner (`cpu6502/eager.py`) reads the same outputs; it has no
+branch or jump implementation either.
 
 The host owns scheduling, opcode/shape routing, interrupt eligibility and
 delivery of neural device effects. CPU, PPU, APU, controller and mapper
@@ -514,17 +505,10 @@ bounds as well as replay hashes.
 
 ## Runtime ownership and observation
 
-The complete execution bank is attached before play, with no native neural
-forward fallback or background learner. Cached starts load compiled extensions;
-initial compilation can take several minutes. Artifact locks cover writing,
-loading and publication, and pruning skips active builds. Generic build/cache
-lifecycle lives in `transformer_nes/build.py`; CPU source sharding lives in
-`weights/engine.py`, alongside source emission. `native/machine_abi.h` defines
-the console interface.
-
-After a cold CPU build, construction graphs are released and their cycles are
-collected before gameplay. Evaluators share work while their source graph is
-live; the compiler retains no global execution-folder cache owning that graph.
+The compiled model is attached before play, with no fallback or background
+learner. Cached starts load the saved model and its library; a cold start
+constructs (seconds) and compiles it. The library is published by rename, so a
+concurrent identical build is harmless.
 
 Dense models and debug graphs are built on demand. CPU/PPU X-rays label actual
 residual live ranges, and ablation intervenes on a computed residual value.
@@ -780,11 +764,11 @@ attention: translation on every read may cost more than occasional copies.
 ## Evidence and research scope
 
 `uv run pytest` checks graph isolation, folding licenses, exact expert forwards,
-reference/checkpoint agreement, device timing, rendering and diagnostic
+reference/eager agreement, device timing, rendering and diagnostic
 interventions. The reference CPU shares declarative opcode metadata with the
 compiler; nestest's external golden log and conformance ROMs provide additional
-checks beyond that shared definition. Standalone union and routed-expert runners
-retain independent PyTorch inference implementations, including softmax attention.
+checks beyond that shared definition. The eager runner checks the saved model by
+PyTorch alone.
 
 The current evidence supports a constructive neural implementation and compiler
 for this supported machine. It does not demonstrate learned execution,

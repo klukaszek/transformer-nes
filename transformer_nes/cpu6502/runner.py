@@ -1,141 +1,79 @@
-"""Construct and run the 6502 analytic transformer weights backend.
+"""Run the 6502 as the NES model's CPU chip.
 
-The graph is scheduled, converted to analytic weights and compiled through scalar SSA.
-Python owns construction, caching and the public machine API; the C++ shell
-owns scheduling, architectural readout and device arbitration.
+The weights (cpu6502/chip.py) compute every instruction; the native host
+(native/console/cpu.cpp) keeps the registers between steps and arbitrates
+device reads, watched writes, interrupts and budgets. This module is its
+Python machine API: for the console's bus, conformance runs and the X-ray.
 """
 
 from __future__ import annotations
 
 import argparse
 import functools
-import gc
 import logging
 import time
+from pathlib import Path
 
-from transformer_nes.cpu6502.engine import (
-    GeneratedWeightsEngine,
-    engine_config_key,
-)
-from transformer_nes.cpu6502.execution import step_spec_base
-from transformer_nes.cpu6502.experts import build_core_experts
-from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, Cpu6502Graph
-from transformer_nes.cpu6502.shapes import match_shape_windows, with_loops
+from transformer_nes import build
+from transformer_nes.cpu6502 import chip
+from transformer_nes.cpu6502.shapes import match_shape_windows
 from transformer_nes.cpu6502.spec import FLAG_I, FLAG_U
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
-from transformer_nes.graph.fold import GraphFolder
-from transformer_nes.model.schedule import asap_schedule
-from transformer_nes.model.weights import build_model
 
 logger = logging.getLogger(__name__)
 
 
+@functools.cache
+def decimal_model():
+    """A 6502 with decimal mode, for 6502 conformance (the NES's 2A03 has
+    none): a model of its own beside the console's."""
+    from transformer_nes.nes.model import CACHE_DIR, NES
+
+    directory = Path(CACHE_DIR) / "decimal"
+    return NES.load(directory, {"cpu": functools.partial(chip.chip, bcd=True)}).compile(directory)
+
+
 class Cpu6502TransformerMachine:
-    """The 6502 as actual transformer weights, stepped position by position."""
+    """The 6502 as transformer weights, run instruction by instruction."""
 
-    def __init__(
-        self,
-        *,
-        bcd: bool = False,
-        union_only: bool = False,
-        mirror_cpu_ram: bool = False,
-    ):
-        self.bcd = bool(bcd)
+    def __init__(self, *, bcd: bool = False, union_only: bool = False, mirror_cpu_ram: bool = False,
+                 shapes: bool = True):
+        from transformer_nes.nes.model import compiled
+
+        self.bcd, self.union_only, self.shapes = bool(bcd), bool(union_only), bool(shapes)
         self.mirror_cpu_ram = bool(mirror_cpu_ram)
-        # The shell embeds inputs and commits neural readouts. The complete
-        # immutable Torch bank is attached before the machine can execute.
-        cache_key = engine_config_key(
-            bcd=bcd,
-            union_only=union_only,
-            mirror_cpu_ram=self.mirror_cpu_ram,
-        )
-        engine = GeneratedWeightsEngine.from_cache(cache_key)
-        if engine is not None:
-            logger.info("engine cache hit (%d experts)", engine.n_experts)
-        if engine is None:
-            # Union diagnostics run whole instructions until a device read
-            # requires the same retained continuation as production.
-            core, meta = self.core_experts()
-            experts, shapes_meta = (
-                (
-                    [
-                        e | {"hook_id": i, "external_only": e.get("read_resume", False)}
-                        for i, e in enumerate(core)
-                        if e["kind"] == "read_request" or e.get("read_resume")
-                    ],
-                    [],
-                )
-                if union_only
-                else (core, meta)
-            )
-            engine = GeneratedWeightsEngine(
-                self.model,
-                step_spec=self.step_spec(),
-                experts=experts,
-                cache_key=cache_key,
-                shapes_meta=shapes_meta,
-                mirror_cpu_ram=self.mirror_cpu_ram,
-                union_id=len(core),
-            )
-            # Execution owns its compiled weights and embedding metadata.
-            # Rebuild the dense reference model only if a caller asks for it.
-            for cached in ("built", "execution_fold", "dim_by_name", "pg", "graph"):
-                self.__dict__.pop(cached, None)
-            del core, meta, experts, shapes_meta
-            # Collect compiler graph cycles before the first gameplay frame.
-            gc.collect()
-        self.engine = engine
-        from transformer_nes.cpu6502.bank import ForwardBank
+        self.chip = (decimal_model() if self.bcd else compiled()).chip("cpu")
+        hardware = build.load_nes_extension("hardware")
+        self.engine = hardware.Cpu(self.chip, chip.tables(self.chip, union_only=union_only), self.mirror_cpu_ram)
 
-        self.forwards = ForwardBank(self)
+    @property
+    def windows(self) -> list[dict]:
+        """The shape windows to find in code (shapes.py:match_shape_windows);
+        none when instructions run one by one (`shapes` off, or the union)."""
+        return [] if self.union_only or not self.shapes else self.chip.chip.constants["windows"]
 
-    # ── The graph and the union model, built when needed ────────────
-    # (a cached engine needs neither: the folds, a rebuild and the X-ray do)
+    # ── The X-ray: the union circuit, model 0 ───────────────────────
 
     @functools.cached_property
-    def graph(self) -> Cpu6502Graph:
-        return Cpu6502Graph(bcd=self.bcd, wide_bits=True)
+    def layout(self):
+        """The union circuit's construction info (which residual slot holds
+        each named value, and when): reconstructed on demand."""
+        from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, Cpu6502Graph
+        from transformer_nes.graph.fold import GraphFolder
+        from transformer_nes.model.construct import construct
 
-    @functools.cached_property
-    def pg(self):
-        return self.graph.program_graph()
+        pg = Cpu6502Graph(bcd=self.bcd, wide_bits=True).program_graph()
+        fold = GraphFolder(pg, root_names=RUNTIME_READ_DIMS, structural_reads=True).fold({}, label="union")
+        return construct(fold.program_graph)[2]
 
-    @functools.cached_property
-    def execution_fold(self):
-        return GraphFolder(self.pg, root_names=RUNTIME_READ_DIMS, structural_reads=True).fold(
-            {}, label="union"
-        )
+    slot_of = property(lambda self: self.layout.slot_of)
+    lives = property(lambda self: self.layout.lives)  # residual live ranges (frontend/xray.py)
 
-    @functools.cached_property
-    def dim_by_name(self) -> dict:
-        return self.execution_fold.dim_of_name
-
-    @functools.cached_property
-    def built(self) -> tuple:
-        """(the union model, its token rows, its build info)."""
-        graph = self.execution_fold.program_graph
-        sched = asap_schedule(graph)
-        return build_model(program_graph=graph, schedule=sched)
-
-    model = property(lambda self: self.built[0])
-    slot_of = property(lambda self: self.built[2].slot_of)
-    lives = property(lambda self: self.built[2].lives)  # residual live ranges (frontend/xray.py)
-
-    def core_experts(self) -> tuple[list[dict], list[dict]]:
-        """The core engine's experts in its build order (the forward hook's
-        ids 0..), and the shapes' metadata (experts.py:build_core_experts;
-        folds cached)."""
-        # Imported here: the fold cache shapes no engine (transformer_nes/build.py).
-        from transformer_nes.cpu6502.folds import cached_fold
-
-        experts, meta = cached_fold(f"core_bcd{int(self.bcd)}", lambda: build_core_experts(self.pg))
-        return with_loops(experts), meta
-
-    def step_spec(self) -> dict:
-        """Slot map for the generated C++ union step (engine.py)."""
-        spec = step_spec_base(lambda name: self.slot_of[self.dim_by_name[name]])
-        spec["outputs"] = {name: self.slot_of[self.dim_by_name[name]] for name in RUNTIME_READ_DIMS}
-        return spec
+    def trace_union(self):
+        """The next instruction through the union circuit: every layer's
+        residual stream, and its fraction bits."""
+        union = self.chip.chip.tokens["union"].general
+        return self.chip.engine.trace(self.engine.union_inputs()), union.f_bits
 
     # ── Machine protocol used by the NES bus and test harness ────────
 
@@ -150,11 +88,8 @@ class Cpu6502TransformerMachine:
         self.engine.seed_image(bytes(ram))
         self.engine.set_run_state(start_pc, 0, 0, 0, 0xFD, FLAG_U | FLAG_I, 0, 0, 0, 0, 0, 0)
         self.engine.clear_windows()
-        for sid, head in match_shape_windows(ram, self.engine.shapes_meta):
+        for sid, head in match_shape_windows(ram, self.windows):
             self.engine.add_window(sid, head)
-
-    def trace_union(self):
-        return self.forwards.trace_union(), 1
 
     def set_nmi(self):
         """The interrupt sequence itself runs inside the weights."""
@@ -170,20 +105,14 @@ class Cpu6502TransformerMachine:
         self.engine.inject_write(addr, value)
 
     def map_region(self, base: int, data: bytes):
-        """Replace a mapped cartridge region without creating WRITE tokens
-        (the engine's map_write stamps state in place; no sequence advance)."""
+        """Replace a mapped cartridge region in place: no CPU write happens."""
         self.engine.map_region(base, data)
         for sid, head in self.region_windows(base, data):
             self.engine.add_window(sid, head)
 
     def region_windows(self, base: int, data: bytes) -> tuple:
         """Match newly mapped code. The native console owns bank-content caching."""
-        return tuple(match_shape_windows(data, self.engine.shapes_meta, base=base))
-
-    def machine_abi(self) -> tuple[int, int, int]:
-        """(version, engine, table) for native callers (native/machine_abi.h).
-        This object must outlive its native callers."""
-        return self.engine.machine_abi()
+        return tuple(match_shape_windows(data, self.windows, base=base))
 
     def run_image(self, memory_image, *, start_pc: int, max_steps: int) -> Trace:
         """The native run's arrays as the canonical reference trace."""
@@ -245,8 +174,8 @@ class Cpu6502TransformerMachine:
         per chunk), so the full Klaus suite verifies without materializing a
         30M-row trace.  Yields the run-protocol result dict for each chunk.
 
-        The latest-written byte image has fixed size, so execution and
-        streaming stay bounded independently of the token log.
+        Memory is a fixed byte image, so execution and streaming stay bounded
+        however long the run.
         """
         self.load_image(memory_image, start_pc=start_pc)
         done = 0
@@ -329,10 +258,6 @@ def main() -> None:
     args = parser.parse_args()
 
     machine = Cpu6502TransformerMachine(bcd=False)
-    logger.info(
-        "transformer: d_model=%d exact-int32",
-        machine.engine.d_model,
-    )
 
     image = verify_program()
     run_start = time.perf_counter()

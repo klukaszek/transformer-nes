@@ -8,14 +8,10 @@ section contains these range and control-flow checks.
 
 from __future__ import annotations
 
-import os
-import pickle
-import zlib
 from dataclasses import dataclass
 
 import numpy as np
 
-from transformer_nes import build
 from transformer_nes.cpu6502.spec import READS_MEMORY
 from transformer_nes.graph import core as graph
 from transformer_nes.graph.core import (
@@ -433,21 +429,6 @@ class SequenceFolder(GraphFolder):
             dim_of_name=dim_of_name,
             insert_side_hazards=tuple(sorted(set().union(*(step.hazards for step in steps)))),
         )
-
-
-def cached_fold(name: str, builder):
-    code = build.source_digest(
-        "transformer_nes.cpu6502.experts", "transformer_nes.cpu6502.graph"
-    )
-    digest = code[:16]
-    path = os.path.join(build.CACHE_DIR, f"build_{digest}_{name}.pklz")
-    with build.artifact_lock(digest):
-        if not os.path.exists(path):
-            build.write_atomic(path, zlib.compress(pickle.dumps(builder())))
-        with open(path, "rb") as source:
-            result = pickle.loads(zlib.decompress(source.read()))
-        build.manifest_put(f"fold:{name}", {"kind": "fold", "digest": digest}, code=code)
-        return result
 
 
 def const_root(fold_result, root: str, k: int, label: str) -> int:

@@ -1,10 +1,7 @@
 """The flagship claim: the 6502 executes as real transformer weights.
 
-Builds the analytic weights (ASAP schedule, no training) and runs genuine
-transformer inference -- per-position embeddings, Q/K/V projections, and
-licensed exact attention state
-attention, ReGLU FFN, output head -- lockstep against the
-reference core, through the compiled int32 Torch bank.
+Builds the analytic weights (ASAP schedule, no training) and runs them --
+the NES model's CPU chip, compiled -- lockstep against the reference core.
 """
 
 from __future__ import annotations
@@ -37,8 +34,7 @@ def lockstep_vs_reference(trace, image):
 def test_write_effects_carry_rmw_operands_without_host_opcode_decoding(union_only):
     from transformer_nes.cpu6502.spec import MODE_ACCUMULATOR, OPCODES
 
-    machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only)
-    machine.engine.shapes_meta = []
+    machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only, shapes=False)
     rmw_operations = {"inc", "dec", "asl", "lsr", "rol", "ror", "dcp", "isb", "slo", "rla", "sre", "rra"}
     for op in OPCODES.values():
         for value in (0, 1, 127, 128, 254, 255):
@@ -99,22 +95,18 @@ def test_transformer_weights_match_reference():
     lockstep_vs_reference(trace, image)
 
 
-def test_region_ops_keep_write_position_in_sync():
-    """Mapping a bank adds no WRITE tokens; a later injected write must
-    still agree with the engine's sequence position."""
+def test_mapped_regions_and_writes_land_in_place():
+    """Mapping a bank replaces bytes where they are; writes still land."""
     machine = Cpu6502TransformerMachine(bcd=False)
     machine.load_image(bytes(65536), start_pc=0x0400)
-    position = machine.get_state()["pos"]
     machine.map_region(0x8000, bytes(range(1, 65)))
     machine.inject_write(0x0010, 0x42)
-    machine.map_region(0x9000, bytes(range(1, 65)))
+    machine.map_region(0xFFF0, bytes(range(1, 33)))  # wraps at $FFFF
     machine.inject_write(0x0011, 0x43)
     assert machine.read_ram(0x8001) == 2
-    assert machine.read_ram(0x9001) == 2
+    assert (machine.read_ram(0xFFFF), machine.read_ram(0x0000)) == (16, 17)
     assert machine.read_ram(0x0010) == 0x42
     assert machine.read_ram(0x0011) == 0x43
-
-    assert machine.get_state()["pos"] == position + 2
 
 
 @pytest.mark.slow
@@ -274,7 +266,7 @@ def test_fixed_shapes_match_per_step():
         if mode == "compact":
             m.engine.clear_windows()
         # Every idiom in the program must be covered by a library shape.
-        assert len(match_shape_windows(image, m.engine.shapes_meta)) == 4
+        assert len(match_shape_windows(image, m.windows)) == 4
         chunks = []
 
         def drain(n, chunks=chunks, m=m):
@@ -419,8 +411,7 @@ def test_neural_next_pc_covers_branch_and_address_wrap_boundaries():
     NOP also needs a forward: advancing its PC is neural work, despite
     preserving every byte register and flag.
     """
-    machine = Cpu6502TransformerMachine()
-    machine.engine.shapes_meta = []
+    machine = Cpu6502TransformerMachine(shapes=False)
     cases = [
         (head, bytes([opcode, offset]), flags)
         for opcode in (0x10, 0x30, 0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0)
@@ -433,7 +424,7 @@ def test_neural_next_pc_covers_branch_and_address_wrap_boundaries():
         for head in (0xFFFE, 0xFFFF)
         for code in (b"\xea", b"\xa9\x42", b"\x4c\xff\xff", b"\x4c\x00\x00")
     ]
-    calls_before = machine.forwards.counts[0]
+    machine.engine.xray_take()
     for head, code, flags in cases:
         image = bytearray(65536)
         for offset, byte in enumerate(code):
@@ -451,7 +442,9 @@ def test_neural_next_pc_covers_branch_and_address_wrap_boundaries():
         assert (actual["pc"], actual["a"], actual["p"], result["cycles"]) == (
             ref.pc, ref.a, ref.p, cycles
         ), (head, code.hex(), flags)
-    assert machine.forwards.counts == (calls_before + len(cases), 0)
+    # Each ran its opcode's own execution: none fell back to the union.
+    paths, _ops, _dispatches = machine.engine.xray_take()
+    assert (paths[2], paths[3]) == (len(cases), 0)
 
 
 @pytest.mark.slow
@@ -535,9 +528,9 @@ def test_loop_recurrences_are_single_steps_exactly():
         m = Cpu6502TransformerMachine(bcd=False)
         m.load_image(bytes(image), start_pc=0x8000)
         m.map_region(0x8000, code)  # registers the ROM's shape windows
-        m.engine.engine.xray_take()
+        m.engine.xray_take()
         out = m.run(100_000, max_cycles=budget, trace=False)
-        _paths, _ops, dispatches = m.engine.engine.xray_take()
+        _paths, _ops, dispatches = m.engine.xray_take()
 
         ref = reference.Cpu6502(memory=bytearray(image), bcd_enabled=False)
         ref.pc = 0x8000
@@ -562,9 +555,9 @@ def test_loop_recurrences_are_single_steps_exactly():
 
 def test_parallel_flag_readouts_match_reference_for_every_byte():
     """Wrap boundaries and shifted-out bits must preserve all architectural flags."""
-    machine = Cpu6502TransformerMachine()
-    machine.engine.shapes_meta = []
+    machine = Cpu6502TransformerMachine(shapes=False)
     machine.load_image(bytes(65536), start_pc=0x8000)
+    machine.engine.xray_take()
     ref = reference.Cpu6502(memory=bytearray(65536), bcd_enabled=False)
     cases = [bytes([opcode]) for opcode in (0xE8, 0xC8, 0xCA, 0x88, 0x0A, 0x2A, 0x4A, 0x6A)]
     cases += [bytes([opcode, 0x20]) for opcode in (0xE6, 0xC6, 0x06, 0x26, 0x46, 0x66)]
@@ -596,7 +589,7 @@ def test_parallel_flag_readouts_match_reference_for_every_byte():
                 ), (code.hex(), value, carry)
                 assert int(out["cycles"]) == cycles
                 assert machine.read_ram(0x20) == ref.memory[0x20]
-    assert machine.forwards.counts[1] == 0
+    assert machine.engine.xray_take()[0][3] == 0  # no instruction fell back to the union
 
 
 def test_counter_recurrences_cover_byte_wrap_and_page_cross_budgets():
@@ -633,30 +626,3 @@ def test_counter_recurrences_cover_byte_wrap_and_page_cross_budgets():
                         ref.p,
                     ), (opcode, head, value, budget)
                     assert (result["steps"], result["cycles"]) == (steps, cycles)
-
-
-def test_cold_build_releases_reference_weights_and_still_executes(monkeypatch):
-    import gc
-    import weakref
-
-    from transformer_nes.cpu6502 import runner
-
-    models = []
-    build_model = runner.build_model
-
-    def track_model(*args, **kwargs):
-        result = build_model(*args, **kwargs)
-        models.append(weakref.ref(result[0]))
-        return result
-
-    monkeypatch.setattr(runner, "build_model", track_model)
-    monkeypatch.setattr(runner.GeneratedWeightsEngine, "from_cache", staticmethod(lambda key: None))
-    machine = runner.Cpu6502TransformerMachine(bcd=False)
-    gc.collect()
-    assert models and all(model() is None for model in models)
-
-    image = bytearray(0x10000)
-    image[0x8000:0x8003] = bytes([0xA9, 0x42, 0x00])  # LDA #$42; BRK
-    machine.load_image(image, start_pc=0x8000)
-    machine.run(2, max_cycles=0, trace=False)
-    assert machine.get_state()["a"] == 0x42

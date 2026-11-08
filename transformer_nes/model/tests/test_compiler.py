@@ -2,7 +2,6 @@
 through the model backend (model/backend.py) exactly."""
 
 import multiprocessing
-import signal
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -67,52 +66,6 @@ def doubling():
     return {"double": TokenGraph(graph, ["value"], ["doubled"])}
 
 
-def _publish_many(root, prefix, connection):
-    _configure(root)
-    connection.send("ready")
-    assert connection.recv() == "publish"
-    for index in range(40):
-        build.manifest_put(f"{prefix}:{index}", {"digest": "1111111111111111"})
-
-
-def test_manifest_preserves_concurrent_publishers(cache):
-    with (
-        _worker(_publish_many, cache, "first") as (first, _),
-        _worker(_publish_many, cache, "second") as (second, _),
-    ):
-        assert _receive(first) == _receive(second) == "ready"
-        first.send("publish")
-        second.send("publish")
-    assert set(build.manifest_read()) == {
-        f"{prefix}:{index}" for prefix in ("first", "second") for index in range(40)
-    }
-
-
-def test_cpu_cache_hit_rechecks_after_waiting_for_artifact(cache, monkeypatch):
-    from transformer_nes.cpu6502 import engine
-
-    monkeypatch.setattr(build, "CACHE_DIR", str(cache))
-    digest = "1111111111111111"
-    header = cache / f"engine_{digest}.hpp"
-    header.touch()
-    build.manifest_put("cpu", {"digest": digest, "compile_shards": engine.compile_shards()})
-
-    lock = build.artifact_lock
-
-    @contextmanager
-    def pruned_before_acquisition(locked_digest, *, blocking=True):
-        # The reader already took its manifest snapshot. Replace it before
-        # it can acquire the artifact, just as a competing publisher can.
-        if locked_digest == digest and blocking:
-            build.manifest_put("cpu", {"digest": "2222222222222222"})
-            assert not header.exists()
-        with lock(locked_digest, blocking=blocking) as acquired:
-            yield acquired
-
-    monkeypatch.setattr(build, "artifact_lock", pruned_before_acquisition)
-    assert engine.GeneratedWeightsEngine.from_cache("cpu") is None
-
-
 def _compile_doubling(root, connection):
     _configure(root)
     engine, _source = compile_tokens(doubling(), Path(root) / "models")
@@ -127,52 +80,6 @@ def test_concurrent_identical_builds_publish_one_library(cache):
         assert [_receive(first), _receive(second)] == [42, 42]
     published = sorted(p.name for p in (cache / "models").iterdir())
     assert len(published) == 1 and published[0].startswith("nes_")
-
-
-def _abandoned_build(root, digest, connection):
-    _configure(root)
-    with build.artifact_lock(digest):
-        directory = Path(root) / f"build_{digest}"
-        directory.mkdir()
-        (directory / "lock").touch()  # Torch's file baton is not an OS lock.
-        (Path(root) / f"graph_{digest}.cpp").write_text("unfinished source")
-        connection.send("locked")
-        connection.recv()  # The test kills this process while it owns the lock.
-
-
-def _recover_build(root, digest, connection):
-    _configure(root)
-    with build.artifact_lock(digest):
-        source = Path(root) / f"graph_{digest}.cpp"
-        source.write_text(
-            "#include <pybind11/pybind11.h>\n"
-            'PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("answer", [] { return 42; }); }\n'
-        )
-        module = build.load_module(f"cache_recovery_{digest}", digest, [str(source)])
-        assert module.answer() == 42
-        connection.send("recovered")
-
-
-def test_killed_builder_releases_ownership_and_stale_torch_baton(cache):
-    digest = "3333333333333333"
-    with _worker(_abandoned_build, cache, digest, expected_exitcode=-signal.SIGTERM) as (
-        connection,
-        process,
-    ):
-        assert _receive(connection) == "locked"
-        # Pruning must skip this digest while the other process owns it.
-        build.manifest_put("pruner", {"digest": "ffffffffffffffff"})
-        assert (cache / f"build_{digest}" / "lock").exists()
-        process.terminate()
-        process.join(10)
-
-    with _worker(_recover_build, cache, digest) as (connection, _):
-        assert _receive(connection) == "recovered"
-    # No manifest entry was published for the abandoned/recovered artifact.
-    # Once its owner exits, ordinary pruning can reclaim the whole group.
-    build.manifest_put("pruner", {"digest": "ffffffffffffffff"})
-    assert not (cache / f"graph_{digest}.cpp").exists()
-    assert not (cache / f"build_{digest}").exists()
 
 
 @pytest.fixture
@@ -334,7 +241,7 @@ def test_float32_weights_preserve_real_inputs_trace_and_ablation(cache):
         return {"real": TokenGraph(graph, ("x",), ("y",))}
 
     engine, _ = compile_tokens(graphs(), cache / "models", dtype="float32")
-    assert engine.dtype == np.dtype("float32") and engine.chip.f_bits == 0
+    assert engine.dtype == np.dtype("float32") and engine.chip.tokens["real"].general.f_bits == 0
     for x in np.linspace(-2, 2, 65):
         expected = 0.125 * (x + 0.25) * max(x - 0.375, 0) - 0.9995 * x
         np.testing.assert_allclose(engine.step([x]), [expected], rtol=0, atol=3e-7)

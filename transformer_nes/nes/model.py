@@ -13,6 +13,7 @@ The CPU still builds its own bank and engine (cpu6502/bank.py, cpu6502/engine.py
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import os
 import shutil
@@ -24,6 +25,7 @@ from torch import Tensor, nn
 
 from transformer_nes import build
 from transformer_nes.apu2a03 import audio
+from transformer_nes.cpu6502 import chip as cpu
 from transformer_nes.model.backend import CompiledChip, CompiledModel, compile_model
 from transformer_nes.model.transformer import Chip, Named, pack_state, unpack_state
 from transformer_nes.nes import controller, mappers
@@ -35,6 +37,7 @@ CACHE_DIR = Path(os.environ.get("TRANSFORMER_NES_CACHE", build.PROJECT_DIR / ".c
 def recipes() -> dict[str, Callable[[], Chip]]:
     """How each chip is constructed from its circuits, by name."""
     return {
+        "cpu": cpu.chip,
         "apu": audio.chip,
         "apu_mixer": audio.mixer_chip,
         "controller": controller.chip,
@@ -44,11 +47,19 @@ def recipes() -> dict[str, Callable[[], Chip]]:
     }
 
 
-def construction_digest() -> str:
+def construction_digest(chips: dict[str, Callable[[], Chip]] | None = None) -> str:
     """The identity of the circuits and their construction: what a saved
-    model was built from."""
-    modules = {getattr(r, "func", r).__module__ for r in recipes().values()}
-    return build.source_digest(*sorted(modules), "transformer_nes.model.construct")[:16]
+    model was built from (and which chips, by name and recipe)."""
+    chips = recipes() if chips is None else chips
+    modules = {getattr(r, "func", r).__module__ for r in chips.values()}
+    names = repr(sorted((n, getattr(r, "keywords", None)) for n, r in chips.items()))
+    code = build.source_digest(*sorted(modules), "transformer_nes.model.construct")
+    return hashlib.sha256(f"{code}|{names}".encode()).hexdigest()[:16]
+
+
+def model_directory(cache_dir: Path = CACHE_DIR, chips: dict[str, Callable[[], Chip]] | None = None) -> Path:
+    """Where the model of the current circuits is saved, once it is."""
+    return Path(cache_dir) / f"model_{construction_digest(chips)}"
 
 
 class NES(nn.Module):
@@ -64,8 +75,8 @@ class NES(nn.Module):
         return self.chips[chip](token, inputs, memory, specialization)
 
     @classmethod
-    def construct(cls) -> NES:
-        return cls({name: build_chip() for name, build_chip in recipes().items()})
+    def construct(cls, chips: dict[str, Callable[[], Chip]] | None = None) -> NES:
+        return cls({name: build_chip() for name, build_chip in (chips or recipes()).items()})
 
     def save(self, directory: Path) -> None:
         """``nes.json``, each chip's structure, and ``nes.safetensors``, its
@@ -85,14 +96,14 @@ class NES(nn.Module):
         return model
 
     @classmethod
-    def load(cls, cache_dir: Path = CACHE_DIR) -> NES:
-        """The model for the current circuits: loaded if saved, else
-        constructed and saved (published by rename, never half-written),
-        replacing models of earlier circuits."""
-        directory = Path(cache_dir) / f"model_{construction_digest()}"
+    def load(cls, cache_dir: Path = CACHE_DIR, chips: dict[str, Callable[[], Chip]] | None = None) -> NES:
+        """The model for the current circuits (by default the console's
+        chips): loaded if saved, else constructed and saved (published by
+        rename, never half-written), replacing models of earlier circuits."""
+        directory = model_directory(cache_dir, chips)
         if (directory / "nes.json").exists():
             return cls.from_directory(directory)
-        model = cls.construct()
+        model = cls.construct(chips)
         work = directory.with_name(f".{directory.name}.{os.getpid()}")
         shutil.rmtree(work, ignore_errors=True)
         model.save(work)

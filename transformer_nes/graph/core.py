@@ -61,6 +61,19 @@ class GraphContext:
         finally:
             _active_graph.reset(token)
 
+    @classmethod
+    def extending(cls, program_graph: ProgramGraph) -> GraphContext:
+        """A context continuing a captured graph: what it constructs joins
+        the graph's own dims (and may read them)."""
+        context = cls()
+        if not program_graph.all_dims or program_graph.all_dims[0] is not program_graph.one:
+            raise ValueError("a captured graph begins with its constant one")
+        context.dims = list(program_graph.all_dims)
+        context.lookups = list(program_graph.all_lookups)
+        context.memory_reads = list(program_graph.all_memory_reads)
+        context.one = program_graph.one
+        return context
+
     def check(self, *expressions):
         for expression in expressions:
             if expression.one is not None and expression.one is not self.one:

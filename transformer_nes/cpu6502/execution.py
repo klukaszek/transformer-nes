@@ -1,13 +1,12 @@
-"""CPU execution effects and their lowering to the residual-slot ABI.
+"""CPU execution effects.
 
 Proof folds retain the facts needed to validate a dispatch. Projection keeps
-only architectural outputs, ordered writes, control and cycles; lowering then
-assigns residual slots. Dictionaries are the final runtime/checkpoint format.
+only architectural outputs, ordered writes, control and cycles; chip.py names
+them as the CPU chip's step outputs.
 """
 
 from __future__ import annotations
 
-import contextlib
 import math
 from dataclasses import dataclass
 from typing import Literal
@@ -74,8 +73,8 @@ class ExecutionGraph:
         return sum(self.cycle_bounds[:-1])
 
 
-# Residual input slots shared by every generated step spec: spec key -> the
-# graph dimension name it resolves through (union slot map or fold name map).
+# The state and context every CPU circuit may read: key -> the graph's input
+# dimension (cpu6502/chip.py INPUTS, in this order).
 INPUT_SLOT_NAMES = {
     "is_state": "is_state",
     "pc_lo": "in_pc_lo",
@@ -112,22 +111,6 @@ P_FLAG_NAMES = (
 # wide_bits builds only (absent from other graphs, so added when present):
 # served A-bit state inputs, MSB first.
 OPTIONAL_INPUT_SLOT_NAMES = {f"a_bit{b}": f"in_a_bit{b}" for b in range(7, -1, -1)}
-
-
-def step_spec_base(slot) -> dict:
-    """The input/p_flag half of a generated step spec; ``slot`` maps a graph
-    dimension name to its residual slot."""
-    spec = {"inputs": {}, "p_flags": []}
-    for key, name in INPUT_SLOT_NAMES.items():
-        with contextlib.suppress(KeyError):
-            spec["inputs"][key] = slot(name)
-    for name, mask in P_FLAG_NAMES:
-        with contextlib.suppress(KeyError):
-            spec["p_flags"].append((slot(name), mask))
-    for key, name in OPTIONAL_INPUT_SLOT_NAMES.items():
-        with contextlib.suppress(KeyError):
-            spec["inputs"][key] = slot(name)
-    return spec
 
 
 SEQUENCE_FLAG_DIMS = (
@@ -268,56 +251,6 @@ def project_sequence_execution(
         cycle_bounds=tuple(bounds),
         dim_of_name=dim_of_name,
     )
-
-
-def lower_execution(execution: ExecutionGraph, info) -> dict:
-    """Lower graph dimensions to the slot-based runtime/checkpoint wire format."""
-
-    def slot(name):
-        return info.slot_of[execution.dim_of_name[name]]
-
-    spec = step_spec_base(slot)
-    spec["sequence_final"] = {
-        "model": {
-            output.name: info.slot_of[output.dimension]
-            for output in execution.outputs
-            if output.source == "model"
-        },
-        "preserve": [output.name for output in execution.outputs if output.source == "preserve"],
-        "constant": {
-            output.name: output.constant
-            for output in execution.outputs
-            if output.source == "constant"
-        },
-    }
-    writes = [[] for _ in range(execution.n_steps)]
-    for write in execution.memory_writes:
-        writes[write.step].append(
-            {"address": info.slot_of[write.address], "value": info.slot_of[write.value],
-             "original": None if write.original is None else info.slot_of[write.original]}
-        )
-    spec["sequence_writes"] = writes
-    spec["sequence_cycles"] = {
-        "constant": sum(c for c in execution.cycles if isinstance(c, int)),
-        "model": [info.slot_of[c] for c in execution.cycles if not isinstance(c, int)],
-    }
-    spec["sequence_halt"] = (
-        None if execution.halt_dimension is None else info.slot_of[execution.halt_dimension]
-    )
-    return spec
-
-
-def readout_slots(spec: dict) -> tuple[int, ...]:
-    """Physical kernel outputs, in the order the native caller decodes them."""
-    slots = set(spec.get("outputs", {}).values())
-    if "sequence_final" in spec:
-        slots.update(spec["sequence_final"]["model"].values())
-        slots.update(s for writes in spec["sequence_writes"] for write in writes
-                     for s in write.values() if s is not None)
-        slots.update(spec["sequence_cycles"]["model"])
-        if spec["sequence_halt"] is not None:
-            slots.add(spec["sequence_halt"])
-    return tuple(sorted(slots))
 
 
 def shape_timing(execution: ExecutionGraph, spin: bool) -> dict:

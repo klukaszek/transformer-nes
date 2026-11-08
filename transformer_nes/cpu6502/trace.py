@@ -5,6 +5,22 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
+from transformer_nes.cpu6502.spec import (
+    MODE_ABSOLUTE,
+    MODE_ABSOLUTE_X,
+    MODE_ABSOLUTE_Y,
+    MODE_ACCUMULATOR,
+    MODE_IMMEDIATE,
+    MODE_INDIRECT,
+    MODE_INDIRECT_X,
+    MODE_INDIRECT_Y,
+    MODE_RELATIVE,
+    MODE_ZERO_PAGE,
+    MODE_ZERO_PAGE_X,
+    MODE_ZERO_PAGE_Y,
+    OPCODES,
+)
+
 
 @dataclass(frozen=True)
 class Cpu6502State:
@@ -110,3 +126,69 @@ class Trace:
 
     def format(self) -> str:
         return format_trace(self.rows)
+
+
+# ── The tables a run loop traces instructions by ─────────────────
+# (native/console/cpu.cpp trace_ea / trace_data): addressing mode,
+# instruction length and the data a trace row reports, by opcode.
+
+ADDRESS_MODE_CODE = {
+    MODE_ZERO_PAGE: 1,
+    MODE_ZERO_PAGE_X: 2,
+    MODE_ZERO_PAGE_Y: 3,
+    MODE_ABSOLUTE: 4,
+    MODE_ABSOLUTE_X: 5,
+    MODE_ABSOLUTE_Y: 6,
+    MODE_INDIRECT_X: 7,
+    MODE_INDIRECT_Y: 8,
+}
+
+
+TRACE_MODE_CODE = ADDRESS_MODE_CODE | {
+    MODE_IMMEDIATE: 11,
+    MODE_INDIRECT: 9,
+    MODE_RELATIVE: 10,
+}
+
+
+def trace_mode_table() -> tuple[int, ...]:
+    table = [0] * 256
+    for byte, op in OPCODES.items():
+        table[byte] = TRACE_MODE_CODE.get(op.mode, 0)
+    return tuple(table)
+
+
+def trace_length_table() -> tuple[int, ...]:
+    table = [1] * 256
+    for byte, op in OPCODES.items():
+        table[byte] = op.length
+    return tuple(table)
+
+
+def trace_data_table() -> tuple[int, ...]:
+    """Trace source codes consumed by the runtime template's trace_data()."""
+    kinds = {
+        1: ("store_a", "pha"),
+        2: ("store_x",),
+        3: ("store_y",),
+        4: ("php",),
+        5: ("inc", "isb", "dec", "dcp", "sax", "slo", "rla", "sre", "rra"),
+        6: ("load_a", "lax", "adc", "sbc", "and", "ora", "eor", "pla", "txa", "tya"),
+        7: ("load_x", "inx", "dex", "tax", "tsx"),
+        8: ("load_y", "iny", "dey", "tay"),
+        9: ("txs",),
+        10: ("plp",),
+        11: ("cmp",),
+        12: ("cpx",),
+        13: ("cpy",),
+        14: ("bit",),
+    }
+    codes = {operation: kind for kind, operations in kinds.items() for operation in operations}
+    table = [0] * 256
+    for byte, op in OPCODES.items():
+        table[byte] = (
+            (6 if op.mode == MODE_ACCUMULATOR else 5)
+            if op.operation in {"asl", "lsr", "rol", "ror"}
+            else codes.get(op.operation, 0)
+        )
+    return tuple(table)

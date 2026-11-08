@@ -95,7 +95,7 @@ def test_overlay_collects_reads_only_while_observed():
             calls.append(enabled)
             return np.ones(65536, dtype=np.uint32)
 
-    runtime = SimpleNamespace(engine=SimpleNamespace(engine=Engine()))
+    runtime = SimpleNamespace(engine=Engine())
     bridge = DebugBridge(None, "weights", cpu_runtime=runtime)
     bridge.note_frame(0.001)
     assert calls == [] and not bridge.cpu_frames

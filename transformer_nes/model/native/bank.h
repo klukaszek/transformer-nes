@@ -7,7 +7,7 @@
 #pragma once
 #include <cstdint>
 
-#define TRANSFORMER_NES_BANK_ABI 2
+#define TRANSFORMER_NES_BANK_ABI 3
 
 namespace transformer_nes_bank {
 
@@ -20,6 +20,7 @@ struct Circuit {
     const void* run;
     int32_t width;  // outputs written
     int32_t aux;    // memory-read addresses reported (X-ray)
+    int32_t f_bits; // fixed-point fraction bits of an integer circuit's readouts
 };
 
 // A token's caller-facing input and output counts, one per circuit.
@@ -35,7 +36,6 @@ struct Bank {
     const Circuit* circuits;
     const Token* tokens;  // n_circuits entries
     int32_t memory;       // bytes of chip memory the kernels address
-    int32_t f_bits;       // fixed-point fraction bits of integer readouts
     int32_t trace_rows;   // residual rows of model 0's trace (layers + 1)
     int32_t primary_width;  // model 0's residual width
 };

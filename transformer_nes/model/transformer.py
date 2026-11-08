@@ -168,19 +168,22 @@ class Layer(nn.Module):
 
 
 class Transformer(nn.Module):
-    """One circuit: embedding into residual slots, the layers, readout slots."""
+    """One circuit: embedding into residual slots, the layers, readout slots.
+    An integer circuit with fractional weights computes in units of
+    2**-f_bits; its inputs and readouts are whole numbers."""
 
     def __init__(self, layers: list[dict[str, Tensor] | Layer], *, d_model: int, one_slot: int,
-                 input_slots: Tensor, output_slots: Tensor, dtype: torch.dtype = INT):
+                 input_slots: Tensor, output_slots: Tensor, dtype: torch.dtype = INT, f_bits: int = 0):
         super().__init__()
-        self.d_model, self.one_slot, self.dtype = d_model, one_slot, dtype
+        self.d_model, self.one_slot, self.dtype, self.f_bits = d_model, one_slot, dtype, f_bits
         self.layers = nn.ModuleList(w if isinstance(w, Layer) else Layer(w) for w in layers)
         # input_slots[i] is input i's slot, or -1 when the circuit never reads it.
         self.register_buffer("input_slots", input_slots.to(INT))
         self.register_buffer("output_slots", output_slots.to(INT))
 
-    def forward(self, inputs: Tensor, memory: Tensor, f_bits: int, outputs: list[int] | None = None) -> Tensor:
+    def forward(self, inputs: Tensor, memory: Tensor, outputs: list[int] | None = None) -> Tensor:
         """The readouts, or only those at positions `outputs`."""
+        f_bits = self.f_bits
         x = torch.zeros(self.d_model, dtype=self.dtype)
         live = self.input_slots >= 0
         values = inputs.to(self.dtype)[live]
@@ -235,13 +238,13 @@ class TokenType(nn.Module):
         """The full circuit if it has one, then each specialization."""
         return ([] if self.general is None else [(None, self.general)]) + list(self.specialized.items())
 
-    def forward(self, inputs: Tensor, memory: Tensor, f_bits: int, specialization: str | None = None,
+    def forward(self, inputs: Tensor, memory: Tensor, specialization: str | None = None,
                 outputs: list[int] | None = None):
         specialization = self.same.get(specialization, specialization)
         if specialization is None and self.general is None:
             raise ValueError("this token type runs only its specializations; choose one")
         circuit = self.general if specialization is None else self.specialized[specialization]
-        return circuit(inputs, memory, f_bits, outputs)
+        return circuit(inputs, memory, outputs)
 
 
 @dataclass(frozen=True)
@@ -264,14 +267,15 @@ class View:
 class Chip(nn.Module):
     """A chip: its token types over one memory of ``memory_size`` bytes.
 
-    ``constants`` are facts about its circuits that their callers need, such
-    as the longest span the APU's oscillator circuit covers."""
+    ``constants`` are facts about its circuits that their callers need, as
+    plain data: the longest span the APU's oscillator circuit covers, which
+    opcode or instruction window each CPU execution runs."""
 
-    def __init__(self, tokens: dict[str, TokenType], *, memory_size: int, f_bits: int,
-                 dtype: torch.dtype = INT, constants: dict[str, int] | None = None,
+    def __init__(self, tokens: dict[str, TokenType], *, memory_size: int,
+                 dtype: torch.dtype = INT, constants: dict | None = None,
                  views: dict[str, dict] | None = None):
         super().__init__()
-        self.memory_size, self.f_bits, self.dtype = memory_size, f_bits, dtype
+        self.memory_size, self.dtype = memory_size, dtype
         self.constants = dict(constants or {})
         self.tokens = Named(tokens)
         # name -> {"base", "outputs", "specializations"}: plain data, saved as such.
@@ -312,8 +316,8 @@ class Chip(nn.Module):
         if (view := self.views.get(token)) is not None:
             if not view.reads(view.same.get(specialization, specialization)):
                 raise ValueError(f"view {token} does not read {specialization}")
-            return self.tokens[view.base](inputs, memory, self.f_bits, specialization, view.indices)
-        return self.tokens[token](inputs, memory, self.f_bits, specialization)
+            return self.tokens[view.base](inputs, memory, specialization, view.indices)
+        return self.tokens[token](inputs, memory, specialization)
 
     def weight_count(self) -> int:
         return sum(c.weight_count() for _t, _s, c in self.circuits())
@@ -323,7 +327,6 @@ class Chip(nn.Module):
     def structure(self) -> dict:
         return {
             "memory_size": self.memory_size,
-            "f_bits": self.f_bits,
             "dtype": str(self.dtype).removeprefix("torch."),
             "constants": self.constants,
             "views": self.view_specs,
@@ -338,6 +341,7 @@ class Chip(nn.Module):
                         "general" if spec is None else f"specialized.{spec}": {
                             "d_model": c.d_model,
                             "one_slot": c.one_slot,
+                            "f_bits": c.f_bits,
                             "layers": [layer.structure() for layer in c.layers],
                         }
                         for spec, c in token.circuits()
@@ -358,6 +362,7 @@ class Chip(nn.Module):
                 [Layer.empty(layer, dtype) for layer in meta["layers"]], d_model=meta["d_model"],
                 one_slot=meta["one_slot"], input_slots=torch.zeros(len(token["inputs"]), dtype=INT),
                 output_slots=torch.zeros(len(token["outputs"]), dtype=INT), dtype=dtype,
+                f_bits=meta["f_bits"],
             )
 
         tokens = {}
@@ -368,8 +373,8 @@ class Chip(nn.Module):
                 {key.removeprefix("specialized."): c for key, c in circuits.items()}, t["pins"],
                 same=t["same"], reassociate_residuals=t["reassociate_residuals"],
             )
-        return cls(tokens, memory_size=structure["memory_size"], f_bits=structure["f_bits"],
-                   dtype=dtype, constants=structure["constants"], views=structure["views"])
+        return cls(tokens, memory_size=structure["memory_size"], dtype=dtype,
+                   constants=structure["constants"], views=structure["views"])
 
 
 # ── The saved form: one flat buffer per integer width ──────────────

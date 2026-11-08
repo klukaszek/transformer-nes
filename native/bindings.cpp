@@ -2,11 +2,11 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "machine_abi.h"
 #include "nes/apu.h"
 #include "nes/bus.h"
 #include "nes/cartridge.h"
 #include "nes/console.h"
+#include "nes/cpu.h"
 #include "nes/mappers/mappers.h"
 #include "nes/ppu.h"
 #include "nes/tape.h"
@@ -140,42 +140,195 @@ private:
   py::object core_;
 };
 
+// The 6502 over the model's compiled CPU chip (cpu6502/chip.py), for Python
+// (cpu6502/runner.py) and the console: it keeps the chip alive, checks its
+// token layout field by field and fills the run loop's tables.
+class CpuHost {
+public:
+  CpuHost(py::object chip, const py::dict& tables, bool mirror_cpu_ram) : chip_(std::move(chip)) {
+    const auto inputs = fields({"is_state", "in_pc_lo", "in_pc_hi", "in_a", "in_x", "in_y", "in_s",
+                                "in_ir", "in_oplo", "in_ophi", "in_ea_lo", "in_ea_hi", "in_data",
+                                "in_halted", "in_nmi", "in_irq", "in_read_addr_lo",
+                                "in_read_addr_hi", "in_read_cycles", "in_loop_limit",
+                                "in_loop_cycles", "in_p_c", "in_p_z", "in_p_i", "in_p_d",
+                                "in_p_b", "in_p_u", "in_p_v", "in_p_n", "in_a_bit7", "in_a_bit6",
+                                "in_a_bit5", "in_a_bit4", "in_a_bit3", "in_a_bit2", "in_a_bit1",
+                                "in_a_bit0"});
+    auto writes = fields({"step_writes"});
+    for (int k = 0; k < 3; ++k)
+      for (const char* f : {"_addr", "_value", "_original"})
+        writes.push_back("step_w" + std::to_string(k) + f);
+    auto step = fields({"step_pc", "step_a", "step_x", "step_y", "step_s", "step_p_c", "step_p_z",
+                        "step_p_i", "step_p_d", "step_p_b", "step_p_v", "step_p_n", "step_halted",
+                        "step_cycles", "step_iterations"});
+    step.insert(step.end(), writes.begin(), writes.end());
+    if (!token_is(chip_, "union", inputs,
+                  fields({"current_pc", "new_a", "new_x", "new_y", "new_s", "new_p",
+                          "new_halted", "fetched_opcode", "fetched_operand_lo",
+                          "fetched_operand_hi", "ea", "data_out", "next_pc", "is_store",
+                          "write_addr_out", "write_value_out", "is_store2", "write_addr2_out",
+                          "write_value2_out", "is_store3", "write_addr3_out", "write_value3_out",
+                          "cycles", "write_original_out"})) ||
+        !token_is(chip_, "step", inputs, step) ||
+        !token_is(chip_, "request", inputs,
+                  fields({"request_address", "request_cycles", "request_oplo", "request_ophi"})) ||
+        inputs.size() != NeuralCpu::inputs || step.size() != NeuralCpu::step_outputs)
+      throw std::invalid_argument("chip is not the CPU");
+    CpuTables t;
+    t.union_model = tables["union"].cast<int>();
+    std::ranges::copy(tables["exec"].cast<vector<int>>(), t.exec.begin());
+    std::ranges::copy(tables["exec_after_read"].cast<vector<bool>>(), t.exec_after_read.begin());
+    std::ranges::copy(tables["request"].cast<vector<int>>(), t.request.begin());
+    t.nmi = tables["nmi"].cast<int>();
+    t.irq = tables["irq"].cast<int>();
+    for (const auto& [reg, delta, model] : tables["loops"].cast<vector<std::tuple<int, int, int>>>())
+      t.loops.push_back({reg, delta, model});
+    for (const py::handle h : tables["shapes"]) {
+      const py::dict d = py::reinterpret_borrow<py::dict>(h);
+      CpuTables::Shape shape{d["model"].cast<int>(), d["length"].cast<int>(), d["steps"].cast<int>(),
+                             d["prefix"].cast<int>(), d["spin"].cast<int>(), {},
+                             d["self_target"].cast<bool>(), {}};
+      for (const auto& c : d["checks"].cast<vector<vector<int>>>())
+        shape.checks.emplace_back(c.at(0), c.at(1));
+      std::ranges::copy(d["loop"].cast<vector<int>>(), shape.loop.begin());
+      t.shapes.push_back(std::move(shape));
+    }
+    for (const char* name : {"trace_mode", "trace_length", "trace_data"}) {
+      auto& table = std::string_view(name) == "trace_mode"     ? t.trace_mode
+                    : std::string_view(name) == "trace_length" ? t.trace_length
+                                                               : t.trace_data;
+      std::ranges::copy(tables[name].cast<vector<int>>(), table.begin());
+    }
+    for (const bool reads : tables["reads_interrupts"].cast<vector<bool>>())
+      t.reads_interrupts.push_back(reads);
+    const auto abi = chip_.attr("abi")().cast<py::tuple>();
+    if (chip_.attr("chip").attr("memory_size").cast<int>() != 0x10000)
+      throw std::invalid_argument("the CPU chip addresses 64 KiB");
+    cpu_ = std::make_unique<NeuralCpu>(
+        reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>()),
+        reinterpret_cast<NeuralCpu::Step>(abi[2].cast<std::uintptr_t>()),
+        reinterpret_cast<uint8_t*>(abi[6].cast<std::uintptr_t>()), std::move(t), mirror_cpu_ram);
+  }
+  NeuralCpu& cpu() { return *cpu_; }
+
+  // The X-ray's reads per address since the last call; while `observe`,
+  // the CPU runs on the chip's observing build, which counts them.
+  py::object xray_reads(bool observe) {
+    py::object counts = observing_.is_none()
+                            ? py::object(py::array_t<uint32_t>(65536))
+                            : observing_.attr("engine").attr("take_reads")();
+    if (observing_.is_none())
+      std::fill_n(counts.cast<py::array_t<uint32_t>>().mutable_data(), 65536, 0u);
+    if (observe && observing_.is_none()) {
+      observing_ = chip_.attr("observing")();
+      bind(observing_);
+    } else if (!observe && !observing_.is_none()) {
+      bind(chip_);
+      observing_ = py::none();
+    }
+    return counts;
+  }
+
+  py::dict run(long max_steps, bool stop_on_trap, long max_cycles, bool trace) {
+    const auto r = cpu_->run(max_steps, stop_on_trap, max_cycles, trace);
+    py::dict out;
+    auto arr = [](const vector<int>& v) { return py::array_t<int>(static_cast<py::ssize_t>(v.size()), v.data()); };
+    // Untraced runs (the console pauses 100+ times a frame) return only
+    // what the bus reads.
+    if (trace) {
+      const auto& t = cpu_->trace();
+      out["pc"] = arr(t.pc);
+      out["a"] = arr(t.a);
+      out["x"] = arr(t.x);
+      out["y"] = arr(t.y);
+      out["s"] = arr(t.s);
+      out["p"] = arr(t.p);
+      out["ir"] = arr(t.ir);
+      out["oplo"] = arr(t.oplo);
+      out["ophi"] = arr(t.ophi);
+      out["ea"] = arr(t.ea);
+      out["data"] = arr(t.data);
+      out["halted"] = arr(t.halted);
+      out["w_row"] = py::array_t<long>(static_cast<py::ssize_t>(t.w_row.size()), t.w_row.data());
+      out["w_addr"] = arr(t.w_addr);
+      out["w_value"] = arr(t.w_value);
+      out["w_original"] = arr(t.w_original);
+    }
+    const auto& h = cpu_->hits();
+    out["hit_addr"] = arr(h.addr);
+    out["hit_value"] = arr(h.value);
+    out["hit_original"] = arr(h.original);
+    out["read_addr"] = r.read_addr;
+    out["read_cycles"] = r.read_cycles;
+    out["reason"] = r.reason;
+    out["cycles"] = r.cycles;
+    out["steps"] = r.steps;
+    out["forwards"] = r.forwards;
+    return out;
+  }
+  py::dict state() const {
+    const auto st = cpu_->state();
+    py::dict d;
+    d["pc"] = st.pc;
+    d["a"] = st.a;
+    d["x"] = st.x;
+    d["y"] = st.y;
+    d["s"] = st.s;
+    d["p"] = st.p;
+    d["halted"] = st.halted;
+    d["ir"] = st.ir;
+    d["oplo"] = st.oplo;
+    d["ophi"] = st.ophi;
+    d["ea"] = st.ea;
+    d["data"] = st.data;
+    d["steps"] = st.steps;
+    d["cycles"] = st.cycles;
+    return d;
+  }
+
+private:
+  void bind(const py::object& chip) {
+    const auto abi = chip.attr("abi")().cast<py::tuple>();
+    cpu_->rebind(reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>()),
+                 reinterpret_cast<NeuralCpu::Step>(abi[2].cast<std::uintptr_t>()),
+                 reinterpret_cast<uint8_t*>(abi[6].cast<std::uintptr_t>()));
+  }
+  py::object chip_, observing_ = py::none();
+  unique_ptr<NeuralCpu> cpu_;
+};
+
 // The transformer CPU's run loop driven natively: Python sets it up
 // (image, watches) and names the shape windows of newly mapped code;
-// every run, lease, write and interrupt goes straight through the ABI.
+// every run, lease, write and interrupt goes straight to the CPU.
 class EngineMachine final : public ConsoleMachine {
 public:
   EngineMachine(py::object runtime, const vector<uint8_t>& image, int start,
                 span<const uint8_t> prg_rom)
-      : rt_(std::move(runtime)), prg_rom_(prg_rom) {
+      : rt_(std::move(runtime)), prg_rom_(prg_rom),
+        cpu_(&rt_.attr("engine").cast<CpuHost&>().cpu()) {
     rt_.attr("load_image")(to_bytes(image), py::arg("start_pc") = start);
-    const auto abi = rt_.attr("machine_abi")().cast<py::tuple>();
-    if (abi[0].cast<int>() != cpu_engine::abi_version)
-      throw std::runtime_error("CPU engine machine ABI version mismatch");
-    ctx_ = reinterpret_cast<void*>(abi[1].cast<std::uintptr_t>());
-    abi_ = reinterpret_cast<const cpu_engine::Abi*>(abi[2].cast<std::uintptr_t>());
   }
   void attach(Device& d, int lo, int hi, bool writes_only = false) override {
     devices_.attach(d, lo, hi, writes_only);
     if (!writes_only)
-      rt_.attr("watch_read")(lo, hi);
-    rt_.attr("watch_write")(lo, hi);
+      cpu_->watch_read(lo, hi);
+    cpu_->watch_write(lo, hi);
   }
-  void set_nmi() override { abi_->set_nmi(ctx_); }
-  void set_irq() override { abi_->set_irq(ctx_); }
-  void clear_irq() override { abi_->clear_irq(ctx_); }
+  void set_nmi() override { cpu_->set_nmi(); }
+  void set_irq() override { cpu_->set_irq(); }
+  void clear_irq() override { cpu_->clear_irq(); }
   void clear_read_lease() override {
     flush_queues();
     leases_.fill({});
     lease_deadline_ = NEVER;
-    abi_->clear_read_lease(ctx_);
+    cpu_->clear_read_lease();
   }
-  int read_ram(int a) const override { return abi_->read_ram(ctx_, a); }
-  void poke(int a, int v) override { abi_->inject_write(ctx_, a, v); }
+  int read_ram(int a) const override { return cpu_->read_ram(a); }
+  void poke(int a, int v) override { cpu_->inject_write(a, v); }
   void map_region(int a, span<const uint8_t> d) override {
-    abi_->map_region(ctx_, a, d.data(), static_cast<long>(d.size()));
+    cpu_->map_bytes(a, d.data(), static_cast<long>(d.size()));
     for (auto [shape, head] : region_windows(a, d))
-      abi_->add_window(ctx_, shape, head);
+      cpu_->add_window(shape, head);
   }
   void drop_leases(Device& d) override { drop_device_leases(&d); }
   MachineRun run_cycles(int64_t budget, function<bool()> pause = {},
@@ -194,11 +347,10 @@ public:
         }
         chunk = std::min(chunk, left);
       }
-      cpu_engine::RunOut out;
-      abi_->run(ctx_, static_cast<long>(chunk), &out);
+      const auto out = cpu_->run(LONG_MAX, false, static_cast<long>(chunk), false);
       cycles += out.cycles;
       // Paused writes are stamped at the end of the returned chunk.
-      cycles += service_writes(out, cycle_base + cycles);
+      cycles += service_writes(cycle_base + cycles);
       const string_view reason = out.reason;
       halted = reason == "halt" || reason == "trap";
       // The paused instruction has not run yet; its read lands on its
@@ -217,15 +369,16 @@ public:
 
 private:
   Device* device_at(int a) const { return devices_.find(a); }
-  int service_writes(const cpu_engine::RunOut& out, int64_t cycle) {
+  int service_writes(int64_t cycle) {
     int stalls = 0;
-    // The hit arrays live until the next run; servicing never runs.
-    for (long i = 0; i < out.n_hits; ++i) {
-      const int a = out.hit_addr[i], v = out.hit_value[i];
+    // The hits live until the next run; servicing never runs.
+    const auto& hits = cpu_->hits();
+    for (size_t i = 0; i < hits.addr.size(); ++i) {
+      const int a = hits.addr[i], v = hits.value[i];
       if (auto* d = device_at(a)) {
         drop_device_leases(d);
-        if (out.hit_original[i] >= 0)
-          d->write_rmw(a, v, out.hit_original[i], cycle);
+        if (hits.original[i] >= 0)
+          d->write_rmw(a, v, hits.original[i], cycle);
         else
           d->write(a, v, cycle);
         stalls += d->take_stall();
@@ -243,9 +396,9 @@ private:
       int evicted = -1;
       const bool queued = std::holds_alternative<ReadReply>(lease);
       if (auto* v = std::get_if<int>(&lease)) {
-        evicted = abi_->set_read_lease(ctx_, a, *v);
+        evicted = cpu_->set_read_lease(a, *v);
       } else if (auto* q = std::get_if<ReadReply>(&lease)) {
-        evicted = abi_->set_read_lease_seq(ctx_, a, q->bytes.data(), q->size);
+        evicted = cpu_->set_read_lease_bytes(a, q->bytes.data(), q->size);
       }
       if (evicted >= 0 && evicted != a)
         if (auto* old = lease_at(evicted))
@@ -276,7 +429,7 @@ private:
   }
   void flush_queue(const Lease& lease) {
     if (lease.queued) {
-      const long count = abi_->take_lease_served(ctx_, lease.address);
+      const long count = cpu_->take_lease_served(lease.address);
       if (count)
         lease.owner->lease_consumed(lease.address, static_cast<int>(count));
     }
@@ -287,7 +440,7 @@ private:
   }
   void release_lease(Lease& lease) {
     flush_queue(lease);
-    abi_->clear_read_lease_addr(ctx_, lease.address);
+    cpu_->clear_read_lease_addr(lease.address);
     lease = {};
   }
   void drop_device_leases(Device* device) {
@@ -332,12 +485,11 @@ private:
   }
   py::object rt_;
   span<const uint8_t> prg_rom_;
+  NeuralCpu* cpu_;
   std::map<std::tuple<int, size_t, size_t>, Windows> rom_regions_;
-  void* ctx_ = nullptr;
-  const cpu_engine::Abi* abi_ = nullptr;
   DeviceMap devices_;
   int64_t lease_deadline_ = NEVER;
-  array<Lease, cpu_engine::read_lease_capacity> leases_;
+  array<Lease, NeuralCpu::lease_capacity> leases_;
   std::unordered_map<uint64_t, vector<Region>> regions_;
 };
 
@@ -442,7 +594,7 @@ public:
         py::len(mixer_graphs["sample"].attr("outputs")) != 3 ||
         py::len(mixer_graphs["gains"].attr("inputs")) != Apu::channel_input_count - 1 ||
         py::len(mixer_graphs["gains"].attr("outputs")) != Apu::sample_parameter_count ||
-        sample_engine_.attr("chip").attr("f_bits").cast<int>() != 0)
+        sample_engine_.attr("chip").attr("dtype").attr("is_floating_point").cast<bool>() == false)
       throw std::invalid_argument("engine is not the APU mixer chip");
     Apu::Engine audio_api;
     std::tie(audio_api.ctx, audio_api.step) = engine_of(audio_engine_);
@@ -676,6 +828,56 @@ PYBIND11_MODULE(nes_hardware, m) {
                   })
       .def_readonly("mapper", &Cartridge::mapper)
       .def_readonly("battery", &Cartridge::battery);
+  py::class_<CpuHost>(m, "Cpu", py::module_local())
+      .def(py::init<py::object, py::dict, bool>(), py::arg("chip"), py::arg("tables"),
+           py::arg("mirror_cpu_ram") = false)
+      .def("reset", [](CpuHost& h) { h.cpu().reset(); })
+      .def("run", &CpuHost::run, py::arg("max_steps"), py::arg("stop_on_trap") = false,
+           py::arg("max_cycles") = 0L, py::arg("trace") = true)
+      .def("watch_read", [](CpuHost& h, int lo, int hi) { h.cpu().watch_read(lo, hi); })
+      .def("watch_write", [](CpuHost& h, int lo, int hi) { h.cpu().watch_write(lo, hi); })
+      .def("set_nmi", [](CpuHost& h) { h.cpu().set_nmi(); })
+      .def("set_irq", [](CpuHost& h) { h.cpu().set_irq(); })
+      .def("clear_irq", [](CpuHost& h) { h.cpu().clear_irq(); })
+      .def("inject_write", [](CpuHost& h, int a, int v) { h.cpu().inject_write(a, v); })
+      .def("map_region", [](CpuHost& h, int base, const py::bytes& data) {
+             const string d = data;
+             h.cpu().map_bytes(base, reinterpret_cast<const uint8_t*>(d.data()), static_cast<long>(d.size()));
+           })
+      .def("seed_image", [](CpuHost& h, const py::bytes& image) {
+             const string d = image;
+             if (d.size() != 65536)
+               throw std::invalid_argument("seed_image needs a 64 KiB image");
+             h.cpu().seed_image(reinterpret_cast<const uint8_t*>(d.data()));
+           })
+      .def("read_ram", [](CpuHost& h, int a) { return h.cpu().read_ram(a); })
+      .def("dump_ram", [](CpuHost& h) {
+             return py::bytes(reinterpret_cast<const char*>(h.cpu().ram()), 65536);
+           })
+      .def("set_run_state", [](CpuHost& h, int pc, int a, int x, int y, int s, int p, int ir,
+                               int oplo, int ophi, int ea, int data, int halted) {
+             h.cpu().set_state(pc, a, x, y, s, p, ir, oplo, ophi, ea, data, halted != 0);
+           })
+      .def("get_run_state", &CpuHost::state)
+      .def("add_window", [](CpuHost& h, int shape, int head) { h.cpu().add_window(shape, head); })
+      .def("clear_windows", [](CpuHost& h) { h.cpu().clear_windows(); })
+      .def("xray_take", [](CpuHost& h) {
+             auto& c = h.cpu();
+             py::list paths, dispatches;
+             for (long& n : c.xray_paths)
+               paths.append(std::exchange(n, 0));
+             for (long& n : c.xray_dispatches)
+               dispatches.append(std::exchange(n, 0));
+             py::array_t<long> ops(256);
+             for (size_t i = 0; i < 256; ++i)
+               ops.mutable_data()[i] = std::exchange(c.xray_opcodes[i], 0);
+             return py::make_tuple(paths, ops, dispatches);
+           })
+      .def("xray_reads", &CpuHost::xray_reads, py::arg("observe"))
+      .def("union_inputs", [](CpuHost& h) {
+             const auto in = h.cpu().union_inputs();
+             return py::array_t<int>(static_cast<py::ssize_t>(in.size()), in.data());
+           });
   py::class_<ConsoleHost>(m, "Console", py::module_local())
       .def(py::init<Cartridge, py::object, double, py::object>(), py::arg("cartridge"),
            py::arg("backend_factory"), py::arg("sample_rate") = 44100.0, py::arg("nes") = py::none())

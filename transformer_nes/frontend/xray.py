@@ -156,7 +156,7 @@ class CpuXray:
 
     def __init__(self, runtime):
         self.runtime = runtime
-        self.engine = runtime.engine.engine
+        self.engine = runtime.engine
 
     @cached_property
     def named(self):

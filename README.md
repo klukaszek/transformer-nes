@@ -49,16 +49,9 @@ uv run 6502-klaus --runner weights --max-steps 30700000
 # registers and cycle counts):
 uv run 6502-nestest --runner both
 
-# Export the weights, then run them in a plain PyTorch transformer that
-# imports nothing from this repository (about two minutes for nestest):
-uv run 6502-export checkpoint/
-uv run 6502-checkpoint checkpoint/ --nestest fixtures/roms/nestest.nes \
-    fixtures/roms/nestest.log
-
-# The folded per-opcode experts, routed by opcode in PyTorch (about a second):
-uv run 6502-export experts/ --experts
-uv run 6502-experts experts/ --nestest fixtures/roms/nestest.nes \
-    fixtures/roms/nestest.log
+# nestest through the saved model's eager PyTorch forward alone: no
+# compiler, no native code (about ten seconds):
+uv run 6502-eager
 
 # Run an NES ROM with the native C++ console hardware:
 uv run nes-run path/to/rom.nes
@@ -129,9 +122,7 @@ The CPU views need the weights CPU; pixel views are always available. The `--deb
 | `6502-klaus` | Klaus Dormann functional test suite (reference / weights) |
 | `6502-nestest` | nestest suite vs the Nintendulator golden log (incl. unofficial opcodes) |
 | `6502-transformer` | Run the 6502 as real transformer weights, lockstep vs the reference |
-| `6502-export` | Write the 6502 transformer as a standalone checkpoint (`weights.safetensors` + `machine.json`) |
-| `6502-checkpoint` | Run an exported checkpoint in plain PyTorch against the nestest golden log |
-| `6502-experts` | Run the exported per-opcode experts as a routed mixture in PyTorch against the nestest golden log |
+| `6502-eager` | Run nestest on the saved model's CPU chip in eager PyTorch, against the golden log |
 | `nes-run` | Run an NES ROM or benchmark a captured input tape on the native console |
 
 The [`transformer_nes/cpu6502/README.md`](transformer_nes/cpu6502/README.md) documents the 6502 machine, including its graph construction, execution backends, compilation pipeline, MMIO/NMI layer, and numerics rules.
@@ -141,18 +132,18 @@ The [`transformer_nes/cpu6502/README.md`](transformer_nes/cpu6502/README.md) doc
 | Path | Role |
 |------|------|
 | `transformer_nes/graph/` | Machine-independent graph DSL: Input/ReGLU/Persist/LookUp dimensions, arithmetic and memory idioms (`ops.py`), direct evaluation (`evaluate.py`), partial evaluation and rebuilding (`fold.py`) |
-| `transformer_nes/model/` | The transformer model as PyTorch modules (`transformer.py`), its construction from circuits (`construct.py`) and compilation into one library (`backend.py`); scheduling (`schedule.py`), analytic matrices and exact checkpoint serialization (`weights.py`), matrix-to-FX compilation (`compiler.py`), scalar lowering and fragment sharing (`ssa.py`), and independent reference inference (`inference.py`) |
-| `transformer_nes/cpu6502/` | The 6502: opcode spec, graph and trace format (`spec.py`, `graph.py`, `trace.py`); expert construction (`shapes.py`, `execution.py`, `folds.py`, `experts.py`); the runtime (`runner.py`, `bank.py`, `engine.py`, C++ templates in `native/`); the oracle (`reference.py`); standalone checkpoints (`checkpoint/`); and the Klaus/nestest harnesses (`conformance/`) |
+| `transformer_nes/model/` | The transformer model as PyTorch modules (`transformer.py`), its construction from circuits (`construct.py`) and compilation into one library (`backend.py`); scheduling (`schedule.py`), analytic matrices (`weights.py`), matrix-to-FX compilation (`compiler.py`), scalar lowering and fragment sharing (`ssa.py`), and independent reference inference (`inference.py`) |
+| `transformer_nes/cpu6502/` | The 6502: opcode spec, graph and trace format (`spec.py`, `graph.py`, `trace.py`); execution construction (`shapes.py`, `execution.py`, `folds.py`, `experts.py`); the CPU chip and its dispatch tables (`chip.py`); the machine API over the native host (`runner.py`); the eager PyTorch runner (`eager.py`); the oracle (`reference.py`); and the Klaus/nestest harnesses (`conformance/`) |
 | `transformer_nes/ppu2c02/` | The PPU graphs: memory layout (`space.py`), register transitions (`registers.py`), background rendering and compositing (`render.py`), sprite selection, overflow and fetch (`sprites.py`), timing/bus/view effects, scanline clocks and sprite-line composition (`control.py`), and the PPU's chips and native dispatch tables (`machine.py`) |
 | `transformer_nes/apu2a03/` | The APU graphs: register programming, channels, frame sequencer, DMC and mixing (`audio.py`); timer and noise transitions (`oscillators.py`) |
 | `transformer_nes/nes/` | The NES model (`model.py`: its chips as one `nn.Module`, saved as safetensors, compiled once), console-level circuits (the controller in `controller.py`, mapper chips in `mappers.py`), and the CPU-backend adapters (`backends.py`) |
 | `transformer_nes/frontend/` | The `nes-run` command (`app.py`), observation (`debug.py`), and the transformer X-ray (`xray.py`) |
-| `transformer_nes/build.py` | Shared paths, source identities, cache ownership, atomic writes, native extension loading and Makefile builds |
+| `transformer_nes/build.py` | Shared paths, source identities, the native console extensions, and the scalar compiler's kernel cache |
 | `native/` | Native C++ console: device headers (`include/nes/`), device implementations (`console/`), Python bindings (`bindings.cpp`), the window and debug overlay (`frontend/`), the conventional PPU oracle (`reference/`) and the native hardware test (`tests/`) |
 | `fixtures/` | The nestest ROM and log, the Klaus functional test, downloaded hardware test ROMs, and local game ROMs |
-| `.cache/engine/` | Generated kernels and native banks (not tracked; safe to delete) |
+| `.cache/` | The saved model and its compiled library (`nes/`) and reusable kernels (`compiler/`): not tracked, safe to delete |
 
-The dependency direction is one-way: `graph/` ← `model/` ← the chip packages ← `nes/` ← `frontend/`. The entire generic `model/` package imports without loading the CPU package; a test enforces this. The standalone checkpoint runners in `cpu6502/checkpoint/` import nothing from this repository; a test enforces that too. The `6502-export`, `6502-checkpoint`, and `6502-experts` commands remain the public entry points.
+The dependency direction is one-way: `graph/` ← `model/` ← the chip packages ← `nes/` ← `frontend/`. The entire generic `model/` package imports without loading the CPU package; a test enforces this. The eager CPU runner (`cpu6502/eager.py`) imports only Torch, safetensors and `model/transformer.py`; a test enforces that too.
 
 For a reading order and the reasons for the module boundaries, see
 [the source layout](docs/source-layout.md).
@@ -185,23 +176,24 @@ fold licenses direct reads over the latest-written byte image before scheduling;
 there are no separate nearest-address or register caches. C++ owns dispatch,
 architectural readout, event scheduling and byte transport. Constant coefficients and sparse routing are
 specialized before play; CPU kernels return packed live readouts, and execution
-allocates no weight tensors or per-call Tensor wrappers. The standalone union and expert checkpoint runners remain independent
-checks, including ordinary softmax attention.
+allocates no weight tensors or per-call Tensor wrappers. The saved model's
+eager PyTorch forward is the independent check: it runs all of nestest.
 
 The graph construction uses single-unit Boolean gates, shared opcode-equality
-hinges and bounded byte extractors. The standalone CPU union has 27,536 nonzero
-coefficients, down from 40,824. Its checkpoint stores each tensor in the smallest
-exact signed integer type and widens it for inference: 281 KiB instead of
-850 KiB, with no quantization. The
+hinges and bounded byte extractors. The CPU chip has 55,587 nonzero weights:
+11,009 in its union circuit, the rest in its 220 executions and 15 read
+requests. The whole NES model is saved in 615 KB, each tensor in the smallest
+exact signed integer type, with no quantization. The
 [architecture notes](docs/neural-architecture.md) describe the construction and
 storage contracts.
 
-The first launch compiles the fixed execution banks before play; later launches
-load cached binaries. No compiler runs in the background during emulation.
+The first launch constructs and compiles the model before play; later launches
+load the saved model and its library. No compiler runs in the background during
+emulation.
 
 Bank rebuilds reuse individual circuits by their canonical SSA, numeric type,
 memory extent and compiler identity. The source cache in
-`.cache/engine/kernels/` is bounded to 256 MiB and evicts the oldest unused
+`.cache/compiler/kernels/` is bounded to 256 MiB and evicts the oldest unused
 entries. New circuits lower directly without importing Inductor or Dynamo; a
 changed bank still needs native compilation. Build logs report reused and newly
 lowered circuits separately. Integer affine cancellation respects overflow and

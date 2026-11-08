@@ -14,7 +14,6 @@ PYTHON ?= $(shell test -x .venv/bin/python && echo .venv/bin/python || echo pyth
 UNAME := $(shell uname -s)
 
 NATIVE := native
-CPU_ABI := transformer_nes/cpu6502/native
 VENDOR := vendor
 BIN := bin
 OBJ := $(BIN)/obj
@@ -24,7 +23,7 @@ PY_INCLUDE := $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_paths(
 CXX ?= c++
 CC ?= cc
 CXXFLAGS := -O2 -std=c++20 -Wall -Wextra -Wpedantic -fPIC -fvisibility=hidden
-NES_INCLUDES := -I$(NATIVE) -I$(NATIVE)/include -I$(CPU_ABI)
+NES_INCLUDES := -I$(NATIVE) -I$(NATIVE)/include
 PY_INCLUDES := -I$(VENDOR)/pybind11/include -I$(PY_INCLUDE)
 UI_INCLUDES := -I$(VENDOR)/sokol -I$(VENDOR)/imgui
 
@@ -39,7 +38,7 @@ FRONTEND_LIBS := -lGL -lX11 -lXi -lXcursor -lasound -ldl -lpthread -lm
 SOKOL_LANG := c
 endif
 
-HW_OBJS := $(addprefix $(OBJ)/,bindings.o bus.o ppu.o apu.o console.o tape.o)
+HW_OBJS := $(addprefix $(OBJ)/,bindings.o bus.o cpu.o ppu.o apu.o console.o tape.o)
 REF_OBJ := $(BIN)/reference_obj
 REF_OBJS := $(HW_OBJS:$(OBJ)/%=$(REF_OBJ)/%)
 IMGUI_OBJS := $(addprefix $(OBJ)/,imgui.o imgui_draw.o imgui_tables.o imgui_widgets.o)
