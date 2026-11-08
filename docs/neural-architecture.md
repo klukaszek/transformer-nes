@@ -18,15 +18,16 @@ token readouts rather than the CPU execution-effect IR.
 
 ```mermaid
 flowchart LR
-    semantics[Machine semantics] --> graph[Computation graph]
-    graph --> fold[Partial evaluation]
-    fold --> proof[Dispatch proofs]
+    semantics[Machine semantics] --> graph1[Computation graph]
+    graph1 --> fold[Partial evaluation]
+    graph1 --> proof[Dispatch proofs]
     proof --> effects[Execution effects]
     effects --> schedule[Layer scheduling]
     schedule --> weights[Transformer matrices]
     weights --> abi[Residual-slot ABI]
     abi --> torch[Torch compilation]
     torch --> runtime[Native scheduling and devices]
+
 ```
 
 | Stage | Implementation | Contract |
