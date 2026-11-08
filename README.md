@@ -52,13 +52,13 @@ uv run 6502-nestest --runner both
 # Export the weights, then run them in a plain PyTorch transformer that
 # imports nothing from this repository (about two minutes for nestest):
 uv run 6502-export checkpoint/
-uv run 6502-checkpoint checkpoint/ --nestest transformer_nes/nes/examples/nestest.nes \
-    transformer_nes/nes/examples/nestest.log
+uv run 6502-checkpoint checkpoint/ --nestest fixtures/roms/nestest.nes \
+    fixtures/roms/nestest.log
 
 # The folded per-opcode experts, routed by opcode in PyTorch (about a second):
 uv run 6502-export experts/ --experts
-uv run 6502-experts experts/ --nestest transformer_nes/nes/examples/nestest.nes \
-    transformer_nes/nes/examples/nestest.log
+uv run 6502-experts experts/ --nestest fixtures/roms/nestest.nes \
+    fixtures/roms/nestest.log
 
 # Run an NES ROM with the native C++ console hardware:
 uv run nes-run path/to/rom.nes
@@ -70,7 +70,7 @@ uv run nes-run path/to/rom.nes --tape tapes/game_tape
 uv run nes-run path/to/rom.nes --tape tapes/game_tape --benchmark-json timings.json
 ```
 
-Game ROMs and tape captures are local inputs; the repository includes the nestest verification ROM and log. The `6502-nestest` command expects `nestest.nes` at `transformer_nes/nes/examples/nestest.nes`; `nes-run` accepts a local ROM path and tape path directly.
+Game ROMs and tape captures are local inputs; the repository includes the nestest verification ROM and log. The `6502-nestest` command expects `nestest.nes` at `fixtures/roms/nestest.nes`; `nes-run` accepts a local ROM path and tape path directly.
 
 Tape benchmarks report p1, p50 and p99 frame times for wall time and, where
 available, thread CPU time. Wall time includes preemption; thread CPU time
@@ -110,7 +110,7 @@ The game keeps running and taking input while the overlay is open. It provides:
 - **Stats:** display FPS, backend name, frame number, CPU cycles, and emulation time per frame.
 - **Options:** toggle overscan cropping, pause emulation, remove the PPU's eight-sprites-per-scanline limit, or mute audio.
 - **Step frame:** pause the emulator and advance exactly one frame.
-- **Transformer X-ray** (`nes/xray.py`), read live from the running engines:
+- **Transformer X-ray** (`frontend/xray.py`), read live from the running engines:
   - *CPU paths:* how each frame's instructions were retired -- proven loop recurrences, folded instruction shapes, per-opcode experts, interrupt experts, or the full model.
   - *CPU memory:* a 256x256 heatmap of the addresses the CPU's attention heads read.
   - *Instruction dissection:* the next instruction through the full CPU model on a copy of the engine, every named value at the layer that computes it (memory reads with their addresses).
@@ -138,16 +138,21 @@ The [`transformer_nes/cpu6502/README.md`](transformer_nes/cpu6502/README.md) doc
 
 ## Layout
 
-| Package | Role |
-|---------|------|
+| Path | Role |
+|------|------|
 | `transformer_nes/graph/` | Machine-independent graph DSL: Input/ReGLU/Persist/LookUp dimensions, arithmetic and memory idioms (`ops.py`), direct evaluation (`evaluate.py`), partial evaluation and rebuilding (`fold.py`) |
-| `transformer_nes/cpu6502/` | The pure 6502: opcode spec, graph construction, trace format, `backends/reference.py`, the weights compiler/runtime in `backends/weights/` (`engine.py` emits model-specific dispatch into the C++ runtime template in `native/engine.cpp`), the self-contained checkpoint exporter and runners (`export.py`, `checkpoint_runner.py`, `expert_runner.py`), and `examples/klaus/` (harness + binary) |
-| `transformer_nes/nes/` | Native C++ NES hardware: bus, cartridge, mapper/MMC headers, PPU, APU, console, tape replay, and the window with its debug overlay; `app.py` builds it, adapts a CPU backend, and launches it; `xray.py` reads the engines for the overlay |
-| `transformer_nes/ppu2c02/` | The PPU graphs: memory layout (`space.py`), register transitions (`registers.py`), background rendering and compositing (`render.py`), sprite selection, overflow and fetch (`sprites.py`), timing/bus/view effects, scanline clocks and sprite-line composition (`control.py`), and the shared engine (`machine.py`) |
 | `transformer_nes/model/` | Transformer machinery: scheduling (`schedule.py`), analytic matrices and exact checkpoint serialization (`weights.py`), matrix-to-FX compilation (`compiler.py`), scalar lowering and fragment sharing (`ssa.py`), the token-graph engine (`graph_engine.py`), and independent reference inference (`inference.py`) |
-| `transformer_nes/build.py` | Shared source identities, cache ownership, atomic writes, native extension loading and Makefile builds |
+| `transformer_nes/cpu6502/` | The 6502: opcode spec, graph and trace format (`spec.py`, `graph.py`, `trace.py`); expert construction (`shapes.py`, `execution.py`, `folds.py`, `experts.py`); the runtime (`runner.py`, `bank.py`, `engine.py`, C++ templates in `native/`); the oracle (`reference.py`); standalone checkpoints (`checkpoint/`); and the Klaus/nestest harnesses (`conformance/`) |
+| `transformer_nes/ppu2c02/` | The PPU graphs: memory layout (`space.py`), register transitions (`registers.py`), background rendering and compositing (`render.py`), sprite selection, overflow and fetch (`sprites.py`), timing/bus/view effects, scanline clocks and sprite-line composition (`control.py`), and the shared engine (`machine.py`) |
+| `transformer_nes/apu2a03/` | The APU graphs: register programming, channels, frame sequencer, DMC and mixing (`audio.py`); timer and noise transitions (`oscillators.py`) |
+| `transformer_nes/nes/` | Console-level circuits and host glue: the controller protocol (`controller.py`), mapper banking and IRQs (`mappers.py`), and the CPU-backend adapters (`backends.py`) |
+| `transformer_nes/frontend/` | The `nes-run` command (`app.py`), observation (`debug.py`), and the transformer X-ray (`xray.py`) |
+| `transformer_nes/build.py` | Shared paths, source identities, cache ownership, atomic writes, native extension loading and Makefile builds |
+| `native/` | Native C++ console: device headers (`include/nes/`), device implementations (`console/`), Python bindings (`bindings.cpp`), the window and debug overlay (`frontend/`), the conventional PPU oracle (`reference/`) and the native hardware test (`tests/`) |
+| `fixtures/` | The nestest ROM and log, the Klaus functional test, downloaded hardware test ROMs, and local game ROMs |
+| `.cache/engine/` | Generated kernels and native banks (not tracked; safe to delete) |
 
-The dependency direction is one-way: `nes/` depends on the NES-independent CPU package; the CPU construction depends on `graph/`, while its weights backend also uses `model/` for scheduling and code generation. The entire generic `model/` package imports without loading the CPU package; a test enforces this. Machine-specific checkpoint export and standalone runners live in `cpu6502/backends/weights/`. The `6502-export`, `6502-checkpoint`, and `6502-experts` commands remain the public entry points.
+The dependency direction is one-way: `graph/` ← `model/` ← the chip packages ← `nes/` ← `frontend/`. The entire generic `model/` package imports without loading the CPU package; a test enforces this. The standalone checkpoint runners in `cpu6502/checkpoint/` import nothing from this repository; a test enforces that too. The `6502-export`, `6502-checkpoint`, and `6502-experts` commands remain the public entry points.
 
 For a reading order and the reasons for the module boundaries, see
 [the source layout](docs/source-layout.md).
@@ -196,7 +201,7 @@ load cached binaries. No compiler runs in the background during emulation.
 
 Bank rebuilds reuse individual circuits by their canonical SSA, numeric type,
 memory extent and compiler identity. The source cache in
-`model/_engine_cache/kernels/` is bounded to 256 MiB and evicts the oldest unused
+`.cache/engine/kernels/` is bounded to 256 MiB and evicts the oldest unused
 entries. New circuits lower directly without importing Inductor or Dynamo; a
 changed bank still needs native compilation. Build logs report reused and newly
 lowered circuits separately. Integer affine cancellation respects overflow and
@@ -219,7 +224,7 @@ The PPU host (`transformer_nes/nes/ppu.cpp`) is a catch-up machine on an absolut
 
 The console loop runs the CPU only up to the next event that must interrupt it: vblank, the frame's end, or a mapper IRQ predicted by a dry run of the PPU. The same dry run tells the engine how long a `$2002` poll result stays valid, so polling loops stay inside the CPU run loop.
 
-Automated tests run the transformer CPU and PPU through blargg's `ppu_vbl_nmi` (10/10), `mmc3_test_2` (5/5 for the supported chip revision), and `oam_read`. See [`transformer_nes/nes/examples/testroms/`](transformer_nes/nes/examples/testroms/README.md).
+Automated tests run the transformer CPU and PPU through blargg's `ppu_vbl_nmi` (10/10), `mmc3_test_2` (5/5 for the supported chip revision), and `oam_read`. See [`fixtures/roms/testroms/`](fixtures/roms/testroms/README.md).
 
 ### The PPU as weights
 
@@ -239,7 +244,7 @@ These token graphs share one engine and memory (`model/graph_engine.py`). Partia
 
 An eight-lane *composition* token merges fetched sprite rows into the line state, preserving first-opaque-pixel priority, clipping the right edge and marking occupied tiles. It reuses the bounded line buffer across ordinary fetches, unlimited-sprite batches and status previews.
 
-Every production console attaches this PPU automatically. Neural control tokens resolve NMI/status races, filtered A12 edges, register-side latch effects and MMC5 view selection. C++ advances the absolute clock, delivers bus effects and stores output buffers. The conventional PPU algorithms live under `nes/tests/ppu_reference.*` and build only into the independent test oracle; they are excluded from the production extension.
+Every production console attaches this PPU automatically. Neural control tokens resolve NMI/status races, filtered A12 edges, register-side latch effects and MMC5 view selection. C++ advances the absolute clock, delivers bus effects and stores output buffers. The conventional PPU algorithms live under `native/reference/ppu_reference.*` and build only into the independent test oracle; they are excluded from the production extension.
 
 The clock circuit (`control.py:clock_graph`) returns scanline transitions, frame-wrap effects and ordered event descriptors, including events sharing a dot and the bounds of consecutive tile runs. At attachment the host materializes the five distinct timelines from these weights. Play consumes their readouts without a neural call per dot or a handwritten event table.
 

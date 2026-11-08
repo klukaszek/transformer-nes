@@ -1,3 +1,3 @@
-"""A MOS 6502 CPU expressed as a transformer computation graph."""
+"""An NES emulator built from analytically constructed transformer circuits."""
 
 __version__ = "0.1.0"

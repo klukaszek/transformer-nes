@@ -17,20 +17,20 @@ in [`transformer_nes/nes/`](../nes/).
 | `spec.py` | Shared opcode, addressing-mode, flag, memory-read, and timing metadata. It contains 227 opcode entries: 151 official NMOS opcodes plus the stable unofficial opcodes exercised by the tests. |
 | `graph.py` | Builds the 6502 graph and exposes the named dimensions consumed by scheduling and code generation. |
 | `trace.py` | Instruction-level state and memory-write records shared by both backends. |
-| `backends/reference.py` | Straightforward Python implementation used as the behavioral oracle. |
-| `backends/weights/runner.py` | Builds, caches, and runs the transformer-weights backend. |
-| `backends/weights/bank.py` | Compiles and attaches the immutable native forward bank; owns its context and diagnostic traces. |
-| `backends/weights/engine.py` | Emits model-specific embedding, readout and dispatch into the CPU runtime template. All neural layers run in the shared scalar SSA compiler. |
-| `backends/weights/export.py` | Exports the self-contained union or folded experts as losslessly packed integer safetensors and machine metadata. |
-| `backends/weights/checkpoint_runner.py` | Standalone PyTorch union runner, importing only the standard library, Torch and safetensors. |
-| `backends/weights/expert_runner.py` | Independent routed expert runner for exported checkpoints and runtime verification. |
-| `backends/weights/experts.py` | Orchestrates folding, dispatch proofs, effect projection, scheduling and ABI lowering. |
-| `backends/weights/folds.py` | Opcode pins, sequence feedback/composition, cached expert construction, range proofs and symbolic-PC/read licenses. |
-| `backends/weights/execution.py` | Typed architectural effects, control/cycles, graph projection and lowering to residual slots. |
-| `backends/weights/shapes.py` | Fixed shape templates, recurrence proofs and matching against live cartridge bytes. |
-| `backends/weights/native/engine.cpp` | CPU runtime template: watches, read leases, cycle budgets, tracing and console bindings. |
-| `examples/klaus/` | Klaus Dormann functional-test binary and harness. |
-| `examples/nestest.py` | Harness for the nestest ROM and its Nintendulator golden log. |
+| `reference.py` | Straightforward Python implementation used as the behavioral oracle. |
+| `runner.py` | Builds, caches, and runs the transformer-weights backend. |
+| `bank.py` | Compiles and attaches the immutable native forward bank; owns its context and diagnostic traces. |
+| `engine.py` | Emits model-specific embedding, readout and dispatch into the CPU runtime template. All neural layers run in the shared scalar SSA compiler. |
+| `checkpoint/export.py` | Exports the self-contained union or folded experts as losslessly packed integer safetensors and machine metadata. |
+| `checkpoint/dense_runner.py` | Standalone PyTorch union runner, importing only the standard library, Torch and safetensors. |
+| `checkpoint/expert_runner.py` | Independent routed expert runner for exported checkpoints and runtime verification. |
+| `experts.py` | Orchestrates folding, dispatch proofs, effect projection, scheduling and ABI lowering. |
+| `folds.py` | Opcode pins, sequence feedback/composition, cached expert construction, range proofs and symbolic-PC/read licenses. |
+| `execution.py` | Typed architectural effects, control/cycles, graph projection and lowering to residual slots. |
+| `shapes.py` | Fixed shape templates, recurrence proofs and matching against live cartridge bytes. |
+| `native/engine.cpp` | CPU runtime template: watches, read leases, cycle budgets, tracing and console bindings. |
+| `conformance/klaus.py` | Harness for the Klaus Dormann functional test (binary in `fixtures/klaus/`). |
+| `conformance/nestest.py` | Harness for the nestest ROM and its Nintendulator golden log (in `fixtures/roms/`). |
 
 ## How the graph represents a CPU
 
@@ -66,7 +66,7 @@ the same trace contract.
 
 ### Reference backend
 
-`backends/reference.py` is intentionally ordinary Python. It uses a dense
+`reference.py` is intentionally ordinary Python. It uses a dense
 64 KiB memory array, implements the full instruction set represented by
 `spec.py`, and provides both traced execution (`step()` and `run()`) and a
 fast trap-oriented loop (`run_traps()`). It is the independent behavioral
@@ -84,7 +84,7 @@ always uses binary arithmetic, including when its decimal flag is set.
 
 ### Transformer-weights backend
 
-`backends/weights/runner.py` builds the graph, schedules it with
+`runner.py` builds the graph, schedules it with
 `model/schedule.py:asap_schedule`, constructs the weights analytically, and
 emits a generated C++ engine. There is no training step. Its attention and
 FFN widths vary by layer according to liveness and the schedule; current
@@ -156,7 +156,7 @@ The weights backend follows this sequence:
    opcode, interrupt, shape, and sequence models.
 5. `model/compiler.py` expands the matrices into FX; `model/ssa.py` lowers and
    shares scalar arithmetic, shared with the PPU. The graph fold exposes
-   licensed indexed reads before scheduling. `backends/weights/engine.py`
+   licensed indexed reads before scheduling. `engine.py`
    supplies embedding, architectural readout and the native run loop;
    `build.py` builds and caches the extensions.
 
@@ -189,7 +189,7 @@ The native NES bus connects those devices to the CPU protocol:
 
 Python boots the weights machine through `load_image` and installs device
 watches. During play the bus calls the shared native ABI in
-`backends/weights/native/machine_abi.h` for runs, writes, cartridge mapping,
+`native/machine_abi.h` for runs, writes, cartridge mapping,
 read leases and interrupts. The Python `run` and injection methods support
 verification harnesses.
 
@@ -225,7 +225,7 @@ uv run pytest transformer_nes/cpu6502/tests
 ```
 
 The nestest harness reads `nestest.nes` and `nestest.log` from
-`transformer_nes/nes/examples/`. The NES console tests in
+`fixtures/roms/`. The NES console tests in
 `transformer_nes/nes/tests/` additionally compare reference and weights
 backends at the hardware boundary, including frames, cycles, RAM, device
 reads, and mapper writes.

@@ -34,12 +34,12 @@ flowchart LR
 | Machine semantics | [`cpu6502/graph.py`](../transformer_nes/cpu6502/graph.py), [`ppu2c02/`](../transformer_nes/ppu2c02/) | Construct expressions for a machine transition or PPU token. `Cpu6502Graph` exposes the CPU's input/output contract in the same module. |
 | Graph language | [`graph/core.py`](../transformer_nes/graph/core.py), [`graph/ops.py`](../transformer_nes/graph/ops.py) | Inputs, attention lookups, ReGLUs, linear persists and captured graphs. A ReGLU computes `a * max(0, b)`. |
 | Partial evaluation | [`graph/evaluate.py`](../transformer_nes/graph/evaluate.py), [`graph/fold.py`](../transformer_nes/graph/fold.py) | Substitute licensed constants, remove dead work and rebuild a graph. Each construction has its own node identities and interning state. |
-| CPU composition and proofs | [`weights/folds.py`](../transformer_nes/cpu6502/backends/weights/folds.py) | Chain instruction graphs with register feedback and symbolic PC offsets; bound reads, identify constants and check symbolic control flow before dispatch. |
-| CPU effects | [`weights/execution.py`](../transformer_nes/cpu6502/backends/weights/execution.py) | Project a licensed graph to final state, ordered writes, control and cycles. Lower graph dimensions to residual slots after scheduling. |
-| Expert construction | [`weights/experts.py`](../transformer_nes/cpu6502/backends/weights/experts.py) | Orchestrate folding, validation, projection and construction in stable dispatch order. |
+| CPU composition and proofs | [`cpu6502/folds.py`](../transformer_nes/cpu6502/folds.py) | Chain instruction graphs with register feedback and symbolic PC offsets; bound reads, identify constants and check symbolic control flow before dispatch. |
+| CPU effects | [`cpu6502/execution.py`](../transformer_nes/cpu6502/execution.py) | Project a licensed graph to final state, ordered writes, control and cycles. Lower graph dimensions to residual slots after scheduling. |
+| Expert construction | [`cpu6502/experts.py`](../transformer_nes/cpu6502/experts.py) | Orchestrate folding, validation, projection and construction in stable dispatch order. |
 | Layers and weights | [`model/schedule.py`](../transformer_nes/model/schedule.py), [`model/weights.py`](../transformer_nes/model/weights.py) | Schedule attention/linear/FFN phases and construct their actual matrices. |
 | Weight lowering | [`model/compiler.py`](../transformer_nes/model/compiler.py), [`model/ssa.py`](../transformer_nes/model/ssa.py) | Expand the matrices into integer or float32 FX operations, lower compact scalar SSA and compile fixed native kernels. |
-| CPU runtime | [`weights/native/engine.cpp`](../transformer_nes/cpu6502/backends/weights/native/engine.cpp), [`weights/engine.py`](../transformer_nes/cpu6502/backends/weights/engine.py) | Embed live inputs, dispatch kernels and commit licensed effects within device and cycle budgets. |
+| CPU runtime | [`cpu6502/native/engine.cpp`](../transformer_nes/cpu6502/native/engine.cpp), [`cpu6502/engine.py`](../transformer_nes/cpu6502/engine.py) | Embed live inputs, dispatch kernels and commit licensed effects within device and cycle budgets. |
 
 The graph and model packages are independent of the CPU package. The neural
 construction and runtime paths also import without loading the reference CPU
@@ -85,7 +85,7 @@ specification remains a dictionary because it is also the checkpoint wire format
 The CPU's full graph computes instruction transitions. Partial evaluation
 produces opcode continuations, read requests, interrupts and fixed polling/counter experts. The fixed shape
 library, recurrence checks and ROM matcher live together in
-[`weights/shapes.py`](../transformer_nes/cpu6502/backends/weights/shapes.py).
+[`cpu6502/shapes.py`](../transformer_nes/cpu6502/shapes.py).
 
 A dispatch proof is a build-time condition, not a confidence estimate. For
 example, fixed shapes must not hide writes from device arbitration; later reads
@@ -335,7 +335,7 @@ recurrent state transition, rather than a new attention-memory construction.
 It shares the memory-free control bank, leaving the CHR attention variants
 unchanged.
 
-Conventional PPU implementations live under `nes/tests/ppu_reference.*` as
+Conventional PPU implementations live under `native/reference/ppu_reference.*` as
 independent oracles. The host stores neural line readouts and schedules dots.
 
 ## Typed CPU write effects
@@ -384,7 +384,7 @@ descriptor supplies neural control without one forward per transferred byte.
 
 ## Audio transitions and recurrent sample construction
 
-[`nes/audio.py`](../transformer_nes/nes/audio.py) constructs seven integer token graphs
+[`apu2a03/audio.py`](../transformer_nes/apu2a03/audio.py) constructs seven integer token graphs
 for the 2A03 and a separate float32 sample bank. Quarter, half and combined modulation experts advance all three
 envelopes, four length counters, the triangle linear counter and both pulse
 sweeps together. The combined event preserves quarter-then-half
@@ -423,7 +423,7 @@ a requested memory read before the bit clock and returns its byte in a reply
 token. It decrements the returned timer budget without rerunning the circuit
 on each empty cycle; period changes leave the current budget intact.
 
-[`nes/oscillators.py`](../transformer_nes/nes/oscillators.py) constructs clock
+[`apu2a03/oscillators.py`](../transformer_nes/apu2a03/oscillators.py) constructs clock
 transitions for all four oscillators. The construction bound is
 `S = min(429, max(1, ceil(cpu_frequency / sample_rate)))`: the DMC and sample
 deadlines bound every span before a forward runs. It cannot cross a frame event
@@ -536,7 +536,7 @@ with the same chip and bank counts share a model. Constant-modulus division uses
 bounded binary subtraction circuits, including for non-power-of-two capacities,
 without a state/outcome cache.
 
-[`BankMapper`](../transformer_nes/nes/include/nes/mappers/banked.h) holds opaque
+[`BankMapper`](../native/include/nes/mappers/banked.h) holds opaque
 register state and applies the returned maps. It copies changed
 PRG windows and delivers CHR maps to the PPU. It contains no banking formulas
 or serial-register implementation.
@@ -591,7 +591,7 @@ for whether its first scanline has arrived, whether its target has passed,
 and whether an IRQ is already pending. A passed target waits for an idle event;
 that event runs the same weights on private preview state to begin a new epoch.
 
-[`MapperIrqProbe`](../transformer_nes/nes/include/nes/mappers/irq.h) counts
+[`MapperIrqProbe`](../native/include/nes/mappers/irq.h) counts
 qualified arrivals against this neural deadline and reports their absolute dot.
 Its countdown is a scheduling budget, not a second mapper counter. Preview
 never commits mapper state or IRQ writes. Mapper register accesses catch the

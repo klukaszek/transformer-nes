@@ -119,7 +119,7 @@ class Cpu6502TransformerMachine:
 
     model = property(lambda self: self.built[0])
     slot_of = property(lambda self: self.built[2].slot_of)
-    lives = property(lambda self: self.built[2].lives)  # residual live ranges (nes/xray.py)
+    lives = property(lambda self: self.built[2].lives)  # residual live ranges (frontend/xray.py)
 
     def core_experts(self) -> tuple[list[dict], list[dict]]:
         """The core engine's experts in its build order (the forward hook's

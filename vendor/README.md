@@ -10,4 +10,4 @@ revisions listed in that script:
 The root Makefile builds the console and frontend into `bin/`. Sokol's
 implementation lives in `nes/sokol_impl.m`, compiled as Objective-C on macOS
 and C elsewhere. Generated transformer extensions use PyTorch's bundled
-pybind11 headers and the separate cache in `model/_engine_cache/`.
+pybind11 headers and the separate cache in `.cache/engine/`.
