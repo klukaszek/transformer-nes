@@ -13,7 +13,7 @@ build/
 .claude/
 
 # C++ build output
-_engine_cache/
+/.cache/
 /bin/
 
 # Vendored deps are fetched by vendor/install_deps.sh

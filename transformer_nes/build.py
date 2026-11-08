@@ -34,7 +34,8 @@ logger = logging.getLogger(__name__)
 
 PACKAGE_DIR = Path(__file__).parent
 PROJECT_DIR = PACKAGE_DIR.parent
-CACHE_DIR = str(PACKAGE_DIR / "model" / "_engine_cache")
+# Generated kernels and native banks live beside the project, never in the package.
+CACHE_DIR = str(PROJECT_DIR / ".cache" / "engine")
 PACKAGE = "transformer_nes"
 ARTIFACT_RE = re.compile(r"^(?:engine|graph|build)_([0-9a-f]{16})(?:[_.].*)?$")
 MAX_KERNEL_BYTES = 256 * 1024**2

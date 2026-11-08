@@ -45,7 +45,7 @@ jobs:
       - name: Build console, frontend and reference oracle
         run: |
           make all reference-hardware PYTHON="$(uv python find)"
-          uv run --locked python -c "from transformer_nes.nes.build import load_frontend; load_frontend()"
+          uv run --locked python -c "from transformer_nes.build import load_nes_extension; load_nes_extension('frontend')"
       - name: Unit and synthetic console tests
         run: uv run --locked pytest -m "not slow" --strict-markers --durations=15 --junitxml="$RUNNER_TEMP/unit-results.xml"
       - name: Fetch pinned hardware ROM fixtures
