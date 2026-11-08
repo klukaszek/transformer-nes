@@ -325,11 +325,14 @@ def compiler_identity(extractor):
             co_consts=tuple(normalized(c) if isinstance(c, types.CodeType) else c for c in code.co_consts),
         )
 
+    # The extractor's own code plus everything its module defines and
+    # imports: a hit must reproduce exactly what a cold lowering would emit.
     return (
         KERNEL_CACHE_SCHEMA, torch.__version__, torch.version.git_version,
         platform.system(), platform.machine(), sys.version_info[:3],
         sys.byteorder, marshal.dumps(normalized(extractor.__code__)),
         extractor.__defaults__, extractor.__kwdefaults__,
+        source_digest(extractor.__module__),
     )
 
 
