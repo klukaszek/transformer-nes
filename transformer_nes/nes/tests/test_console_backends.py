@@ -8,8 +8,8 @@ import os
 import numpy as np
 import pytest
 
+from transformer_nes.build import load_nes_extension
 from transformer_nes.nes.backends import backend_factory
-from transformer_nes.nes.build import load_hardware
 
 EXAMPLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
 
@@ -330,7 +330,7 @@ def test_console_weights_matches_reference(rom):
     path = os.path.join(EXAMPLES, rom)
     if not os.path.exists(path):
         pytest.skip(f"{rom} not present")
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     cart = hardware.Cartridge.load(path)
     ref, ref_frames = run_console(hardware, cart, "reference", FRAMES)
     wts, wts_frames = run_console(hardware, cart, "weights", FRAMES)
@@ -384,7 +384,7 @@ def mmc1_rmw_cart(hardware):
 
 @pytest.mark.parametrize("backend", ["reference", "weights"])
 def test_mmc1_rmw_register_write_uses_rom_byte(backend):
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     cart = mmc1_rmw_cart(hardware)
     console, _frames = run_console(hardware, cart, backend, 2, script={})
     # Register = 0b11111 -> bank 1 at $8000, whose first byte is the
@@ -426,7 +426,7 @@ def test_leased_poll_recurrence_matches_reference():
     """A poll recurrence extrapolates only what single steps would read: a
     lease serving another value than the read the poll began with (served
     by the device at a pause) ends it."""
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     cart = vblank_poll_cart(hardware)
     ref, _ = run_console(hardware, cart, "reference", 12, script={})
     wts, _ = run_console(hardware, cart, "weights", 12, script={})
@@ -436,7 +436,7 @@ def test_leased_poll_recurrence_matches_reference():
 
 
 def test_controller_reply_survives_lease_eviction_and_device_invalidation():
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     ports = (0x4016, 0x4016, 0x4017, 0x2002, 0x200A, 0x2012, 0x201A, 0x2022)
     strobe = bytes.fromhex("a9018d1640a9008d1640")
     code = bytearray(strobe)
@@ -668,7 +668,7 @@ def test_controller_reply_packets_match_serial_reads():
 
 @pytest.mark.parametrize("backend", ["reference", "weights"])
 def test_mmc5_neural_ram_protection_and_multiplier(backend):
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     code = []
 
     def write(addr, value):
@@ -711,7 +711,7 @@ def test_mmc5_neural_ram_protection_and_multiplier(backend):
 
 @pytest.mark.parametrize("backend", ["reference", "weights"])
 def test_mmc5_bank_matcher_refreshes_writable_code(backend):
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     code = []
 
     def write(address, value):

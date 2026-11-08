@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-from transformer_nes.cpu6502.backends.weights.proofs import const_root, interval_of
+from transformer_nes.cpu6502.backends.weights.folds import const_root, interval_of
 from transformer_nes.cpu6502.spec import (
     FLAG_B,
     FLAG_C,

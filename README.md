@@ -143,10 +143,14 @@ The [`transformer_nes/cpu6502/README.md`](transformer_nes/cpu6502/README.md) doc
 | `transformer_nes/graph/` | Machine-independent graph DSL: Input/ReGLU/Persist/LookUp dimensions, arithmetic and memory idioms (`ops.py`), direct evaluation (`evaluate.py`), partial evaluation and rebuilding (`fold.py`) |
 | `transformer_nes/cpu6502/` | The pure 6502: opcode spec, graph construction, trace format, `backends/reference.py`, the weights compiler/runtime in `backends/weights/` (`engine.py` emits model-specific dispatch into the C++ runtime template in `native/engine.cpp`), the self-contained checkpoint exporter and runners (`export.py`, `checkpoint_runner.py`, `expert_runner.py`), and `examples/klaus/` (harness + binary) |
 | `transformer_nes/nes/` | Native C++ NES hardware: bus, cartridge, mapper/MMC headers, PPU, APU, console, tape replay, and the window with its debug overlay; `app.py` builds it, adapts a CPU backend, and launches it; `xray.py` reads the engines for the overlay |
-| `transformer_nes/ppu2c02/` | The PPU graphs: memory layout (`space.py`), register transitions (`registers.py`), background rendering and compositing (`render.py`), sprite selection, overflow and fetch (`sprites.py`), scanline timelines (`clock.py`), timing/bus/view effects and sprite-line composition (`control.py`), and the shared engine (`machine.py`) |
-| `transformer_nes/model/` | Transformer machinery: layer scheduling (`schedule.py`), analytical weight construction (`weights.py`), shared weight layout and compilation (`torch_layout.py`, `torch_codegen.py`, `scalar_ir.py`, `outline.py`), the generic token-graph engine (`graph_engine.py`), native build/cache support (`build.py`), exact CSR checkpoint serialization (`artifacts.py`), and reference inference (`inference.py`) |
+| `transformer_nes/ppu2c02/` | The PPU graphs: memory layout (`space.py`), register transitions (`registers.py`), background rendering and compositing (`render.py`), sprite selection, overflow and fetch (`sprites.py`), timing/bus/view effects, scanline clocks and sprite-line composition (`control.py`), and the shared engine (`machine.py`) |
+| `transformer_nes/model/` | Transformer machinery: scheduling (`schedule.py`), analytic matrices and exact checkpoint serialization (`weights.py`), matrix-to-FX compilation (`compiler.py`), scalar lowering and fragment sharing (`ssa.py`), the token-graph engine (`graph_engine.py`), and independent reference inference (`inference.py`) |
+| `transformer_nes/build.py` | Shared source identities, cache ownership, atomic writes, native extension loading and Makefile builds |
 
 The dependency direction is one-way: `nes/` depends on the NES-independent CPU package; the CPU construction depends on `graph/`, while its weights backend also uses `model/` for scheduling and code generation. The entire generic `model/` package imports without loading the CPU package; a test enforces this. Machine-specific checkpoint export and standalone runners live in `cpu6502/backends/weights/`. The `6502-export`, `6502-checkpoint`, and `6502-experts` commands remain the public entry points.
+
+For a reading order and the reasons for the module boundaries, see
+[the source layout](docs/source-layout.md).
 
 ## Architecture
 
@@ -237,7 +241,7 @@ An eight-lane *composition* token merges fetched sprite rows into the line state
 
 Every production console attaches this PPU automatically. Neural control tokens resolve NMI/status races, filtered A12 edges, register-side latch effects and MMC5 view selection. C++ advances the absolute clock, delivers bus effects and stores output buffers. The conventional PPU algorithms live under `nes/tests/ppu_reference.*` and build only into the independent test oracle; they are excluded from the production extension.
 
-The clock circuit (`clock.py`) returns scanline transitions, frame-wrap effects and ordered event descriptors, including events sharing a dot and the bounds of consecutive tile runs. At attachment the host materializes the five distinct timelines from these weights. Play consumes their readouts without a neural call per dot or a handwritten event table.
+The clock circuit (`control.py:clock_graph`) returns scanline transitions, frame-wrap effects and ordered event descriptors, including events sharing a dot and the bounds of consecutive tile runs. At attachment the host materializes the five distinct timelines from these weights. Play consumes their readouts without a neural call per dot or a handwritten event table.
 
 Frames stay pixel-identical to the native PPU on every mapper the console supports (NROM, MMC1, MMC3, MMC2/MMC4, MMC5), checked over game captures and synthetic carts that sweep every register path. `model/inference.py` runs constructed graphs exactly in float64 as the verification reference: discrete circuits match exactly, while real-valued audio circuits use measured error tolerances.
 

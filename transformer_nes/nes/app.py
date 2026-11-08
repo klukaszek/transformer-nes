@@ -12,8 +12,8 @@ from pathlib import Path
 
 import numpy as np
 
+from transformer_nes.build import load_nes_extension
 from transformer_nes.nes.backends import backend_factory
-from transformer_nes.nes.build import load_frontend, load_hardware
 from transformer_nes.nes.debug import DebugBridge
 
 logger = logging.getLogger(__name__)
@@ -119,7 +119,7 @@ def main():
     if args.benchmark_json and not args.tape:
         parser.error("--benchmark-json requires --tape")
     setup_start = time.perf_counter()
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     cart = hardware.Cartridge.load(args.rom)
 
     runtimes = []  # the CPU runtime the console drives
@@ -144,7 +144,7 @@ def main():
         if args.benchmark_json:
             Path(args.benchmark_json).write_text(json.dumps(result, indent=2) + "\n")
         return
-    frontend = load_frontend()
+    frontend = load_nes_extension("frontend")
     rate = frontend.audio_setup()
 
     console = hardware.Console(cart, build_backend, float(rate) if rate else 44100.0)

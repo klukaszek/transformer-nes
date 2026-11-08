@@ -12,10 +12,9 @@ import numpy as np
 
 def load_reference_hardware():
     """Conventional PPU oracle; excluded from the production extension."""
-    from transformer_nes.nes.build import _import_extension, _make
+    from transformer_nes.build import load_nes_extension
 
-    _make("reference-hardware")
-    return _import_extension("nes_hardware_reference")
+    return load_nes_extension("reference-hardware")
 
 
 def absolute(op: int, addr: int) -> list[int]:

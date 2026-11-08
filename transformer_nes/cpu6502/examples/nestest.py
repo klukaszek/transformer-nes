@@ -16,6 +16,7 @@ import logging
 import os
 import time
 
+from transformer_nes.build import PACKAGE_DIR
 from transformer_nes.cpu6502.backends import reference
 from transformer_nes.cpu6502.backends.reference import Cpu6502
 from transformer_nes.cpu6502.spec import opcode_for
@@ -23,9 +24,7 @@ from transformer_nes.cpu6502.spec import opcode_for
 logger = logging.getLogger(__name__)
 
 # Keep the CPU harness outside nes/; only its ROM and golden log are NES assets.
-NESTEST_DIR = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "nes", "examples")
-)
+NESTEST_DIR = str(PACKAGE_DIR / "nes" / "examples")
 NESTEST_ROM = os.path.join(NESTEST_DIR, "nestest.nes")
 NESTEST_LOG = os.path.join(NESTEST_DIR, "nestest.log")
 START_PC = 0xC000

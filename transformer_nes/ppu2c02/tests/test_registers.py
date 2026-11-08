@@ -14,11 +14,11 @@ from transformer_nes.ppu2c02.machine import ppu_engine, register_graph
 
 @pytest.mark.parametrize("token", ["bus", "background_span", "access_bus", "view", "dma", "clock"])
 def test_bus_effect_tokens_execute_exact_weights(token):
-    from transformer_nes.ppu2c02 import clock, control
+    from transformer_nes.ppu2c02 import control
 
     engine = control.control_engine()
     graph = {"bus": control.bus_graph, "background_span": control.background_span_graph, "access_bus": control.access_bus_graph,
-             "view": control.view_graph, "dma": control.dma_graph, "clock": clock.clock_graph}[token]()
+             "view": control.view_graph, "dma": control.dma_graph, "clock": control.clock_graph}[token]()
     model, _, info = construct(graph)
     eager = ExactInference(model)
     dims = {d.name: d for d in graph.all_dims}
@@ -55,7 +55,7 @@ def test_bus_effect_tokens_execute_exact_weights(token):
 
 
 def test_clock_covers_every_scanline_and_preserves_tied_events_and_batch_limits():
-    from transformer_nes.ppu2c02 import clock, control
+    from transformer_nes.ppu2c02 import control
 
     engine = control.control_engine()
     model = engine.model_id("clock")
@@ -92,7 +92,7 @@ def test_clock_covers_every_scanline_and_preserves_tied_events_and_batch_limits(
             if event == "slot":
                 while index + run < len(expected) and expected[index + run] == (dot + 8 * run, "slot", slot + run):
                     run += 1
-            assert out[4:] == [dot, clock.EVENTS.index(event), slot, run]
+            assert out[4:] == [dot, control.CLOCK_EVENTS.index(event), slot, run]
 
 
 def test_dma_descriptors_partition_every_destination_and_keep_projections_independent():

@@ -7,8 +7,8 @@ import os
 
 import pytest
 
+from transformer_nes.build import load_nes_extension
 from transformer_nes.nes.backends import backend_factory
-from transformer_nes.nes.build import load_hardware
 
 TESTROMS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples", "testroms"
@@ -44,7 +44,7 @@ def fetch_roms():
 
 
 def run_rom(path, frames=1200):
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     console = hardware.Console(
         hardware.Cartridge.load(path), backend_factory("weights"), 44100.0
     )

@@ -56,7 +56,7 @@ _HEADLINE = (
 )
 
 
-def _kind(dim) -> str:
+def dimension_kind(dim) -> str:
     """Where a value comes from: the embedding, an attention read (also
     through persists that only carry one along), a ReGLU neuron, or a
     linear combination of earlier values."""
@@ -70,7 +70,7 @@ def _kind(dim) -> str:
         return "attention"  # a memory read (graph/ops.py:memory_site)
     if isinstance(dim, PersistDimension):
         terms = [t for t in dim.expr.terms if not isinstance(t, InputDimension)]
-        if len(terms) == 1 and _kind(terms[0]) == "attention":
+        if len(terms) == 1 and dimension_kind(terms[0]) == "attention":
             return "attention"
     return "linear"
 
@@ -99,11 +99,7 @@ def disassemble(memory: bytes, pc: int) -> str:
     return f"${pc:04X}  {op.mnemonic} {forms.get(op.mode, '')}".rstrip()
 
 
-def _named(lives) -> list:
-    return [life for life in lives if not _ANONYMOUS.match(life[0].name)]
-
-
-def _memory_read(dim):
+def memory_origin(dim):
     if isinstance(dim, MemoryReadDimension):
         return dim, dim.memory_read.address
     site = getattr(dim, "memory_read", None)
@@ -112,7 +108,7 @@ def _memory_read(dim):
     if isinstance(dim, PersistDimension):
         sources = [d for d in dim.expr.terms if not isinstance(d, InputDimension)]
         if len(sources) == 1:
-            return _memory_read(sources[0])
+            return memory_origin(sources[0])
     return None
 
 
@@ -139,13 +135,13 @@ def layer_steps(named, snap, f_bits, slot_of, read_label, headline=()) -> dict:
         if value == 0.0 and dim.name not in headline:
             continue  # a decode line that stayed off
         detail = ""
-        site = _memory_read(dim)
+        site = memory_origin(dim)
         if site is not None and first > 0:
             source, expression = site
             address = evaluate(expression, first_row.get(source, first) - 1)
             if address is not None:
                 detail = read_label(int(round(address)))
-        steps.append((int(first), _kind(dim), dim.name, detail, float(value)))
+        steps.append((int(first), dimension_kind(dim), dim.name, detail, float(value)))
     steps.sort(key=lambda s: (s[0], s[1] != "attention", s[2]))
     return {
         "layers": len(values) - 1,
@@ -166,7 +162,7 @@ class CpuXray:
     def named(self):
         # Counters need only the running engine. Materialize the full graph
         # and its debug labels when a dissection actually asks for them.
-        return _named(self.runtime.lives)
+        return [life for life in self.runtime.lives if not _ANONYMOUS.match(life[0].name)]
 
     def take_paths(self) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
         """Instructions per path since the last call, and the opcodes that
@@ -234,7 +230,7 @@ class PpuXray:
 
     @cached_property
     def named(self):
-        return _named(self.engine.lives)
+        return [life for life in self.engine.lives if not _ANONYMOUS.match(life[0].name)]
 
     @cached_property
     def life_of(self):
@@ -302,7 +298,7 @@ class ReadHeat:
 UNRENDERED = 255  # Ppu::unrendered_slot: no transformer output yet
 
 
-def _rgba(r: int, g: int, b: int) -> int:
+def rgba(r: int, g: int, b: int) -> int:
     return r | g << 8 | b << 16 | 0xFF << 24
 
 
@@ -312,8 +308,8 @@ def expert_colors(names: list[str]) -> list[int]:
     fine x for the plain background experts (lighter with table 1),
     orange with sprites, green at the line's edge slots; the variants
     that keep the CHR-latch logic lean purple."""
-    colors = [_rgba(230, 70, 60)] * 256  # the full graph
-    colors[UNRENDERED] = _rgba(70, 70, 76)
+    colors = [rgba(230, 70, 60)] * 256  # the full graph
+    colors[UNRENDERED] = rgba(70, 70, 76)
     for model, name in enumerate(names, start=1):
         pins = EXPERTS[name]
         r, g, b = 250, 160, 40  # sprites: nothing below pins sprite pixels off
@@ -324,7 +320,7 @@ def expert_colors(names: list[str]) -> list[int]:
             r, g, b = 40 + 30 * pins["ctrlbit4"], 90 + 18 * fine_x, 230
         if "latch" not in pins:
             r, g, b = (r + 190) // 2, g * 2 // 3, (b + 230) // 2
-        colors[model] = _rgba(r, g, b)
+        colors[model] = rgba(r, g, b)
     return colors
 
 

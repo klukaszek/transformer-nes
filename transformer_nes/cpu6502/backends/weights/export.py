@@ -29,12 +29,14 @@ from transformer_nes.cpu6502.backends.weights.experts import (
     build_interrupt_experts,
     build_opcode_execution_experts,
 )
-from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS, Cpu6502Graph
+from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, Cpu6502Graph
 from transformer_nes.cpu6502.spec import OPCODES
 from transformer_nes.graph.core import InputDimension
-from transformer_nes.model.artifacts import (
+from transformer_nes.model.schedule import asap_schedule
+from transformer_nes.model.weights import (
     ATTENTION_TEMPERATURE,
     SCALE_BITS,
+    build_model,
     compact_integer_tensors,
     csr_tensors,
     prune_layer,
@@ -42,8 +44,6 @@ from transformer_nes.model.artifacts import (
     split_clear_gates,
     to_fixed_point,
 )
-from transformer_nes.model.schedule import asap_schedule
-from transformer_nes.model.weights import build_model
 
 
 def export_model(out_dir: str, *, bcd: bool = False) -> dict:

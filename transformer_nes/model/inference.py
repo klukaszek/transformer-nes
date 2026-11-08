@@ -14,7 +14,7 @@ import scipy.sparse as sp
 from transformer_nes.model.weights import HARD_K, WeightModel
 
 
-class _HeadCache:
+class AttentionCache:
     """Keys (n, 2) and values (n, 2) of one lookup head, deduplicated."""
 
     __slots__ = ("keys", "values", "positions", "size", "slot_of_key")
@@ -75,7 +75,7 @@ class ExactInference:
                 "ff_in": sp.csr_matrix(model.ff_in[li].weight),
                 "ff_out": sp.csr_matrix(model.ff_out[li].weight),
                 "d_ffn": model.ff_out[li].weight.shape[1],
-                "caches": [_HeadCache() for _ in lookup_heads],
+                "caches": [AttentionCache() for _ in lookup_heads],
             }
             self.layers.append(layer)
         self.position = -1

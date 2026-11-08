@@ -15,18 +15,17 @@ in [`transformer_nes/nes/`](../nes/).
 | File | Purpose |
 |------|---------|
 | `spec.py` | Shared opcode, addressing-mode, flag, memory-read, and timing metadata. It contains 227 opcode entries: 151 official NMOS opcodes plus the stable unofficial opcodes exercised by the tests. |
-| `interpreter.py` | Builds the 6502 graph from the graph DSL. |
-| `construction.py` | Defines the construction boundary and exposes the named dimensions consumed by scheduling and code generation. |
+| `graph.py` | Builds the 6502 graph and exposes the named dimensions consumed by scheduling and code generation. |
 | `trace.py` | Instruction-level state and memory-write records shared by both backends. |
 | `backends/reference.py` | Straightforward Python implementation used as the behavioral oracle. |
 | `backends/weights/runner.py` | Builds, caches, and runs the transformer-weights backend. |
+| `backends/weights/bank.py` | Compiles and attaches the immutable native forward bank; owns its context and diagnostic traces. |
 | `backends/weights/engine.py` | Emits model-specific embedding, readout and dispatch into the CPU runtime template. All neural layers run in the shared scalar SSA compiler. |
 | `backends/weights/export.py` | Exports the self-contained union or folded experts as losslessly packed integer safetensors and machine metadata. |
 | `backends/weights/checkpoint_runner.py` | Standalone PyTorch union runner, importing only the standard library, Torch and safetensors. |
 | `backends/weights/expert_runner.py` | Independent routed expert runner for exported checkpoints and runtime verification. |
 | `backends/weights/experts.py` | Orchestrates folding, dispatch proofs, effect projection, scheduling and ABI lowering. |
-| `backends/weights/folds.py` | Opcode pins, register/PC feedback, sequence composition and cached expert construction. |
-| `backends/weights/proofs.py` | Build-time constants, conservative ranges, symbolic-PC evaluation and read licenses. |
+| `backends/weights/folds.py` | Opcode pins, sequence feedback/composition, cached expert construction, range proofs and symbolic-PC/read licenses. |
 | `backends/weights/execution.py` | Typed architectural effects, control/cycles, graph projection and lowering to residual slots. |
 | `backends/weights/shapes.py` | Fixed shape templates, recurrence proofs and matching against live cartridge bytes. |
 | `backends/weights/native/engine.cpp` | CPU runtime template: watches, read leases, cycle budgets, tracing and console bindings. |
@@ -155,11 +154,11 @@ The weights backend follows this sequence:
    the analytic attention and ReGLU matrices.
 4. `graph/fold.py` partially evaluates the union graph to build licensed
    opcode, interrupt, shape, and sequence models.
-5. `model/torch_layout.py` and `model/torch_codegen.py` compile the actual
-   matrices through scalar SSA, shared with the PPU. The graph fold exposes
+5. `model/compiler.py` expands the matrices into FX; `model/ssa.py` lowers and
+   shares scalar arithmetic, shared with the PPU. The graph fold exposes
    licensed indexed reads before scheduling. `backends/weights/engine.py`
    supplies embedding, architectural readout and the native run loop;
-   `model/build.py` builds and caches the extensions.
+   `build.py` builds and caches the extensions.
 
 The run loop can execute for a step or cycle budget, stop at a HALT or
 jump-to-self trap, stream bounded trace arrays, and pause on watched device

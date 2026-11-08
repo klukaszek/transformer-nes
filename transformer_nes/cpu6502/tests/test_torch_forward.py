@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 import torch
 
+from transformer_nes import build
+from transformer_nes.cpu6502.backends.weights.bank import bank_module
 from transformer_nes.cpu6502.backends.weights.expert_runner import (
     HALVES,
     WEIGHTS,
@@ -20,9 +22,7 @@ from transformer_nes.cpu6502.backends.weights.expert_runner import (
     share_queries,
 )
 from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
-from transformer_nes.cpu6502.backends.weights.torch_forward import bank_module
-from transformer_nes.model.torch_codegen import weight_module
-from transformer_nes.model.torch_layout import layer_arrays
+from transformer_nes.model.compiler import layer_arrays, weight_module
 
 
 def test_neural_pipeline_does_not_import_the_reference_emulator():
@@ -41,7 +41,7 @@ class NoReference(importlib.abc.MetaPathFinder):
 
 guard = NoReference()
 sys.meta_path.insert(0, guard)
-from transformer_nes.cpu6502.construction import Cpu6502Graph
+from transformer_nes.cpu6502.graph import Cpu6502Graph
 from transformer_nes.cpu6502.backends.weights.experts import build_opcode_execution_experts
 from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
 from transformer_nes.nes.backends import backend_factory
@@ -77,14 +77,14 @@ def test_cached_bank_identity_does_not_import_the_compiler():
             """
 import importlib.abc
 import sys
-from transformer_nes.cpu6502.backends.weights import torch_forward
+from transformer_nes.cpu6502.backends.weights import bank
 class NoCompiler(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
         if fullname.startswith(('torch._inductor', 'torch._dynamo')):
             raise AssertionError(f'cache lookup imported the compiler: {fullname}')
 sys.meta_path.insert(0, NoCompiler())
-assert torch_forward.bank_path(False).endswith('.so')
-assert torch_forward.bank_path(False) != torch_forward.bank_path(True)
+assert bank.bank_path(False).endswith('.so')
+assert bank.bank_path(False) != bank.bank_path(True)
 """,
         ],
         check=True,
@@ -286,22 +286,22 @@ def test_machine_keeps_hook_context_alive_without_a_separate_handle():
     gc.collect()
     machine.run(1, trace=False)
     assert machine.get_state()["a"] == 0x42
-    assert machine._torch_forwards.counts == (1, 0)
+    assert machine.forwards.counts == (1, 0)
 
 
 def test_loaded_bank_survives_pruned_files_when_constructing_another_cpu(tmp_path, monkeypatch):
-    from transformer_nes.cpu6502.backends.weights import torch_forward
+    from transformer_nes.cpu6502.backends.weights import bank
 
     first = Cpu6502TransformerMachine()
     hook = bank_module(False)
-    monkeypatch.setattr(torch_forward, "CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(build, "CACHE_DIR", str(tmp_path))
 
     def unexpected_child(*args, **kwargs):
         raise AssertionError("a loaded extension must not require a new compiler child")
 
-    monkeypatch.setattr(torch_forward.subprocess, "run", unexpected_child)
+    monkeypatch.setattr(bank.subprocess, "run", unexpected_child)
     second = Cpu6502TransformerMachine()
-    assert first._torch_forwards.hook is second._torch_forwards.hook is hook
+    assert first.forwards.hook is second.forwards.hook is hook
     image = bytearray(65536)
     image[0x8000:0x8002] = bytes((0xA9, 0x42))
     second.load_image(image, start_pc=0x8000)
@@ -310,10 +310,10 @@ def test_loaded_bank_survives_pruned_files_when_constructing_another_cpu(tmp_pat
 
 
 def test_compiler_child_rejects_stale_source_identity():
-    from transformer_nes.cpu6502.backends.weights import torch_forward
+    from transformer_nes.cpu6502.backends.weights import bank
 
     result = subprocess.run(
-        [sys.executable, "-m", torch_forward.__name__, "0", "obsolete-source-digest"],
+        [sys.executable, "-m", bank.__name__, "0", "obsolete-source-digest"],
         capture_output=True, text=True,
     )
     assert result.returncode != 0

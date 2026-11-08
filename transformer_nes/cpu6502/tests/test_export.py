@@ -8,7 +8,7 @@ import pytest
 def test_lossless_integer_storage_keeps_values_shapes_and_range_boundaries():
     import numpy as np
 
-    from transformer_nes.model.artifacts import compact_integer_tensors
+    from transformer_nes.model.weights import compact_integer_tensors
 
     tensors = {
         "empty": np.empty((0, 3), dtype=np.int32),

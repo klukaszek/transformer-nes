@@ -5,9 +5,9 @@ This is an instruction-level interpreter (one transformer step = one 6502 instru
 Code and data share one attention-backed 64 KiB memory image, so instruction fetch is just memory read at PC.  CPU state is stored in the residual stream of STATE tokens; the "current" state is the latest STATE token.  Memory writes are appended as WRITE tokens; reads look up the latest write for an address, with non-exact nearest-address hits masked to zero (so unwritten memory reads as 0).
 
 Correctness contract for graph construction:
-  - stepglu(one, b) equals step(b >= 0) ONLY for integer-valued b; every threshold expression must therefore be an integer (never `x - 9.5`). Likewise match_zero/match_byte require integer arguments.
+  - stepglu(one, b) equals step(b >= 0) ONLY for integer-valued b; every threshold expression must therefore be an integer (never `x - 9.5`). Likewise match_zero/equals require integer arguments.
   - wrap8 / wrap16 subtract at most one modulus, so their arguments must lie in [-256, 511] / [-65536, 131071]; splitting a full 16-bit value into bytes must instead be derived from values that are already bytes (see the JSR/BRK push-address construction).
-  - Opcode/mode gates are one-hot 0/1 signals; mux chains rely on this.
+  - Opcode/mode gates are one-hot 0/1 signals; select chains rely on this.
   - bcd=False models the NES 2A03, which ignores the D flag: ADC/SBC (and the unofficial RRA/ISB) always compute in binary, and the decimal circuitry is left out of the graph entirely.  The unofficial RRA/ISB are binary-only even with bcd=True (no test suite exercises them in decimal mode).
   - Flags in decimal mode: V always reflects the binary sum, as on NMOS hardware; the reference core matches this.
   - Interrupts are graph logic, not harness magic: when a STATE token carries in_nmi=1 or in_irq=1 (never both; the harness gates IRQ on the I flag at the step boundary), the step performs the interrupt sequence instead of the fetched instruction -- push PCH/PCL/P (B clear, U set) through the three write channels, S-3, I=1, and vector through $FFFA/$FFFB (NMI) or $FFFE/$FFFF (IRQ) via the shared vector-read slots.  Every effect of the (decoded but not executed) instruction at PC is discarded by final is_int muxes.  The interrupt trace row reports the interrupted PC with ea=0 and data=0.
@@ -45,21 +45,23 @@ from transformer_nes.graph.core import (
     Expression,
     ExprLike,
     InputDimension,
+    ProgramGraph,
     auto_name,
+    construction,
+    current_graph,
     fetch,
     persist,
     stepglu,
     to_expr,
 )
 from transformer_nes.graph.ops import (
+    equals,
     extract_bits,
     extract_bits_wide,
     gate,
     grouped_read,
-    match_byte,
     memory_site,
     multiply,
-    mux,
     read_bits,
     select,
     signed_byte,
@@ -314,7 +316,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     opcode_gates: dict[int, Expression] = {}
     for op in OPCODES.values():
         opcode_gates[op.byte] = persist(
-            match_byte(fetched_opcode, op.byte), name=f"is_op_{op.byte:02X}"
+            equals(fetched_opcode, op.byte), name=f"is_op_{op.byte:02X}"
         )
 
     # ── Table-driven mode / operation families ──────────────────────
@@ -364,28 +366,28 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     branch_target = persist(pc_after + rel_offset, name="branch_target")
 
     # Base EA for simple modes
-    base_ea = mux(
+    base_ea = select(
         is_zpg,
         fetched_operand_lo,
-        mux(
+        select(
             is_zpx,
             wrap8(fetched_operand_lo + current_x),
-            mux(
+            select(
                 is_zpy,
                 wrap8(fetched_operand_lo + current_y),
-                mux(
+                select(
                     is_abs,
                     abs_addr,
-                    mux(
+                    select(
                         is_abx,
                         wrap16(abs_addr + current_x),
-                        mux(
+                        select(
                             is_aby,
                             wrap16(abs_addr + current_y),
-                            mux(
+                            select(
                                 is_rel,
                                 branch_target,
-                                mux(
+                                select(
                                     is_imm,
                                     fetched_operand_lo,
                                     0,
@@ -414,41 +416,41 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
 
     # ── Memory read ─────────────────────────────────────────────────
     # Shared memory-read slots.  A single instruction only uses one family of
-    # reads at a time, so we mux the addresses into three slots and share the
+    # reads at a time, so we select the addresses into three slots and share the
     # attention lookups across pointer reads, stack reads, and IRQ-vector reads.
     is_pointer_read = is_idx + is_idy + is_ind
-    pointer_base = mux(is_idx, idx_ptr, mux(is_idy, idy_ptr, abs_addr))
-    addrA = mux(
+    pointer_base = select(is_idx, idx_ptr, select(is_idy, idy_ptr, abs_addr))
+    addrA = select(
         is_pointer_read,
         pointer_base,
-        mux(
+        select(
             family["pla"] + family["plp"] + family["rts"] + family["rti"],
             stack_pull_addr,
-            mux(family["brk"], 0xFFFE, 0),
+            select(family["brk"], 0xFFFE, 0),
         ),
     )
     # Second pointer byte: zero-page wrap for (zp,X)/(zp),Y; NMOS page-wrap
     # bug for JMP (abs) -- the high byte is read from the same page.
-    pointer_next = mux(
+    pointer_next = select(
         is_ind,
         256 * fetched_operand_hi + wrap8(fetched_operand_lo + 1),
         wrap8(pointer_base + 1),
     )
-    addrB = mux(
+    addrB = select(
         is_pointer_read,
         pointer_next,
-        mux(
+        select(
             family["pla"] + family["plp"] + family["rts"] + family["rti"],
             stack_pull_addr2,
-            mux(family["brk"], 0xFFFF, 0),
+            select(family["brk"], 0xFFFF, 0),
         ),
     )
-    addrC = mux(family["pla"] + family["plp"] + family["rts"] + family["rti"], stack_pull_addr3, 0)
+    addrC = select(family["pla"] + family["plp"] + family["rts"] + family["rti"], stack_pull_addr3, 0)
     # An interrupt step reads its vector through the same two slots BRK uses
     # for $FFFE/$FFFF; everything else the interrupted instruction would have
     # read is left in place and discarded by the is_int muxes below.
-    addrA = mux(is_nmi, 0xFFFA, mux(is_irq, 0xFFFE, addrA))
-    addrB = mux(is_nmi, 0xFFFB, mux(is_irq, 0xFFFF, addrB))
+    addrA = select(is_nmi, 0xFFFA, select(is_irq, 0xFFFE, addrA))
+    addrB = select(is_nmi, 0xFFFB, select(is_irq, 0xFFFF, addrB))
     addrA = persist(addrA, name="addrA")
     addrB = persist(addrB, name="addrB")
     addrC = persist(addrC, name="addrC")
@@ -472,8 +474,8 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
 
     # Effective address: indirect modes resolved from the pointer reads above.
     # An interrupt step performs no operand access; its trace EA is 0.
-    ea = mux(is_idx, idx_ea, mux(is_idy, idy_ea, mux(is_ind, ind_ea, base_ea)))
-    ea = mux(is_int, 0, ea)
+    ea = select(is_idx, idx_ea, select(is_idy, idy_ea, select(is_ind, ind_ea, base_ea)))
+    ea = select(is_int, 0, ea)
     ea = persist(ea, name="ea")
 
     # Stack/IRQ vector reads
@@ -491,10 +493,10 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
 
     # Operand memory read (for loads/stores/ALU with memory addressing)
     operand_mem = memory_at(ea, "operand_mem")
-    operand = mux(
+    operand = select(
         is_imm,
         fetched_operand_lo,
-        mux(
+        select(
             is_acc,
             current_a,
             operand_mem,
@@ -505,7 +507,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     # ── Bit extraction for bitwise / shift ops ────────────────────────
     if wide_bits:
         # Served bits: A's from state, reads' from the fused read; the
-        # operand mux mirrors operand's own gating exactly, and the mode
+        # operand select mirrors operand's own gating exactly, and the mode
         # gates fold in every routed expert, leaving a linear passthrough.
         a_bits = current_a_bits
         opmem_bits = read_bits(operand_mem, "opmemsrv")
@@ -565,9 +567,9 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         ah_adc_mod = ah_adc - 10 * carry_out_adc
         adc_decimal_result = ah_adc_mod * 16 + al_adc_mod
         adc_decimal_result = persist(adc_decimal_result, name="adc_decimal_result")
-        decimal_adc = mux(current_p_d, adc_decimal_result, adc_result)
+        decimal_adc = select(current_p_d, adc_decimal_result, adc_result)
         decimal_adc = persist(decimal_adc, name="decimal_adc")
-        decimal_adc_carry = mux(current_p_d, carry_out_adc, adc_carry)
+        decimal_adc_carry = select(current_p_d, carry_out_adc, adc_carry)
 
         # Decimal SBC (integer thresholds, as above)
         al_sbc = a_lo_nibble - m_lo_nibble - (1 - carry_in)
@@ -578,9 +580,9 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         ah_sbc_mod = ah_sbc + 10 * (1 - carry_out_sbc)
         sbc_decimal_result = ah_sbc_mod * 16 + al_sbc_mod
         sbc_decimal_result = persist(sbc_decimal_result, name="sbc_decimal_result")
-        decimal_sbc = mux(current_p_d, sbc_decimal_result, sbc_result)
+        decimal_sbc = select(current_p_d, sbc_decimal_result, sbc_result)
         decimal_sbc = persist(decimal_sbc, name="decimal_sbc")
-        decimal_sbc_carry = mux(current_p_d, carry_out_sbc, sbc_carry)
+        decimal_sbc_carry = select(current_p_d, carry_out_sbc, sbc_carry)
     else:
         # 2A03: the D flag is ignored, arithmetic is always binary.
         decimal_adc = persist(adc_result, name="decimal_adc")
@@ -738,7 +740,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
 
     # ── New register values ─────────────────────────────────────────
     # The A-writing families are a mutually exclusive one-hot, so new_a is a
-    # *parallel* gated sum (depth 2) rather than a sixteen-deep mux chain.
+    # *parallel* gated sum (depth 2) rather than a sixteen-deep select chain.
     # Shifts write A only in accumulator mode; memory-mode RMW leaves it be.
     arith_a = (family["adc"] + family["sbc"] + family["tya"] + family["slo"] + family["rla"] + family["sre"]
                + family["rra"] + family["isb"])
@@ -768,7 +770,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         + gate(is_acc, shift_acc_result)
         + gate(1 - writes_a, current_a)
     )
-    new_a = mux(is_int, current_a, new_a)
+    new_a = select(is_int, current_a, new_a)
     new_a = persist(new_a, name="new_a")
 
     if wide_bits:
@@ -797,7 +799,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
                 + gate(arith_a, arith_a_bits[j])
                 + gate(1 - writes_a, a_bits[j])
             )
-            persist(mux(is_int, a_bits[j], expr), name=f"new_a_bit{7 - j}")
+            persist(select(is_int, a_bits[j], expr), name=f"new_a_bit{7 - j}")
 
     # X, Y and S select the same way: disjoint family gates around an
     # unchanged-register default, so each is one parallel stage.
@@ -810,7 +812,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         + gate(family["tsx"], current_s)
         + gate(1 - writes_x, current_x)
     )
-    new_x = mux(is_int, current_x, new_x)
+    new_x = select(is_int, current_x, new_x)
     new_x = persist(new_x, name="new_x")
 
     writes_y = family["load_y"] + family["iny"] + family["dey"] + family["tay"]
@@ -821,7 +823,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         + gate(family["tay"], current_a)
         + gate(1 - writes_y, current_y)
     )
-    new_y = mux(is_int, current_y, new_y)
+    new_y = select(is_int, current_y, new_y)
     new_y = persist(new_y, name="new_y")
 
     writes_s = (family["pha"] + family["php"] + family["jsr"] + family["brk"] + family["pla"] + family["plp"]
@@ -837,7 +839,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         + gate(1 - writes_s, current_s)
     )
     # NMI pushes three bytes, exactly like BRK.
-    new_s = mux(is_int, wrap8(current_s - 3), new_s)
+    new_s = select(is_int, wrap8(current_s - 3), new_s)
     new_s = persist(new_s, name="new_s")
 
     # ── Flags ───────────────────────────────────────────────────────
@@ -965,36 +967,36 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
 
     # Overflow flag updates
     writes_v = family["adc"] + family["sbc"] + family["bit"] + family["clv"] + family["rra"] + family["isb"]
-    new_p_v = mux(
+    new_p_v = select(
         writes_v,
-        mux(family["adc"], adc_overflow,
-            mux(family["sbc"], sbc_overflow,
-                mux(family["bit"], bit_v,
-                    mux(family["rra"], rra_overflow,
-                        mux(family["isb"], isb_overflow,
-                            mux(family["clv"], 0, current_p_v)))))),
+        select(family["adc"], adc_overflow,
+            select(family["sbc"], sbc_overflow,
+                select(family["bit"], bit_v,
+                    select(family["rra"], rra_overflow,
+                        select(family["isb"], isb_overflow,
+                            select(family["clv"], 0, current_p_v)))))),
         current_p_v,
     )
     new_p_v = persist(new_p_v, name="new_p_v")
 
     # Decimal flag
-    new_p_d = mux(family["cld"], 0, mux(family["sed"], 1, current_p_d))
+    new_p_d = select(family["cld"], 0, select(family["sed"], 1, current_p_d))
     new_p_d = persist(new_p_d, name="new_p_d")
 
     # Interrupt flag
-    new_p_i = mux(family["cli"], 0, mux(family["sei"] + family["brk"], 1, current_p_i))
+    new_p_i = select(family["cli"], 0, select(family["sei"] + family["brk"], 1, current_p_i))
     new_p_i = persist(new_p_i, name="new_p_i")
 
     # Break flag (cleared by PLP/RTI; PHP pushes B=1 but does not set live P)
-    new_p_b = mux(family["plp"] + family["rti"], 0, current_p_b)
+    new_p_b = select(family["plp"] + family["rti"], 0, current_p_b)
     new_p_b = persist(new_p_b, name="new_p_b")
 
     # Unused flag always 1
     new_p_u = one
 
     # BIT special: N and V come from operand, Z from A & operand
-    new_p_n = mux(family["bit"], bit_n, new_p_n)
-    new_p_z = mux(family["bit"], bit_z, new_p_z)
+    new_p_n = select(family["bit"], bit_n, new_p_n)
+    new_p_z = select(family["bit"], bit_z, new_p_z)
     new_p_n = persist(new_p_n, name="new_p_n_bit")
     new_p_z = persist(new_p_z, name="new_p_z_bit")
 
@@ -1006,22 +1008,22 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         pull_bits = {1 << b: pull_srv_bits[7 - b] for b in range(8)}
     else:
         pull_bits = pulled_flag_bits(stack_pull_byte, "pullp")
-    new_p_c = mux(op_pull_p, pull_bits[FLAG_C], new_p_c)
-    new_p_z = mux(op_pull_p, pull_bits[FLAG_Z], new_p_z)
-    new_p_i = mux(op_pull_p, pull_bits[FLAG_I], new_p_i)
-    new_p_d = mux(op_pull_p, pull_bits[FLAG_D], new_p_d)
-    new_p_v = mux(op_pull_p, pull_bits[FLAG_V], new_p_v)
-    new_p_n = mux(op_pull_p, pull_bits[FLAG_N], new_p_n)
+    new_p_c = select(op_pull_p, pull_bits[FLAG_C], new_p_c)
+    new_p_z = select(op_pull_p, pull_bits[FLAG_Z], new_p_z)
+    new_p_i = select(op_pull_p, pull_bits[FLAG_I], new_p_i)
+    new_p_d = select(op_pull_p, pull_bits[FLAG_D], new_p_d)
+    new_p_v = select(op_pull_p, pull_bits[FLAG_V], new_p_v)
+    new_p_n = select(op_pull_p, pull_bits[FLAG_N], new_p_n)
     # NMI: the interrupted instruction's flag effects are discarded; the
     # sequence only sets I (NMOS interrupts do not touch D).  These muxes
     # come last so they also override the PLP/RTI pull path above.
-    new_p_c = mux(is_int, current_p_c, new_p_c)
-    new_p_z = mux(is_int, current_p_z, new_p_z)
-    new_p_i = mux(is_int, 1, new_p_i)
-    new_p_d = mux(is_int, current_p_d, new_p_d)
-    new_p_b = mux(is_int, current_p_b, new_p_b)
-    new_p_v = mux(is_int, current_p_v, new_p_v)
-    new_p_n = mux(is_int, current_p_n, new_p_n)
+    new_p_c = select(is_int, current_p_c, new_p_c)
+    new_p_z = select(is_int, current_p_z, new_p_z)
+    new_p_i = select(is_int, 1, new_p_i)
+    new_p_d = select(is_int, current_p_d, new_p_d)
+    new_p_b = select(is_int, current_p_b, new_p_b)
+    new_p_v = select(is_int, current_p_v, new_p_v)
+    new_p_n = select(is_int, current_p_n, new_p_n)
     new_p_c = persist(new_p_c, name="new_p_c_final")
     new_p_z = persist(new_p_z, name="new_p_z_final")
     new_p_i = persist(new_p_i, name="new_p_i_final")
@@ -1044,14 +1046,14 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
 
     # ── PC update ───────────────────────────────────────────────────
     next_pc = pc_after
-    next_pc = mux(family["jmp"] + family["jsr"], ea, next_pc)
-    next_pc = mux(family["rts"], wrap16(pulled_word + 1), next_pc)
-    next_pc = mux(family["rti"], rti_return, next_pc)
-    next_pc = mux(family["brk"], irq_vector, next_pc)
-    next_pc = mux(branch_taken, branch_target, next_pc)
-    # NMI vectors through $FFFA/$FFFB (read into irq_vector above); this mux
+    next_pc = select(family["jmp"] + family["jsr"], ea, next_pc)
+    next_pc = select(family["rts"], wrap16(pulled_word + 1), next_pc)
+    next_pc = select(family["rti"], rti_return, next_pc)
+    next_pc = select(family["brk"], irq_vector, next_pc)
+    next_pc = select(branch_taken, branch_target, next_pc)
+    # NMI vectors through $FFFA/$FFFB (read into irq_vector above); this select
     # is last so it overrides whatever the interrupted instruction decoded to.
-    next_pc = mux(is_int, irq_vector, next_pc)
+    next_pc = select(is_int, irq_vector, next_pc)
     next_pc = persist(next_pc, name="next_pc")
 
     # ── Primary memory write for this instruction ─────────────────────
@@ -1063,27 +1065,27 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         family["store_a"] + family["store_x"] + family["store_y"] + family["inc"] + family["dec"] + shifts_mem
         + family["pha"] + family["php"] + family["jsr"] + family["brk"] + unofficial_store
     )
-    is_store = mux(is_int, 1, is_store)
+    is_store = select(is_int, 1, is_store)
     is_store = persist(is_store, name="is_store")
 
     # Typed write effect: retain the byte actually read by memory RMWs.
     # Devices consume this operand directly rather than decoding an opcode
     # or reconstructing a first write from memory after the CPU has committed.
-    rmw = persist(mux(is_int, 0, family["inc"] + family["dec"] + shifts_mem
+    rmw = persist(select(is_int, 0, family["inc"] + family["dec"] + shifts_mem
                       + family["dcp"] + family["isb"] + family["slo"]
                       + family["rla"] + family["sre"] + family["rra"]), name="rmw_write")
-    persist(mux(rmw, operand, -1), name="write_original_out")
+    persist(select(rmw, operand, -1), name="write_original_out")
 
-    write_addr = mux(
+    write_addr = select(
         family["store_a"] + family["store_x"] + family["store_y"] + family["inc"] + family["dec"] + shifts_mem + unofficial_store,
         ea,
-        mux(
+        select(
             family["pha"] + family["php"] + family["jsr"] + family["brk"],
             wrap16(0x0100 + current_s),
             0,
         ),
     )
-    write_addr = mux(is_int, 0x0100 + current_s, write_addr)
+    write_addr = select(is_int, 0x0100 + current_s, write_addr)
     write_addr = persist(write_addr, name="write_addr_out")
 
     # JSR and BRK both push PC+2 (JSR: last byte of the 3-byte instruction;
@@ -1094,42 +1096,42 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     push_ret_hi = persist(wrap8(current_pc_hi + push_ret_carry), name="push_ret_hi")
 
     php_push_value = current_p + FLAG_B * (1 - current_p_b) + FLAG_U * (1 - current_p_u)
-    write_value = mux(
+    write_value = select(
         family["store_a"], current_a,
-        mux(family["store_x"], current_x,
-            mux(family["store_y"], current_y,
-                mux(family["inc"], inc_result,
-                    mux(family["dec"], dec_result,
-                        mux(family["asl"], asl_result,
-                            mux(family["lsr"], lsr_result,
-                                mux(family["rol"], rol_result,
-                                    mux(family["ror"], ror_result,
-                                        mux(family["pha"], current_a,
-                                            mux(family["php"], php_push_value,
-                                                mux(family["jsr"] + family["brk"], push_ret_hi, 0))))))))))))
-    write_value = mux(family["sax"], sax_result, write_value)
-    write_value = mux(family["dcp"], dec_result, write_value)
-    write_value = mux(family["isb"], inc_result, write_value)
-    write_value = mux(family["slo"], asl_result, write_value)
-    write_value = mux(family["rla"], rol_result, write_value)
-    write_value = mux(family["sre"], lsr_result, write_value)
-    write_value = mux(family["rra"], ror_result, write_value)
+        select(family["store_x"], current_x,
+            select(family["store_y"], current_y,
+                select(family["inc"], inc_result,
+                    select(family["dec"], dec_result,
+                        select(family["asl"], asl_result,
+                            select(family["lsr"], lsr_result,
+                                select(family["rol"], rol_result,
+                                    select(family["ror"], ror_result,
+                                        select(family["pha"], current_a,
+                                            select(family["php"], php_push_value,
+                                                select(family["jsr"] + family["brk"], push_ret_hi, 0))))))))))))
+    write_value = select(family["sax"], sax_result, write_value)
+    write_value = select(family["dcp"], dec_result, write_value)
+    write_value = select(family["isb"], inc_result, write_value)
+    write_value = select(family["slo"], asl_result, write_value)
+    write_value = select(family["rla"], rol_result, write_value)
+    write_value = select(family["sre"], lsr_result, write_value)
+    write_value = select(family["rra"], ror_result, write_value)
     # NMI pushes PCH first (the interrupted PC, not PC+2 as BRK pushes).
-    write_value = mux(is_int, current_pc_hi, write_value)
+    write_value = select(is_int, current_pc_hi, write_value)
     write_value = persist(write_value, name="write_value_out")
 
     # Second and third stack pushes (JSR pushes 2 bytes, BRK and NMI push 3).
     # The push addresses are shared: NMI uses the same S-1/S-2 slots as
     # JSR/BRK, so only the gates and pushed values need is_int muxes.
-    persist(mux(is_int, 1, family["jsr"] + family["brk"]), name="is_store2")
+    persist(select(is_int, 1, family["jsr"] + family["brk"]), name="is_store2")
     persist(0x0100 + wrap8(current_s - 1), name="write_addr2_out")
-    persist(mux(is_int, current_pc_lo, push_ret_lo), name="write_value2_out")
+    persist(select(is_int, current_pc_lo, push_ret_lo), name="write_value2_out")
 
     # NMI/IRQ push P with B clear and U set (BRK/PHP push with B set).
     int_push_p = current_p - FLAG_B * current_p_b + FLAG_U * (1 - current_p_u)
-    persist(mux(is_int, 1, family["brk"]), name="is_store3")
+    persist(select(is_int, 1, family["brk"]), name="is_store3")
     persist(0x0100 + wrap8(current_s - 2), name="write_addr3_out")
-    persist(mux(is_int, int_push_p, php_push_value), name="write_value3_out")
+    persist(select(is_int, int_push_p, php_push_value), name="write_value3_out")
 
     # ── Trace-context outputs ────────────────────────────────────────
     # Field-for-field what reference.py reports: operands only when the
@@ -1143,7 +1145,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     report_operand_hi = persist(report_operand_hi, name="fetched_operand_hi")
 
     # The family gates are a mutually exclusive one-hot, so data is a
-    # *parallel* gated sum (depth 2), not a mux chain; families with
+    # *parallel* gated sum (depth 2), not a select chain; families with
     # data == 0 are simply absent.
     data_ref = (
         gate(family["store_a"] + family["pha"], current_a)
@@ -1171,7 +1173,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
         + gate(family["cpy"], cpy_result)
         + gate(family["bit"], operand)
     )
-    data_out = mux(is_int, 0, data_ref)
+    data_out = select(is_int, 0, data_ref)
     data_out = persist(data_out, name="data_out")
 
     # ── Timing ──────────────────────────────────────────────────────
@@ -1203,7 +1205,7 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     # ── Halt ────────────────────────────────────────────────────────
     # BRK halts only if the IRQ vector is 0 (uninitialized memory).  An
     # interrupt never halts, even if the interrupted byte happens to be $00.
-    halted_now = gate(family["brk"], match_byte(irq_vector, 0))
+    halted_now = gate(family["brk"], equals(irq_vector, 0))
     halted_now = gate(halted_now, 1 - is_int)
     new_halted = current_halted + halted_now
     new_halted = persist(new_halted, name="new_halted")
@@ -1217,3 +1219,59 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
 
     auto_name(locals())
     return input_tokens, output_tokens
+
+
+RUNTIME_READ_DIMS = (
+    "current_pc",
+    "new_a",
+    "new_x",
+    "new_y",
+    "new_s",
+    "new_p",
+    "new_halted",
+    "fetched_opcode",
+    "fetched_operand_lo",
+    "fetched_operand_hi",
+    "ea",
+    "data_out",
+    "next_pc",
+    "is_store",
+    "write_addr_out",
+    "write_value_out",
+    "is_store2",
+    "write_addr2_out",
+    "write_value2_out",
+    "is_store3",
+    "write_addr3_out",
+    "write_value3_out",
+    "cycles",
+    "write_original_out",
+)
+
+
+class Cpu6502Graph:
+    """Build the 6502 graph and expose its stable dimension handles."""
+
+    @construction
+    def __init__(self, *, bcd: bool = True, wide_bits: bool = False):
+        input_tokens, output_tokens = build(
+            bcd=bcd,
+            wide_bits=wide_bits,
+        )
+        self.program = current_graph().capture(input_tokens, output_tokens)
+        self.dim_of_name = {}
+        for dim in self.program.all_dims:
+            self.dim_of_name.setdefault(dim.name, dim)
+
+    def program_graph(self) -> ProgramGraph:
+        """The graph the engine runs.  The run loop reads the machine's
+        outputs (RUNTIME_READ_DIMS) from the residual stream, so they must
+        survive to the last layer: a synthetic READOUT token marks them as
+        outputs for the scheduler (its head row is ignored: only STATE vs
+        HALT compete)."""
+        output_tokens = dict(self.program.output_tokens)
+        readout = 0
+        for name in RUNTIME_READ_DIMS:
+            readout = readout + 1e-6 * self.dim_of_name[name]
+        output_tokens["READOUT"] = readout
+        return self.program.with_outputs(output_tokens)

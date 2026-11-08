@@ -22,11 +22,6 @@ from transformer_nes.graph.core import (
 )
 
 
-def match_byte(value: ExprLike, byte: int) -> Expression:
-    """Return a 0/1 gate for integer equality, sharing adjacent hinges."""
-    return equals(value, byte)
-
-
 def match_zero(value: ExprLike) -> Expression:
     """Return a 0/1 gate: 1 iff an integer expression is exactly zero."""
     one = graph.current_graph().one
@@ -37,11 +32,6 @@ def match_zero(value: ExprLike) -> Expression:
 def multiply(a, b) -> Expression:
     """Multiply two scalar expressions using the graph DSL's internal helper."""
     return make_multiply(to_expr(a), to_expr(b))
-
-
-def mux(gate: ExprLike, if_one: ExprLike, if_zero: ExprLike) -> Expression:
-    """Select between two linear expressions using a 0/1 gate."""
-    return select(gate, if_one, if_zero)
 
 
 def remainder(value, modulus: int, maximum: int):

@@ -1,6 +1,6 @@
 """Construct and run the 6502 analytic transformer weights backend.
 
-The graph is scheduled and converted to weights compiled by PyTorch Inductor.
+The graph is scheduled, converted to analytic weights and compiled through scalar SSA.
 Python owns construction, caching and the public machine API; the C++ shell
 owns scheduling, architectural readout and device arbitration.
 """
@@ -20,7 +20,7 @@ from transformer_nes.cpu6502.backends.weights.engine import (
 from transformer_nes.cpu6502.backends.weights.execution import step_spec_base
 from transformer_nes.cpu6502.backends.weights.experts import build_core_experts
 from transformer_nes.cpu6502.backends.weights.shapes import match_shape_windows, with_loops
-from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS, Cpu6502Graph
+from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, Cpu6502Graph
 from transformer_nes.cpu6502.spec import FLAG_I, FLAG_U
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_nes.graph.fold import GraphFolder
@@ -85,9 +85,9 @@ class Cpu6502TransformerMachine:
             # Collect compiler graph cycles before the first gameplay frame.
             gc.collect()
         self.engine = engine
-        from transformer_nes.cpu6502.backends.weights.torch_forward import TorchForwards
+        from transformer_nes.cpu6502.backends.weights.bank import ForwardBank
 
-        TorchForwards(self)
+        self.forwards = ForwardBank(self)
 
     # ── The graph and the union model, built when needed ────────────
     # (a cached engine needs neither: the folds, a rebuild and the X-ray do)
@@ -125,7 +125,7 @@ class Cpu6502TransformerMachine:
         """The core engine's experts in its build order (the forward hook's
         ids 0..), and the shapes' metadata (experts.py:build_core_experts;
         folds cached)."""
-        # Imported here: the fold cache shapes no engine (model/sources.py).
+        # Imported here: the fold cache shapes no engine (transformer_nes/build.py).
         from transformer_nes.cpu6502.backends.weights.folds import cached_fold
 
         experts, meta = cached_fold(f"core_bcd{int(self.bcd)}", lambda: build_core_experts(self.pg))
@@ -154,7 +154,7 @@ class Cpu6502TransformerMachine:
             self.engine.add_window(sid, head)
 
     def trace_union(self):
-        return self._torch_forwards.trace_union(), 1
+        return self.forwards.trace_union(), 1
 
     def set_nmi(self):
         """The interrupt sequence itself runs inside the weights."""

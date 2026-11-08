@@ -1,17 +1,19 @@
-"""Emit the native 6502 transformer runtime.
+"""Emit and load the native CPU scheduling shell.
 
-Torch owns every neural forward. This module emits model-specific embedding,
-readout and dispatch into native/engine.cpp, which owns the persistent CPU
-runtime and Python/console bindings.
+Source templates live in native/. Sharding keeps native compilation bounded;
+the emitter specializes embedding, readout and dispatch tables. Neural forwards
+are compiled separately by bank.py; native/engine.cpp owns device arbitration.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections.abc import Callable
+from pathlib import Path
 
-from transformer_nes.cpu6502.backends.weights import native
+from transformer_nes import build
 from transformer_nes.cpu6502.backends.weights.execution import readout_slots
 from transformer_nes.cpu6502.spec import (
     MODE_ABSOLUTE,
@@ -28,22 +30,101 @@ from transformer_nes.cpu6502.spec import (
     MODE_ZERO_PAGE_Y,
     OPCODES,
 )
-from transformer_nes.model.build import (
-    CACHE_DIR,
-    artifact_lock,
-    load_module,
-    manifest_put,
-    manifest_read,
-)
-from transformer_nes.model.sources import source_digest
+
+NATIVE_DIR = Path(__file__).with_name("native")
+ENGINE_FILES = tuple(str(path) for path in sorted((NATIVE_DIR / "engine.cpp", NATIVE_DIR / "machine_abi.h")))
+
+
+def native_source(name: str) -> str:
+    return (NATIVE_DIR / name).read_text(encoding="utf-8")
+
+
+# Bound translation-unit size separately from the generic build job limit.
+DEFAULT_COMPILE_SHARDS = 12
+
+
+def compile_shards() -> int:
+    return build.positive_env_int("TRANSFORMER_NES_COMPILE_SHARDS", DEFAULT_COMPILE_SHARDS)
+
+
+FUNC_RE = re.compile(r"^    (void|bool|int|long long) (step_core\w*)\((.*)\) \{$")
+
+
+def shard_source(source: str, struct_name: str, n_shards: int) -> tuple[str, list[str]]:
+    """Split a single-TU engine into a header + n_shards bodies so ninja
+    compiles them in parallel.  The generated step_core* methods become out-of-class definitions, greedily balanced by line
+    count; everything else stays in-class (implicitly inline) in the
+    header.  The PYBIND module block lands in shard 0.  Purely a deterministic post-processing of the emitted
+    text -- the digest covers the original."""
+    lines = source.split("\n")
+    header: list[str] = ["#pragma once"]
+    chunks: dict[str, list[str]] = {}
+    pybind: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = FUNC_RE.match(line)
+        if m is not None:
+            returns, name, args = m.groups()
+            depth = line.count("{") - line.count("}")
+            chunk = [f"{returns} {struct_name}::{name}({args}) {{"]
+            i += 1
+            while depth > 0:
+                depth += lines[i].count("{") - lines[i].count("}")
+                chunk.append(lines[i])
+                i += 1
+            header.append(f"    {returns} {name}({args});")
+            chunks.setdefault(name, []).extend([*chunk, ""])
+            continue
+        if line.startswith("PYBIND11_MODULE("):
+            depth = line.count("{") - line.count("}")
+            pybind.append(line)
+            i += 1
+            while depth > 0:
+                depth += lines[i].count("{") - lines[i].count("}")
+                pybind.append(lines[i])
+                i += 1
+            continue
+        header.append(line)
+        i += 1
+
+    shards: list[list[str]] = [[] for _ in range(max(1, n_shards))]
+    sizes = [0] * len(shards)
+    for chunk in sorted(chunks.values(), key=len, reverse=True):
+        k = sizes.index(min(sizes))
+        shards[k].extend(chunk)
+        sizes[k] += len(chunk)
+    shards[0] = pybind + [""] + shards[0]
+    return "\n".join(header) + "\n", ["\n".join(s) + "\n" for s in shards]
+
+
+def write_shards(cache_dir: str, stem: str, struct_name: str, source: str, n_shards: int) -> list[str]:
+    """`source` as cache_dir/<stem>.hpp and <stem>_s<k>.cpp (shard_source),
+    unless already written; the shards' paths."""
+    hpp_path = os.path.join(cache_dir, f"{stem}.hpp")
+    shard_paths = [os.path.join(cache_dir, f"{stem}_s{k}.cpp") for k in range(n_shards)]
+    existing = [
+        os.path.join(cache_dir, path)
+        for path in os.listdir(cache_dir)
+        if path.startswith(f"{stem}_s") and path.endswith(".cpp")
+    ]
+    if not os.path.exists(hpp_path) or set(existing) != set(shard_paths):
+        header, shards = shard_source(source, struct_name, n_shards)
+        for path, body in zip(shard_paths, shards, strict=True):
+            build.write_atomic(path, f'#include "{stem}.hpp"\n\n{body}'.encode())
+        build.write_atomic(hpp_path, header.encode())
+        for path in set(existing) - set(shard_paths):
+            os.unlink(path)
+    return shard_paths
+
 
 # What shapes the emitted engine: the runner
-# that builds them and everything it imports (model/sources.py).
+# that builds them and everything it imports (transformer_nes/build.py).
 ENGINE_SOURCES = ("transformer_nes.cpu6502.backends.weights.runner",)
 
 
 def engine_code_digest() -> str:
-    return source_digest(*ENGINE_SOURCES, files=native.ENGINE_FILES)
+    return build.source_digest(*ENGINE_SOURCES, files=ENGINE_FILES)
 
 
 def engine_config_key(*, bcd: bool, union_only: bool = False, mirror_cpu_ram: bool = False) -> str:
@@ -506,9 +587,9 @@ def generate_source(
     emit("        return 0;")
     emit("    }")
     dispatch = "\n".join(lines).lstrip("\n") + "\n"
-    source = native.source("engine.cpp")
+    source = native_source("engine.cpp")
     replacements = {
-        "@MACHINE_ABI@": native.source("machine_abi.h").removeprefix("#pragma once\n"),
+        "@MACHINE_ABI@": native_source("machine_abi.h").removeprefix("#pragma once\n"),
         "@MIRROR_CPU_RAM@": "true" if mirror_cpu_ram else "false",
         "@D_MODEL@": str(d_model),
         "@XBUF_SIZE@": str(xbuf_size),
@@ -575,14 +656,14 @@ class GeneratedWeightsEngine:
         digest = hashlib.sha256(source.encode()).hexdigest()[:16]
         self.digest = digest
         source = source.replace("ENGINE_T", f"Engine_{digest}")
-        n_shards = native.compile_shards()
-        with artifact_lock(digest):
-            sources = native.write_shards(
-                CACHE_DIR, f"engine_{digest}", f"Engine_{digest}", source, n_shards
+        n_shards = compile_shards()
+        with build.artifact_lock(digest):
+            sources = write_shards(
+                build.CACHE_DIR, f"engine_{digest}", f"Engine_{digest}", source, n_shards
             )
-            module = load_module(f"weights_gen_{digest}", digest, sources)
+            module = build.load_module(f"weights_gen_{digest}", digest, sources)
             if cache_key is not None:
-                manifest_put(
+                build.manifest_put(
                     cache_key,
                     {
                         "digest": digest,
@@ -601,26 +682,26 @@ class GeneratedWeightsEngine:
     def from_cache(cls, cache_key: str) -> GeneratedWeightsEngine | None:
         """Load an engine by config key alone, skipping the expert folds and
         the source emission entirely; None on any miss."""
-        entry = manifest_read().get(cache_key)
+        entry = build.manifest_read().get(cache_key)
         if entry is None:
             return None
-        with artifact_lock(entry["digest"]):
+        with build.artifact_lock(entry["digest"]):
             # A publisher may replace the entry or prune its files between
             # the initial snapshot and acquiring the artifact lock.
-            if manifest_read().get(cache_key) != entry:
+            if build.manifest_read().get(cache_key) != entry:
                 return None
-            if entry.get("compile_shards") != native.compile_shards():
+            if entry.get("compile_shards") != compile_shards():
                 return None
-            if not os.path.exists(os.path.join(CACHE_DIR, f"engine_{entry['digest']}.hpp")):
+            if not os.path.exists(os.path.join(build.CACHE_DIR, f"engine_{entry['digest']}.hpp")):
                 return None
             digest = entry["digest"]
             sources = [
-                os.path.join(CACHE_DIR, f"engine_{digest}_s{k}.cpp")
+                os.path.join(build.CACHE_DIR, f"engine_{digest}_s{k}.cpp")
                 for k in range(entry["compile_shards"])
             ]
             if not all(map(os.path.exists, sources)):
                 return None
-            module = load_module(f"weights_gen_{digest}", digest, sources)
+            module = build.load_module(f"weights_gen_{digest}", digest, sources)
         self = cls.__new__(cls)
         self.digest = entry["digest"]
         self.n_experts = entry["n_experts"]

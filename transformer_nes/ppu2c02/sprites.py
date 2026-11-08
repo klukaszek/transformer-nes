@@ -105,13 +105,13 @@ DEBUG_FETCH_EXPERTS = {
 }
 
 
-def _memory(chr_full: int):
+def sprite_memory(chr_full: int):
     inputs = [InputDimension(n) for n in ("is_mem_write", "mem_addr", "mem_value")]
     groups = chr_full_groups(chr_full)[-1] + 1 if chr_full else BASE_GROUPS
     return inputs, Memory(*inputs, groups=groups)
 
 
-def _tokens(name: str, inp: dict, memory_inputs: list, outputs: dict):
+def sprite_tokens(name: str, inp: dict, memory_inputs: list, outputs: dict):
     """The token inputs, and the outputs as one READOUT token (persisted
     by name, so the engine reads them out of the residual stream)."""
     input_tokens = {
@@ -127,7 +127,7 @@ def _tokens(name: str, inp: dict, memory_inputs: list, outputs: dict):
 def build_evaluation(chr_full: int = 0):
     one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in EVALUATE_INPUTS}
-    memory_inputs, memory = _memory(chr_full)
+    memory_inputs, memory = sprite_memory(chr_full)
     tall = persist(extract_bits(inp["ctrl"], "ctrl")[2], name="tall")
     start = persist(inp["start"], name="evaluation_start")
     height = 8 + 8 * tall
@@ -168,7 +168,7 @@ def build_evaluation(chr_full: int = 0):
 
     outputs = {"count": found, **{f"index{k}": index[k] for k in range(SPRITES)}}
     auto_name(locals())
-    return _tokens("EVALUATE", inp, memory_inputs, outputs)
+    return sprite_tokens("EVALUATE", inp, memory_inputs, outputs)
 
 
 def build_overflow(chr_full: int = 0):
@@ -180,7 +180,7 @@ def build_overflow(chr_full: int = 0):
     """
     one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in OVERFLOW_INPUTS}
-    memory_inputs, memory = _memory(chr_full)
+    memory_inputs, memory = sprite_memory(chr_full)
     tall = persist(extract_bits(inp["ctrl"], "ctrl")[2], name="tall")
     height = 8 + 8 * tall
     hits = []
@@ -197,10 +197,10 @@ def build_overflow(chr_full: int = 0):
     )
     result = select(stepglu(one, 7 - first_match), inp["start"] + first_match, 64)
     auto_name(locals())
-    return _tokens("OVERFLOW", inp, memory_inputs, {"index": result})
+    return sprite_tokens("OVERFLOW", inp, memory_inputs, {"index": result})
 
 
-def _encode_row(lo, hi, flip_h, shown, meta):
+def encode_row(lo, hi, flip_h, shown, meta):
     """Encode eight binary pattern lanes, then optionally reverse the row.
 
     Pattern bits, flip_h and shown are 0/1. A transparent pixel remains zero;
@@ -224,7 +224,7 @@ def build_fetch(chr_full: int = 0):
     through their own banks from it), or 0 for the CHR windows."""
     one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in FETCH_INPUTS}
-    memory_inputs, memory = _memory(chr_full)
+    memory_inputs, memory = sprite_memory(chr_full)
     ctrl_bits = extract_bits(inp["ctrl"], "ctrl")  # MSB first
     tall = persist(ctrl_bits[2], name="tall")
     table8 = ctrl_bits[4]  # 8x8 sprites' pattern table
@@ -287,7 +287,7 @@ def build_fetch(chr_full: int = 0):
         sprite0 = both(present, equals(inp["index0"], 0)) if k == 0 else 0
         meta = 16 + 8 * attr_bits[6] + 4 * attr_bits[7] + 64 * behind + 128 * sprite0
         shown = both(draw, valid)
-        for c, pixel in enumerate(_encode_row(lo, hi, flip_h, shown, meta)):
+        for c, pixel in enumerate(encode_row(lo, hi, flip_h, shown, meta)):
             outputs[f"sprite{k}_pixel{c}"] = pixel
         outputs[f"sprite{k}_x"] = x
         # A selected sprite fetches when valid; the empty slots past the
@@ -299,4 +299,4 @@ def build_fetch(chr_full: int = 0):
     outputs["new_latch_hi"] = latch["hi"] if not chr_full else inp["latch_hi"]
     outputs = {name: outputs[name] for name in FETCH_OUTPUTS}
     auto_name(locals())
-    return _tokens("FETCH", inp, memory_inputs, outputs)
+    return sprite_tokens("FETCH", inp, memory_inputs, outputs)

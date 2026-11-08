@@ -9,14 +9,13 @@ from pathlib import Path
 
 import pytest
 
+from transformer_nes import build
 from transformer_nes.graph.core import InputDimension, construction, current_graph, persist, reglu
-from transformer_nes.model import build, graph_engine, sources
 from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
 
 
 def _configure(root):
     build.CACHE_DIR = str(root)
-    build.MANIFEST_PATH = str(Path(root) / "manifest.json")
 
 
 @contextmanager
@@ -46,7 +45,6 @@ def _receive(connection):
 @pytest.fixture
 def cache(tmp_path, monkeypatch):
     monkeypatch.setattr(build, "CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr(build, "MANIFEST_PATH", str(tmp_path / "manifest.json"))
     return tmp_path
 
 
@@ -74,23 +72,25 @@ def test_manifest_preserves_concurrent_publishers(cache):
 def test_cpu_cache_hit_rechecks_after_waiting_for_artifact(cache, monkeypatch):
     from transformer_nes.cpu6502.backends.weights import engine
 
-    monkeypatch.setattr(engine, "CACHE_DIR", str(cache))
+    monkeypatch.setattr(build, "CACHE_DIR", str(cache))
     digest = "1111111111111111"
     header = cache / f"engine_{digest}.hpp"
     header.touch()
-    build.manifest_put("cpu", {"digest": digest, "compile_shards": engine.native.compile_shards()})
+    build.manifest_put("cpu", {"digest": digest, "compile_shards": engine.compile_shards()})
+
+    lock = build.artifact_lock
 
     @contextmanager
-    def pruned_before_acquisition(locked_digest):
-        assert locked_digest == digest
+    def pruned_before_acquisition(locked_digest, *, blocking=True):
         # The reader already took its manifest snapshot. Replace it before
         # it can acquire the artifact, just as a competing publisher can.
-        build.manifest_put("cpu", {"digest": "2222222222222222"})
-        assert not header.exists()
-        with build.artifact_lock(digest):
-            yield
+        if locked_digest == digest and blocking:
+            build.manifest_put("cpu", {"digest": "2222222222222222"})
+            assert not header.exists()
+        with lock(locked_digest, blocking=blocking) as acquired:
+            yield acquired
 
-    monkeypatch.setattr(engine, "artifact_lock", pruned_before_acquisition)
+    monkeypatch.setattr(build, "artifact_lock", pruned_before_acquisition)
     assert engine.GeneratedWeightsEngine.from_cache("cpu") is None
 
 
@@ -98,11 +98,9 @@ def _compile_graph(root, size, connection):
     import torch.utils.cpp_extension as extension
 
     from transformer_nes.graph.core import InputDimension, construction, current_graph, persist
-    from transformer_nes.model import graph_engine
     from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
 
     _configure(root)
-    graph_engine.CACHE_DIR = str(root)
     original_load = extension.load
 
     def paused_load(*args, **kwargs):
@@ -207,7 +205,7 @@ def test_killed_builder_releases_ownership_and_stale_torch_baton(cache):
 
 @pytest.fixture
 def package(tmp_path, monkeypatch):
-    monkeypatch.setattr(sources, "ROOT", str(tmp_path))
+    monkeypatch.setattr(build, "PROJECT_DIR", tmp_path)
     root = tmp_path / "transformer_nes"
     root.mkdir()
     files = {
@@ -245,9 +243,9 @@ async def also_optional():
     }
     for name, text in files.items():
         (root / name).write_text(text)
-    sources.source_digest.cache_clear()
+    build.source_digest.cache_clear()
     yield root
-    sources.source_digest.cache_clear()
+    build.source_digest.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -267,8 +265,8 @@ async def also_optional():
 )
 def test_cache_identity_follows_source_dependencies(package, name, changed):
     def digest():
-        sources.source_digest.cache_clear()
-        return sources.source_digest(
+        build.source_digest.cache_clear()
+        return build.source_digest(
             "transformer_nes.builder", files=(str(package / "runtime.inc"),)
         )
 
@@ -309,8 +307,6 @@ for name in ('graph', 'model'):
 
 def test_graph_cache_respects_memory_size(tmp_path, monkeypatch):
     monkeypatch.setattr(build, "CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr(build, "MANIFEST_PATH", str(tmp_path / "manifest.json"))
-    monkeypatch.setattr(graph_engine, "CACHE_DIR", str(tmp_path))
     builds = 0
 
     @construction
@@ -340,7 +336,7 @@ def test_graph_cache_respects_memory_size(tmp_path, monkeypatch):
         raise RuntimeError("compiler failed")
 
     with monkeypatch.context() as failed_build:
-        failed_build.setattr(graph_engine, "load_module", failed_load)
+        failed_build.setattr(build, "load_module", failed_load)
         with pytest.raises(RuntimeError, match="compiler failed"):
             compile_engine(8192)
     assert build.manifest_read()["graph:cache_test"]["digest"] == small.digest
@@ -410,8 +406,8 @@ def test_float32_weights_preserve_real_inputs_trace_and_ablation():
 def test_constant_one_survives_implicit_linear_gates(gate, input_value):
     import torch
 
+    from transformer_nes.model.compiler import weight_module
     from transformer_nes.model.graph_engine import construct
-    from transformer_nes.model.torch_codegen import weight_module
 
     @construction
     def token():
@@ -427,7 +423,7 @@ def test_constant_one_survives_implicit_linear_gates(gate, input_value):
     pg = token.program_graph
     _model, _idx, info = construct(pg)
     assert (pg.one, info.slot_of[pg.one], 0, info.n_layers + 1) in info.lives
-    compiled = CompiledGraph._compile(token, pg, pg.all_dims)
+    compiled = CompiledGraph.compile_token(token, pg, pg.all_dims)
     forward = weight_module(compiled)
     assert forward.f_bits == int(gate == 0.5)
     result, _reads = forward(
@@ -470,8 +466,8 @@ def test_integer_expansion_preserves_memory_bounds_and_half_rounding(reassociate
     # invalid addresses and the fixed-point rescaling at the raw ABI.
     token = graphs()["read"]
     folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
-    expert = CompiledGraph._compile(token, folded.program_graph, list(folded.dim_of_name.values()))
-    from transformer_nes.model.torch_codegen import weight_module
+    expert = CompiledGraph.compile_token(token, folded.program_graph, list(folded.dim_of_name.values()))
+    from transformer_nes.model.compiler import weight_module
 
     forward = weight_module(expert, memory_size=256)
     memory = torch.arange(256, dtype=torch.int32).to(torch.uint8)
@@ -510,10 +506,10 @@ def _identity_extractor(source, index, *, scalar="int32_t"):
 def test_kernel_identity_tracks_code_not_source_locations():
     import types
 
-    from transformer_nes.model.kernel_cache import fingerprint
+    from transformer_nes.build import kernel_fingerprint
 
     def key(extractor, **overrides):
-        return fingerprint(
+        return kernel_fingerprint(
             ("graph",), overrides.pop("config", {"cpp.threads": 1}),
             **(dict(memory_size=256, scalar="int32_t", extractor=extractor) | overrides),
         )
@@ -536,7 +532,7 @@ def test_kernel_identity_tracks_code_not_source_locations():
 
 
 def test_kernel_cache_recovers_corrupt_entries_and_evicts_old_sources(cache, monkeypatch):
-    from transformer_nes.model import kernel_cache
+    from transformer_nes import build
 
     lowered = []
 
@@ -545,21 +541,21 @@ def test_kernel_cache_recovers_corrupt_entries_and_evicts_old_sources(cache, mon
         return _cached_body()
 
     first, second = "a" * 64, "b" * 64
-    assert kernel_cache.get_kernel(first, lower)[-1] is False
-    assert kernel_cache.get_kernel(first, lower)[-1] is True
+    assert build.cached_kernel(first, lower)[-1] is False
+    assert build.cached_kernel(first, lower)[-1] is True
     path = cache / "kernels" / f"{first}.json"
     size = path.stat().st_size
     path.write_text('{"body": "truncated')
-    assert kernel_cache.get_kernel(first, lower)[-1] is False
+    assert build.cached_kernel(first, lower)[-1] is False
     assert len(lowered) == 2
-    monkeypatch.setattr(kernel_cache, "MAX_BYTES", size + 1)
-    assert kernel_cache.get_kernel(second, lower)[-1] is False
+    monkeypatch.setattr(build, "MAX_KERNEL_BYTES", size + 1)
+    assert build.cached_kernel(second, lower)[-1] is False
     assert not path.exists()
-    assert kernel_cache.get_kernel(second, lower)[-1] is True
+    assert build.cached_kernel(second, lower)[-1] is True
 
 
 def _shared_kernel(root, may_compile, connection):
-    from transformer_nes.model import kernel_cache
+    from transformer_nes import build
 
     _configure(root)
     connection.send("started")
@@ -570,7 +566,7 @@ def _shared_kernel(root, may_compile, connection):
         assert connection.recv() == "finish"
         return _cached_body()
 
-    body, headers, meta, hit = kernel_cache.get_kernel("c" * 64, lower)
+    body, headers, meta, hit = build.cached_kernel("c" * 64, lower)
     connection.send((body, headers, meta, hit))
 
 
@@ -588,9 +584,9 @@ def test_kernel_cache_owns_compilation_across_processes(cache):
 
 
 def test_cached_circuits_relocate_between_banks_without_lowering(cache, monkeypatch):
-    from transformer_nes.model import kernel_cache as compiler
+    from transformer_nes import build as compiler
 
-    monkeypatch.setattr(graph_engine, "CACHE_DIR", str(cache))
+    monkeypatch.setattr(build, "CACHE_DIR", str(cache))
 
     @construction
     def graphs(reverse=False, changed=False):
@@ -610,14 +606,14 @@ def test_cached_circuits_relocate_between_banks_without_lowering(cache, monkeypa
     assert original.step([7], original.model_id("double")).tolist() == [14]
     assert original.step([7], original.model_id("square")).tolist() == [49]
 
-    real_compile = compiler.get_kernel
+    real_compile = compiler.cached_kernel
 
     def unexpected_lowering(*args, **kwargs):
         result = real_compile(*args, **kwargs)
         assert result[-1], "identical SSA circuits must survive a new bank identity"
         return result
 
-    monkeypatch.setattr(compiler, "get_kernel", unexpected_lowering)
+    monkeypatch.setattr(compiler, "cached_kernel", unexpected_lowering)
     # Different graph order/model ids, token-bank identity and unused RAM
     # extent: bind each cached body's circuit name to its new index.
     reordered = CompiledGraph(
@@ -634,7 +630,7 @@ def test_cached_circuits_relocate_between_banks_without_lowering(cache, monkeypa
             calls.append(1)
         return result
 
-    monkeypatch.setattr(compiler, "get_kernel", count_lowering)
+    monkeypatch.setattr(compiler, "cached_kernel", count_lowering)
     changed = CompiledGraph(lambda: graphs(changed=True), tag="kernel_changed", sources=(), memory_size=1)
     assert len(calls) == 1
     assert changed.step([7], changed.model_id("double")).tolist() == [14]
@@ -642,10 +638,10 @@ def test_cached_circuits_relocate_between_banks_without_lowering(cache, monkeypa
 
 
 def test_fixed_read_cache_shares_valid_extents_and_keeps_out_of_bounds_zero(cache, monkeypatch):
-    from transformer_nes.model import kernel_cache as compiler
+    from transformer_nes import build as compiler
     from transformer_nes.ppu2c02.space import Memory
 
-    monkeypatch.setattr(graph_engine, "CACHE_DIR", str(cache))
+    monkeypatch.setattr(build, "CACHE_DIR", str(cache))
 
     @construction
     def graphs():
@@ -658,7 +654,7 @@ def test_fixed_read_cache_shares_valid_extents_and_keeps_out_of_bounds_zero(cach
         )
         return {"read": TokenGraph(graph, ("offset",), ("result",))}
 
-    real_compile, calls = compiler.get_kernel, []
+    real_compile, calls = compiler.cached_kernel, []
 
     def count_lowering(*args, **kwargs):
         result = real_compile(*args, **kwargs)
@@ -666,7 +662,7 @@ def test_fixed_read_cache_shares_valid_extents_and_keeps_out_of_bounds_zero(cach
             calls.append(1)
         return result
 
-    monkeypatch.setattr(compiler, "get_kernel", count_lowering)
+    monkeypatch.setattr(compiler, "cached_kernel", count_lowering)
     large = CompiledGraph(graphs, tag="fixed_large", sources=(), memory_size=256)
     large.write(7, 215)
     assert large.step([3]).tolist() == [221]
@@ -683,7 +679,7 @@ def test_fixed_read_cache_shares_valid_extents_and_keeps_out_of_bounds_zero(cach
 def test_shared_neurons_emit_once_without_importing_inductor(cache, monkeypatch):
     import builtins
 
-    monkeypatch.setattr(graph_engine, "CACHE_DIR", str(cache))
+    monkeypatch.setattr(build, "CACHE_DIR", str(cache))
     original_import = builtins.__import__
 
     def no_inductor(name, *args, **kwargs):
@@ -717,7 +713,7 @@ def test_standard_ppu_source_stays_under_two_and_a_quarter_mebibytes():
     from transformer_nes.ppu2c02.machine import ppu_engine
 
     engine = ppu_engine()
-    meta, source = CompiledGraph._generate(engine.build_graphs(), engine.memory_size)
+    meta, source = CompiledGraph.generate_bank(engine.build_graphs(), engine.memory_size)
     assert meta["digest"] == engine.digest
     # Real rendering, fetch, status and register experts previously emitted
     # over 20 MiB, then 4.1 MiB with scalar SSA. Preserve the shared-fragment
@@ -730,7 +726,7 @@ def test_float32_ssa_matches_fx_bits_at_rounding_boundaries():
     import torch
 
     from transformer_nes.graph.fold import GraphFolder
-    from transformer_nes.model.torch_codegen import weight_module
+    from transformer_nes.model.compiler import weight_module
 
     @construction
     def graphs():
@@ -742,7 +738,7 @@ def test_float32_ssa_matches_fx_bits_at_rounding_boundaries():
     engine = CompiledGraph(graphs, tag="ssa_float_bits", sources=(), memory_size=1, dtype="float32")
     token = graphs()["real"]
     folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
-    model = CompiledGraph._compile(token, folded.program_graph, list(folded.dim_of_name.values()), dtype="float32")
+    model = CompiledGraph.compile_token(token, folded.program_graph, list(folded.dim_of_name.values()), dtype="float32")
     forward = weight_module(model, memory_size=1)
     values = np.concatenate([
         np.array([-0.0, 0.0, -2, 2**-24, 1, np.nextafter(np.float32(1), np.float32(2))], dtype=np.float32),
@@ -772,7 +768,7 @@ def test_shared_fragments_preserve_bound_values_and_projection_grouping(dtype):
         }
 
     engine = CompiledGraph(graphs, tag=f"shared_grouping_{dtype}", sources=(), memory_size=1, dtype=dtype)
-    source = (Path(graph_engine.CACHE_DIR) / f"graph_{engine.digest}.cpp").read_text()
+    source = (Path(build.CACHE_DIR) / f"graph_{engine.digest}.cpp").read_text()
     assert "always_inline" in source
     pairs = [(-0.0, -1), (0, 0), (1, 1), (-7, 1), (46341, 2), (2**31 - 1, 0)]
     if dtype == "int32":
@@ -786,11 +782,11 @@ def test_shared_fragments_preserve_bound_values_and_projection_grouping(dtype):
             expected.append(x)
     else:
         from transformer_nes.graph.fold import GraphFolder
-        from transformer_nes.model.torch_codegen import weight_module
+        from transformer_nes.model.compiler import weight_module
 
         token = graphs()["xy"]
         folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
-        model = CompiledGraph._compile(token, folded.program_graph, list(folded.dim_of_name.values()), dtype=dtype)
+        model = CompiledGraph.compile_token(token, folded.program_graph, list(folded.dim_of_name.values()), dtype=dtype)
         forward = weight_module(model, memory_size=1)
         result, _ = forward(torch.tensor(np.array(pairs).T, dtype=torch.float32), torch.zeros(1, dtype=torch.uint8))
         expected = result.numpy().ravel()

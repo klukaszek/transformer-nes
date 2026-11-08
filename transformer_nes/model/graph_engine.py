@@ -15,11 +15,12 @@ import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from transformer_nes.files import write_atomic
+from transformer_nes import build
 from transformer_nes.graph.core import (
     Expression,
     InputDimension,
@@ -27,19 +28,12 @@ from transformer_nes.graph.core import (
     project_program_graph,
 )
 from transformer_nes.graph.fold import GraphFolder
-from transformer_nes.model.build import (
-    CACHE_DIR,
-    artifact_lock,
-    load_module,
-    manifest_put,
-    manifest_read,
-)
+from transformer_nes.model.compiler import bank_source
 from transformer_nes.model.schedule import asap_schedule
-from transformer_nes.model.sources import source_digest
-from transformer_nes.model.torch_codegen import bank_source
 from transformer_nes.model.weights import build_model
 
 logger = logging.getLogger(__name__)
+NATIVE_DIR = Path(__file__).with_name("native")
 
 
 def construct(program_graph: ProgramGraph):
@@ -48,15 +42,13 @@ def construct(program_graph: ProgramGraph):
 
 
 def generate_graph_source(models: list[dict], memory_size: int = 0x10000) -> tuple[str, int]:
-    from pathlib import Path
-
     f_bits = max(m["fraction_bits"] for m in models)
     for model in models:
         model["fraction_bits"] = f_bits
     table = ["struct Token { int n_in, n_out; };", "static const Token tokens[] = {"]
     table.extend(f"{{{len(m['input_slots'])}, {len(m['output_slots'])}}}," for m in models)
     table.append("};")
-    adapter = Path(__file__).with_name("native").joinpath("graph.cpp").read_text()
+    adapter = (NATIVE_DIR / "graph.cpp").read_text()
     decode = """
         for (int i = 0; i < tokens[model].n_out; ++i) {
             if (result[i] & ((1 << @F_BITS@) - 1)) throw std::runtime_error("fractional readout value");
@@ -146,14 +138,12 @@ class CompiledGraph:
         self.dtype = np.dtype(dtype)
         self.build_graphs = build_graphs
         self.memory_size = memory_size
-        from pathlib import Path
-
-        native_files = tuple(str(p) for p in Path(__file__).with_name("native").iterdir())
+        native_files = tuple(str(p) for p in NATIVE_DIR.iterdir())
         key = f"graph:{tag}"
         code = hashlib.sha256(
-            f"{source_digest(__name__, *sources, files=native_files)}|{torch.__version__}".encode()
+            f"{build.source_digest(__name__, *sources, files=native_files)}|{torch.__version__}".encode()
         ).hexdigest()
-        entry = manifest_read().get(key)
+        entry = build.manifest_read().get(key)
         module = None
         if (
             entry is not None
@@ -161,14 +151,14 @@ class CompiledGraph:
             and entry.get("memory_size") == memory_size
             and entry.get("dtype", "int32") == dtype
         ):
-            with artifact_lock(entry["digest"]):
-                path = os.path.join(CACHE_DIR, f"graph_{entry['digest']}.cpp")
+            with build.artifact_lock(entry["digest"]):
+                path = os.path.join(build.CACHE_DIR, f"graph_{entry['digest']}.cpp")
                 if os.path.exists(path):
-                    module = load_module(f"graph_gen_{entry['digest']}", entry["digest"], [path])
+                    module = build.load_module(f"graph_gen_{entry['digest']}", entry["digest"], [path])
         if module is None:
             start = time.perf_counter()
             logger.info("building weight bank %s", tag)
-            generated, source = self._generate(build_graphs(), memory_size, dtype=dtype)
+            generated, source = self.generate_bank(build_graphs(), memory_size, dtype=dtype)
             logger.info(
                 "generated %s: %d circuits, %.1f MiB source in %.1fs",
                 tag, len(generated["model_ids"]), len(source.encode()) / 2**20,
@@ -181,11 +171,11 @@ class CompiledGraph:
                 "dtype": dtype,
                 **generated,
             }
-            with artifact_lock(entry["digest"]):
-                path = os.path.join(CACHE_DIR, f"graph_{entry['digest']}.cpp")
-                write_atomic(path, source.encode())
-                module = load_module(f"graph_gen_{entry['digest']}", entry["digest"], [path])
-                manifest_put(key, entry)
+            with build.artifact_lock(entry["digest"]):
+                path = os.path.join(build.CACHE_DIR, f"graph_{entry['digest']}.cpp")
+                build.write_atomic(path, source.encode())
+                module = build.load_module(f"graph_gen_{entry['digest']}", entry["digest"], [path])
+                build.manifest_put(key, entry)
         self.graphs = {name: TokenIO(*io) for name, io in entry["tokens"].items()}
         self.digest, self.f_bits = entry["digest"], entry["f_bits"]
         self.source_code = code
@@ -197,10 +187,10 @@ class CompiledGraph:
         import weakref
 
         owner = weakref.proxy(self)
-        self.engine.set_debug_loader(lambda trace: owner._debug_kernel(trace))
+        self.engine.set_debug_loader(lambda trace: owner.debug_kernel(trace))
 
     @staticmethod
-    def _generate(graphs: Mapping[str, TokenGraph], memory_size: int, *, dtype="int32") -> tuple[dict, str]:
+    def generate_bank(graphs: Mapping[str, TokenGraph], memory_size: int, *, dtype="int32") -> tuple[dict, str]:
         """Compile every graph and expert to weights and emit the engine's
         source; what the cache records of it."""
         model_ids, models = [], []
@@ -210,7 +200,7 @@ class CompiledGraph:
                 token.program_graph, root_names=list(token.outputs), structural_reads=True
             ).fold({}, label=name)
             models.append(
-                CompiledGraph._compile(
+                CompiledGraph.compile_token(
                     token, full.program_graph, list(full.dim_of_name.values()), dtype=dtype
                 )
             )
@@ -224,7 +214,7 @@ class CompiledGraph:
                     fold = folder.fold(dict(pins), label=expert)
                     model_ids.append((name, expert, len(models)))
                     models.append(
-                        CompiledGraph._compile(
+                        CompiledGraph.compile_token(
                             token,
                             fold.program_graph,
                             list(fold.dim_of_name.values()),
@@ -245,7 +235,7 @@ class CompiledGraph:
         }, source.replace("ENGINE_T", f"GraphEngine_{digest}")
 
     @functools.cached_property
-    def _primary(self):
+    def primary_layout(self):
         """The primary graph's full model's construction info."""
         token = next(iter(self.build_graphs().values()))
         fold = GraphFolder(
@@ -255,17 +245,17 @@ class CompiledGraph:
 
     @property
     def slot_of(self) -> dict:
-        return self._primary.slot_of
+        return self.primary_layout.slot_of
 
     @property
     def lives(self) -> list:
-        return self._primary.lives
+        return self.primary_layout.lives
 
     def model_id(self, graph: str, expert: str | None = None) -> int:
         return self.model_ids[graph, expert]
 
     @staticmethod
-    def _compile(token: TokenGraph, program_graph, dims, *, dtype="int32") -> dict:
+    def compile_token(token: TokenGraph, program_graph, dims, *, dtype="int32") -> dict:
         model, _idx, info = construct(program_graph)
         by_name = {}
         for d in dims:
@@ -292,17 +282,15 @@ class CompiledGraph:
             "output_slots": [info.slot_of[by_name[n]] for n in token.outputs],
         }
 
-    def _debug_kernel(self, trace: bool):
+    def debug_kernel(self, trace: bool):
         if trace not in self._debug_modules:
-            from pathlib import Path
-
             key = f"graph_debug:{self.digest}:{trace}"
-            entry = manifest_read().get(key)
+            entry = build.manifest_read().get(key)
             if entry is not None and entry.get("code") == self.source_code:
-                with artifact_lock(entry["digest"]):
-                    path = Path(CACHE_DIR) / f"graph_{entry['digest']}_debug.cpp"
+                with build.artifact_lock(entry["digest"]):
+                    path = Path(build.CACHE_DIR) / f"graph_{entry['digest']}_debug.cpp"
                     if path.exists():
-                        self._debug_modules[trace] = load_module(
+                        self._debug_modules[trace] = build.load_module(
                             f"graph_debug_{entry['digest']}", entry["digest"], [str(path)]
                         )
                         return self._debug_modules[trace].kernel()
@@ -310,7 +298,7 @@ class CompiledGraph:
             fold = GraphFolder(
                 token.program_graph, root_names=list(token.outputs), structural_reads=True
             ).fold({}, label="primary")
-            model = self._compile(
+            model = self.compile_token(
                 token, fold.program_graph, list(fold.dim_of_name.values()), dtype=self.dtype.name
             )
             model["fraction_bits"] = self.f_bits
@@ -319,13 +307,13 @@ class CompiledGraph:
                 [model], adapter, memory_size=self.memory_size, trace=trace, ablation=True
             )
             digest = hashlib.sha256(source.encode()).hexdigest()[:16]
-            with artifact_lock(digest):
-                path = Path(CACHE_DIR) / f"graph_{digest}_debug.cpp"
-                write_atomic(path, source.encode())
-                self._debug_modules[trace] = load_module(
+            with build.artifact_lock(digest):
+                path = Path(build.CACHE_DIR) / f"graph_{digest}_debug.cpp"
+                build.write_atomic(path, source.encode())
+                self._debug_modules[trace] = build.load_module(
                     f"graph_debug_{digest}", digest, [str(path)]
                 )
-                manifest_put(key, {"kind": "graph_debug", "digest": digest}, code=self.source_code)
+                build.manifest_put(key, {"kind": "graph_debug", "digest": digest}, code=self.source_code)
         return self._debug_modules[trace].kernel()
 
     def write(self, addr: int, value: int) -> None:

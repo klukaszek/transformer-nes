@@ -1,21 +1,141 @@
-"""Compile fixed transformer weights through a compact scalar SSA.
+"""Compile analytic matrices into FX arithmetic and fixed native banks.
 
-The FX graph is a scalar expansion of the checkpoint's attention and ReGLU
-matrices, including integer rounding points or float32 residual arithmetic. The scalar IR folds immutable
-coefficients, removes dead residual slots and shares each surviving value. No opcode
-semantics are supplied to this compiler.
+layer_arrays projects each layer into live integer or float32 matrices.
+weight_module expands those matrices into FX, preserving every rounding point.
+bank_source lowers and shares scalar SSA, then assembles the native adapter.
+No opcode or rendering semantics are supplied to this compiler.
 """
+
+from __future__ import annotations
 
 import logging
 import operator
 import re
 import time
+from pathlib import Path
 
+import numpy as np
 import torch
 from torch.fx import Graph, GraphModule
 
-from transformer_nes.model import kernel_cache, outline, scalar_ir
-from transformer_nes.model.torch_layout import layer_arrays
+from transformer_nes import build
+from transformer_nes.model import ssa
+from transformer_nes.model.weights import rescale_head_queries, split_clear_gates, to_fixed_point
+
+NATIVE_DIR = Path(__file__).with_name("native")
+
+LOOKUP, PASSTHROUGH = 1, 2
+NO_MEMORY_GROUP = -1
+READ_CODES = {"value": -1, "address": -2, **{f"bit{n}": n for n in range(8)}}
+
+
+def share_queries(w_in, w_out, read_kind):
+    """Share query projections and merge identical live value channels."""
+    queries, rows, routes, columns, channels = {}, [], [], [], {}
+    for h, kinds in enumerate(read_kind.tolist()):
+        pair = w_in[2 * h : 2 * h + 2]
+        key = pair.numpy().tobytes()
+        if key not in queries:
+            queries[key] = len(rows)
+            rows.append(pair)
+        for c, kind in enumerate(kinds):
+            column = w_out[:, 2 * h + c]
+            if kind == -3 or not column.any():
+                continue
+            value = (queries[key], kind)
+            if value not in channels:
+                channels[value] = len(columns)
+                columns.append(column.to(torch.int64))
+                routes.append(value)
+            else:
+                columns[channels[value]] += column
+    projected = torch.cat([*rows, w_in[2 * len(read_kind) :]])
+    values = torch.stack(columns, 1) if columns else w_out[:, :0]
+    out = torch.cat([values, w_out[:, 2 * len(read_kind) :]], 1).to(torch.int64)
+    if ((out < -(2**31)) | (out >= 2**31)).any():
+        raise ValueError("shared value projection exceeds int32")
+    return projected, out.to(w_out.dtype), torch.tensor(routes, dtype=torch.int32).reshape(-1, 2)
+
+
+def layer_arrays(model, li: int, *, floating: bool = False) -> dict:
+    """Layer `li` of a folded model in expert_runner.layer's form (as
+    expert_runner.ExpertLayer cuts it from the exported checkpoint)."""
+    attn, heads = model.attn[li], model.attn[li].num_heads
+    kinds, groups = model.head_kinds[li], model.head_memory_groups[li]
+    if any(kinds[h] == LOOKUP and groups[h] == NO_MEMORY_GROUP for h in range(heads)):
+        raise ValueError(f"layer {li}: a lookup head that reads no memory")
+    # Head h's query is in-projection rows 2h, 2h + 1, its value rows
+    # 4H + 2h, + 1; its output, out-projection columns 2h, 2h + 1.  No
+    # head needs its keys.  In units of a half, the engine's fixed point.
+    memory = [h for h in range(heads) if kinds[h] == LOOKUP and groups[h] != NO_MEMORY_GROUP]
+    if floating:
+        if memory:
+            raise ValueError("float32 circuits require memory-free attention")
+        passes = [2 * h + c for h in range(heads) if kinds[h] == PASSTHROUGH for c in range(2)]
+        w_in = attn.in_proj_weight[[4 * heads + c for c in passes]]
+        w_out = attn.out_proj.weight[:, passes]
+        w_ff, w_down = model.ff_in[li].weight, model.ff_out[li].weight
+        ins, outs = touched(w_in, 0), touched(w_out, 1)
+        ff_ins, ff_outs = touched(w_ff, 0), touched(w_down, 1)
+        return {
+            "in_slots": ins, "out_slots": outs,
+            "ff_in_slots": ff_ins, "ff_out_slots": ff_outs,
+            "read_kind": np.empty((0, 2), dtype=np.int32),
+            "w_in": w_in[:, ins].astype(np.float32),
+            "w_out": w_out[outs].astype(np.float32),
+            "w_ff": w_ff[:, ff_ins].astype(np.float32),
+            "w_down": w_down[ff_outs].astype(np.float32),
+        }
+    if any(groups[h] >= 0 for h in memory):
+        raise ValueError("Torch models require structural memory reads before scheduling")
+    reads = [2 * h + c for h in memory for c in range(2)]
+    passes = [2 * h + c for h in range(heads) if kinds[h] == PASSTHROUGH for c in range(2)]
+    w_in = split_clear_gates(rescale_head_queries(attn.in_proj_weight, heads))[0]
+    w_in = to_fixed_point(w_in[reads + [4 * heads + c for c in passes]], "w_in")
+    w_out = to_fixed_point(attn.out_proj.weight[:, reads + passes], "w_out")
+    w_ff = to_fixed_point(model.ff_in[li].weight, "w_ff")
+    w_down = to_fixed_point(model.ff_out[li].weight, "w_down")
+    if (w_in % 2).any():
+        raise ValueError(f"layer {li}: half coefficients in the in-projection")
+    outputs = model.head_memory_outputs[li]
+    w_in, w_out, read_kind = share_queries(
+        torch.from_numpy(w_in),
+        torch.from_numpy(w_out),
+        torch.tensor([read_codes(outputs[h]) for h in memory], dtype=torch.int32).reshape(-1, 2),
+    )
+    w_in, w_out, read_kind = w_in.numpy(), w_out.numpy(), read_kind.numpy()
+    in_slots, out_slots = touched(w_in, 0), touched(w_out, 1)
+    ff_in_slots, ff_out_slots = touched(w_ff, 0), touched(w_down, 1)
+    doubled = {
+        "w_in": w_in[:, in_slots],
+        "w_out": w_out[out_slots],
+        "w_ff": w_ff[:, ff_in_slots],
+        "w_down": w_down[ff_out_slots],
+    }
+    halves = {f"h_{name[2:]}": W - 2 * (W >> 1) for name, W in doubled.items() if name != "w_in"}
+    arrays = {
+        "in_slots": in_slots,
+        "out_slots": out_slots,
+        "ff_in_slots": ff_in_slots,
+        "ff_out_slots": ff_out_slots,
+        "read_kind": read_kind,
+        **{name: W >> 1 for name, W in doubled.items()},
+    }
+    if any(h.any() for h in halves.values()):
+        arrays |= halves
+    arrays = {name: np.ascontiguousarray(a, dtype=np.int32) for name, a in arrays.items()}
+    return arrays
+
+
+def touched(W: np.ndarray, axis: int) -> np.ndarray:
+    """The columns (axis 0) or rows (axis 1) of W holding a nonzero."""
+    return np.flatnonzero((W != 0).any(axis=axis)).astype(np.int32)
+
+
+def read_codes(outputs) -> list[int]:
+    kinds = list(outputs or ("value", "address"))
+    return [READ_CODES[k] for k in kinds] + [-3] * (2 - len(kinds))
+
 
 INT = torch.int32
 logger = logging.getLogger(__name__)
@@ -366,21 +486,21 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
     start = time.perf_counter()
     for index, expert in enumerate(experts):
         module = weight_module(expert, memory_size=memory_size, trace=trace, ablation=ablation)
-        program = scalar_ir.encode(module)
+        program = ssa.encode(module)
         key = (program["inputs"], tuple(
             (name, program[name].dtype.str, program[name].shape, program[name].tobytes())
             for name in ("code", "terms", "registers", "outputs", "reads")
         ))
-        digest = kernel_cache.fingerprint(
+        digest = build.kernel_fingerprint(
             key, {}, memory_size=module.memory_extent,
-            scalar=scalar, extractor=scalar_ir.emit_cpp,
+            scalar=scalar, extractor=ssa.emit_cpp,
         )
         if digest in compiled:
             metadata.append(compiled[digest])
             continue
 
-        body, _headers, meta, hit = kernel_cache.get_kernel(
-            digest, lambda program=program: scalar_ir.emit_cpp(program, scalar=scalar),
+        body, _headers, meta, hit = build.cached_kernel(
+            digest, lambda program=program: ssa.emit_cpp(program, scalar=scalar),
         )
         cache_hits += hit
         bodies.append(re.sub(r"\bcircuit_0\b", f"circuit_{index}", body))
@@ -394,11 +514,11 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
         "weight circuits: %d unique, %d reused, %d lowered in %.1fs",
         len(compiled), cache_hits, len(compiled) - cache_hits, time.perf_counter() - start,
     )
-    helpers, plans = outline.share(programs, scalar=scalar)
+    helpers, plans = ssa.share_fragments(programs, scalar=scalar)
     shared_bodies = list(bodies)
     for i, plan in enumerate(plans):
         if plan:
-            shared_bodies[i] = scalar_ir.emit_cpp(programs[i], indices[i], scalar=scalar, blocks=plan)[0]
+            shared_bodies[i] = ssa.emit_cpp(programs[i], indices[i], scalar=scalar, blocks=plan)[0]
     # The planner estimates call costs. Verify the complete bank too: longer
     # references to fragment results can outweigh a small local text saving.
     if len(helpers) + 1 + sum(map(len, shared_bodies)) < sum(map(len, bodies)):
@@ -410,9 +530,7 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
         f"{{circuit_{m['circuit']}, {m['width']}, {m['reads']}, {str(m['checks_division']).lower()}}}"
         for m in metadata
     )
-    from pathlib import Path
-
-    runtime = Path(__file__).with_name("native").joinpath("torch_bank.h").read_text()
+    runtime = (NATIVE_DIR / "torch_bank.h").read_text()
     hook = runtime + "\n" + adapter
     for name, value in {
         "@ENTRIES@": entries,
@@ -423,4 +541,4 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
     }.items():
         hook = hook.replace(name, value)
     shared = helpers + "\n" if helpers else ""
-    return scalar_ir.CPP_PREAMBLE + f"using V = {scalar};\n" + shared + "\n".join(bodies) + "\n" + hook
+    return ssa.CPP_PREAMBLE + f"using V = {scalar};\n" + shared + "\n".join(bodies) + "\n" + hook

@@ -196,7 +196,7 @@ RRA rra      zpg 67 5  zpx 77 6  abs 6F 6  abx 7F 7  aby 7B 7  idx 63 8  idy 73 
 """
 
 
-def _parse_opcodes(table: str) -> dict[int, Opcode]:
+def parse_opcodes(table: str) -> dict[int, Opcode]:
     opcodes = {}
     for line in table.strip().splitlines():
         if line.startswith("#"):
@@ -207,7 +207,7 @@ def _parse_opcodes(table: str) -> dict[int, Opcode]:
     return opcodes
 
 
-OPCODES: dict[int, Opcode] = _parse_opcodes(_OPCODE_TABLE)
+OPCODES: dict[int, Opcode] = parse_opcodes(_OPCODE_TABLE)
 
 
 def opcode_for(byte: int) -> Opcode:

@@ -2,7 +2,7 @@
 
 
 def test_graph_builder_exposes_codegen_inputs():
-    from transformer_nes.cpu6502.construction import Cpu6502Graph
+    from transformer_nes.cpu6502.graph import Cpu6502Graph
 
     graph = Cpu6502Graph()
 

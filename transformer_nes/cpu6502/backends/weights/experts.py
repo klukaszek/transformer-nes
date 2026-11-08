@@ -2,7 +2,7 @@
 
 The stages are explicit: fold a candidate, prove its dispatch license,
 project architectural effects, schedule weights, then lower its runtime ABI.
-Execution contracts live in execution.py; numerical licenses live in proofs.py.
+Execution contracts live in execution.py; folding and numerical licenses live together in folds.py.
 """
 
 from __future__ import annotations
@@ -27,13 +27,11 @@ from transformer_nes.cpu6502.backends.weights.execution import (
 from transformer_nes.cpu6502.backends.weights.folds import (
     SEQUENCE_FEEDBACK,
     SequenceFolder,
-    opcode_pins,
-    sequence_shape_pins,
-)
-from transformer_nes.cpu6502.backends.weights.proofs import (
     check_reads_licensed,
     const_root,
     eval_over_heads,
+    opcode_pins,
+    sequence_shape_pins,
 )
 from transformer_nes.cpu6502.backends.weights.shapes import (
     COUNTERS,
@@ -44,8 +42,8 @@ from transformer_nes.cpu6502.backends.weights.shapes import (
 from transformer_nes.cpu6502.spec import BRANCH_OPERATIONS, MEMORY_MODES, OPCODES, READS_MEMORY
 from transformer_nes.graph.core import MemoryReadDimension
 from transformer_nes.graph.fold import GraphFolder, const_of, linear_input_form
+from transformer_nes.model.compiler import layer_arrays
 from transformer_nes.model.schedule import asap_schedule
-from transformer_nes.model.torch_layout import layer_arrays
 from transformer_nes.model.weights import build_model
 
 logger = logging.getLogger(__name__)
@@ -104,7 +102,7 @@ def build_opcode_execution_experts(pg, opcodes, *, resume_reads=False) -> list[d
     shapes = [
         (f"exec_{byte:02X}", bytes([byte] + [0] * (op.length - 1)), 1) for byte, op in eligible
     ]
-    experts, _meta = _build_symbolic_execution_experts(
+    experts, _meta = build_symbolic_execution_experts(
         pg,
         shapes,
         expert_kind="exec_resume" if resume_reads else "exec_opcode",
@@ -158,7 +156,7 @@ def sequence_folder(pg) -> SequenceFolder:
     return SequenceFolder(pg, root_names=SEQUENCE_ROOT_DIMS, structural_reads=True)
 
 
-def _build_execution_expert(
+def build_execution_expert(
     folder: SequenceFolder,
     shape: tuple[str, bytes, int],
     sid: int,
@@ -297,7 +295,7 @@ def _build_execution_expert(
     return expert, metadata
 
 
-def _build_symbolic_execution_experts(
+def build_symbolic_execution_experts(
     pg,
     shapes,
     *,
@@ -307,14 +305,14 @@ def _build_symbolic_execution_experts(
     folder = sequence_folder(pg)
     experts, metadata = [], []
     for sid, shape in enumerate(shapes):
-        expert, record = _build_execution_expert(folder, shape, sid, expert_kind)
+        expert, record = build_execution_expert(folder, shape, sid, expert_kind)
         experts.append(expert)
         metadata.append(record)
     return experts, metadata
 
 
 def build_shape_experts(pg, shapes) -> tuple[list[dict], list[dict]]:
-    return _build_symbolic_execution_experts(
+    return build_symbolic_execution_experts(
         pg,
         shapes,
         expert_kind="shape",

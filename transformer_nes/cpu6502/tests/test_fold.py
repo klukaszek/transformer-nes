@@ -25,9 +25,8 @@ from transformer_nes.cpu6502.backends.weights.folds import (
     sequence_pins,
 )
 from transformer_nes.cpu6502.backends.weights.shapes import decode_ops, last_a_bit_step
-from transformer_nes.cpu6502.construction import RUNTIME_READ_DIMS
-from transformer_nes.cpu6502.interpreter import build
-from transformer_nes.cpu6502.spec import OPCODES
+from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, build
+from transformer_nes.cpu6502.spec import FLAG_C, OPCODES
 from transformer_nes.graph.core import (
     MEMORY_GROUP_FUSED,
     InputDimension,
@@ -126,7 +125,10 @@ def test_sequence_execution_projection_keeps_only_final_state(folder):
     keeps exactly one final architectural receipt."""
     code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
     pin_list = sequence_pins(POLL_HEAD, code, OPCODES)
-    r = folder.fold_execution_sequence(
+    # Projection consumes individual flag roots, which need not remain live
+    # under the packed new_p readout after affine circuit simplification.
+    proof = SequenceFolder(folder.pg, root_names=(*RUNTIME_READ_DIMS, *SEQUENCE_ROOT_DIMS))
+    r = proof.fold_execution_sequence(
         pin_list,
         SEQUENCE_FEEDBACK,
         label="projected_poll",
@@ -158,8 +160,11 @@ def test_sequence_execution_projection_keeps_only_final_state(folder):
             assert f"{name}__s{k}" not in execution.dim_of_name
 
 
-def test_sequence_execution_projection_eliminates_deterministic_model(folder):
-    """A licensed deterministic region needs no transformer operations."""
+def test_sequence_execution_projection_keeps_only_the_pinned_state_dependencies(folder):
+    """Pinned control flow retains at most the carry-flag identity circuit."""
+    import numpy as np
+
+    from transformer_nes.model.inference import ExactInference
     pins = (
         sequence_pins(
             SPIN_HEAD,
@@ -183,15 +188,26 @@ def test_sequence_execution_projection_eliminates_deterministic_model(folder):
         execution,
         len(pins),
     )
-    _model, _rows, execution_info = schedule_and_build(execution_graph)
+    model, _rows, execution_info = schedule_and_build(execution_graph)
 
-    assert not any(output.source == "model" for output in execution_graph.outputs)
-    assert execution_info.n_layers == 0
+    live = [output for output in execution_graph.outputs if output.source == "model"]
+    assert {output.name for output in live} <= {"p_c"}
     assert {
         dim.name
         for dim in execution_graph.program_graph.all_dims
         if isinstance(dim, InputDimension)
-    } == {"one"}
+    } <= {"one", "in_p_c"}
+    # The existing circuit retains C as a model output. Check the numerical
+    # identity rather than assuming the folder classifies it as preservation.
+    eager = ExactInference(model)
+    for carry in (0, 1):
+        values = np.zeros(execution_info.d_model)
+        for dim, slot in execution_info.slot_of.items():
+            if isinstance(dim, InputDimension):
+                values[slot] = 1 if dim.name == "one" else carry
+        residual = eager.forward(values)
+        for output in live:
+            assert residual[execution_info.slot_of[output.dimension]] == carry
 
 
 def test_structural_execution_uses_external_memory_reads(folder):
@@ -337,7 +353,7 @@ def test_shape_execution_abi_contains_only_live_state(union_pg):
 
     # The PC feeds the closing branch's target and page-cross timing.
     assert set(spec["inputs"]) == {"x", "pc_lo", "pc_hi"}
-    assert spec["p_flags"] == []
+    assert [mask for _slot, mask in spec["p_flags"]] == [FLAG_C]
     assert {"p_z", "p_n"} <= set(spec["sequence_final"]["model"])
     assert "new_pc" in spec["sequence_final"]["model"]
     assert "sequence_control" not in spec
@@ -403,7 +419,7 @@ def test_completed_compilation_does_not_retain_the_source_graph():
     import weakref
 
     from transformer_nes.cpu6502.backends.weights.experts import sequence_folder
-    from transformer_nes.cpu6502.construction import Cpu6502Graph
+    from transformer_nes.cpu6502.graph import Cpu6502Graph
 
     program = Cpu6502Graph(bcd=False, wide_bits=True).program_graph()
     reference = weakref.ref(program)

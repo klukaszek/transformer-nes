@@ -31,15 +31,14 @@ flowchart LR
 
 | Stage | Implementation | Contract |
 |---|---|---|
-| Machine semantics | [`cpu6502/interpreter.py`](../transformer_nes/cpu6502/interpreter.py), [`ppu2c02/`](../transformer_nes/ppu2c02/) | Construct expressions for a machine transition or PPU token. `interpreter.py` builds a graph; it is not the runtime CPU emulator. |
+| Machine semantics | [`cpu6502/graph.py`](../transformer_nes/cpu6502/graph.py), [`ppu2c02/`](../transformer_nes/ppu2c02/) | Construct expressions for a machine transition or PPU token. `Cpu6502Graph` exposes the CPU's input/output contract in the same module. |
 | Graph language | [`graph/core.py`](../transformer_nes/graph/core.py), [`graph/ops.py`](../transformer_nes/graph/ops.py) | Inputs, attention lookups, ReGLUs, linear persists and captured graphs. A ReGLU computes `a * max(0, b)`. |
 | Partial evaluation | [`graph/evaluate.py`](../transformer_nes/graph/evaluate.py), [`graph/fold.py`](../transformer_nes/graph/fold.py) | Substitute licensed constants, remove dead work and rebuild a graph. Each construction has its own node identities and interning state. |
-| CPU composition | [`weights/folds.py`](../transformer_nes/cpu6502/backends/weights/folds.py) | Chain instruction graphs with register feedback and symbolic PC offsets. |
-| CPU proofs | [`weights/proofs.py`](../transformer_nes/cpu6502/backends/weights/proofs.py) | Bound reads, identify constants and exhaustively check symbolic PC expressions where their dependency domain permits it. |
+| CPU composition and proofs | [`weights/folds.py`](../transformer_nes/cpu6502/backends/weights/folds.py) | Chain instruction graphs with register feedback and symbolic PC offsets; bound reads, identify constants and check symbolic control flow before dispatch. |
 | CPU effects | [`weights/execution.py`](../transformer_nes/cpu6502/backends/weights/execution.py) | Project a licensed graph to final state, ordered writes, control and cycles. Lower graph dimensions to residual slots after scheduling. |
 | Expert construction | [`weights/experts.py`](../transformer_nes/cpu6502/backends/weights/experts.py) | Orchestrate folding, validation, projection and construction in stable dispatch order. |
 | Layers and weights | [`model/schedule.py`](../transformer_nes/model/schedule.py), [`model/weights.py`](../transformer_nes/model/weights.py) | Schedule attention/linear/FFN phases and construct their actual matrices. |
-| Weight lowering | [`model/torch_layout.py`](../transformer_nes/model/torch_layout.py), [`model/torch_codegen.py`](../transformer_nes/model/torch_codegen.py), [`model/scalar_ir.py`](../transformer_nes/model/scalar_ir.py), [`model/outline.py`](../transformer_nes/model/outline.py) | Expand the matrices into integer or float32 FX operations, lower compact scalar SSA and compile fixed native kernels. |
+| Weight lowering | [`model/compiler.py`](../transformer_nes/model/compiler.py), [`model/ssa.py`](../transformer_nes/model/ssa.py) | Expand the matrices into integer or float32 FX operations, lower compact scalar SSA and compile fixed native kernels. |
 | CPU runtime | [`weights/native/engine.cpp`](../transformer_nes/cpu6502/backends/weights/native/engine.cpp), [`weights/engine.py`](../transformer_nes/cpu6502/backends/weights/engine.py) | Embed live inputs, dispatch kernels and commit licensed effects within device and cycle budgets. |
 
 The graph and model packages are independent of the CPU package. The neural
@@ -248,7 +247,7 @@ conditional tile-fetch effects. Payloads are zero when `fetched` is clear, and
 the host consumes them only when it is set. Folding can therefore remove the
 inactive circuitry.
 
-[`ppu2c02/clock.py`](../transformer_nes/ppu2c02/clock.py) constructs the bounded
+[`ppu2c02/control.py`](../transformer_nes/ppu2c02/control.py) constructs the bounded
 scanline clock. Given a line and event index, its weights return the next line,
 frame-wrap effect, timeline identity, event count, dot, action, tile slot and
 contiguous run length. It preserves ordering at tied dots: sprite evaluation
@@ -496,8 +495,9 @@ The complete execution bank is attached before play, with no native neural
 forward fallback or background learner. Cached starts load compiled extensions;
 initial compilation can take several minutes. Artifact locks cover writing,
 loading and publication, and pruning skips active builds. Generic build/cache
-lifecycle lives in `model/build.py`; CPU source sharding lives beside its runtime
-template. `native/machine_abi.h` defines the console interface.
+lifecycle lives in `transformer_nes/build.py`; CPU source sharding lives in
+`weights/engine.py`, alongside source emission. `native/machine_abi.h` defines
+the console interface.
 
 After a cold CPU build, construction graphs are released and their cycles are
 collected before gameplay. Evaluators share work while their source graph is

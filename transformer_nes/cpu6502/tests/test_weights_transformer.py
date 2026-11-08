@@ -433,7 +433,7 @@ def test_neural_next_pc_covers_branch_and_address_wrap_boundaries():
         for head in (0xFFFE, 0xFFFF)
         for code in (b"\xea", b"\xa9\x42", b"\x4c\xff\xff", b"\x4c\x00\x00")
     ]
-    calls_before = machine._torch_forwards.counts[0]
+    calls_before = machine.forwards.counts[0]
     for head, code, flags in cases:
         image = bytearray(65536)
         for offset, byte in enumerate(code):
@@ -451,7 +451,7 @@ def test_neural_next_pc_covers_branch_and_address_wrap_boundaries():
         assert (actual["pc"], actual["a"], actual["p"], result["cycles"]) == (
             ref.pc, ref.a, ref.p, cycles
         ), (head, code.hex(), flags)
-    assert machine._torch_forwards.counts == (calls_before + len(cases), 0)
+    assert machine.forwards.counts == (calls_before + len(cases), 0)
 
 
 @pytest.mark.slow
@@ -596,7 +596,7 @@ def test_parallel_flag_readouts_match_reference_for_every_byte():
                 ), (code.hex(), value, carry)
                 assert int(out["cycles"]) == cycles
                 assert machine.read_ram(0x20) == ref.memory[0x20]
-    assert machine._torch_forwards.counts[1] == 0
+    assert machine.forwards.counts[1] == 0
 
 
 def test_counter_recurrences_cover_byte_wrap_and_page_cross_budgets():

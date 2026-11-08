@@ -16,8 +16,8 @@ from carts import (
     register_cart,
 )
 
+from transformer_nes.build import load_nes_extension
 from transformer_nes.nes.backends import backend_factory
-from transformer_nes.nes.build import load_hardware
 from transformer_nes.ppu2c02 import render
 from transformer_nes.ppu2c02.machine import ppu_engine
 
@@ -89,7 +89,7 @@ def test_experts_agree_with_the_full_graph():
 
 def whole_ppu(cart, count):
     """Frames through the production console's mandatory transformer PPU."""
-    return console_frames(load_hardware(), cart, count)
+    return console_frames(load_nes_extension("hardware"), cart, count)
 
 
 def test_dma_wrap_mirrors_parity_and_destination_after_render_catchup():
@@ -142,7 +142,7 @@ def test_dma_wrap_mirrors_parity_and_destination_after_render_catchup():
             cycles += 513 + (cycles & 1)
         cpu.step()
     assert parities == {0, 1}
-    for hardware in (load_reference_hardware(), load_hardware()):
+    for hardware in (load_reference_hardware(), load_nes_extension("hardware")):
         for backend in ("reference", "weights"):
             console = hardware.Console(hardware.Cartridge.parse(image), backend_factory(backend), 44100)
             for _ in range(10):
@@ -185,7 +185,7 @@ def test_graph_renders_mmc5(exram_mode):
 
 @pytest.mark.parametrize("mapper", [0, 9, 10, 5])
 def test_unlimited_sprites_preserve_hardware_bus_effects(mapper):
-    reference, production = load_reference_hardware(), load_hardware()
+    reference, production = load_reference_hardware(), load_nes_extension("hardware")
     setup = [0xA9, 0] + absolute(0x8D, 0x2001) + absolute(0x8D, 0x2003)
     for i in range(64):
         for value in (40, 0xFD + i % 2, i % 4, i * 4):
@@ -205,7 +205,7 @@ def test_unlimited_sprites_preserve_hardware_bus_effects(mapper):
 
 
 def test_production_console_requires_the_transformer_ppu():
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     console = hardware.Console(
         register_cart(hardware, vertical=False), backend_factory("weights"), 44100
     )
@@ -242,7 +242,7 @@ def test_slot_trace_explains_the_frame():
     (on a copy of the engine) reports the color the frame shows."""
     from transformer_nes.nes.xray import PpuXray
 
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     console = hardware.Console(latch_cart(hardware, mapper=9), backend_factory("weights"), 44100.0)
     engine = ppu_engine()
     console.set_ppu_engine(engine)

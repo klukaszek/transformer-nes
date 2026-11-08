@@ -15,21 +15,21 @@ def test_row_circuit_exhausts_patterns_flip_visibility_and_metadata():
     import torch
 
     from transformer_nes.graph.core import InputDimension, construction, current_graph, persist
+    from transformer_nes.model.compiler import weight_module
     from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
-    from transformer_nes.model.torch_codegen import weight_module
-    from transformer_nes.ppu2c02.sprites import _encode_row
+    from transformer_nes.ppu2c02.sprites import encode_row
 
     @construction
     def row():
         names = [*(f"lo{i}" for i in range(8)), *(f"hi{i}" for i in range(8)), "flip", "shown", "meta"]
         values = [InputDimension(n) for n in names]
-        result = _encode_row(values[:8], values[8:16], *values[16:])
+        result = encode_row(values[:8], values[8:16], *values[16:])
         outputs = [persist(v, name=f"pixel{i}") for i, v in enumerate(result)]
         graph = current_graph().capture({"ROW": sum(values)}, {"READOUT": sum(outputs)})
         return TokenGraph(graph, names, [f"pixel{i}" for i in range(8)])
 
     token = row()
-    expert = CompiledGraph._compile(token, token.program_graph, token.program_graph.all_dims)
+    expert = CompiledGraph.compile_token(token, token.program_graph, token.program_graph.all_dims)
     forward = weight_module(expert, memory_size=1)
     pairs = np.arange(65536, dtype=np.int32)
     low, high = pairs & 255, pairs >> 8

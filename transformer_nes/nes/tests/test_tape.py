@@ -2,12 +2,12 @@
 
 import math
 
+from transformer_nes.build import load_nes_extension
 from transformer_nes.nes.backends import backend_factory
-from transformer_nes.nes.build import load_hardware
 
 
 def test_tape_samples_obey_limits_and_empty_replays(tmp_path):
-    hardware = load_hardware()
+    hardware = load_nes_extension("hardware")
     prg = bytearray(0x4000)
     prg[:3] = bytes((0x4C, 0, 0x80))  # JMP $8000
     prg[-4:-2] = bytes((0, 0x80))

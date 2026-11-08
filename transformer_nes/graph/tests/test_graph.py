@@ -31,8 +31,8 @@ def test_nonzero_mask_handles_unsigned_values_signed_payloads_and_half_units(sim
     import torch
 
     from transformer_nes.graph.ops import gate_nonzero, nonzero
+    from transformer_nes.model.compiler import weight_module
     from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
-    from transformer_nes.model.torch_codegen import weight_module
 
     @construction
     def circuit():
@@ -48,7 +48,7 @@ def test_nonzero_mask_handles_unsigned_values_signed_payloads_and_half_units(sim
         return TokenGraph(pg, ("enabled", "value", "payload"), ("masked", "flag"))
 
     token = circuit()
-    expert = CompiledGraph._compile(token, token.program_graph, token.program_graph.all_dims)
+    expert = CompiledGraph.compile_token(token, token.program_graph, token.program_graph.all_dims)
     forward = weight_module(expert, memory_size=1)
     assert forward.f_bits == 1
     g, v, p = np.meshgrid([0, 1], np.arange(256), [-511, -255, -1, 0, 1, 255, 511], indexing="ij")
@@ -168,7 +168,7 @@ def test_projection_does_not_retain_builder_caches_or_dead_nodes():
 
 
 def test_cpu_capture_survives_other_constructions_and_folds():
-    from transformer_nes.cpu6502.construction import Cpu6502Graph
+    from transformer_nes.cpu6502.graph import Cpu6502Graph
     from transformer_nes.ppu2c02.machine import register_graph
 
     cpu = Cpu6502Graph(bcd=False, wide_bits=True)
@@ -374,10 +374,10 @@ def test_byte_bit_extraction_is_exact_for_every_byte(extract, neurons):
 
 @construction
 def test_shared_opcode_tents_cover_all_bytes_and_full_address_zero():
-    from transformer_nes.graph.ops import match_byte
+    from transformer_nes.graph.ops import equals
 
     value = InputDimension("value")
-    gates = [match_byte(value, byte) for byte in range(256)]
+    gates = [equals(value, byte) for byte in range(256)]
     assert sum(isinstance(d, ReGLUDimension) for d in current_graph().dims) == 258
     domain = np.arange(-65535, 65536, dtype=np.int32)
     evaluate = circuit_values(value, domain)
@@ -388,19 +388,19 @@ def test_shared_opcode_tents_cover_all_bytes_and_full_address_zero():
 def test_boolean_selection_is_affine_for_constants_and_exact_for_signed_halves():
     import torch
 
-    from transformer_nes.graph.ops import gate, mux, select
+    from transformer_nes.graph.ops import gate, select
+    from transformer_nes.model.compiler import weight_module
     from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
-    from transformer_nes.model.torch_codegen import weight_module
 
     with GraphContext().activate() as ctx:
         enabled, value = InputDimension("enabled"), InputDimension("value")
-        outputs = [persist(mux(enabled, value, -value), name="signed"),
+        outputs = [persist(select(enabled, value, -value), name="signed"),
                    persist(select(enabled, 3, 7), name="constant"),
                    persist(gate(enabled, 0.5 * value), name="half")]
         pg = ctx.capture({"VALUE": enabled + value}, {"READOUT": sum(outputs)})
         assert sum(isinstance(d, ReGLUDimension) for d in ctx.dims) == 2
     token = TokenGraph(pg, ("enabled", "value"), ("signed", "constant", "half"))
-    expert = CompiledGraph._compile(token, pg, pg.all_dims)
+    expert = CompiledGraph.compile_token(token, pg, pg.all_dims)
     forward = weight_module(expert, memory_size=1)
     g, x = np.meshgrid([0, 1], np.arange(-512, 512), indexing="ij")
     actual, _ = forward(torch.tensor(np.stack([g.ravel(), x.ravel()]), dtype=torch.int32),
