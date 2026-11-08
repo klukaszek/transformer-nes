@@ -244,12 +244,12 @@ class PpuXray:
         if life is None or life[2] == 0:
             raise ValueError(f"{name} is not a computed value of the render graph")
         _dim, slot, first, _end = life
-        self.engine.engine.ablate(slot, first, value)
+        self.engine.ablate(slot, first, value)
         console.ppu_force_full_render = True
         return f"{name} forced to {value} after layer {first - 1}"
 
     def restore(self, console) -> None:
-        self.engine.engine.ablate()
+        self.engine.ablate()
         console.ppu_force_full_render = False
 
     def dissect(self, trace: dict, x: int) -> dict:

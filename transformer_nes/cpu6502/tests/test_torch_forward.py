@@ -289,24 +289,13 @@ def test_machine_keeps_hook_context_alive_without_a_separate_handle():
     assert machine.forwards.counts == (1, 0)
 
 
-def test_loaded_bank_survives_pruned_files_when_constructing_another_cpu(tmp_path, monkeypatch):
-    from transformer_nes.cpu6502 import bank
-
-    first = Cpu6502TransformerMachine()
-    hook = bank_module(False)
-    monkeypatch.setattr(build, "CACHE_DIR", str(tmp_path))
-
-    def unexpected_child(*args, **kwargs):
-        raise AssertionError("a loaded extension must not require a new compiler child")
-
-    monkeypatch.setattr(bank.subprocess, "run", unexpected_child)
-    second = Cpu6502TransformerMachine()
-    assert first.forwards.hook is second.forwards.hook is hook
-    image = bytearray(65536)
-    image[0x8000:0x8002] = bytes((0xA9, 0x42))
-    second.load_image(image, start_pc=0x8000)
-    second.run(1, trace=False)
-    assert second.get_state()["a"] == 0x42
+def test_loaded_bank_outlives_its_pruned_files(tmp_path, monkeypatch):
+    """A mapped bank extension is reused once its files are gone: another CPU
+    in the same process gets the same bank and nothing is rebuilt."""
+    hook = Cpu6502TransformerMachine().forwards.hook
+    monkeypatch.setattr(build, "CACHE_DIR", str(tmp_path))  # a cache without the bank's files
+    assert bank_module(False) is hook
+    assert not any(tmp_path.iterdir())
 
 
 def test_compiler_child_rejects_stale_source_identity():

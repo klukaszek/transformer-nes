@@ -7,8 +7,7 @@
 NES: constructed from its circuits the first time, then loaded from
 safetensors, and compiled once per model and backend.
 
-Chips arrive here one by one as they move onto this path; the rest of the
-console still builds its engines through model/graph_engine.py.
+The CPU still builds its own bank and engine (cpu6502/bank.py, cpu6502/engine.py).
 """
 
 from __future__ import annotations
@@ -26,8 +25,9 @@ from torch import Tensor, nn
 from transformer_nes import build
 from transformer_nes.apu2a03 import audio
 from transformer_nes.model.backend import CompiledChip, CompiledModel, compile_model
-from transformer_nes.model.transformer import Chip, pack_state, unpack_state
+from transformer_nes.model.transformer import Chip, Named, pack_state, unpack_state
 from transformer_nes.nes import controller, mappers
+from transformer_nes.ppu2c02 import control, machine
 
 CACHE_DIR = Path(os.environ.get("TRANSFORMER_NES_CACHE", build.PROJECT_DIR / ".cache" / "nes"))
 
@@ -39,6 +39,8 @@ def recipes() -> dict[str, Callable[[], Chip]]:
         "apu_mixer": audio.mixer_chip,
         "controller": controller.chip,
         **{name: functools.partial(mappers.chip, number) for number, name in mappers.CHIPS.items()},
+        "ppu": machine.chip,
+        "ppu_control": control.chip,
     }
 
 
@@ -54,7 +56,7 @@ class NES(nn.Module):
 
     def __init__(self, chips: dict[str, Chip]):
         super().__init__()
-        self.chips = nn.ModuleDict(chips)
+        self.chips = Named(chips)
 
     def forward(self, chip: str, token: str, inputs: Tensor, memory: Tensor,
                 specialization: str | None = None) -> Tensor:
@@ -106,7 +108,7 @@ class NES(nn.Module):
     def compile(self, cache_dir: Path = CACHE_DIR) -> CompiledNES:
         """The whole model as one native library."""
         compiled = compile_model(dict(self.chips), cache_dir)
-        return CompiledNES(compiled.module, compiled.chips)
+        return CompiledNES(compiled.module, compiled.chips, compiled.library)
 
 
 class CompiledNES(CompiledModel):

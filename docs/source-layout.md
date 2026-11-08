@@ -30,10 +30,13 @@ fixtures/                 ROMs, golden logs and test binaries
 
 The model holds weights only; memory is the runtime's state, passed to each
 forward. A specialization is its own smaller circuit, valid where its pins
-hold. The library is keyed by the model's weights and the backend's sources,
-built on first use and published by rename. Chips move onto this path one by
-one: the controller, mapper chips and APU have; the PPU and CPU still build
-through `model/graph_engine.py` and their own caches.
+hold; specializations that fold to the same circuit store it once. A view is a
+token type read off another's circuits at fewer outputs (the PPU's status and
+bus previews): it stores no weights, and its kernels keep only the work its
+outputs need. The library is keyed by the model's weights and the backend's sources,
+built on first use and published by rename. Every chip but the CPU is on
+this path; the CPU still builds its own bank and engine (`cpu6502/bank.py`,
+`cpu6502/engine.py`) through `build.py`'s caches.
 
 ## A reading order
 

@@ -124,6 +124,19 @@ def extract_bits(value: ExprLike, name: str) -> list[Expression]:
     return bits
 
 
+def high_bit(value: ExprLike, bit: int, width: int = 8) -> Expression:
+    """Bit `bit` of an integer in [0, 2**width) in one layer: the alternating
+    sum of its 2**(width - bit) - 1 thresholds at multiples of 2**bit. A
+    threshold ladder (extract_bits) needs width - bit layers; this is cheap
+    for the high bits."""
+    one = graph.current_graph().one
+    place = 1 << bit
+    return sum(
+        ((-1) ** (j + 1) * stepglu(one, value - j * place) for j in range(1, 1 << (width - bit))),
+        Expression(),
+    )
+
+
 def group_spans(count: int, size: int = 4096) -> list[tuple[int, int]]:
     """`count` consecutive lookup groups of `size` bytes from address 0."""
     return [(g * size, g * size + size - 1) for g in range(count)]

@@ -89,7 +89,7 @@ void Ppu::access_effects(const RegisterAccess& request, const RegisterFile& befo
     reference_access_bus(in, out);
   else
 #endif
-    engine_.control_step(engine_.control_ctx, engine_.access_bus_models[request.is_write][request.reg], in, out);
+    engine_.control_step(engine_.control_ctx, engine_.access_bus_model, in, out);
   if (out[0] && a12(out[1] != 0, dot))
     schedule_changed_ = true;
   chr_latch.latch_fe[0] = out[2] != 0;
@@ -562,12 +562,12 @@ int64_t Ppu::next_frame_start() const {
   if (!engine_.ctx)
     return r_.frame_start + frame_dots - (r_.odd && rendering_enabled() ? 1 : 0);
 #endif
-  // Ask the same event expert used at dot 339. Its skip readout depends
+  // Ask the control circuit for the dot-339 event. Its skip readout depends
   // only on parity and mask; no preview or live state update is needed.
   const auto event = static_cast<size_t>(ControlEvent::OddSkip);
   const int in[control_inputs] = {static_cast<int>(event), mask, ctrl, r_.odd};
   int out[control_outputs];
-  engine_.control_step(engine_.control_ctx, engine_.control_models[event], in, out);
+  engine_.control_step(engine_.control_ctx, engine_.control_model, in, out);
   return r_.frame_start + frame_dots - out[out_control_skip];
 }
 
@@ -660,7 +660,7 @@ bool Ppu::control(ControlEvent event, int64_t dot, const RegisterResult& effects
   *field++ = effects.nmi_fall;
   *field = r_.hit_dot != NEVER || r_.overflow_dot != NEVER;
   int out[control_outputs];
-  engine_.control_step(engine_.control_ctx, engine_.control_models[static_cast<size_t>(event)], in, out);
+  engine_.control_step(engine_.control_ctx, engine_.control_model, in, out);
   r_.v = static_cast<uint16_t>(out[0] | (out[1] << 5) | (out[2] << 10) | (out[3] << 12));
   oam_addr = static_cast<uint8_t>(out[4]);
   r_.vblank = out[5] != 0;
@@ -682,18 +682,16 @@ bool Ppu::control(ControlEvent event, int64_t dot, const RegisterResult& effects
 
 // Transport ordered eight-pixel windows through the composition circuit.
 // Both bytes and occupancy return as state, including right-edge padding.
-void Ppu::compose_sprite_rows(const int* fetched, int count) {
-  for (int k = 0; k < count; ++k) {
-    const size_t x = static_cast<size_t>(fetched[out_sprite_x + k]);
-    int in[compose_inputs] = {static_cast<int>(x), r_.sprite_slots[x >> 3], r_.sprite_slots[(x >> 3) + 1]};
-    std::copy_n(fetched + k * 8, 8, in + 3);
-    std::copy_n(r_.sprites.data() + x, 8, in + 11);
-    int out[compose_outputs];
-    engine_.control_step(engine_.control_ctx, engine_.compose_model, in, out);
-    std::copy_n(out, 8, r_.sprites.data() + x);
-    r_.sprite_slots[x >> 3] = out[8];
-    r_.sprite_slots[(x >> 3) + 1] = out[9];
-  }
+void Ppu::compose_sprite_row(const int* fetched) {
+  const size_t x = static_cast<size_t>(fetched[out_sprite_x]);
+  int in[compose_inputs] = {static_cast<int>(x), r_.sprite_slots[x >> 3], r_.sprite_slots[(x >> 3) + 1]};
+  std::copy_n(fetched, 8, in + 3);
+  std::copy_n(r_.sprites.data() + x, 8, in + 11);
+  int out[compose_outputs];
+  engine_.control_step(engine_.control_ctx, engine_.compose_model, in, out);
+  std::copy_n(out, 8, r_.sprites.data() + x);
+  r_.sprite_slots[x >> 3] = out[8];
+  r_.sprite_slots[(x >> 3) + 1] = out[9];
 }
 
 // The selected OAM indices and diagonal overflow candidate come from
@@ -707,18 +705,18 @@ void Ppu::evaluate_sprites_graph(int64_t dot) {
   int in[evaluate_inputs] = {1, r_.line, ctrl, 0};
   int out[evaluate_outputs];
   auto& rows = sprite_rows_;
-  const int model = engine_.sprites.evaluate[(ctrl & 0x20) ? 2 : 1];
-  if (rows.oam_epoch != oam_epoch_ || rows.model != model) {
+  const int tall = (ctrl & 0x20) != 0;
+  if (rows.oam_epoch != oam_epoch_ || rows.tall != tall) {
     rows.valid.reset();
     rows.oam_epoch = oam_epoch_;
-    rows.model = model;
+    rows.tall = tall;
   }
   const auto line = static_cast<size_t>(r_.line);
   auto& row = rows.rows[line];
   if (rows.valid[line]) {
     std::copy(row.begin(), row.end(), out);
   } else {
-    graph_step(model, in, out);
+    graph_step(engine_.sprites.evaluate, in, out);
     std::copy_n(out, row.size(), row.begin());
     rows.valid[line] = true;
   }
@@ -729,7 +727,7 @@ void Ppu::evaluate_sprites_graph(int64_t dot) {
     for (int start = out[8] + 1; start < 64; start += 8) {
       const int probe[4] = {1, r_.line, ctrl, start};
       int found;
-      graph_step(engine_.sprites.overflow[(ctrl & 0x20) ? 2 : 1], probe, &found);
+      graph_step(engine_.sprites.overflow, probe, &found);
       if (found < 64) {
         r_.overflow_dot = dot + 48 + 2 * found;
         mark_status_change(r_.overflow_dot);
@@ -739,15 +737,15 @@ void Ppu::evaluate_sprites_graph(int64_t dot) {
   }
   while (!dry_ && !sprite_limit && out[0] == 8 && out[8] < 63) {
     in[3] = out[8] + 1;
-    graph_step(engine_.sprites.evaluate[(ctrl & 0x20) ? 4 : 3], in, out);
+    graph_step(engine_.sprites.evaluate, in, out);
     for (int k = 0; k < out[0]; ++k)
       r_.selected[static_cast<size_t>(r_.selected_count++)] = static_cast<uint8_t>(out[1 + k]);
   }
 }
 
-// The sprite fetch through the fetch graph: the selected sprites' rows
-// and where they go, the latches the fetches flip, and the pattern table
-// every fetch reads, for its A12 edge.
+// The sprite fetch, a SPRITE token per slot: each selected sprite's row and
+// where it goes, the latches its fetch flips (passed on to the next slot),
+// and the pattern table it reads, for its A12 edge.
 void Ppu::load_sprites_graph(int64_t dot) {
   if (dry_ && ((!track_status_ && !wants_a12_) ||
                (track_status_ && (r_.hit_dot != NEVER || (mask & 0x18) != 0x18))))
@@ -756,60 +754,64 @@ void Ppu::load_sprites_graph(int64_t dot) {
     return;
   const int total = r_.line < 240 ? r_.selected_count : 0;
   const int count = std::min(total, 8);
-  int in[fetch_inputs] = {1, r_.line, ctrl, count};
-  for (int k = 0; k < count; ++k)
-    in[in_index + k] = r_.selected[static_cast<size_t>(k)];
-  in[in_latch] = chr_latch_active && chr_latch.latch_fe[0];
-  in[in_latch + 1] = chr_latch_active && chr_latch.latch_fe[1];
-  in[in_latch + 2] = chr_latch.wide_low;
-  if (mmc5.active())
-    for (int s = 0; s < 8; ++s)
-      in[in_banks + s] = static_cast<int>(sprite_banks()[s] >> 10);
-  in[in_fetch_whole] = whole_chr();
   const bool bus_only = dry_ && !track_status_;
   const bool status_only = dry_ && track_status_;
-  const auto& models = bus_only      ? engine_.sprites.fetch_bus
-                       : status_only ? engine_.sprites.fetch_status
-                                     : engine_.sprites.fetch;
-  int out[fetch_outputs];
-  const int model = chr_latch_active ? models[0] : models[1 + ((ctrl & 0x20) ? 9 : 0) + count];
-  if (status_only) {
-    int selected[27];
-    graph_step(model, in, selected);
-    std::copy_n(selected, 8, out);
-    out[out_sprite_x] = selected[8];
-    std::copy_n(selected + 9, 18, out + out_sprite_fetch);
-  } else {
-    graph_step(model, in, bus_only ? out + out_sprite_fetch : out);
-  }
-  for (int k = 0; k < 8; ++k)
-    if (out[out_sprite_fetch + k]) {
-      bus_event(BusEvent::Sprite, out[out_sprite_a12 + k] != 0, dot + 8 * k);
+  const int tall = (ctrl & 0x20) != 0;
+  const auto& models = engine_.sprites;
+  int in[sprite_inputs] = {1, r_.line, ctrl};
+  in[in_sprite_latch] = chr_latch_active && chr_latch.latch_fe[0];
+  in[in_sprite_latch + 1] = chr_latch_active && chr_latch.latch_fe[1];
+  in[in_sprite_latch + 2] = chr_latch.wide_low;
+  if (mmc5.active())
+    for (int s = 0; s < 8; ++s)
+      in[in_sprite_banks + s] = static_cast<int>(sprite_banks()[s] >> 10);
+  in[in_sprite_whole] = whole_chr();
+  int out[sprite_outputs];
+  // An empty slot's dummy fetch reaches only the mapper's bus and latches.
+  const int slots = wants_a12_ || chr_latch_active ? 8 : count;
+  bool repeat = false; // the empty slot before this one applies again
+  for (int k = 0; k < slots; ++k) {
+    const bool present = k < count;
+    // Rows to draw: every sprite, the first alone for sprite-0 status.
+    const bool row = present && !bus_only && (!status_only || k == 0);
+    in[in_sprite_present] = present;
+    in[in_sprite_index] = present ? r_.selected[static_cast<size_t>(k)] : 0;
+    const int model = !present ? models.absent
+                      : row    ? models.fetch[chr_latch_active][tall]
+                               : models.fetch_bus[chr_latch_active][tall];
+    if (!repeat) {
+      const int latch_lo = in[in_sprite_latch], latch_hi = in[in_sprite_latch + 1];
+      graph_step(model, in, row ? out : out + out_sprite_fetch);
+      // An empty slot whose fetch leaves the latches as it found them hands
+      // the next empty slot the same inputs over the same memory.
+      repeat = !present && out[out_sprite_latch] == latch_lo &&
+               out[out_sprite_latch + 1] == latch_hi;
     }
-  const bool latch_lo = out[out_sprite_latch] != 0, latch_hi = out[out_sprite_latch + 1] != 0;
+    if (out[out_sprite_fetch])
+      bus_event(BusEvent::Sprite, out[out_sprite_a12] != 0, dot + 8 * k);
+    in[in_sprite_latch] = out[out_sprite_latch];
+    in[in_sprite_latch + 1] = out[out_sprite_latch + 1];
+    if (row)
+      compose_sprite_row(out);
+  }
+  const bool latch_lo = in[in_sprite_latch] != 0, latch_hi = in[in_sprite_latch + 1] != 0;
   if (chr_latch_active &&
       (chr_latch.latch_fe[0] != latch_lo || chr_latch.latch_fe[1] != latch_hi)) {
     chr_latch.latch_fe[0] = latch_lo;
     chr_latch.latch_fe[1] = latch_hi;
     chr_map_changed();
   }
-  if (bus_only)
+  if (dry_)
     return;
-  compose_sprite_rows(out, status_only ? std::min(count, 1) : count);
-  if (status_only)
-    return;
-  // Debug rows past the hardware cap affect pixels only: no A12 edges
-  // and no latch flips, even within a batch.
-  for (int base = 8; base < total; base += 8) {
-    const int extra = std::min(total - base, 8);
-    in[3] = extra;
-    for (int k = 0; k < extra; ++k)
-      in[in_index + k] = r_.selected[static_cast<size_t>(base + k)];
-    in[in_latch] = chr_latch_active && chr_latch.latch_fe[0];
-    in[in_latch + 1] = chr_latch_active && chr_latch.latch_fe[1];
-    graph_step(chr_latch_active ? engine_.sprites.debug_fetch[(ctrl & 0x20) ? 1 : 0]
-                               : models[1 + ((ctrl & 0x20) ? 9 : 0) + extra], in, out);
-    compose_sprite_rows(out, extra);
+  // Rows past the hardware cap (sprite_limit off) affect pixels only: no
+  // A12 edges, and every one reads the latches as the line left them.
+  in[in_sprite_present] = 1;
+  in[in_sprite_latch] = chr_latch_active && chr_latch.latch_fe[0];
+  in[in_sprite_latch + 1] = chr_latch_active && chr_latch.latch_fe[1];
+  for (int k = 8; k < total; ++k) {
+    in[in_sprite_index] = r_.selected[static_cast<size_t>(k)];
+    graph_step(models.fetch[chr_latch_active][tall], in, out);
+    compose_sprite_row(out);
   }
 }
 

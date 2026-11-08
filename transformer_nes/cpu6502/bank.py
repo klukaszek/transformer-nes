@@ -40,6 +40,24 @@ def bank_code_digest() -> str:
     return hashlib.sha256(f"{sources}|{torch.__version__}|{BANK_CFLAGS!r}".encode()).hexdigest()
 
 
+# The union's diagnostic module: its full layer trace as a (layers + 1) x
+# width array, for the X-ray.
+DEBUG_ADAPTER = r"""
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("kernel", [] { return py::make_tuple(
+        reinterpret_cast<std::uintptr_t>(circuits[0].run), circuits[0].aux); });
+    m.def("evaluate", [](py::array_t<Scalar, py::array::c_style | py::array::forcecast> x,
+                          std::uintptr_t ram) {
+        py::array_t<Scalar> out({@ROWS@, circuits[0].width / @ROWS@});
+        std::vector<int32_t> aux(std::max(1, circuits[0].aux));
+        invoke(circuits[0].run, x.data(), reinterpret_cast<const uint8_t*>(ram),
+               out.mutable_data(), aux.data());
+        return out;
+    });
+}
+"""
+
+
 def bank_digest(bcd: bool) -> str:
     return hashlib.sha256(f"{bank_code_digest()}|bcd={int(bcd)}".encode()).hexdigest()[:16]
 
@@ -122,7 +140,6 @@ class ForwardBank:
         import numpy as np
 
         from transformer_nes.model.compiler import bank_source
-        from transformer_nes.model.graph_engine import DEBUG_ADAPTER
 
         code = hashlib.sha256((bank_code_digest() + DEBUG_ADAPTER).encode()).hexdigest()
         key = f"cpu_trace:{self.machine.bcd}"

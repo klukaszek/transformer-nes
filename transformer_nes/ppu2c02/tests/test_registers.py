@@ -6,32 +6,37 @@ import numpy as np
 import pytest
 
 from transformer_nes.graph.core import InputDimension
-from transformer_nes.model.construct import TokenGraph, construct
-from transformer_nes.model.graph_engine import CompiledGraph
+from transformer_nes.model.construct import construct
 from transformer_nes.model.inference import ExactInference
-from transformer_nes.ppu2c02 import registers, space
-from transformer_nes.ppu2c02.machine import ppu_engine, register_graph
+from transformer_nes.nes.model import compiled
+from transformer_nes.ppu2c02 import control, registers, space
+from transformer_nes.ppu2c02.machine import PpuEngine, register_graph
+
+
+def control_chip():
+    return compiled().chip("ppu_control")
 
 
 @pytest.mark.parametrize("token", ["bus", "background_span", "access_bus", "view", "dma", "clock"])
 def test_bus_effect_tokens_execute_exact_weights(token):
-    from transformer_nes.ppu2c02 import control
-
-    engine = control.control_engine()
+    engine = control_chip()
     graph = {"bus": control.bus_graph, "background_span": control.background_span_graph, "access_bus": control.access_bus_graph,
              "view": control.view_graph, "dma": control.dma_graph, "clock": control.clock_graph}[token]()
     model, _, info = construct(graph)
     eager = ExactInference(model)
     dims = {d.name: d for d in graph.all_dims}
     rng = np.random.default_rng(73)
-    io = engine.graphs[token]
+    inputs, outputs = (
+        (control.DMA_INPUTS, control.DMA_OUTPUTS) if token == "dma"
+        else (engine.graphs[token].inputs, engine.graphs[token].outputs)
+    )
     limits = {"event": 3, "reg": 8, "ctrl": 256, "old_ctrl": 256, "new_ctrl": 256,
               "old_mask": 256, "new_mask": 256, "new_v_fy": 8,
               "old_v_cx": 32, "old_v_cy": 32, "old_v_nt": 4, "old_v_fy": 8,
               "exram_mode": 4, "fill_tile": 256, "fill_color": 4,
               "page": 256, "oam_addr": 256, "line": 262, "index": 37}
     for _ in range(256):
-        x = {n: int(rng.integers(limits.get(n, 2))) for n in io.inputs}
+        x = {n: int(rng.integers(limits.get(n, 2))) for n in inputs}
         if token in ("bus", "background_span"):
             x["low_age"] = int(rng.integers(-1, 12))
         if token == "background_span":
@@ -41,24 +46,22 @@ def test_bus_effect_tokens_execute_exact_weights(token):
         for name, value in x.items():
             residual[info.slot_of[dims[name]]] = value
         actual = eager.forward(residual)
-        expected = [round(actual[info.slot_of[dims[n]]]) for n in io.outputs]
-        packet = [x[n] for n in io.inputs]
-        np.testing.assert_array_equal(engine.step(packet, engine.model_id(token)), expected)
+        expected = [round(actual[info.slot_of[dims[n]]]) for n in outputs]
+        packet = [x[n] for n in inputs]
+        if token == "bus":
+            out = engine.step(packet, engine.model_id("bus", control.BUS_EVENTS[x["event"]]))
+        elif token == "dma":
+            out = np.concatenate([engine.step(packet, engine.model_id(name))
+                                  for name in ("dma_request", "dma_transfer")])
+        else:
+            out = engine.step(packet, engine.model_id(token))
+        np.testing.assert_array_equal(out, expected)
         if token == "access_bus":
             np.testing.assert_array_equal(engine.step(packet, engine.model_id("access_delay")), expected[-1:])
-        if token == "dma":
-            np.testing.assert_array_equal(engine.step(packet, engine.model_id("dma_request")), expected[:2])
-            np.testing.assert_array_equal(engine.step(packet, engine.model_id("dma_transfer")), expected[2:])
-        if token in ("bus", "access_bus"):
-            name = (control.BUS_EVENTS[x["event"]] if token == "bus"
-                    else f"{'write' if x['is_write'] else 'read'}{x['reg']}")
-            np.testing.assert_array_equal(engine.step(packet, engine.model_id(token, name)), expected)
 
 
 def test_clock_covers_every_scanline_and_preserves_tied_events_and_batch_limits():
-    from transformer_nes.ppu2c02 import control
-
-    engine = control.control_engine()
+    engine = control_chip()
     model = engine.model_id("clock")
     for line in range(262):
         expected = []
@@ -97,18 +100,13 @@ def test_clock_covers_every_scanline_and_preserves_tied_events_and_batch_limits(
 
 
 def test_dma_descriptors_partition_every_destination_and_keep_projections_independent():
-    from transformer_nes.ppu2c02 import control
-
-    engine = control.control_engine()
+    engine = control_chip()
     for address in range(256):
         for parity in range(2):
             for ctrl in (0, 0x20, 0xDF, 0xFF):
                 page = (73 * address + parity) & 255
                 expected = [page * 256, 513 + parity, address, 256 - address,
                             256 - address, address, bool(ctrl & 0x20)]
-                np.testing.assert_array_equal(
-                    engine.step([page, parity, address, ctrl], engine.model_id("dma")), expected
-                )
                 np.testing.assert_array_equal(
                     engine.step([page, parity, -999, -999], engine.model_id("dma_request")), expected[:2]
                 )
@@ -121,9 +119,7 @@ def test_dma_descriptors_partition_every_destination_and_keep_projections_indepe
 
 
 def test_bus_pin_pairs_keep_timestamp_and_strict_filter_boundary():
-    from transformer_nes.ppu2c02 import control
-
-    engine = control.control_engine()
+    engine = control_chip()
     for event in range(3):
         for age in range(-1, 12):
             for old in range(2):
@@ -150,9 +146,7 @@ def test_bus_pin_pairs_keep_timestamp_and_strict_filter_boundary():
 
 
 def test_background_spans_match_literal_pins_at_every_length_and_filter_age():
-    from transformer_nes.ppu2c02 import control
-
-    engine = control.control_engine()
+    engine = control_chip()
     for old in range(2):
         for age in range(-1, 12):
             for ctrl in (0, 16):
@@ -177,9 +171,7 @@ def test_background_spans_match_literal_pins_at_every_length_and_filter_age():
 
 
 def test_access_bus_latches_include_rows_halves_and_address_aliases():
-    from transformer_nes.ppu2c02 import control
-
-    engine = control.control_engine()
+    engine = control_chip()
     addresses = [base + row for base in (0x0FD0, 0x0FE0, 0x1FD0, 0x1FE0) for row in range(16)]
     for wide in range(2):
         for state in range(4):
@@ -203,9 +195,8 @@ def test_access_bus_latches_include_rows_halves_and_address_aliases():
                             elif (wide and 0x0FE8 <= addr <= 0x0FEF) or (not wide and addr == 0x0FE8):
                                 lo = 1
                         expected = [reg == 7, 0, lo, hi, lo != x["latch_lo"] or hi != x["latch_hi"], 0, 0]
-                        name = f"{'write' if write else 'read'}{reg}"
                         np.testing.assert_array_equal(
-                            engine.step([x[n] for n in control.ACCESS_INPUTS], engine.model_id("access_bus", name)), expected
+                            engine.step([x[n] for n in control.ACCESS_INPUTS], engine.model_id("access_bus")), expected
                         )
 
 
@@ -248,19 +239,15 @@ def random_writes(rng, write, count: int) -> None:
     [0, pytest.param(1, marks=pytest.mark.slow)],  # every seeded byte is a float64 forward
     ids=["chr-windows", "whole-chr"],
 )
-def test_compiled_engine_is_the_exact_forward(whole_chr):
-    """The native engine against model/inference.py's float64 forward of
-    the same weights, on random memory writes and accesses."""
+def test_register_specializations_are_the_exact_forward(whole_chr):
+    """The compiled specialization the console dispatches each access to,
+    against model/inference.py's float64 forward of the full register
+    graph, on random memory writes and accesses."""
     graph = register_graph()
     model, _rows, info = construct(graph)
     reference = ExactInference(model)
-    token = TokenGraph(graph, registers.INPUTS, registers.OUTPUTS)
-    engine = CompiledGraph(
-        lambda: {"access": token},
-        tag="ppu_registers",
-        sources=("transformer_nes.ppu2c02.machine",),
-        memory_size=space.MEMORY_SIZE,
-    )
+    ppu = PpuEngine(compiled(), whole_chr)
+    engine = ppu.ppu
     dims = {d.name: d for d in graph.all_dims}
     inputs = {d.name: d for d in graph.all_dims if isinstance(d, InputDimension)}
 
@@ -287,37 +274,23 @@ def test_compiled_engine_is_the_exact_forward(whole_chr):
     for _ in range(300):
         random_writes(rng, write, 4)
         access = random_access(rng, whole_chr=whole_chr)
-        compiled = engine.step([access[name] for name in registers.INPUTS])
+        model_id = ppu.register_dispatch[access["is_write"]][access["reg"]]
+        actual = engine.step([access[name] for name in registers.INPUTS], model_id)
         residual = forward(access)
         expected = [round(residual[info.slot_of[dims[name]]]) for name in registers.OUTPUTS]
-        assert list(compiled) == expected, access
-
-
-def test_register_experts_agree_with_the_full_graph():
-    engine = ppu_engine()
-    rng = np.random.default_rng(11)
-    for addr in range(0x7000):
-        engine.write(addr, int(rng.integers(256)))
-    full = engine.model_id("access")
-    for is_write, models in enumerate(engine.register_dispatch):
-        for reg, model in enumerate(models):
-            for _ in range(200):
-                random_writes(rng, engine.write, 2)
-                access = random_access(rng, reg, is_write)
-                inputs = [access[name] for name in registers.INPUTS]
-                assert np.array_equal(engine.step(inputs, full), engine.step(inputs, model)), access
+        assert list(actual) == expected, access
 
 
 def test_register_experts_report_interrupt_effects():
-    engine = ppu_engine()
+    ppu = PpuEngine(compiled())
     rng = np.random.default_rng(29)
     for writing in range(2):
-        for reg, model in enumerate(engine.register_dispatch[writing]):
+        for reg, model in enumerate(ppu.register_dispatch[writing]):
             for ctrl in (0, 0x7F, 0x80, 0xFF):
                 for value in (0, 0x7F, 0x80, 0xFF):
                     access = random_access(rng, reg, writing)
                     access.update(ctrl=ctrl, value=value)
-                    out = engine.step([access[name] for name in registers.INPUTS], model)
+                    out = ppu.ppu.step([access[name] for name in registers.INPUTS], model)
                     expected = (
                         reg == 2 and not writing,
                         reg == 0 and writing and bool(value & 0x80) and not (ctrl & 0x80),
@@ -328,21 +301,19 @@ def test_register_experts_report_interrupt_effects():
 
 @pytest.mark.parametrize("event", range(6))
 def test_event_control_weights_and_timing_boundaries(event):
-    """Event experts and actual matrices against conventional control rules.
+    """The control circuit and its matrices against conventional control rules.
 
     Cross every status/effect bit combination with the suppression/NMI
     boundaries, including the last vblank dot and an already pending edge.
     """
-    from transformer_nes.ppu2c02 import control
-
-    engine = control.control_engine()
+    engine = control_chip()
     graph = control.control_graph()
     model, _, info = construct(graph)
     eager = ExactInference(model)
     dims = {d.name: d for d in graph.all_dims}
     rng = np.random.default_rng(41 + event)
     phases = [0, 241 * 341, 241 * 341 + 1, 241 * 341 + 2, 261 * 341, 261 * 341 + 1, 261 * 341 + 2]
-    expert = engine.model_id("control", control.EVENTS[event])
+    circuit = engine.model_id("control")
     for phase in phases:
         for age in (-1, 0, 1, 2, 3):
             for flags in range(256):
@@ -427,8 +398,7 @@ def test_event_control_weights_and_timing_boundaries(event):
                     rendering,
                 ]
                 inputs = [x[n] for n in control.INPUTS]
-                np.testing.assert_array_equal(engine.step(inputs, expert), expected, err_msg=str(x))
-                np.testing.assert_array_equal(engine.step(inputs), expected, err_msg=str(x))
+                np.testing.assert_array_equal(engine.step(inputs, circuit), expected, err_msg=str(x))
                 if age == -1 and flags == 0:
                     residual = np.zeros(info.d_model)
                     residual[info.slot_of[graph.one]] = 1

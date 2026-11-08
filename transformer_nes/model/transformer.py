@@ -30,6 +30,8 @@ This file imports only torch.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import Tensor, nn
 
@@ -177,7 +179,8 @@ class Transformer(nn.Module):
         self.register_buffer("input_slots", input_slots.to(INT))
         self.register_buffer("output_slots", output_slots.to(INT))
 
-    def forward(self, inputs: Tensor, memory: Tensor, f_bits: int) -> Tensor:
+    def forward(self, inputs: Tensor, memory: Tensor, f_bits: int, outputs: list[int] | None = None) -> Tensor:
+        """The readouts, or only those at positions `outputs`."""
         x = torch.zeros(self.d_model, dtype=self.dtype)
         live = self.input_slots >= 0
         values = inputs.to(self.dtype)[live]
@@ -185,7 +188,7 @@ class Transformer(nn.Module):
         x[self.one_slot] = 1 << f_bits
         for layer in self.layers:
             x = layer(x, memory, f_bits)
-        out = x[self.output_slots]
+        out = x[self.output_slots if outputs is None else self.output_slots[outputs]]
         if self.dtype == INT and f_bits:
             if (out & ((1 << f_bits) - 1)).any():
                 raise ValueError("fractional readout value")
@@ -196,43 +199,66 @@ class Transformer(nn.Module):
         return sum(layer.weight_count() for layer in self.layers)
 
 
-class Specializations(nn.ModuleDict):
-    """Circuits by specialization name. A name may coincide with a dict
-    method (a PPU event called ``clear``): entries are only ever indexed."""
+class Named(nn.ModuleDict):
+    """Modules by name -- chips, token types, specializations. A name may
+    coincide with a module or dict method (a PPU event called ``clear``, a
+    token called ``double``): entries are only ever indexed."""
 
     def __setitem__(self, name: str, module: nn.Module) -> None:
         if not name or "." in name:
-            raise KeyError(f"bad specialization name {name!r}")
+            raise KeyError(f"bad module name {name!r}")
         self._modules[name] = module
 
 
 class TokenType(nn.Module):
     """A kind of token: named inputs and outputs, the full circuit, and its
-    specializations by name (each with the pins that make it valid).
+    specializations by name (each with the pins that make it valid). A
+    specialization in ``same`` folds to the circuit of the one it names (None:
+    the full circuit) and is stored once, there.
 
     ``reassociate_residuals`` is a compiler hint, not semantics: False keeps
     a hot circuit's measured projection grouping when it is lowered."""
 
     def __init__(self, inputs: list[str], outputs: list[str], general: Transformer | None,
                  specialized: dict[str, Transformer], pins: dict[str, dict[str, float]],
-                 *, reassociate_residuals: bool = True):
+                 *, same: dict[str, str | None] | None = None, reassociate_residuals: bool = True):
         super().__init__()
         if general is None and not specialized:
             raise ValueError("a token type needs a circuit")
         self.inputs, self.outputs, self.pins = list(inputs), list(outputs), dict(pins)
+        self.same = dict(same or {})
         self.reassociate_residuals = reassociate_residuals
         self.general = general  # None: callers always choose a specialization
-        self.specialized = Specializations(specialized)
+        self.specialized = Named(specialized)
 
     def circuits(self) -> list[tuple[str | None, Transformer]]:
         """The full circuit if it has one, then each specialization."""
         return ([] if self.general is None else [(None, self.general)]) + list(self.specialized.items())
 
-    def forward(self, inputs: Tensor, memory: Tensor, f_bits: int, specialization: str | None = None):
+    def forward(self, inputs: Tensor, memory: Tensor, f_bits: int, specialization: str | None = None,
+                outputs: list[int] | None = None):
+        specialization = self.same.get(specialization, specialization)
         if specialization is None and self.general is None:
             raise ValueError("this token type runs only its specializations; choose one")
         circuit = self.general if specialization is None else self.specialized[specialization]
-        return circuit(inputs, memory, f_bits)
+        return circuit(inputs, memory, f_bits, outputs)
+
+
+@dataclass(frozen=True)
+class View:
+    """A token type read off another's circuits at fewer outputs. It has no
+    weights of its own: its forward is the base token's at those outputs, and
+    each compiled kernel keeps only the work they need."""
+
+    base: str
+    inputs: list[str]
+    outputs: list[str]
+    indices: list[int]  # each output's position among the base's
+    specializations: list[str | None] | None  # the base circuits it reads; None: all
+    same: dict[str, str | None]  # the base's shared specializations
+
+    def reads(self, specialization: str | None) -> bool:
+        return self.specializations is None or specialization in self.specializations
 
 
 class Chip(nn.Module):
@@ -242,21 +268,51 @@ class Chip(nn.Module):
     as the longest span the APU's oscillator circuit covers."""
 
     def __init__(self, tokens: dict[str, TokenType], *, memory_size: int, f_bits: int,
-                 dtype: torch.dtype = INT, constants: dict[str, int] | None = None):
+                 dtype: torch.dtype = INT, constants: dict[str, int] | None = None,
+                 views: dict[str, dict] | None = None):
         super().__init__()
         self.memory_size, self.f_bits, self.dtype = memory_size, f_bits, dtype
         self.constants = dict(constants or {})
-        self.tokens = nn.ModuleDict(tokens)
+        self.tokens = Named(tokens)
+        # name -> {"base", "outputs", "specializations"}: plain data, saved as such.
+        self.view_specs = {name: dict(v) for name, v in (views or {}).items()}
+        self.views = {}
+        for name, v in self.view_specs.items():
+            base = self.tokens[v["base"]]
+            if missing := sorted(set(v["outputs"]) - set(base.outputs)):
+                raise ValueError(f"view {name}: {v['base']} has no outputs {missing}")
+            self.views[name] = View(
+                v["base"], base.inputs, list(v["outputs"]),
+                [base.outputs.index(o) for o in v["outputs"]], v.get("specializations"), base.same,
+            )
 
     def circuits(self) -> list[tuple[str, str | None, Transformer]]:
-        """Every circuit in model-id order: token by token, full circuit first."""
+        """Every stored circuit: token by token, full circuit first."""
         return [(name, spec, c) for name, token in self.tokens.items() for spec, c in token.circuits()]
+
+    def programs(self) -> list[tuple[str, str | None, Transformer, list[int] | None]]:
+        """Everything compiled, in model-id order: every circuit at all its
+        outputs, then each view's base circuits at the view's outputs."""
+        out = [(name, spec, c, None) for name, spec, c in self.circuits()]
+        for name, view in self.views.items():
+            out.extend((name, spec, c, view.indices)
+                       for spec, c in self.tokens[view.base].circuits() if view.reads(spec))
+        return out
+
+    def io(self, name: str) -> tuple[list[str], list[str]]:
+        """A token type's or view's inputs and outputs."""
+        t = self.views.get(name) or self.tokens[name]
+        return list(t.inputs), list(t.outputs)
 
     def memory(self) -> Tensor:
         """A fresh, zeroed memory for this chip."""
         return torch.zeros(self.memory_size, dtype=torch.uint8)
 
     def forward(self, token: str, inputs: Tensor, memory: Tensor, specialization: str | None = None):
+        if (view := self.views.get(token)) is not None:
+            if not view.reads(view.same.get(specialization, specialization)):
+                raise ValueError(f"view {token} does not read {specialization}")
+            return self.tokens[view.base](inputs, memory, self.f_bits, specialization, view.indices)
         return self.tokens[token](inputs, memory, self.f_bits, specialization)
 
     def weight_count(self) -> int:
@@ -270,11 +326,13 @@ class Chip(nn.Module):
             "f_bits": self.f_bits,
             "dtype": str(self.dtype).removeprefix("torch."),
             "constants": self.constants,
+            "views": self.view_specs,
             "tokens": {
                 name: {
                     "inputs": token.inputs,
                     "outputs": token.outputs,
                     "pins": token.pins,
+                    "same": token.same,
                     "reassociate_residuals": token.reassociate_residuals,
                     "circuits": {
                         "general" if spec is None else f"specialized.{spec}": {
@@ -308,10 +366,10 @@ class Chip(nn.Module):
             tokens[name] = TokenType(
                 t["inputs"], t["outputs"], circuits.pop("general", None),
                 {key.removeprefix("specialized."): c for key, c in circuits.items()}, t["pins"],
-                reassociate_residuals=t["reassociate_residuals"],
+                same=t["same"], reassociate_residuals=t["reassociate_residuals"],
             )
         return cls(tokens, memory_size=structure["memory_size"], f_bits=structure["f_bits"],
-                   dtype=dtype, constants=structure["constants"])
+                   dtype=dtype, constants=structure["constants"], views=structure["views"])
 
 
 # ── The saved form: one flat buffer per integer width ──────────────

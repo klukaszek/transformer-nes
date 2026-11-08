@@ -138,7 +138,13 @@ represent different circuits; size comparisons must cover the same bank.
 CPU, PPU and mapper graphs share the weight compiler. It expands their actual attention and
 ReGLU matrices; it is not supplied handwritten opcode or rendering formulas.
 The scalar SSA lowering specializes constant coefficients, shares affine forms
-and emits each surviving value once. Integer cancellation preserves wraparound
+and emits each surviving value once. A pre-activation is written as a sum over
+the values it reads, but a sum that several values read, such as a residual slot
+holding a prefix count, is computed once and read as one term. Expanding it into
+every reader instead made sprite evaluation's kernel 21,266 additions for 8,373
+weights; computed once, it takes 3,464. Sums that differ only by a constant (a
+step's two hinges) share the sum, and an integer ReLU is one operation. The
+model's kernels together drop from 57k additions to 28k. Integer cancellation preserves wraparound
 and stops at shifts and nonlinear operations; float32 arithmetic stays ordered.
 Hot tile graphs preserve their projection grouping. Equivalent SSA programs share
 a kernel within a bank. A bank-level outlining pass shares repeated fragments,
@@ -241,8 +247,11 @@ input-sampling and lease behavior.
 
 ## PPU tokens and conditional effects
 
-The PPU has token graphs for register access, event/bus control, memory-view
-descriptors, rendering, sprite evaluation, fetch and overflow. A render token returns palette pixels, sprite hits and
+The PPU is two chips of the NES model, built by
+[`ppu2c02/machine.py`](../transformer_nes/ppu2c02/machine.py): `ppu`, token types for
+register access, rendering, sprite evaluation, per-slot sprite fetch and the
+overflow scan over one memory, and `ppu_control`, the memory-free event, bus,
+memory-view, composition, DMA and clock circuits. A render token returns palette pixels, sprite hits and
 conditional tile-fetch effects. Payloads are zero when `fetched` is clear, and
 the host consumes them only when it is set. Folding can therefore remove the
 inactive circuitry.
@@ -269,8 +278,8 @@ addition and storage remain host operations.
 
 A blank-state expert pins both rendering enables off while retaining palette
 addressing and greyscale behavior. Other experts pin verified control states.
-Timing previews project graphs to bus/status readouts before scheduling, so
-unused pixel work disappears. Previews write no framebuffer and restore live
+Timing previews read views of the same circuits at their bus/status readouts,
+so compilation removes the unused pixel work and no weights are stored twice. Previews write no framebuffer and restore live
 state afterwards.
 
 Register tokens return vblank-clear and NMI-enable/disable effects as well as
@@ -281,9 +290,10 @@ including the last-dot exclusion. Register conditions and timing rules are not
 decoded again by the host. Memory writes commit directly from the register
 token's write packet.
 
-Five further event experts compute horizontal and vertical scroll copies,
-sprite-line OAMADDR reset, odd-frame shortening, vblank entry and pre-render
-status clearing. The same odd-frame expert predicts the next frame deadline;
+The same circuit computes, for its other events, horizontal and vertical
+scroll copies, sprite-line OAMADDR reset, odd-frame shortening, vblank entry and
+pre-render status clearing. It runs a few hundred times a frame, so it has no
+specializations. The odd-frame event predicts the next frame deadline;
 there is no separate native prediction formula. State remains in the PPU's
 preview snapshot, so live execution and dry runs use identical circuits.
 
@@ -292,7 +302,7 @@ the vblank flag has been set, 0 through 2 within its race window, and 3 for olde
 settings. Absolute clocks stay outside the integer model. Neural readouts
 request timestamp set/clear and status-change effects; the host delivers them
 at the scheduled dot. This keeps fixed-size model state independent of the
-number of elapsed frames. Event experts are checked against the full matrices
+number of elapsed frames. Every event is checked against the matrices
 and conventional rules across all status/effect bit combinations at the race
 boundaries, then through the PPU/MMC3 conformance ROMs.
 
@@ -305,7 +315,7 @@ qualify its four-dot rise. A pair starting low can qualify at its second pin.
 The host applies the returned timestamp and emits the edge at its returned
 offset. Live rendering and IRQ previews use identical circuits and snapshots.
 
-Register-side effect experts compute A12 drive requests, MMC2/MMC4 post-read
+One register-side effect circuit computes A12 drive requests, MMC2/MMC4 post-read
 FD/FE latch updates, CHR invalidation and mapper-schedule invalidation. They
 preserve MMC2's exact low-table addresses, MMC4's eight-row ranges and 15-bit
 scroll-address aliases. A projection of the same graph returns the PPUMASK
@@ -318,9 +328,16 @@ this descriptor through page views and bulk fill delivery. The same ExRAM
 storage remains shared with CPU accesses. The weights compute mode decoding, fill-color expansion and sprite-size bank
 selection. Independent CHR/latch and nametable formulas live in the test oracle.
 
-Sprite overflow follows the diagonal OAM scan, including non-Y bytes. Unlimited
-sprites repeat eight-index selection and fetch; extra rows cannot alter CHR
-latches or mapper bus effects.
+Sprite overflow follows the diagonal OAM scan, including non-Y bytes.
+
+The fetch is a token per sprite slot: its OAM bytes, pattern row and pixels,
+the pattern table it reads (for the A12 edge) and the MMC2/MMC4 latches its
+fetch flips, which the host passes to the next slot. It is specialized by
+sprite size for carts without latches, for MMC5's whole CHR and for live latch
+windows, plus an empty slot's dummy fetch; a view keeps only the bus and latch
+effects for previews. Eight lanes folded per sprite count took 153k
+weights; per slot the fetch takes 5k. Unlimited sprites repeat eight-index
+selection and fetch; extra rows cannot alter CHR latches or mapper bus effects.
 
 An eight-lane composition token in `control.py` updates the sprite line in OAM order. Its
 bounded state packet contains the existing pixel window and the two occupied
@@ -329,7 +346,7 @@ including its palette, behind-background and sprite-zero metadata. The circuit
 clips the right edge and updates occupancy; a padded line and a sentinel tile
 let the host apply every packet with the same fixed-size copies. Status previews
 use this transition too, and snapshot the line state with the other render
-state. Unlimited sprites reuse it across fetch batches, preserving priority.
+state. Unlimited sprites reuse it across fetch rows, preserving priority.
 No extra attention cache or frame history is introduced. This is an explicit
 recurrent state transition, rather than a new attention-memory construction.
 It shares the memory-free control bank, leaving the CHR attention variants

@@ -481,7 +481,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
 
 
 def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=False):
-    """A bank's kernels with a native adapter appended (graph_engine banks)."""
+    """A bank's kernels with a native adapter appended (the CPU's banks)."""
     kernels, metadata, scalar = bank_kernels(
         experts, memory_size=memory_size, trace=trace, ablation=ablation
     )

@@ -3,12 +3,13 @@
 import numpy as np
 import pytest
 
-from transformer_nes.ppu2c02.machine import ppu_engine
+from transformer_nes.nes.model import compiled
+from transformer_nes.ppu2c02.machine import PpuEngine
 
 
 @pytest.fixture(scope="module")
 def engine():
-    return ppu_engine()
+    return compiled().chip("ppu")
 
 
 def test_row_circuit_exhausts_patterns_flip_visibility_and_metadata():
@@ -64,7 +65,7 @@ def test_composition_executes_exact_weights_and_ordered_clipped_updates():
     from transformer_nes.model.inference import ExactInference
     from transformer_nes.ppu2c02 import control
 
-    engine = control.control_engine()
+    engine = compiled().chip("ppu_control")
     graph = control.composition_graph()
     model, _, info = construct(graph)
     eager = ExactInference(model)
@@ -116,19 +117,12 @@ def test_evaluation_selects_the_first_eight_in_oam_order(engine):
             engine.write(0x4000 + 4 * i, y)
         covering = [i for i in range(64) if 0 <= line - ys[i] < height]
         want = [min(len(covering), 8), *(covering[:8] + [64] * 8)[:8]]
-        tall = f"tall{int(height == 16)}"
-        for model in (engine.model_id("evaluate"), engine.model_id("evaluate", tall)):
-            assert engine.step([1, line, ctrl, 0], model).tolist() == want
-        # The ordinary expert must actually fold its start pin to zero.
-        assert engine.step([1, line, ctrl, 64], engine.model_id("evaluate", tall)).tolist() == want
+        model = engine.model_id("evaluate")
+        assert engine.step([1, line, ctrl, 0], model).tolist() == want
         start = int(rng.integers(65))
         remaining = [i for i in covering if i >= start]
         want = [min(len(remaining), 8), *(remaining[:8] + [64] * 8)[:8]]
-        for model in (
-            engine.model_id("evaluate"),
-            engine.model_id("evaluate", f"remaining_{tall}"),
-        ):
-            assert engine.step([1, line, ctrl, start], model).tolist() == want
+        assert engine.step([1, line, ctrl, start], model).tolist() == want
 
 
 def test_overflow_reads_diagonally_including_non_y_bytes(engine):
@@ -146,26 +140,23 @@ def test_overflow_reads_diagonally_including_non_y_bytes(engine):
             (j for j in range(start, 64) if 0 <= line - int(oam[4 * j + (j - start) % 4]) < height),
             64,
         )
-        for model in (
-            engine.model_id("overflow"),
-            engine.model_id("overflow", f"tall{int(height == 16)}"),
-        ):
-            found = 64
-            # Include start=64: a completely empty batch must not match.
-            for base in range(start, max(start + 1, 64), 8):
-                batch = next(
-                    (
-                        j
-                        for j in range(base, min(base + 8, 64))
-                        if 0 <= line - int(oam[4 * j + (j - start) % 4]) < height
-                    ),
-                    64,
-                )
-                found = engine.step([1, line, ctrl, base], model).tolist()[0]
-                assert found == batch
-                if found != 64:
-                    break
-            assert found == want
+        model = engine.model_id("overflow")
+        found = 64
+        # Include start=64: a completely empty batch must not match.
+        for base in range(start, max(start + 1, 64), 8):
+            batch = next(
+                (
+                    j
+                    for j in range(base, min(base + 8, 64))
+                    if 0 <= line - int(oam[4 * j + (j - start) % 4]) < height
+                ),
+                64,
+            )
+            found = engine.step([1, line, ctrl, base], model).tolist()[0]
+            assert found == batch
+            if found != 64:
+                break
+        assert found == want
 
 
 def after_fetch(latch, address, wide_low):
@@ -220,7 +211,12 @@ def native_fetch(memory, line, ctrl, count, index, latch, wide_low, latches=True
     return pixels, xs, fetch, a12, latch
 
 
-def test_fetch_is_the_native_sprite_fetch(engine):
+def test_fetch_is_the_native_sprite_fetch():
+    """Slot by slot as nes/ppu.cpp:load_sprites_graph runs it, each slot
+    taking the latches the one before it left: through the CHR windows with
+    live latches, and on a cart without them."""
+    ppu = PpuEngine(compiled())
+    engine, models = ppu.ppu, ppu.sprite_dispatch
     rng = np.random.default_rng(3)
     memory = rng.integers(256, size=0x7000)
     for address, value in enumerate(memory):
@@ -228,7 +224,8 @@ def test_fetch_is_the_native_sprite_fetch(engine):
     for _ in range(1000):
         line, ctrl, count = int(rng.integers(240)), int(rng.integers(256)), int(rng.integers(9))
         index = sorted(rng.choice(64, 8, replace=False).tolist())
-        height = 16 if ctrl & 0x20 else 8
+        tall = int(bool(ctrl & 0x20))
+        height = 16 if tall else 8
         for i in index:  # mostly covering the line, often latch tiles
             sprite = 0x4000 + 4 * i
             if rng.random() < 0.9:
@@ -236,28 +233,26 @@ def test_fetch_is_the_native_sprite_fetch(engine):
             memory[sprite + 1] = rng.choice([0xFD, 0xFE, 0xFC, 0xFF, int(rng.integers(256))])
             for j in range(4):
                 engine.write(sprite + j, int(memory[sprite + j]))
-        latch, wide_low = [int(rng.integers(2)), int(rng.integers(2))], int(rng.integers(2))
-        inputs = [1, line, ctrl, count, *index, *latch, wide_low, *[0] * 8, 0]  # CHR windows
-        # The full model, and the expert for the size on a cart without
-        # latches (inputs 0, no flips).
-        expert = f"tall{int(height == 16)}_count{count}"
-        debug = f"debug_tall{int(height == 16)}"
-        for name, latches in ((None, True), (debug, False), (expert, False)):
-            if name == expert:
-                inputs[12:14] = [0, 0]
+        wide_low = int(rng.integers(2))
+        for latched in (1, 0):
+            latch = [int(rng.integers(2)), int(rng.integers(2))] if latched else [0, 0]
             pixels, xs, fetch, a12, new_latch = native_fetch(
-                memory, line, ctrl, count, index, inputs[12:14], wide_low, latches
+                memory, line, ctrl, count, index, latch, wide_low, latches=bool(latched)
             )
-            out = engine.step(inputs, engine.model_id("fetch", name)).tolist()
-            projected = engine.model_id("fetch_bus", name)
-            assert engine.step(inputs, projected).tolist() == out[72:]
-            status = engine.model_id("fetch_status", name)
-            assert engine.step(inputs, status).tolist() == out[:8] + [out[64]] + out[72:]
-            assert out[:64] == pixels
-            assert out[72:80] == fetch
             for k in range(8):
-                if k < count:
-                    assert out[64 + k] == xs[k]
+                present = k < count
+                inputs = [1, line, ctrl, int(present), index[k] if present else 0,
+                          *latch, wide_low, *[0] * 8, 0]  # CHR windows
+                if present:
+                    out = engine.step(inputs, models["fetch"][latched][tall]).tolist()
+                    assert out[:8] == pixels[8 * k : 8 * k + 8]
+                    assert out[8] == xs[k]
+                    bus = engine.step(inputs, models["fetch_bus"][latched][tall]).tolist()
+                    assert bus == out[9:]
+                else:
+                    bus = engine.step(inputs, models["absent"]).tolist()
+                assert bus[0] == fetch[k]
                 if fetch[k]:
-                    assert out[80 + k] == a12[k]
-            assert out[88:90] == new_latch
+                    assert bus[1] == a12[k]
+                latch = bus[2:]
+            assert latch == new_latch

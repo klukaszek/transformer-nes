@@ -22,6 +22,8 @@ one-unit gated forms (graph/ops.py: gate/both/either/select/equals).
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from transformer_nes.graph import core as graph
 from transformer_nes.graph.core import (
     Expression,
@@ -139,23 +141,22 @@ EXPERTS = {
 }
 
 
-def dispatch(names: list[str]) -> list[dict]:
-    """The native per-slot choice (nes/ppu.cpp:render_slot) as model ids
-    (k runs names[k - 1]), without and then with the CHR latches: inner
-    slots per background table and fine x, sprite slots, the edge slots
-    0 and 31 per table, and every other slot without extended attributes."""
-    model = {name: k for k, name in enumerate(names, start=1)}
+def dispatch(model: Callable[[str], int]) -> list[dict]:
+    """The native per-slot choice (nes/ppu.cpp:render_slot) as the model ids
+    of specializations by name, without and then with the CHR latches: inner
+    slots per background table and fine x, sprite slots, the edge slots 0
+    and 31 per table, and every other slot without extended attributes."""
 
     def variant(suffix: str) -> dict:
         return {
             "inner": [
-                [model[f"no_sprites_bg{t}_fine_x{f}{suffix}"] for f in range(8)] for t in range(2)
+                [model(f"no_sprites_bg{t}_fine_x{f}{suffix}") for f in range(8)] for t in range(2)
             ],
-            "sprites": model[f"sprites{suffix}"],
-            "blank": model["blank"],
-            "first": [model[f"no_sprites_bg{t}_first{suffix}"] for t in range(2)],
-            "last": [model[f"no_sprites_bg{t}_last{suffix}"] for t in range(2)],
-            "general": model["general"],
+            "sprites": model(f"sprites{suffix}"),
+            "blank": model("blank"),
+            "first": [model(f"no_sprites_bg{t}_first{suffix}") for t in range(2)],
+            "last": [model(f"no_sprites_bg{t}_last{suffix}") for t in range(2)],
+            "general": model("general"),
         }
 
     return [variant(""), variant("_latched")]

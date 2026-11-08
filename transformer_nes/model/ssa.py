@@ -16,6 +16,8 @@ import torch
 
 INPUT, ADD, MUL, AND, SHL, SHR, EQ, GT, GE, LT, WHERE, CLAMP, DIV, LOAD, RELU, REGLU = range(16)
 LINEAR = 16
+# A sum of at least this many terms that several values read is computed once.
+SHARED_SUM = 2
 BINARY = {
     operator.add: ADD, operator.mul: MUL, operator.and_: AND,
     operator.lshift: SHL, operator.rshift: SHR, operator.eq: EQ,
@@ -33,18 +35,35 @@ def encode(module):
     def wrap(value):
         return (int(value) + 2**31) % 2**32 - 2**31
 
+    def summed(node):
+        return node.op == "call_function" and node.target in (operator.add, operator.mul)
+
     def affine(node):
+        """A value as an integer combination of the values it sums."""
         if not isinstance(node, torch.fx.Node):
             return {None: int(node)}
+        # Sums chain thousands deep: form their operands first, bottom up.
+        pending = [node]
+        while pending:
+            top = pending[-1]
+            waiting = [a for a in top.args if isinstance(a, torch.fx.Node) and a not in forms]
+            if top not in forms and summed(top) and waiting:
+                pending.extend(waiting)
+            else:
+                pending.pop()
+                form_of(top)
+        return forms[node]
+
+    def form_of(node):
         if node not in forms:
             if node.op == "call_function" and node.target is torch.full:
                 form = {None: int(node.args[1])}
             elif node.op == "call_function" and node.target is operator.add:
-                form = dict(affine(node.args[0]))
-                for term, coefficient in affine(node.args[1]).items():
+                form = dict(term_of(node.args[0]))
+                for term, coefficient in term_of(node.args[1]).items():
                     form[term] = form.get(term, 0) + coefficient
             elif node.op == "call_function" and node.target is operator.mul:
-                a, b = (affine(arg) for arg in node.args)
+                a, b = (term_of(arg) for arg in node.args)
                 if set(a) <= {None}:
                     form = {term: a.get(None, 0) * c for term, c in b.items()}
                 elif set(b) <= {None}:
@@ -55,6 +74,17 @@ def encode(module):
                 form = {node: 1}
             forms[node] = {term: wrap(c) for term, c in form.items() if wrap(c)}
         return forms[node]
+
+    def term_of(node):
+        """How a consumer sees a value: expanded into what it sums, unless it
+        is a wide sum other values also read (a residual slot such as a
+        prefix count), which is computed once and read as one term. Every
+        consumer sees a node the same way, so residual clears still cancel."""
+        form = affine(node)
+        if (isinstance(node, torch.fx.Node) and len(form) >= SHARED_SUM
+                and len(node.users) > 1):
+            return {node: 1}
+        return form
 
     def linear(form):
         combined = {}
@@ -68,6 +98,13 @@ def encode(module):
             return const(bias)
         if len(weighted) == 1 and weighted[0][1] == 1 and bias == 0:
             return weighted[0][0]
+        if len(weighted) > 1 and bias:
+            # Sums differing only by a constant (a step's two hinges, a
+            # threshold ladder) share the sum: one more addition each.
+            weighted = ((summation(weighted, 0), 1),)
+        return summation(weighted, bias)
+
+    def summation(weighted, bias):
         key = weighted, bias
         if key not in linears:
             offset = len(terms)
@@ -113,6 +150,17 @@ def encode(module):
             return gate, a, shift
         return None
 
+    def relu_of(node):
+        """x for an integer where(x > 0, x, 0): one max instead of a compare
+        and a select. (Float keeps the select: max would keep -0.0.)"""
+        if floating or node.target is not torch.where or len(node.args) != 3:
+            return None
+        condition, value, otherwise = node.args
+        if (otherwise == 0 and isinstance(condition, torch.fx.Node)
+                and condition.target is operator.gt and condition.args == (value, 0)):
+            return value
+        return None
+
     def get(value):
         if not isinstance(value, torch.fx.Node):
             return const(value)
@@ -147,6 +195,8 @@ def encode(module):
                     raise ValueError("unsupported circuit indexing")
             elif target in BINARY:
                 result = emit(BINARY[target], get(args[0]), get(args[1]))
+            elif (rectified := relu_of(node)) is not None:
+                result = emit(RELU, get(rectified))
             elif target in (torch.where, torch.clamp):
                 result = emit(WHERE if target is torch.where else CLAMP, *(get(x) for x in args))
             elif target is torch.div:

@@ -158,7 +158,7 @@ struct GraphEngine {
 };
 
 template <class Scalar>
-void bind_graph_engine(py::module_& m, const char* name) {
+void bind_engine(py::module_& m, const char* name) {
     using E = GraphEngine<Scalar>;
     using Array = py::array_t<Scalar, py::array::c_style | py::array::forcecast>;
     py::class_<E>(m, name, py::module_local())
@@ -188,8 +188,8 @@ void bind_graph_engine(py::module_& m, const char* name) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("abi") = TRANSFORMER_NES_BANK_ABI;
-    bind_graph_engine<int32_t>(m, "EngineInt32");
-    bind_graph_engine<float>(m, "EngineFloat32");
+    bind_engine<int32_t>(m, "EngineInt32");
+    bind_engine<float>(m, "EngineFloat32");
     m.def("chips", [] {
         std::vector<std::string> names;
         for (int i = 0; i < nes_chip_count; ++i) names.emplace_back(nes_chips[i].name);

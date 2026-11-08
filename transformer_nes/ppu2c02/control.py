@@ -4,13 +4,10 @@ Inputs use bounded frame phases and flag/pin ages. The host applies returned
 state, timestamp and transfer effects on its absolute clock.
 """
 
-from dataclasses import replace
-from functools import cache
-
 from transformer_nes.graph.core import InputDimension, construction, current_graph, persist, stepglu
 from transformer_nes.graph.ops import both, either, equals, extract_bits, gate, remainder, select
-from transformer_nes.model.construct import TokenGraph
-from transformer_nes.model.graph_engine import CompiledGraph
+from transformer_nes.model.construct import TokenGraph, construct_chip
+from transformer_nes.model.transformer import Chip
 from transformer_nes.ppu2c02.registers import LOOPY_FIELDS
 
 EVENTS = ("access", "vertical_copy", "sprite_line", "odd_skip", "vblank", "clear")
@@ -140,8 +137,7 @@ def background_span_graph():
 def access_bus_graph():
     """Register-side bus/latch effects and memory/schedule invalidation."""
     x = {name: InputDimension(name) for name in ACCESS_INPUTS}
-    reg = persist(x["reg"], name="access_reg")
-    writing = persist(x["is_write"], name="access_writing")
+    reg, writing = x["reg"], x["is_write"]
     ctrl = extract_bits(x["new_ctrl"], "new_ctrl")
     old_ctrl = extract_bits(x["old_ctrl"], "old_ctrl")
     mask = extract_bits(x["new_mask"], "new_mask")
@@ -215,7 +211,7 @@ def view_graph():
 @construction
 def control_graph():
     x = {name: InputDimension(name) for name in INPUTS}
-    event = persist(x["event"], name="event_tag")
+    event = x["event"]
     ev = {name: equals(event, i) for i, name in enumerate(EVENTS)}
     mask = extract_bits(x["mask"], "mask")
     rendering = either(mask[3], mask[4])  # bits 4 and 3, MSB first
@@ -333,49 +329,35 @@ def composition_graph():
     return current_graph().capture({"COMPOSE": sum(x.values())}, outputs)
 
 
-@cache
-def control_engine():
-    def graphs():
-        dma = TokenGraph(dma_graph(), DMA_INPUTS, DMA_OUTPUTS)
-        access = TokenGraph(
-            access_bus_graph(),
-            ACCESS_INPUTS,
-            ACCESS_OUTPUTS,
-            {
-                f"{'write' if w else 'read'}{r}": {"access_reg": r, "access_writing": w}
-                for w in range(2)
-                for r in range(8)
-            },
-        )
-        return {
-            "control": TokenGraph(
-                control_graph(),
-                INPUTS,
-                OUTPUTS,
-                {name: {"event_tag": i} for i, name in enumerate(EVENTS)},
-            ),
+def chip() -> Chip:
+    """The PPU's control: finite events, bus pins, composition, DMA and the
+    scanline clock. The host always knows which event or register it is
+    delivering, so the bus and register-bus tokens have only their
+    specializations; the rest run a few hundred times a frame or are small,
+    and run their full circuits."""
+    dma = TokenGraph(dma_graph(), DMA_INPUTS, DMA_OUTPUTS)
+    access = TokenGraph(access_bus_graph(), ACCESS_INPUTS, ACCESS_OUTPUTS)
+    return construct_chip(
+        {
+            "control": TokenGraph(control_graph(), INPUTS, OUTPUTS),
             "bus": TokenGraph(
-                bus_graph(),
-                BUS_INPUTS,
-                BUS_OUTPUTS,
+                bus_graph(), BUS_INPUTS, BUS_OUTPUTS,
                 {name: {"bus_event": i} for i, name in enumerate(BUS_EVENTS)},
+                full_circuit=False,
             ),
             "background_span": TokenGraph(background_span_graph(), SPAN_INPUTS, SPAN_OUTPUTS),
             "access_bus": access,
-            "access_delay": replace(access, experts={}).project(DELAY_OUTPUTS),
             "view": TokenGraph(view_graph(), VIEW_INPUTS, VIEW_OUTPUTS),
             "compose": TokenGraph(composition_graph(), COMPOSE_INPUTS, COMPOSE_OUTPUTS),
             "dma": dma,
-            "dma_request": dma.project(DMA_REQUEST),
-            "dma_transfer": dma.project(DMA_TRANSFER),
             "clock": TokenGraph(clock_graph(), CLOCK_INPUTS, CLOCK_OUTPUTS),
-        }
-
-    return CompiledGraph(
-        graphs,
-        tag="ppu_control",
-        sources=(__name__,),
+        },
         memory_size=1,
+        views={
+            "access_delay": {"base": "access_bus", "outputs": DELAY_OUTPUTS},
+            "dma_request": {"base": "dma", "outputs": DMA_REQUEST},
+            "dma_transfer": {"base": "dma", "outputs": DMA_TRANSFER},
+        },
     )
 
 

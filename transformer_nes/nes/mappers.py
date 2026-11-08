@@ -467,8 +467,9 @@ def chip(number: int) -> Chip:
         ),
         "layout": TokenGraph(layout, (*BANK_STATE[number], *BOARD), (*layout.output_tokens,)),
         "access": access,
-        "address": TokenGraph(access.program_graph, ACCESS_INPUTS, ACCESS_OUTPUTS).project(ADDRESS_OUTPUTS),
     }
     if number in (4, 5):
         tokens["irq"] = TokenGraph(irq_graph(number == 5), INPUTS, OUTPUTS)
-    return construct_chip(tokens, memory_size=1)
+    # The address projection reads the full access circuit.
+    views = {"address": {"base": "access", "outputs": ADDRESS_OUTPUTS, "specializations": [None]}}
+    return construct_chip(tokens, memory_size=1, views=views)

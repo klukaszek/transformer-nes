@@ -80,20 +80,11 @@ const vector<string> render_outputs =
             {"hit", 8}, "new_latch_lo", "new_latch_hi"});
 const vector<string> evaluate_inputs = fields({"is_evaluate", "line", "ctrl", "start"});
 const vector<string> evaluate_outputs = fields({"count", {"index", 8}});
-const vector<string> fetch_inputs =
-    fields({"is_fetch", "line", "ctrl", "count", {"index", 8}, "latch_lo", "latch_hi", "wide_low",
+const vector<string> sprite_inputs =
+    fields({"is_fetch", "line", "ctrl", "present", "index", "latch_lo", "latch_hi", "wide_low",
             {"bank", 8}, "whole_chr"});
-const vector<string> fetch_outputs = [] {
-  vector<string> out;
-  for (int k = 0; k < 8; ++k)
-    for (int c = 0; c < 8; ++c)
-      out.push_back("sprite" + std::to_string(k) + "_pixel" + std::to_string(c));
-  for (const char* field : {"_x", "_fetch", "_a12"})
-    for (int k = 0; k < 8; ++k)
-      out.push_back("sprite" + std::to_string(k) + field);
-  out.insert(out.end(), {"new_latch_lo", "new_latch_hi"});
-  return out;
-}();
+const vector<string> sprite_outputs =
+    fields({{"pixel", 8}, "x", "fetch", "a12", "new_latch_lo", "new_latch_hi"});
 const vector<string> register_inputs =
     fields({"is_access", "reg", "value", "is_write", "status", "rendering", {"nt_page", 4},
             "chr_writable", "latch_lo", "latch_hi", {"bank", 8}, "t_cx", "t_cy", "t_nt", "t_fy", "v_cx", "v_cy", "v_nt", "v_fy",
@@ -103,6 +94,26 @@ const vector<string> register_outputs =
             "new_v_fy", "new_fine_x", "new_w", "new_ctrl", "new_mask", "new_oam_addr",
             "new_read_buffer", "read_value", "mem_write", "mem_write_addr", "mem_write_value",
             "clear_vblank", "nmi_rise", "nmi_fall"});
+
+// A compiled chip's (model/backend.py:CompiledChip) engine and raw step.
+std::pair<void*, void (*)(void*, int, const int*, int*)> engine_of(const py::object& chip) {
+  const auto abi = chip.attr("abi")().cast<py::tuple>();
+  return {reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>()),
+          reinterpret_cast<void (*)(void*, int, const int*, int*)>(abi[2].cast<std::uintptr_t>())};
+}
+// Whether a chip has token type `name` with exactly these fields.
+bool token_is(const py::object& chip, const char* name, const vector<string>& in,
+              const vector<string>& out) {
+  const py::dict graphs = chip.attr("graphs");
+  return graphs.contains(name) && graphs[name].attr("inputs").cast<vector<string>>() == in &&
+         graphs[name].attr("outputs").cast<vector<string>>() == out;
+}
+int model_id(const py::object& chip, const char* token) {
+  return chip.attr("model_id")(token).cast<int>();
+}
+int model_id(const py::object& chip, const char* token, const string& specialization) {
+  return chip.attr("model_id")(token, specialization).cast<int>();
+}
 
 class PythonSteppedRuntime final : public SteppedRuntime {
 public:
@@ -351,18 +362,6 @@ public:
                                                                         : BankControl::Mmc5;
       mapper_engine_ = nes.attr("mapper")(number);
     }
-    const auto engine_of = [](const py::object& chip) {
-      const auto abi = chip.attr("abi")().cast<py::tuple>();
-      return std::pair{reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>()),
-                       reinterpret_cast<void (*)(void*, int, const int*, int*)>(abi[2].cast<std::uintptr_t>())};
-    };
-    const auto token_is = [](const py::object& chip, const char* name, const vector<string>& in,
-                             const vector<string>& out) {
-      const py::dict graphs = chip.attr("graphs");
-      return graphs.contains(name) &&
-             graphs[name].attr("inputs").cast<vector<string>>() == in &&
-             graphs[name].attr("outputs").cast<vector<string>>() == out;
-    };
     if (auto* bank = mapper->bank_state()) {
       const py::object transition = mapper_engine_.attr("graphs")["transition"];
       const auto inputs = transition.attr("inputs").cast<vector<string>>();
@@ -478,7 +477,7 @@ public:
     control.model = controller_engine_.attr("model_id")("controller").cast<int>();
 #ifndef TRANSFORMER_NES_PPU_REFERENCE
     set_ppu_engine(py::module_::import("transformer_nes.ppu2c02.machine")
-                       .attr("ppu_engine")(console_->ppu.whole_chr()));
+                       .attr("PpuEngine")(nes, console_->ppu.whole_chr()));
 #endif
   }
   py::array_t<uint8_t> run_frame() {
@@ -513,45 +512,31 @@ public:
     const auto& map = console_->ppu.completed_expert_map();
     return py::bytes(reinterpret_cast<const char*>(map.data()), map.size());
   }
-  // Run the PPU as the compiled transformer built by
-  // ppu2c02.machine.ppu_engine (register accesses, tile slots, the sprite
-  // unit), kept alive here. Its token graphs must be the PPU's,
-  // checked field by field.
+  // Run the PPU as the model's compiled ppu and ppu_control chips
+  // (ppu2c02/machine.py:PpuEngine), kept alive here. Their token types must
+  // be the PPU's, checked field by field.
   void set_ppu_engine(py::object engine) {
     if (engine.is_none()) {
 #ifdef TRANSFORMER_NES_PPU_REFERENCE
       console_->ppu.set_engine({});
       ppu_engine_ = py::none();
-      ppu_control_engine_ = py::none();
       return;
 #else
       throw std::invalid_argument("PPU transformer engine is required");
 #endif
     }
-    const py::dict graphs = engine.attr("graphs");
-    auto token_is = [&](const char* name, const vector<string>& in, const vector<string>& out) {
-      if (!graphs.contains(name))
-        return false;
-      const py::object g = graphs[name];
-      return py::cast<vector<string>>(g.attr("inputs")) == in &&
-             py::cast<vector<string>>(g.attr("outputs")) == out;
-    };
-    vector<string> fetch_status_outputs(fetch_outputs.begin(), fetch_outputs.begin() + 8);
-    fetch_status_outputs.push_back(fetch_outputs[64]);
-    fetch_status_outputs.insert(fetch_status_outputs.end(), fetch_outputs.begin() + 72,
-                                fetch_outputs.end());
-    if (!token_is("render", render_inputs, render_outputs) ||
-        !token_is("render_status", render_inputs,
+    const py::object ppu = engine.attr("ppu"), control = engine.attr("control");
+    if (!token_is(ppu, "render", render_inputs, render_outputs) ||
+        !token_is(ppu, "render_status", render_inputs,
                   vector<string>(render_outputs.begin() + 8, render_outputs.end())) ||
-        !token_is("fetch_status", fetch_inputs, fetch_status_outputs) ||
-        !token_is("evaluate", evaluate_inputs, evaluate_outputs) ||
-        !token_is("fetch", fetch_inputs, fetch_outputs) ||
-        !token_is("fetch_bus", fetch_inputs,
-                  vector<string>(fetch_outputs.begin() + 72, fetch_outputs.end())) ||
-        !token_is("overflow", {"is_overflow", "line", "ctrl", "start"}, {"index"}) ||
-        !token_is("access", register_inputs, register_outputs))
-      throw std::invalid_argument("engine is not the PPU graphs");
-    const auto abi = engine.attr("abi")().cast<py::tuple>();
+        !token_is(ppu, "evaluate", evaluate_inputs, evaluate_outputs) ||
+        !token_is(ppu, "sprite", sprite_inputs, sprite_outputs) ||
+        !token_is(ppu, "sprite_bus", sprite_inputs,
+                  vector<string>(sprite_outputs.begin() + 9, sprite_outputs.end())) ||
+        !token_is(ppu, "overflow", {"is_overflow", "line", "ctrl", "start"}, {"index"}) ||
+        !token_is(ppu, "access", register_inputs, register_outputs))
+      throw std::invalid_argument("engine is not the PPU chip");
+    const auto abi = ppu.attr("abi")().cast<py::tuple>();
     Ppu::PpuEngine api;
     api.ctx = reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>());
     api.write = reinterpret_cast<void (*)(void*, int, int)>(abi[1].cast<std::uintptr_t>());
@@ -575,40 +560,34 @@ public:
       out.general = static_cast<uint8_t>(d["general"].cast<int>());
     }
     const py::dict sprites = engine.attr("sprite_dispatch");
-    std::ranges::copy(sprites["evaluate"].cast<vector<int>>(), api.sprites.evaluate.begin());
-    std::ranges::copy(sprites["fetch"].cast<vector<int>>(), api.sprites.fetch.begin());
-    std::ranges::copy(sprites["fetch_bus"].cast<vector<int>>(), api.sprites.fetch_bus.begin());
-    std::ranges::copy(sprites["fetch_status"].cast<vector<int>>(), api.sprites.fetch_status.begin());
+    api.sprites.evaluate = static_cast<uint8_t>(sprites["evaluate"].cast<int>());
+    api.sprites.overflow = static_cast<uint8_t>(sprites["overflow"].cast<int>());
+    for (const auto& [name, table] : {std::pair{"fetch", &api.sprites.fetch},
+                                      std::pair{"fetch_bus", &api.sprites.fetch_bus}}) {
+      const auto ids = sprites[name].cast<vector<vector<int>>>();
+      for (size_t latched = 0; latched < 2; ++latched)
+        std::ranges::copy(ids[latched], (*table)[latched].begin());
+    }
+    api.sprites.absent = static_cast<uint8_t>(sprites["absent"].cast<int>());
     api.render_status = engine.attr("status_render_dispatch").cast<vector<int>>();
-    std::ranges::copy(sprites["overflow"].cast<vector<int>>(), api.sprites.overflow.begin());
-    std::ranges::copy(sprites["debug_fetch"].cast<vector<int>>(), api.sprites.debug_fetch.begin());
     const auto registers = engine.attr("register_dispatch").cast<vector<vector<int>>>();
     for (size_t w = 0; w < 2; ++w)
       std::ranges::copy(registers[w], api.registers[w].begin());
-    py::object control = py::module_::import("transformer_nes.ppu2c02.control")
-                             .attr("control_engine")();
-    const py::object token = control.attr("graphs")["control"];
-    if (token.attr("inputs").cast<vector<string>>() !=
-            fields({"event", "mask", "ctrl", "odd", "phase", "flag_age", "vblank", "suppressed",
-                    "nmi_edge", "nmi_delayed", "t_cx", "t_cy", "t_nt", "t_fy",
-                    "v_cx", "v_cy", "v_nt", "v_fy", "oam_addr", "clear_vblank",
-                    "nmi_rise", "nmi_fall", "status_pending"}) ||
-        token.attr("outputs").cast<vector<string>>() !=
-            fields({"new_v_cx", "new_v_cy", "new_v_nt", "new_v_fy", "new_oam_addr",
-                    "new_vblank", "new_suppressed", "new_nmi_edge", "new_nmi_delayed",
-                    "set_stamp", "clear_stamp", "clear_status", "status_changed", "skip_dot",
-                    "rendering"}))
-      throw std::invalid_argument("engine is not the PPU control graph");
-    const auto control_abi = control.attr("abi")().cast<py::tuple>();
-    api.control_ctx = reinterpret_cast<void*>(control_abi[0].cast<std::uintptr_t>());
-    api.control_step = reinterpret_cast<void (*)(void*, int, const int*, int*)>(
-        control_abi[2].cast<std::uintptr_t>());
-    const array<const char*, 6> events{"access", "vertical_copy", "sprite_line", "odd_skip",
-                                      "vblank", "clear"};
-    for (size_t i = 0; i < events.size(); ++i)
-      api.control_models[i] = control.attr("model_id")("control", events[i]).cast<int>();
+
     const py::object module = py::module_::import("transformer_nes.ppu2c02.control");
-    const py::dict graphs_control = control.attr("graphs");
+    const auto io = [&](const char* name) { return module.attr(name).cast<vector<string>>(); };
+    if (!token_is(control, "control",
+                  fields({"event", "mask", "ctrl", "odd", "phase", "flag_age", "vblank",
+                          "suppressed", "nmi_edge", "nmi_delayed", "t_cx", "t_cy", "t_nt", "t_fy",
+                          "v_cx", "v_cy", "v_nt", "v_fy", "oam_addr", "clear_vblank",
+                          "nmi_rise", "nmi_fall", "status_pending"}),
+                  fields({"new_v_cx", "new_v_cy", "new_v_nt", "new_v_fy", "new_oam_addr",
+                          "new_vblank", "new_suppressed", "new_nmi_edge", "new_nmi_delayed",
+                          "set_stamp", "clear_stamp", "clear_status", "status_changed",
+                          "skip_dot", "rendering"})) ||
+        !token_is(control, "clock", fields({"line", "index"}),
+                  fields({"next_line", "wrap", "table", "count", "dot", "event", "slot", "run"})))
+      throw std::invalid_argument("engine is not the PPU control chip");
     for (const auto& [name, input, output, ni, no] :
          {std::tuple{"bus", "BUS_INPUTS", "BUS_OUTPUTS", 6, 4},
           {"background_span", "SPAN_INPUTS", "SPAN_OUTPUTS", 5, 6},
@@ -616,36 +595,24 @@ public:
           {"access_delay", "ACCESS_INPUTS", "DELAY_OUTPUTS", 17, 1},
           {"view", "VIEW_INPUTS", "VIEW_OUTPUTS", 4, 6},
           {"compose", "COMPOSE_INPUTS", "COMPOSE_OUTPUTS", 19, 10},
-          {"dma", "DMA_INPUTS", "DMA_OUTPUTS", 4, 7},
           {"dma_request", "DMA_INPUTS", "DMA_REQUEST", 4, 2},
-          {"dma_transfer", "DMA_INPUTS", "DMA_TRANSFER", 4, 5}}) {
-      const py::object graph = graphs_control[name];
-      if (graph.attr("inputs").cast<vector<string>>() != module.attr(input).cast<vector<string>>() ||
-          graph.attr("outputs").cast<vector<string>>() != module.attr(output).cast<vector<string>>() ||
-          py::len(graph.attr("inputs")) != static_cast<size_t>(ni) ||
-          py::len(graph.attr("outputs")) != static_cast<size_t>(no))
-        throw std::invalid_argument("engine is not the PPU bus graphs");
-    }
-    api.background_span_model = control.attr("model_id")("background_span").cast<int>();
-    const py::object clock = graphs_control["clock"];
-    if (clock.attr("inputs").cast<vector<string>>() != fields({"line", "index"}) ||
-        clock.attr("outputs").cast<vector<string>>() !=
-            fields({"next_line", "wrap", "table", "count", "dot", "event", "slot", "run"}))
-      throw std::invalid_argument("engine is not the PPU clock graph");
-    api.clock_model = control.attr("model_id")("clock").cast<int>();
+          {"dma_transfer", "DMA_INPUTS", "DMA_TRANSFER", 4, 5}})
+      if (!token_is(control, name, io(input), io(output)) ||
+          io(input).size() != static_cast<size_t>(ni) || io(output).size() != static_cast<size_t>(no))
+        throw std::invalid_argument("engine is not the PPU control chip");
+    std::tie(api.control_ctx, api.control_step) = engine_of(control);
+    api.control_model = model_id(control, "control");
     const array<const char*, 3> bus_events{"pin", "background", "sprite"};
     for (size_t i = 0; i < bus_events.size(); ++i)
-      api.bus_models[i] = control.attr("model_id")("bus", bus_events[i]).cast<int>();
-    for (int w = 0; w < 2; ++w)
-      for (int reg = 0; reg < 8; ++reg)
-        api.access_bus_models[w][reg] = control.attr("model_id")(
-            "access_bus", string(w ? "write" : "read") + std::to_string(reg)).cast<int>();
-    api.view_model = control.attr("model_id")("view").cast<int>();
-    api.access_delay_model = control.attr("model_id")("access_delay").cast<int>();
-    api.compose_model = control.attr("model_id")("compose").cast<int>();
-    api.dma_request_model = control.attr("model_id")("dma_request").cast<int>();
-    api.dma_transfer_model = control.attr("model_id")("dma_transfer").cast<int>();
-    ppu_control_engine_ = control;
+      api.bus_models[i] = model_id(control, "bus", bus_events[i]);
+    api.background_span_model = model_id(control, "background_span");
+    api.clock_model = model_id(control, "clock");
+    api.access_bus_model = model_id(control, "access_bus");
+    api.access_delay_model = model_id(control, "access_delay");
+    api.view_model = model_id(control, "view");
+    api.compose_model = model_id(control, "compose");
+    api.dma_request_model = model_id(control, "dma_request");
+    api.dma_transfer_model = model_id(control, "dma_transfer");
     ppu_engine_ = engine;
     console_->ppu.set_engine(api);
   }
@@ -687,7 +654,6 @@ private:
   py::object audio_engine_ = py::none();
   py::object sample_engine_ = py::none();
   py::object ppu_engine_ = py::none();
-  py::object ppu_control_engine_ = py::none();
   unique_ptr<PythonSteppedRuntime> stepped_;
   unique_ptr<ConsoleMachine> machine_;
   unique_ptr<Console> console_;

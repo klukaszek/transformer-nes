@@ -165,15 +165,13 @@ public:
     array<uint8_t, 2> first{}, last{}; // slots 0 and 31, per table
     uint8_t general = 0;               // any other slot without extended attributes
   };
-  // The sprite unit's models (ppu2c02/machine.py:sprite_dispatch):
-  // evaluation: full, size experts from index 0, remaining-batch experts;
-  // overflow: full, size experts; debug fetch: frozen-latch size experts;
-  // fetch: full, then experts per size and count 0-8 without CHR latches.
+  // The sprite unit's models (ppu2c02/machine.py:sprite_dispatch).
   struct SpriteDispatch {
-    array<uint8_t, 5> evaluate{};
-    array<uint8_t, 3> overflow{};
-    array<uint8_t, 2> debug_fetch{};
-    array<uint8_t, 19> fetch{}, fetch_bus{}, fetch_status{};
+    uint8_t evaluate = 0, overflow = 0;
+    // A slot's fetch, and its bus and latch effects alone, by
+    // [CHR latches active][8x16 sprites].
+    array<array<uint8_t, 2>, 2> fetch{}, fetch_bus{};
+    uint8_t absent = 0; // an empty slot's dummy fetch
   };
   struct PpuEngine {
     void* ctx = nullptr;
@@ -190,11 +188,11 @@ public:
     array<array<uint8_t, 8>, 2> registers{}; // [is_write][register]
     void* control_ctx = nullptr;
     void (*control_step)(void*, int, const int*, int*) = nullptr;
-    array<int, 6> control_models{};
+    int control_model = 0;
     array<int, 3> bus_models{};
     int background_span_model = 0;
     int clock_model = 0;
-    array<array<int, 8>, 2> access_bus_models{};
+    int access_bus_model = 0;
     int view_model = 0;
     int access_delay_model = 0;
     int dma_request_model = 0, dma_transfer_model = 0;
@@ -208,13 +206,14 @@ public:
   static constexpr int in_access_banks = 13, in_access_state = 21, in_access_whole = 35;
   // Finite event control (ppu2c02/control.py INPUTS, OUTPUTS).
   static constexpr int control_inputs = 23, control_outputs = 15, out_control_skip = 13;
-  // The sprite graphs' (ppu2c02/sprites.py EVALUATE_*, FETCH_*).
+  // The sprite tokens' (ppu2c02/sprites.py EVALUATE_*, SPRITE_*).
   static constexpr int evaluate_inputs = 4, evaluate_outputs = 9;
-  static constexpr int fetch_inputs = 24, fetch_outputs = 90;
+  static constexpr int sprite_inputs = 17, sprite_outputs = 13;
   static constexpr int compose_inputs = 19, compose_outputs = 10;
-  static constexpr int in_index = 4, in_latch = 12, in_banks = 15, in_fetch_whole = 23;
-  static constexpr int out_sprite_x = 64, out_sprite_fetch = 72, out_sprite_a12 = 80,
-                       out_sprite_latch = 88;
+  static constexpr int in_sprite_present = 3, in_sprite_index = 4, in_sprite_latch = 5,
+                       in_sprite_banks = 8, in_sprite_whole = 16;
+  static constexpr int out_sprite_x = 8, out_sprite_fetch = 9, out_sprite_a12 = 10,
+                       out_sprite_latch = 11;
   void set_engine(PpuEngine engine);
   // The X-ray's pixel dissection: the next time the render graph draws
   // `slot` of `line`, also trace that slot through the full model.
@@ -396,7 +395,7 @@ private:
   bool a12(bool high, int64_t dot) { return bus_event(BusEvent::Pin, high, dot); }
   void refresh_mmc5_view();
   bool start_sprite_line();
-  void compose_sprite_rows(const int* fetched, int count);
+  void compose_sprite_row(const int* fetched);
   // The sprite unit as graph steps (engine_.sprites).
   void evaluate_sprites_graph(int64_t dot);
   void load_sprites_graph(int64_t dot);
@@ -408,7 +407,7 @@ private:
     array<array<uint8_t, evaluate_outputs>, frame_height> rows{};
     std::bitset<frame_height> valid;
     uint64_t oam_epoch = ~0ULL;
-    int model = -1;
+    int tall = -1; // the sprite size the rows were selected for
   } sprite_rows_;
 
   Render r_;

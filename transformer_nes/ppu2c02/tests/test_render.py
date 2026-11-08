@@ -18,8 +18,9 @@ from carts import (
 
 from transformer_nes.build import FIXTURES_DIR, load_nes_extension
 from transformer_nes.nes.backends import backend_factory
+from transformer_nes.nes.model import compiled
 from transformer_nes.ppu2c02 import render
-from transformer_nes.ppu2c02.machine import ppu_engine
+from transformer_nes.ppu2c02.machine import PpuEngine
 
 EXAMPLES = str(FIXTURES_DIR / "roms")
 
@@ -66,14 +67,15 @@ def random_slot(rng, pins: dict) -> list[int]:
 
 
 def test_experts_agree_with_the_full_graph():
-    engine = ppu_engine()
+    ppu = PpuEngine(compiled())
+    engine = ppu.ppu
     rng = np.random.default_rng(7)
     for lo, hi in ((0, 0x3000), (0x5000, 0x7000)):
         for addr in range(lo, hi):
             engine.write(addr, int(rng.integers(256)))
     for addr in range(0x3F00, 0x3F20):
         engine.write(addr, int(rng.integers(64)))
-    for model, name in enumerate(engine.expert_names, start=1):
+    for model, name in enumerate(ppu.expert_names, start=1):
         for _ in range(300):
             inputs = random_slot(rng, render.EXPERTS[name])
             full, folded = engine.step(inputs, 0), engine.step(inputs, model)
@@ -241,7 +243,7 @@ def test_slot_trace_explains_the_frame():
 
     hardware = load_nes_extension("hardware")
     console = hardware.Console(latch_cart(hardware, mapper=9), backend_factory("weights"), 44100.0)
-    engine = ppu_engine()
+    engine = PpuEngine(compiled())
     console.set_ppu_engine(engine)
     xray = PpuXray(engine)
     for _ in range(3):
@@ -268,7 +270,7 @@ def test_knock_out_breaks_rendering_until_restored():
     cart = latch_cart(hardware, mapper=9)
     native = console_frames(hardware, cart, 8)
     console = hardware.Console(cart, backend_factory("weights"), 44100.0)
-    engine = ppu_engine()
+    engine = PpuEngine(compiled())
     console.set_ppu_engine(engine)
     xray = PpuXray(engine)
     out = []
@@ -290,7 +292,7 @@ def test_knock_out_breaks_rendering_until_restored():
 
 @pytest.mark.parametrize("whole_chr", [False, True], ids=["mapped-chr", "mmc5-chr"])
 def test_blank_expert_preserves_palette_and_disables_fetch_effects(whole_chr):
-    engine = ppu_engine(whole_chr)
+    engine = PpuEngine(compiled(), whole_chr).ppu
     blank = engine.model_id("render", "blank")
     rng = np.random.default_rng(61)
     for address in range(0x3F00, 0x3F20):

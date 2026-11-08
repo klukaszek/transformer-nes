@@ -1,4 +1,5 @@
-"""Compiler cache identity, concurrent ownership and reusable graph execution."""
+"""Compiler cache identity, concurrent ownership, and token circuits compiled
+through the model backend (model/backend.py) exactly."""
 
 import multiprocessing
 import signal
@@ -11,8 +12,8 @@ import pytest
 
 from transformer_nes import build
 from transformer_nes.graph.core import InputDimension, construction, current_graph, persist, reglu
-from transformer_nes.model.construct import TokenGraph, describe
-from transformer_nes.model.graph_engine import CompiledGraph
+from transformer_nes.model.backend import compile_model
+from transformer_nes.model.construct import TokenGraph, construct_chip, describe
 
 
 def _configure(root):
@@ -47,6 +48,23 @@ def _receive(connection):
 def cache(tmp_path, monkeypatch):
     monkeypatch.setattr(build, "CACHE_DIR", str(tmp_path))
     return tmp_path
+
+
+def compile_tokens(tokens, directory, *, memory_size=1, dtype="int32"):
+    """Token types compiled through the model backend as one chip, into
+    `directory`: the chip's engine and its generated source."""
+    model = compile_model(
+        {"t": construct_chip(tokens, memory_size=memory_size, dtype=dtype)}, Path(directory)
+    )
+    return model.chip("t"), (model.library / "chip_0.cpp").read_text()
+
+
+@construction
+def doubling():
+    value = InputDimension("value")
+    output = persist(2 * value, name="doubled")
+    graph = current_graph().capture({"VALUE": value.as_expr()}, {"READOUT": output})
+    return {"double": TokenGraph(graph, ["value"], ["doubled"])}
 
 
 def _publish_many(root, prefix, connection):
@@ -95,68 +113,20 @@ def test_cpu_cache_hit_rechecks_after_waiting_for_artifact(cache, monkeypatch):
     assert engine.GeneratedWeightsEngine.from_cache("cpu") is None
 
 
-def _compile_graph(root, size, connection):
-    import torch.utils.cpp_extension as extension
-
-    from transformer_nes.graph.core import InputDimension, construction, current_graph, persist
-    from transformer_nes.model.construct import TokenGraph
-    from transformer_nes.model.graph_engine import CompiledGraph
-
+def _compile_doubling(root, connection):
     _configure(root)
-    original_load = extension.load
-
-    def paused_load(*args, **kwargs):
-        connection.send(("building", Path(kwargs["build_directory"]).name.removeprefix("build_")))
-        assert connection.recv() == "compile"
-        return original_load(*args, **kwargs)
-
-    extension.load = paused_load
-
-    @construction
-    def graphs():
-        value = InputDimension("value")
-        output = persist(2 * value, name="doubled")
-        graph = current_graph().capture({"VALUE": value.as_expr()}, {"READOUT": output})
-        return {"double": TokenGraph(graph, ["value"], ["doubled"])}
-
-    tag = f"parallel:{size}"
-    engine = CompiledGraph(graphs, tag=tag, sources=(), memory_size=size)
-    assert list(engine.step([21])) == [42]
-
-    def unexpected_rebuild():
-        raise AssertionError("a completed graph should be reusable without construction")
-
-    cached = CompiledGraph(unexpected_rebuild, tag=tag, sources=(), memory_size=size)
-    assert list(cached.step([13])) == [26]
-    connection.send(engine.digest)
+    engine, _source = compile_tokens(doubling(), Path(root) / "models")
+    connection.send(int(engine.step([21])[0]))
 
 
-def test_parallel_builds_survive_pruning_and_publish_only_after_loading(cache):
-    obsolete = cache / "graph_0000000000000000.cpp"
-    obsolete.write_text("obsolete")
+def test_concurrent_identical_builds_publish_one_library(cache):
     with (
-        _worker(_compile_graph, cache, 4096) as (first, _),
-        _worker(_compile_graph, cache, 8192) as (second, _),
+        _worker(_compile_doubling, cache) as (first, _),
+        _worker(_compile_doubling, cache) as (second, _),
     ):
-        # Both must enter compilation before either finishes: independent
-        # digests cannot be serialized by the manifest lock.
-        stages = [_receive(first), _receive(second)]
-        assert all(stage == "building" for stage, _ in stages)
-        digests = [digest for _, digest in stages]
-        assert len(set(digests)) == 2
-        assert build.manifest_read() == {}
-        build.manifest_put("pruner", {"digest": "ffffffffffffffff"})
-        assert not obsolete.exists()
-        for digest in digests:
-            assert (cache / f"graph_{digest}.cpp").exists()
-            assert (cache / f"build_{digest}").is_dir()
-        first.send("compile")
-        second.send("compile")
-        assert [_receive(first), _receive(second)] == digests
-    manifest = build.manifest_read()
-    assert manifest["graph:parallel:4096"]["digest"] == digests[0]
-    assert manifest["graph:parallel:8192"]["digest"] == digests[1]
-    assert "pruner" in manifest
+        assert [_receive(first), _receive(second)] == [42, 42]
+    published = sorted(p.name for p in (cache / "models").iterdir())
+    assert len(published) == 1 and published[0].startswith("nes_")
 
 
 def _abandoned_build(root, digest, connection):
@@ -307,51 +277,25 @@ for name in ('graph', 'model'):
     )
 
 
-def test_graph_cache_respects_memory_size(tmp_path, monkeypatch):
-    monkeypatch.setattr(build, "CACHE_DIR", str(tmp_path))
-    builds = 0
-
-    @construction
-    def graphs():
-        nonlocal builds
-        builds += 1
-        value = InputDimension("value")
-        output = persist(2 * value, name="doubled")
-        graph = current_graph().capture({"VALUE": value.as_expr()}, {"READOUT": output})
-        return {"double": TokenGraph(graph, ["value"], ["doubled"])}
-
-    def compile_engine(size):
-        return CompiledGraph(graphs, tag="cache_test", sources=(), memory_size=size)
-
-    small = compile_engine(4096)
+def test_library_identity_covers_memory_size_and_outlives_replacement(cache):
+    small, _ = compile_tokens(doubling(), cache / "models", memory_size=4096)
     assert list(small.step([21])) == [42]
     small.write(4095, 7)
     with pytest.raises(IndexError):
         small.write(4096, 7)
+    (library,) = (cache / "models").iterdir()
+    built = library.stat().st_mtime_ns
 
-    cached = compile_engine(4096)
-    assert builds == 1
-    assert cached.digest == small.digest
+    cached, _ = compile_tokens(doubling(), cache / "models", memory_size=4096)
+    assert [p.stat().st_mtime_ns for p in (cache / "models").iterdir()] == [built]
     assert list(cached.step([13])) == [26]
 
-    def failed_load(*args, **kwargs):
-        raise RuntimeError("compiler failed")
-
-    with monkeypatch.context() as failed_build:
-        failed_build.setattr(build, "load_module", failed_load)
-        with pytest.raises(RuntimeError, match="compiler failed"):
-            compile_engine(8192)
-    assert build.manifest_read()["graph:cache_test"]["digest"] == small.digest
-    assert compile_engine(4096).digest == small.digest
-    assert builds == 2
-
-    large = compile_engine(8192)
-    assert builds == 3
-    assert large.digest != small.digest
+    large, _ = compile_tokens(doubling(), cache / "models", memory_size=8192)
+    (replacement,) = (cache / "models").iterdir()
+    assert replacement != library
     large.write(8191, 9)
     assert list(large.step([17])) == [34]
-
-    # The original instance remains usable after replacing its cache entry.
+    # An engine of the replaced library stays usable: its mapping outlives the files.
     assert list(small.step([5])) == [10]
 
 
@@ -374,10 +318,13 @@ def test_token_projection_removes_unused_computation():
         full.project(("missing",))
 
 
-def test_float32_weights_preserve_real_inputs_trace_and_ablation():
+def test_float32_weights_preserve_real_inputs_trace_and_ablation(cache):
     import ctypes
 
     import numpy as np
+
+    from transformer_nes.graph.fold import GraphFolder
+    from transformer_nes.model.construct import construct
 
     @construction
     def graphs():
@@ -386,8 +333,8 @@ def test_float32_weights_preserve_real_inputs_trace_and_ablation():
         graph = current_graph().capture({"VALUE": x.as_expr()}, {"READOUT": y})
         return {"real": TokenGraph(graph, ("x",), ("y",))}
 
-    engine = CompiledGraph(graphs, tag="real_test", sources=(), memory_size=1, dtype="float32")
-    assert engine.dtype == np.dtype("float32") and engine.f_bits == 0
+    engine, _ = compile_tokens(graphs(), cache / "models", dtype="float32")
+    assert engine.dtype == np.dtype("float32") and engine.chip.f_bits == 0
     for x in np.linspace(-2, 2, 65):
         expected = 0.125 * (x + 0.25) * max(x - 0.375, 0) - 0.9995 * x
         np.testing.assert_allclose(engine.step([x]), [expected], rtol=0, atol=3e-7)
@@ -396,9 +343,12 @@ def test_float32_weights_preserve_real_inputs_trace_and_ablation():
     inputs = np.array([0.8125], dtype=np.float32)
     residuals = np.zeros((abi[4], abi[5]), dtype=np.float32)
     trace(abi[0], inputs.ctypes.data, residuals.ctypes.data)
-    slot = next(slot for dim, slot in engine.slot_of.items() if dim.name == "y")
+    token = graphs()["real"]
+    fold = GraphFolder(token.program_graph, root_names=["y"], structural_reads=True).fold({})
+    info = construct(fold.program_graph)[2]
+    slot = next(slot for dim, slot in info.slot_of.items() if dim.name == "y")
     np.testing.assert_allclose(residuals[-1, slot], engine.step(inputs)[0], rtol=0, atol=3e-7)
-    engine.engine.ablate(slot, engine.n_layers, 0.123456789)
+    engine.engine.ablate(slot, info.n_layers, 0.123456789)
     assert engine.step(inputs).tolist() == [float(np.float32(0.123456789))]
     engine.engine.ablate()
     np.testing.assert_array_equal(engine.step(inputs), residuals[-1, slot:slot + 1])
@@ -435,7 +385,7 @@ def test_constant_one_survives_implicit_linear_gates(gate, input_value):
 
 
 @pytest.mark.parametrize("reassociate_residuals", [False, True])
-def test_integer_expansion_preserves_memory_bounds_and_half_rounding(reassociate_residuals):
+def test_integer_expansion_preserves_memory_bounds_and_half_rounding(reassociate_residuals, cache):
     import numpy as np
     import torch
 
@@ -459,9 +409,7 @@ def test_integer_expansion_preserves_memory_bounds_and_half_rounding(reassociate
             reassociate_residuals=reassociate_residuals,
         )}
 
-    engine = CompiledGraph(
-        graphs, tag=f"integer_read_test_{reassociate_residuals}", sources=(), memory_size=256
-    )
+    engine, _ = compile_tokens(graphs(), cache / "models", memory_size=256)
     for address in range(256):
         engine.write(address, address)
     # Exercise both the FX and native paths, including negative half products,
@@ -481,7 +429,7 @@ def test_integer_expansion_preserves_memory_bounds_and_half_rounding(reassociate
             assert output.tolist() == [v << forward.f_bits for v in expected]
 
 
-def test_integer_residual_simplification_preserves_int32_overflow():
+def test_integer_residual_simplification_preserves_int32_overflow(cache):
     @construction
     def graphs():
         value = InputDimension("value")
@@ -489,7 +437,7 @@ def test_integer_residual_simplification_preserves_int32_overflow():
         graph = current_graph().capture({"VALUE": value.as_expr()}, {"READOUT": result})
         return {"overflow": TokenGraph(graph, ("value",), ("result",))}
 
-    engine = CompiledGraph(graphs, tag="integer_overflow_test", sources=(), memory_size=1)
+    engine, _ = compile_tokens(graphs(), cache / "models")
     for value in (-2**31, -65536, -1, 0, 1, 46341, 65536, 2**31 - 1):
         expected = (value * max(0, value) + 17 * value + 2**31) % 2**32 - 2**31
         assert engine.step([value]).tolist() == [expected]
@@ -604,7 +552,7 @@ def test_cached_circuits_relocate_between_banks_without_lowering(cache, monkeypa
         }
         return dict(reversed(list(tokens.items()))) if reverse else tokens
 
-    original = CompiledGraph(graphs, tag="kernel_original", sources=(), memory_size=1)
+    original, _ = compile_tokens(graphs(), cache / "original")
     assert original.step([7], original.model_id("double")).tolist() == [14]
     assert original.step([7], original.model_id("square")).tolist() == [49]
 
@@ -616,11 +564,9 @@ def test_cached_circuits_relocate_between_banks_without_lowering(cache, monkeypa
         return result
 
     monkeypatch.setattr(compiler, "cached_kernel", unexpected_lowering)
-    # Different graph order/model ids, token-bank identity and unused RAM
+    # Different token order and model ids, library identity and unused RAM
     # extent: bind each cached body's circuit name to its new index.
-    reordered = CompiledGraph(
-        lambda: graphs(True), tag="kernel_reordered", sources=(), memory_size=4096,
-    )
+    reordered, _ = compile_tokens(graphs(True), cache / "reordered", memory_size=4096)
     for value in (-7, 0, 11):
         assert reordered.step([value], reordered.model_id("double")).tolist() == [2 * value]
         assert reordered.step([value], reordered.model_id("square")).tolist() == [value * max(0, value)]
@@ -633,7 +579,7 @@ def test_cached_circuits_relocate_between_banks_without_lowering(cache, monkeypa
         return result
 
     monkeypatch.setattr(compiler, "cached_kernel", count_lowering)
-    changed = CompiledGraph(lambda: graphs(changed=True), tag="kernel_changed", sources=(), memory_size=1)
+    changed, _ = compile_tokens(graphs(changed=True), cache / "changed")
     assert len(calls) == 1
     assert changed.step([7], changed.model_id("double")).tolist() == [14]
     assert changed.step([7], changed.model_id("square")).tolist() == [56]
@@ -665,15 +611,15 @@ def test_fixed_read_cache_shares_valid_extents_and_keeps_out_of_bounds_zero(cach
         return result
 
     monkeypatch.setattr(compiler, "cached_kernel", count_lowering)
-    large = CompiledGraph(graphs, tag="fixed_large", sources=(), memory_size=256)
+    large, _ = compile_tokens(graphs(), cache / "large", memory_size=256)
     large.write(7, 215)
     assert large.step([3]).tolist() == [221]
     assert len(calls) == 1
-    small = CompiledGraph(graphs, tag="fixed_small", sources=(), memory_size=8)
+    small, _ = compile_tokens(graphs(), cache / "small", memory_size=8)
     small.write(7, 13)
     assert small.step([3]).tolist() == [19]
     assert len(calls) == 1
-    outside = CompiledGraph(graphs, tag="fixed_outside", sources=(), memory_size=4)
+    outside, _ = compile_tokens(graphs(), cache / "outside", memory_size=4)
     assert outside.step([3]).tolist() == [6]
     assert len(calls) == 2
 
@@ -699,8 +645,7 @@ def test_shared_neurons_emit_once_without_importing_inductor(cache, monkeypatch)
         graph = current_graph().capture({"VALUE": x.as_expr()}, {"READOUT": sum(outputs)})
         return {"fanout": TokenGraph(graph, ("x",), tuple(f"out{i}" for i in range(64)))}
 
-    engine = CompiledGraph(graphs, tag="ssa_fanout", sources=(), memory_size=1)
-    source = (cache / f"graph_{engine.digest}.cpp").read_text()
+    engine, source = compile_tokens(graphs(), cache / "models")
     assert source.count(" > 0 ?") == 1
     assert "scratch_" not in source and "phase_" not in source
     for value in (-65536, -1, 0, 1, 46341, 65536):
@@ -711,21 +656,20 @@ def test_shared_neurons_emit_once_without_importing_inductor(cache, monkeypatch)
         assert engine.step([value]).tolist() == expected
 
 
-def test_ppu_source_stays_under_two_and_three_quarter_mebibytes():
-    from transformer_nes.ppu2c02.machine import ppu_engine
+def test_ppu_source_stays_compact():
+    from transformer_nes.model.backend import chip_source
+    from transformer_nes.nes.model import NES
 
-    engine = ppu_engine()
-    meta, source = CompiledGraph.generate_bank(engine.build_graphs(), engine.memory_size)
-    assert meta["digest"] == engine.digest
+    source = chip_source(0, NES.load().chips["ppu"])
     # Real rendering, fetch, status and register experts previously emitted
-    # over 20 MiB, then 4.1 MiB with scalar SSA, then about 2.05 MiB per CHR
-    # variant. One bank now serves every cart, MMC5's whole-CHR experts
-    # included (about 2.7 MiB): preserve the shared-fragment and compact
-    # scalar representation.
-    assert len(source.encode()) < 11 * 1024**2 // 4
+    # over 20 MiB, then 4.1 MiB with scalar SSA, then about 2.7 MiB for one
+    # bank serving every cart. With specializations that do not pay gone and
+    # shared sums computed once it is about 0.75 MiB: preserve the
+    # shared-fragment and compact scalar representation.
+    assert len(source.encode()) < 1024**2
 
 
-def test_float32_ssa_matches_fx_bits_at_rounding_boundaries():
+def test_float32_ssa_matches_fx_bits_at_rounding_boundaries(cache):
     import numpy as np
     import torch
 
@@ -739,7 +683,7 @@ def test_float32_ssa_matches_fx_bits_at_rounding_boundaries():
         pg = current_graph().capture({"VALUE": x.as_expr()}, {"READOUT": y})
         return {"real": TokenGraph(pg, ("x",), ("y",))}
 
-    engine = CompiledGraph(graphs, tag="ssa_float_bits", sources=(), memory_size=1, dtype="float32")
+    engine, _ = compile_tokens(graphs(), cache / "models", dtype="float32")
     token = graphs()["real"]
     folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
     model = describe(token, folded.program_graph, list(folded.dim_of_name.values()), dtype="float32")
@@ -754,7 +698,7 @@ def test_float32_ssa_matches_fx_bits_at_rounding_boundaries():
 
 
 @pytest.mark.parametrize("dtype", ["int32", "float32"])
-def test_shared_fragments_preserve_bound_values_and_projection_grouping(dtype):
+def test_shared_fragments_preserve_bound_values_and_projection_grouping(dtype, cache):
     import numpy as np
     import torch
 
@@ -771,8 +715,7 @@ def test_shared_fragments_preserve_bound_values_and_projection_grouping(dtype):
             "yx": TokenGraph(graph, ("y", "x"), ("result",), reassociate_residuals=False),
         }
 
-    engine = CompiledGraph(graphs, tag=f"shared_grouping_{dtype}", sources=(), memory_size=1, dtype=dtype)
-    source = (Path(build.CACHE_DIR) / f"graph_{engine.digest}.cpp").read_text()
+    engine, source = compile_tokens(graphs(), cache / "models", dtype=dtype)
     assert "always_inline" in source
     pairs = [(-0.0, -1), (0, 0), (1, 1), (-7, 1), (46341, 2), (2**31 - 1, 0)]
     if dtype == "int32":

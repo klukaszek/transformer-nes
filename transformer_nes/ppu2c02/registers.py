@@ -76,20 +76,26 @@ EFFECT_FIELDS = (
 )
 OUTPUTS = tuple(f"new_{f}" for f in STATE_FIELDS) + EFFECT_FIELDS
 
-# Folded experts, one per register and direction, for carts with CHR
-# windows and (mmc5_*) with whole-CHR addressing: an access always meets
-# exactly one's pins, so the full graph never has to run.
-_ACCESS_EXPERTS = {
-    f"{'write' if writing else 'read'}{r}": {
-        "writing": writing,
-        **{f"reg{j}": int(j == r) for j in range(8)},
-    }
-    for writing in range(2)
-    for r in range(8)
-}
+# Folded experts, one per register and direction: an access always meets
+# exactly one's pins, so the full circuit is never built. Only $2007 reaches
+# CHR, so only it comes twice: through the CHR windows and (mmc5_*) through
+# MMC5's banks into the whole CHR.
 EXPERTS = {
-    **{name: {**pins, "whole_chr": 0} for name, pins in _ACCESS_EXPERTS.items()},
-    **{f"mmc5_{name}": {**pins, "whole_chr": 1} for name, pins in _ACCESS_EXPERTS.items()},
+    **{
+        f"{'write' if writing else 'read'}{r}": {
+            "writing": writing,
+            **{f"reg{j}": int(j == r) for j in range(8)},
+            **({"whole_chr": 0} if r == 7 else {}),
+        }
+        for writing in range(2)
+        for r in range(8)
+    },
+    **{
+        f"mmc5_{'write' if writing else 'read'}7": {
+            "writing": writing, **{f"reg{j}": int(j == 7) for j in range(8)}, "whole_chr": 1,
+        }
+        for writing in range(2)
+    },
 }
 
 

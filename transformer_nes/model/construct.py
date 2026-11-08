@@ -11,6 +11,8 @@ construction code behind them.
 
 from __future__ import annotations
 
+import hashlib
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
@@ -97,6 +99,9 @@ def circuits(name: str, token: TokenGraph, *, dtype: str = "int32") -> list[tupl
     unknown name, so such a specialization would be a copy of the full circuit.
     """
     persists = {d.name for d in token.program_graph.all_dims if d.kind == "persist"}
+    named = Counter(d.name for d in token.program_graph.all_dims)
+    if ambiguous := sorted(o for o in token.outputs if named[o] > 1):
+        raise ValueError(f"{name}: outputs {ambiguous} each name more than one value")
     for expert, pins in token.experts.items():
         if unfoldable := sorted(set(pins) - persists):
             raise ValueError(f"{name}/{expert}: pins {unfoldable} name no persist dim to fold")
@@ -161,20 +166,44 @@ def transformer(description: dict) -> Transformer:
     )
 
 
+def circuit_key(circuit: Transformer) -> bytes:
+    """A circuit's identity: its shape and every weight."""
+    h = hashlib.sha256(f"{circuit.d_model},{circuit.one_slot}".encode())
+    for key, tensor in circuit.state_dict().items():
+        h.update(f"{key}{tuple(tensor.shape)}{tensor.dtype}".encode())
+        h.update(tensor.contiguous().numpy().tobytes())
+    return h.digest()
+
+
 def construct_chip(tokens: Mapping[str, TokenGraph], *, memory_size: int, dtype: str = "int32",
-                   constants: Mapping[str, int] | None = None) -> Chip:
-    """A chip's token types as one model.transformer.Chip."""
+                   constants: Mapping[str, int] | None = None,
+                   views: Mapping[str, Mapping] | None = None) -> Chip:
+    """A chip's token types as one model.transformer.Chip. ``views`` name
+    token types read off another's circuits at fewer outputs (``base``,
+    ``outputs``, optionally the base ``specializations`` read): they are
+    compiled from the base's weights and store none of their own."""
     described = {name: circuits(name, token, dtype=dtype) for name, token in tokens.items()}
     f_bits = max(d["fraction_bits"] for cs in described.values() for _, d in cs)
     token_types = {}
     for name, token in tokens.items():
-        built = {spec: transformer(d) for spec, d in described[name]}
+        # Different pins can fold to the same circuit (a projection drops the
+        # values that told them apart): store each circuit once.
+        built, same, first = {}, {}, {}
+        for spec, d in described[name]:
+            circuit = transformer(d)
+            key = circuit_key(circuit)
+            if key in first:
+                same[spec] = first[key]
+            else:
+                first[key], built[spec] = spec, circuit
         token_types[name] = TokenType(
             token.inputs, token.outputs, built.pop(None, None), built,
             {name: dict(pins) for name, pins in token.experts.items()},
-            reassociate_residuals=token.reassociate_residuals,
+            same=same, reassociate_residuals=token.reassociate_residuals,
         )
     return Chip(
         token_types, memory_size=memory_size, f_bits=f_bits,
         dtype=torch.float32 if dtype == "float32" else torch.int32, constants=constants,
+        views={name: {"base": v["base"], "outputs": list(v["outputs"]),
+                      "specializations": v.get("specializations")} for name, v in (views or {}).items()},
     )

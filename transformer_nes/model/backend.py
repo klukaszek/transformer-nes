@@ -22,7 +22,7 @@ import logging
 import os
 import shutil
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import numpy as np
@@ -95,25 +95,29 @@ def layer_blocks(layer: Layer) -> dict[str, np.ndarray]:
     return blocks
 
 
-def circuit_description(chip: Chip, token: str, circuit: Transformer) -> dict:
-    """A circuit in the compiler's terms (model/compiler.py:weight_module)."""
+def circuit_description(chip: Chip, token: str, circuit: Transformer,
+                        outputs: list[int] | None = None) -> dict:
+    """A circuit, read at all its outputs or those at positions `outputs`,
+    in the compiler's terms (model/compiler.py:weight_module)."""
+    view = chip.views.get(token)
+    readout = circuit.output_slots if outputs is None else circuit.output_slots[outputs]
     return {
         "layers": [layer_blocks(layer) for layer in circuit.layers],
         "d_model": circuit.d_model,
         "one_slot": circuit.one_slot,
         "input_slots": circuit.input_slots.tolist(),
-        "output_slots": circuit.output_slots.tolist(),
+        "output_slots": readout.tolist(),
         "fraction_bits": chip.f_bits,
         "dtype": "int32" if chip.dtype == torch.int32 else "float32",
-        "reassociate_residuals": chip.tokens[token].reassociate_residuals,
+        "reassociate_residuals": chip.tokens[view.base if view else token].reassociate_residuals,
     }
 
 
 def chip_source(index: int, chip: Chip) -> str:
     """One translation unit: the chip's kernels (internal to it) and its descriptor."""
-    circuits = chip.circuits()
+    programs = chip.programs()
     kernels, metadata, scalar = bank_kernels(
-        [circuit_description(chip, token, c) for token, _spec, c in circuits],
+        [circuit_description(chip, token, c, outputs) for token, _spec, c, outputs in programs],
         memory_size=chip.memory_size,
     )
     entries = ",\n    ".join(
@@ -121,13 +125,12 @@ def chip_source(index: int, chip: Chip) -> str:
         for m in metadata
     )
     tokens = ", ".join(
-        f"{{{len(chip.tokens[token].inputs)}, {len(chip.tokens[token].outputs)}}}"
-        for token, _spec, _c in circuits
+        f"{{{len(chip.io(token)[0])}, {len(chip.io(token)[1])}}}" for token, _spec, _c, _o in programs
     )
-    primary = circuits[0][2]
+    primary = programs[0][2]
     kind = "Float32" if scalar == "float" else "Int32"
     return (
-        f"// Chip {index}: {len(circuits)} circuits.\n"
+        f"// Chip {index}: {len(programs)} programs.\n"
         + ssa.CPP_PREAMBLE
         + '#include "bank.h"\n'
         + "namespace {\n"
@@ -136,7 +139,7 @@ def chip_source(index: int, chip: Chip) -> str:
         + f"const transformer_nes_bank::Token tokens[] = {{{tokens}}};\n"
         + "}  // namespace\n"
         + f"extern const transformer_nes_bank::Bank chip_{index} = {{\n"
-        + f"    TRANSFORMER_NES_BANK_ABI, transformer_nes_bank::{kind}, {len(circuits)}, circuits, tokens,\n"
+        + f"    TRANSFORMER_NES_BANK_ABI, transformer_nes_bank::{kind}, {len(programs)}, circuits, tokens,\n"
         + f"    {chip.memory_size}, {chip.f_bits}, {len(primary.layers) + 1}, {primary.d_model}}};\n"
     )
 
@@ -168,31 +171,24 @@ def compile_model(chips: Mapping[str, Chip], cache_dir: Path) -> CompiledModel:
     name = f"nes_{digest}"
     final = Path(cache_dir) / name
     library = final / f"{name}.so"
-    if name in _LOADED:
-        module = _LOADED[name]
-    elif library.exists():
-        module = load_library(name, library)
-    else:
-        module = build_library(name, chips, final)
-    _LOADED[name] = module
-    return CompiledModel(module, chips)
+    if name not in _LOADED:
+        _LOADED[name] = load_library(name, library) if library.exists() else build_library(name, chips, final)
+    return CompiledModel(_LOADED[name], chips, final)
 
 
-def build_library(name: str, chips: dict[str, Chip], final: Path):
+def build_extension(name: str, final: Path, generated: Callable[[], dict[str, str]],
+                    files: tuple[Path, ...] = ()):
+    """Compile `files` and the sources `generated` returns (file name ->
+    text) into the Torch extension ``final/name.so``, published by rename."""
     from torch.utils.cpp_extension import load
 
-    start = time.perf_counter()
     work = final.with_name(f".{final.name}.{os.getpid()}")
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    sources = [str(RUNTIME_FILES[0])]
-    for i, chip in enumerate(chips.values()):
-        path = work / f"chip_{i}.cpp"
-        path.write_text(chip_source(i, chip))
-        sources.append(str(path))
-    (work / "chips.cpp").write_text(table_source(list(chips)))
-    sources.append(str(work / "chips.cpp"))
-    lowered = time.perf_counter()
+    sources = [str(f) for f in files]
+    for file_name, text in generated().items():
+        (work / file_name).write_text(text)
+        sources.append(str(work / file_name))
     module = load(
         name=name,
         sources=sources,
@@ -209,27 +205,77 @@ def build_library(name: str, chips: dict[str, Chip], final: Path):
         work.rename(final)
     except OSError:  # an identical concurrent build published first
         shutil.rmtree(work, ignore_errors=True)
+    return module
+
+
+def build_library(name: str, chips: dict[str, Chip], final: Path):
+    start = time.perf_counter()
+
+    def generated() -> dict[str, str]:
+        sources = {f"chip_{i}.cpp": chip_source(i, chip) for i, chip in enumerate(chips.values())}
+        logger.info("lowered %d chips in %.1fs", len(chips), time.perf_counter() - start)
+        return sources | {"chips.cpp": table_source(list(chips))}
+
+    module = build_extension(name, final, generated, files=(RUNTIME_FILES[0],))
+    # Older libraries, and the debug kernels built beside them.
     for older in final.parent.glob("nes_*"):
         if older != final:
             shutil.rmtree(older, ignore_errors=True)
-    logger.info(
-        "built %s: %d chips lowered in %.1fs, compiled in %.1fs",
-        name, len(chips), lowered - start, time.perf_counter() - lowered,
-    )
+    logger.info("built %s in %.1fs", name, time.perf_counter() - start)
     return module
+
+
+DEBUG_MODULE = """
+#include <pybind11/pybind11.h>
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("kernel", [] {
+        return pybind11::make_tuple(reinterpret_cast<std::uintptr_t>(&circuit_0), @READS@);
+    });
+}
+"""
+
+
+def debug_kernel(library: Path, name: str, chip: Chip, trace: bool) -> tuple[int, int]:
+    """(kernel address, reads) of a chip's model 0 compiled for diagnosis:
+    taking an ablation (slot, row, value) after its inputs, and for `trace`
+    writing every layer's residual stream. Built on first use beside the
+    library, which it is pruned with."""
+    kind = "trace" if trace else "ablate"
+    final = library.with_name(f"{library.name}.{name}_{kind}")
+    module_name = f"{library.name}_{name}_{kind}"
+    if module_name not in _LOADED:
+        so = final / f"{module_name}.so"
+        if so.exists():
+            _LOADED[module_name] = load_library(module_name, so)
+        else:
+            def generated() -> dict[str, str]:
+                token, _spec, circuit = chip.circuits()[0]
+                kernels, metadata, _scalar = bank_kernels(
+                    [circuit_description(chip, token, circuit)],
+                    memory_size=chip.memory_size, trace=trace, ablation=True,
+                )
+                module = DEBUG_MODULE.replace("@READS@", str(metadata[0]["reads"]))
+                return {"debug.cpp": ssa.CPP_PREAMBLE + kernels + module}
+
+            _LOADED[module_name] = build_extension(module_name, final, generated)
+    return _LOADED[module_name].kernel()
 
 
 class CompiledModel:
     """A model's chips compiled into one native library."""
 
-    def __init__(self, module, chips: dict[str, Chip]):
+    def __init__(self, module, chips: dict[str, Chip], library: Path):
         if list(module.chips()) != list(chips):
             raise RuntimeError("the library does not hold this model's chips")
-        self.module, self.chips = module, chips
+        self.module, self.chips, self.library = module, chips, library
 
     def chip(self, name: str) -> CompiledChip:
         """A new engine, with its own memory, running the named chip."""
-        return CompiledChip(self.module.engine(name), self.chips[name])
+        chip = self.chips[name]
+        engine = self.module.engine(name)
+        library = self.library
+        engine.set_debug_loader(lambda trace: debug_kernel(library, name, chip, trace))
+        return CompiledChip(engine, chip)
 
 
 class CompiledChip:
@@ -238,8 +284,13 @@ class CompiledChip:
 
     def __init__(self, engine, chip: Chip):
         self.engine, self.chip = engine, chip
-        self.graphs = dict(chip.tokens)  # name -> TokenType (.inputs, .outputs, .pins)
-        self.model_ids = {(token, spec): i for i, (token, spec, _c) in enumerate(chip.circuits())}
+        # name -> TokenType or View (.inputs, .outputs)
+        self.graphs = {**chip.tokens, **chip.views}
+        self.model_ids = {(token, spec): i for i, (token, spec, _c, _o) in enumerate(chip.programs())}
+        for name, token in self.graphs.items():
+            for spec, target in token.same.items():
+                if (name, target) in self.model_ids:
+                    self.model_ids[name, spec] = self.model_ids[name, target]
         self.dtype = np.int32 if chip.dtype == torch.int32 else np.float32
 
     def model_id(self, token: str, specialization: str | None = None) -> int:
