@@ -7,25 +7,25 @@ reference/weights lockstep suites; this module only checks construction facts.
 
 import pytest
 
-from transformer_nes.cpu6502.backends.weights.engine import generate_source
-from transformer_nes.cpu6502.backends.weights.execution import (
+from transformer_nes.cpu6502.engine import generate_source
+from transformer_nes.cpu6502.execution import (
     SEQUENCE_ROOT_DIMS,
     SEQUENCE_STATE_DIMS,
     project_sequence_execution,
 )
-from transformer_nes.cpu6502.backends.weights.experts import (
+from transformer_nes.cpu6502.experts import (
     build_opcode_execution_experts,
     build_shape_experts,
     schedule_and_build,
 )
-from transformer_nes.cpu6502.backends.weights.folds import (
+from transformer_nes.cpu6502.folds import (
     SEQUENCE_FEEDBACK,
     SequenceFolder,
     opcode_pins,
     sequence_pins,
 )
-from transformer_nes.cpu6502.backends.weights.shapes import decode_ops, last_a_bit_step
 from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, build
+from transformer_nes.cpu6502.shapes import decode_ops, last_a_bit_step
 from transformer_nes.cpu6502.spec import FLAG_C, OPCODES
 from transformer_nes.graph.core import (
     MEMORY_GROUP_FUSED,
@@ -418,7 +418,7 @@ def test_completed_compilation_does_not_retain_the_source_graph():
     import gc
     import weakref
 
-    from transformer_nes.cpu6502.backends.weights.experts import sequence_folder
+    from transformer_nes.cpu6502.experts import sequence_folder
     from transformer_nes.cpu6502.graph import Cpu6502Graph
 
     program = Cpu6502Graph(bcd=False, wide_bits=True).program_graph()

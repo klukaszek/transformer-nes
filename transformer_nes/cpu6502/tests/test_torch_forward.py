@@ -12,8 +12,8 @@ import pytest
 import torch
 
 from transformer_nes import build
-from transformer_nes.cpu6502.backends.weights.bank import bank_module
-from transformer_nes.cpu6502.backends.weights.expert_runner import (
+from transformer_nes.cpu6502.bank import bank_module
+from transformer_nes.cpu6502.checkpoint.expert_runner import (
     HALVES,
     WEIGHTS,
     attention_read,
@@ -21,7 +21,7 @@ from transformer_nes.cpu6502.backends.weights.expert_runner import (
     layer,
     share_queries,
 )
-from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
+from transformer_nes.cpu6502.runner import Cpu6502TransformerMachine
 from transformer_nes.model.compiler import layer_arrays, weight_module
 
 
@@ -36,14 +36,14 @@ import sys
 
 class NoReference(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if fullname == 'transformer_nes.cpu6502.backends.reference':
+        if fullname == 'transformer_nes.cpu6502.reference':
             raise AssertionError('neural pipeline imported the reference emulator')
 
 guard = NoReference()
 sys.meta_path.insert(0, guard)
 from transformer_nes.cpu6502.graph import Cpu6502Graph
-from transformer_nes.cpu6502.backends.weights.experts import build_opcode_execution_experts
-from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
+from transformer_nes.cpu6502.experts import build_opcode_execution_experts
+from transformer_nes.cpu6502.runner import Cpu6502TransformerMachine
 from transformer_nes.nes.backends import backend_factory
 
 graph = Cpu6502Graph(bcd=False, wide_bits=True)
@@ -59,7 +59,7 @@ assert machine.get_state()['a'] == 0x42
 # Explicit requests for the public reference API still work.
 sys.meta_path.remove(guard)
 from transformer_nes.cpu6502 import Cpu6502, run
-from transformer_nes.cpu6502.backends import reference
+from transformer_nes.cpu6502 import reference
 assert Cpu6502 is reference.Cpu6502 and run is reference.run
 """,
         ],
@@ -77,7 +77,7 @@ def test_cached_bank_identity_does_not_import_the_compiler():
             """
 import importlib.abc
 import sys
-from transformer_nes.cpu6502.backends.weights import bank
+from transformer_nes.cpu6502 import bank
 class NoCompiler(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
         if fullname.startswith(('torch._inductor', 'torch._dynamo')):
@@ -242,7 +242,7 @@ def test_counter_transition_weights_cover_every_licensed_state_and_limit():
     The graph has no memory heads or table of outcomes. Batched eager FX
     evaluates its actual matrices; the native bank is checked separately.
     """
-    from transformer_nes.cpu6502.backends.weights.experts import build_counter_recurrence_experts
+    from transformer_nes.cpu6502.experts import build_counter_recurrence_experts
 
     values, limits = np.meshgrid(np.arange(1, 256), np.arange(256), indexing="ij")
     for expert in build_counter_recurrence_experts():
@@ -290,7 +290,7 @@ def test_machine_keeps_hook_context_alive_without_a_separate_handle():
 
 
 def test_loaded_bank_survives_pruned_files_when_constructing_another_cpu(tmp_path, monkeypatch):
-    from transformer_nes.cpu6502.backends.weights import bank
+    from transformer_nes.cpu6502 import bank
 
     first = Cpu6502TransformerMachine()
     hook = bank_module(False)
@@ -310,7 +310,7 @@ def test_loaded_bank_survives_pruned_files_when_constructing_another_cpu(tmp_pat
 
 
 def test_compiler_child_rejects_stale_source_identity():
-    from transformer_nes.cpu6502.backends.weights import bank
+    from transformer_nes.cpu6502 import bank
 
     result = subprocess.run(
         [sys.executable, "-m", bank.__name__, "0", "obsolete-source-digest"],
@@ -333,7 +333,7 @@ def test_torch_engine_requires_its_bank_instead_of_falling_back():
 
 @pytest.mark.parametrize("union_only", [False, True])
 def test_read_requests_pause_without_committing_then_consume_the_reply(union_only):
-    from transformer_nes.cpu6502.backends.reference import Cpu6502, instruction_cycles
+    from transformer_nes.cpu6502.reference import Cpu6502, instruction_cycles
     from transformer_nes.cpu6502.spec import MEMORY_MODES, OPCODES, READS_MEMORY
 
     machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only)

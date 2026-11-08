@@ -13,14 +13,14 @@ import gc
 import logging
 import time
 
-from transformer_nes.cpu6502.backends.weights.engine import (
+from transformer_nes.cpu6502.engine import (
     GeneratedWeightsEngine,
     engine_config_key,
 )
-from transformer_nes.cpu6502.backends.weights.execution import step_spec_base
-from transformer_nes.cpu6502.backends.weights.experts import build_core_experts
-from transformer_nes.cpu6502.backends.weights.shapes import match_shape_windows, with_loops
+from transformer_nes.cpu6502.execution import step_spec_base
+from transformer_nes.cpu6502.experts import build_core_experts
 from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, Cpu6502Graph
+from transformer_nes.cpu6502.shapes import match_shape_windows, with_loops
 from transformer_nes.cpu6502.spec import FLAG_I, FLAG_U
 from transformer_nes.cpu6502.trace import Cpu6502State, MemWrite, Trace, TraceRow
 from transformer_nes.graph.fold import GraphFolder
@@ -85,7 +85,7 @@ class Cpu6502TransformerMachine:
             # Collect compiler graph cycles before the first gameplay frame.
             gc.collect()
         self.engine = engine
-        from transformer_nes.cpu6502.backends.weights.bank import ForwardBank
+        from transformer_nes.cpu6502.bank import ForwardBank
 
         self.forwards = ForwardBank(self)
 
@@ -126,7 +126,7 @@ class Cpu6502TransformerMachine:
         ids 0..), and the shapes' metadata (experts.py:build_core_experts;
         folds cached)."""
         # Imported here: the fold cache shapes no engine (transformer_nes/build.py).
-        from transformer_nes.cpu6502.backends.weights.folds import cached_fold
+        from transformer_nes.cpu6502.folds import cached_fold
 
         experts, meta = cached_fold(f"core_bcd{int(self.bcd)}", lambda: build_core_experts(self.pg))
         return with_loops(experts), meta
@@ -319,7 +319,7 @@ def verify_program() -> bytes:
 
 
 def main() -> None:
-    from transformer_nes.cpu6502.backends import reference
+    from transformer_nes.cpu6502 import reference
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(

@@ -13,8 +13,8 @@ from pathlib import Path
 import numpy as np
 
 from transformer_nes.build import load_nes_extension
+from transformer_nes.frontend.debug import DebugBridge
 from transformer_nes.nes.backends import backend_factory
-from transformer_nes.nes.debug import DebugBridge
 
 logger = logging.getLogger(__name__)
 

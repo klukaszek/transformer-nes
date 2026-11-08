@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 PACKAGE_DIR = Path(__file__).parent
 PROJECT_DIR = PACKAGE_DIR.parent
+FIXTURES_DIR = PROJECT_DIR / "fixtures"
 # Generated kernels and native banks live beside the project, never in the package.
 CACHE_DIR = str(PROJECT_DIR / ".cache" / "engine")
 PACKAGE = "transformer_nes"

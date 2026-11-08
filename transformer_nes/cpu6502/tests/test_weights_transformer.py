@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.weights.runner import (
+from transformer_nes.cpu6502 import reference
+from transformer_nes.cpu6502.runner import (
     VERIFY_START,
     Cpu6502TransformerMachine,
     verify_program,
@@ -119,7 +119,7 @@ def test_region_ops_keep_write_position_in_sync():
 
 @pytest.mark.slow
 def test_transformer_int32_engine_matches_high_address_nestest_prefix():
-    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
+    from transformer_nes.cpu6502.conformance.nestest import START_PC, load_image
 
     image = load_image()
     machine = Cpu6502TransformerMachine(bcd=False, union_only=True)
@@ -142,7 +142,7 @@ def test_the_model_times_every_instruction(union_only):
     """Elapsed time is an output of the forward, like the registers: each
     nestest instruction's cycles, page-crossing branches and indexed reads
     included, from the opcode experts and from the union model alike."""
-    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image, new_cpu
+    from transformer_nes.cpu6502.conformance.nestest import START_PC, load_image, new_cpu
 
     image = load_image()
     machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only)
@@ -162,7 +162,7 @@ def test_run_loop_and_chunks_match_union_steps():
     including writes and jump-to-self trap detection."""
     from collections import defaultdict
 
-    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
+    from transformer_nes.cpu6502.conformance.nestest import START_PC, load_image
 
     image = load_image()
     n = 120
@@ -237,7 +237,7 @@ def test_fixed_shapes_match_per_step():
     as the per-instruction path across polls, branches and odd boundaries."""
     import numpy as np
 
-    from transformer_nes.cpu6502.backends.weights.shapes import (
+    from transformer_nes.cpu6502.shapes import (
         match_shape_windows,
     )
 
@@ -639,7 +639,7 @@ def test_cold_build_releases_reference_weights_and_still_executes(monkeypatch):
     import gc
     import weakref
 
-    from transformer_nes.cpu6502.backends.weights import runner
+    from transformer_nes.cpu6502 import runner
 
     models = []
     build_model = runner.build_model

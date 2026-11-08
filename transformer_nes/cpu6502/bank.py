@@ -19,8 +19,8 @@ from pathlib import Path
 import torch
 
 from transformer_nes import build
-from transformer_nes.cpu6502.backends.weights.engine import NATIVE_DIR
-from transformer_nes.cpu6502.backends.weights.execution import readout_slots
+from transformer_nes.cpu6502.engine import NATIVE_DIR
+from transformer_nes.cpu6502.execution import readout_slots
 
 logger = logging.getLogger(__name__)
 BANK_CFLAGS = ("-O3",)
@@ -31,7 +31,7 @@ def bank_code_digest() -> str:
     """Compiler identity as source data, available without loading weights."""
     sources = build.source_digest(
         "transformer_nes.model.compiler",
-        "transformer_nes.cpu6502.backends.weights.runner",
+        "transformer_nes.cpu6502.runner",
         files=(
             str(NATIVE_DIR / "torch_hook.cpp"),
             str(build.PACKAGE_DIR / "model/native/torch_bank.h"),
@@ -50,9 +50,9 @@ def bank_path(bcd: bool) -> str:
 
 
 def compile_bank(bcd: bool):
-    from transformer_nes.cpu6502.backends.weights.execution import step_spec_base
-    from transformer_nes.cpu6502.backends.weights.experts import build_core_experts
-    from transformer_nes.cpu6502.backends.weights.folds import cached_fold
+    from transformer_nes.cpu6502.execution import step_spec_base
+    from transformer_nes.cpu6502.experts import build_core_experts
+    from transformer_nes.cpu6502.folds import cached_fold
     from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, Cpu6502Graph
     from transformer_nes.graph.fold import GraphFolder
     from transformer_nes.model.compiler import bank_source

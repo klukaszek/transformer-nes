@@ -478,7 +478,7 @@ class SequenceFolder(GraphFolder):
 
 def cached_fold(name: str, builder):
     code = build.source_digest(
-        "transformer_nes.cpu6502.backends.weights.experts", "transformer_nes.cpu6502.graph"
+        "transformer_nes.cpu6502.experts", "transformer_nes.cpu6502.graph"
     )
     digest = code[:16]
     path = os.path.join(build.CACHE_DIR, f"build_{digest}_{name}.pklz")

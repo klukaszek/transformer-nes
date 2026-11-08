@@ -14,7 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from transformer_nes import build
-from transformer_nes.cpu6502.backends.weights.execution import readout_slots
+from transformer_nes.cpu6502.execution import readout_slots
 from transformer_nes.cpu6502.spec import (
     MODE_ABSOLUTE,
     MODE_ABSOLUTE_X,
@@ -120,7 +120,7 @@ def write_shards(cache_dir: str, stem: str, struct_name: str, source: str, n_sha
 
 # What shapes the emitted engine: the runner
 # that builds them and everything it imports (transformer_nes/build.py).
-ENGINE_SOURCES = ("transformer_nes.cpu6502.backends.weights.runner",)
+ENGINE_SOURCES = ("transformer_nes.cpu6502.runner",)
 
 
 def engine_code_digest() -> str:

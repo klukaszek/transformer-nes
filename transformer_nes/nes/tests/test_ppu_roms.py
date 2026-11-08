@@ -7,12 +7,10 @@ import os
 
 import pytest
 
-from transformer_nes.build import load_nes_extension
+from transformer_nes.build import FIXTURES_DIR, load_nes_extension
 from transformer_nes.nes.backends import backend_factory
 
-TESTROMS = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples", "testroms"
-)
+TESTROMS = str(FIXTURES_DIR / "roms" / "testroms")
 ROMS = {
     # mmc3_test_2 (6-MMC3_alt targets the other chip revision)
     **{name: f"mmc3_test_2/rom_singles/{name}.nes" for name in (

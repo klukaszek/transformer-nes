@@ -16,16 +16,12 @@ from carts import (
     register_cart,
 )
 
-from transformer_nes.build import load_nes_extension
+from transformer_nes.build import FIXTURES_DIR, load_nes_extension
 from transformer_nes.nes.backends import backend_factory
 from transformer_nes.ppu2c02 import render
 from transformer_nes.ppu2c02.machine import ppu_engine
 
-EXAMPLES = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "nes",
-    "examples",
-)
+EXAMPLES = str(FIXTURES_DIR / "roms")
 
 
 def random_slot(rng, pins: dict) -> list[int]:
@@ -93,7 +89,7 @@ def whole_ppu(cart, count):
 
 
 def test_dma_wrap_mirrors_parity_and_destination_after_render_catchup():
-    from transformer_nes.cpu6502.backends.reference import Cpu6502, instruction_cycles
+    from transformer_nes.cpu6502.reference import Cpu6502, instruction_cycles
     from transformer_nes.cpu6502.spec import opcode_for
 
     # The first request ends at CPU cycle 89 (dot 265), crossing dot 257
@@ -240,7 +236,7 @@ def test_graph_renders_games(rom):
 def test_slot_trace_explains_the_frame():
     """The X-ray's pixel dissection: a slot traced through the full model
     (on a copy of the engine) reports the color the frame shows."""
-    from transformer_nes.nes.xray import PpuXray
+    from transformer_nes.frontend.xray import PpuXray
 
     hardware = load_nes_extension("hardware")
     console = hardware.Console(latch_cart(hardware, mapper=9), backend_factory("weights"), 44100.0)
@@ -265,7 +261,7 @@ def test_slot_trace_explains_the_frame():
 def test_knock_out_breaks_rendering_until_restored():
     """Ablation: the full model alone renders identically; forcing its
     palette-selection neuron to 0 changes the picture; restoring brings it back."""
-    from transformer_nes.nes.xray import PpuXray
+    from transformer_nes.frontend.xray import PpuXray
 
     hardware = load_reference_hardware()
     cart = latch_cart(hardware, mapper=9)

@@ -8,10 +8,10 @@ import os
 import numpy as np
 import pytest
 
-from transformer_nes.build import load_nes_extension
+from transformer_nes.build import FIXTURES_DIR, load_nes_extension
 from transformer_nes.nes.backends import backend_factory
 
-EXAMPLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+EXAMPLES = str(FIXTURES_DIR / "roms")
 
 # Frame -> controller mask: Start taps at the title, then hold A+Right
 # (exercises the strobe writes and the serial-read lease queue).
@@ -40,10 +40,10 @@ def reference_channel_gains(state):
 
 @pytest.mark.parametrize("token", ["control", "parameters", "levels", "sample", "dac", "frame", "program", "dmc", "oscillate", "tick", "noise"])
 def test_audio_tokens_execute_the_constructed_weights(token):
+    from transformer_nes.apu2a03 import audio, oscillators
     from transformer_nes.graph.core import InputDimension
     from transformer_nes.model.graph_engine import construct
     from transformer_nes.model.inference import ExactInference
-    from transformer_nes.nes import audio, oscillators
 
     floating = token in ("parameters", "sample", "levels", "dac")
     engine = audio.sample_engine() if floating else audio.audio_engine(41)
@@ -122,7 +122,7 @@ def test_audio_tokens_execute_the_constructed_weights(token):
 
 
 def test_neural_audio_filter_tracks_the_nonlinear_reference_and_clips():
-    from transformer_nes.nes import audio
+    from transformer_nes.apu2a03 import audio
 
     engine = audio.sample_engine()
     x = dict.fromkeys(audio.SAMPLE_INPUTS, 0)
@@ -157,7 +157,7 @@ def test_neural_audio_filter_tracks_the_nonlinear_reference_and_clips():
 @pytest.mark.parametrize("mode", [0, 1])
 @pytest.mark.parametrize("parity", [0, 1])
 def test_audio_oscillator_spans_match_literal_clocks_and_compose(mode, parity, maximum):
-    from transformer_nes.nes import audio, oscillators
+    from transformer_nes.apu2a03 import audio, oscillators
 
     engine = audio.audio_engine(maximum)
     rng = np.random.default_rng(67)
@@ -220,7 +220,7 @@ def test_audio_oscillator_spans_match_literal_clocks_and_compose(mode, parity, m
 
 
 def test_audio_dmc_fetch_wrap_reload_irq_and_disable():
-    from transformer_nes.nes import audio
+    from transformer_nes.apu2a03 import audio
 
     engine = audio.audio_engine()
     state = dict.fromkeys(audio.DMC_STATE, 0)
@@ -262,7 +262,7 @@ def test_audio_dmc_fetch_wrap_reload_irq_and_disable():
 
 
 def test_audio_frame_reset_irq_and_immediate_clocks():
-    from transformer_nes.nes import audio
+    from transformer_nes.apu2a03 import audio
 
     engine = audio.audio_engine()
     for five, inhibit, irq, step, event, value in itertools.product(
@@ -287,7 +287,7 @@ def test_audio_frame_reset_irq_and_immediate_clocks():
 
 
 def test_audio_joint_clock_reloads_and_distinct_pulse_negation():
-    from transformer_nes.nes import audio
+    from transformer_nes.apu2a03 import audio
 
     engine = audio.audio_engine()
     x = dict.fromkeys(audio.INPUTS, 0)

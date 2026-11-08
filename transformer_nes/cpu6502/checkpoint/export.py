@@ -13,7 +13,7 @@ normalization.
 The exported model is the self-contained ``wide_bits=False`` build, which is
 NOT the shape the generated engine runs; see ``export_model``.
 
-Usage: ``uv run python -m transformer_nes.cpu6502.backends.weights.export OUT_DIR [--bcd]``
+Usage: ``uv run python -m transformer_nes.cpu6502.checkpoint.export OUT_DIR [--bcd]``
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import time
 
 import numpy as np
 
-from transformer_nes.cpu6502.backends.weights.experts import (
+from transformer_nes.cpu6502.experts import (
     build_interrupt_experts,
     build_opcode_execution_experts,
 )

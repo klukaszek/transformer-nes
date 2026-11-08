@@ -24,8 +24,9 @@ vendor/pybind11/
 # Battery saves are user data, written next to the ROM
 *.sav
 
-# ROMs and tape captures stay local
+# ROMs and tape captures stay local; the nestest verification ROM is a fixture
 *.nes
+!/fixtures/roms/nestest.nes
 tapes/
 
 # Finder litter
@@ -33,8 +34,8 @@ tapes/
 
 # Editor state
 .obsidian/
-checkpoint/
-experts/
+/checkpoint/
+/experts/
 
 # Local profiles from earlier runs
-windows/
+/windows/

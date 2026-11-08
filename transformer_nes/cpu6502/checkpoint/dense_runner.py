@@ -1,6 +1,6 @@
 """Run the exported 6502 checkpoint as a plain PyTorch transformer.
 
-Everything here comes from the two files cpu6502/backends/weights/export.py writes --
+Everything here comes from the two files cpu6502/checkpoint/export.py writes --
 ``weights.safetensors`` and ``machine.json`` -- and nothing else from this
 repository: no graph, no compiler, no generated engine.  This file imports
 only torch and safetensors, so it is the whole claim made checkable: a
@@ -32,7 +32,7 @@ up to three memory writes out of the residual stream.  The harness appends those
 writes as WRITE tokens and the next state as the next STATE token --
 autoregressive decoding.
 
-    python -m transformer_nes.cpu6502.backends.weights.checkpoint_runner CHECKPOINT \\
+    python -m transformer_nes.cpu6502.checkpoint.dense_runner CHECKPOINT \\
         --nestest nestest.nes nestest.log
 """
 

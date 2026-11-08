@@ -31,7 +31,7 @@ class ReferenceCore:
     def peek(self) -> tuple[int, int]:
         """The next step's cycles and the device read it issues (-1:
         none): an interrupt sequence reads nothing a device answers."""
-        from transformer_nes.cpu6502.backends.reference import instruction_cycles, irq_deliverable
+        from transformer_nes.cpu6502.reference import instruction_cycles, irq_deliverable
 
         cpu = self.cpu
         if cpu.nmi_pending or irq_deliverable(cpu.p, cpu.irq_pending):
@@ -50,7 +50,7 @@ class ReferenceCore:
 def backend_factory(name: str):
     def build(image: bytes, start_pc: int):
         if name == "weights":
-            from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
+            from transformer_nes.cpu6502.runner import Cpu6502TransformerMachine
 
             machine = Cpu6502TransformerMachine(
                 bcd=False,
@@ -58,7 +58,7 @@ def backend_factory(name: str):
             )
             return machine, True
         if name == "reference":
-            from transformer_nes.cpu6502.backends.reference import Cpu6502
+            from transformer_nes.cpu6502.reference import Cpu6502
 
             cpu = Cpu6502(
                 memory=bytearray(image),

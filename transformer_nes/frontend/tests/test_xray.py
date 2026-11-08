@@ -1,7 +1,7 @@
 """The overlay's X-ray reads the live engines without disturbing them."""
 
-from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
-from transformer_nes.nes.xray import PATHS, CpuXray, PpuXray
+from transformer_nes.cpu6502.runner import Cpu6502TransformerMachine
+from transformer_nes.frontend.xray import PATHS, CpuXray, PpuXray
 
 
 def machine_at(program: bytes) -> Cpu6502TransformerMachine:
@@ -64,7 +64,7 @@ def test_path_counters_cover_every_instruction():
 def test_overlay_reuses_one_snapshot_until_the_next_emulated_frame():
     from types import SimpleNamespace
 
-    from transformer_nes.nes.debug import DebugBridge
+    from transformer_nes.frontend.debug import DebugBridge
 
     maps = []
     console = SimpleNamespace(ppu_expert_map=lambda: maps.append(True) or bytes([255]) * 7680)
@@ -82,7 +82,7 @@ def test_overlay_collects_reads_only_while_observed():
 
     import numpy as np
 
-    from transformer_nes.nes.debug import DebugBridge
+    from transformer_nes.frontend.debug import DebugBridge
 
     calls = []
 

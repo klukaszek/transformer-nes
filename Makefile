@@ -21,7 +21,7 @@ PY_INCLUDE := $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_paths(
 CXX ?= c++
 CC ?= cc
 CXXFLAGS := -O2 -std=c++20 -Wall -Wextra -Wpedantic -fPIC -fvisibility=hidden
-NES_INCLUDES := -I$(NES) -I$(NES)/include
+NES_INCLUDES := -I$(NES) -I$(NES)/include -Itransformer_nes/cpu6502/native
 PY_INCLUDES := -I$(VENDOR)/pybind11/include -I$(PY_INCLUDE)
 UI_INCLUDES := -I$(VENDOR)/sokol -I$(VENDOR)/imgui
 

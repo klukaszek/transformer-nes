@@ -6,6 +6,7 @@ The host schedules deadlines, transports DMA bytes and plays returned samples.
 
 from functools import cache
 
+from transformer_nes.apu2a03.oscillators import MAX_CYCLES, bits
 from transformer_nes.graph.core import (
     Expression,
     InputDimension,
@@ -17,7 +18,6 @@ from transformer_nes.graph.core import (
 )
 from transformer_nes.graph.ops import both, either, equals, gate, select
 from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
-from transformer_nes.nes.oscillators import MAX_CYCLES, bits
 
 ENVELOPE = ("env_start", "env_loop", "env_constant", "env_period", "env_divider", "env_decay")
 PULSE = (
@@ -544,7 +544,7 @@ def audio_engine(maximum=MAX_CYCLES):
         raise ValueError("oscillator span bound must be in 1..429")
 
     def graphs():
-        from transformer_nes.nes import oscillators
+        from transformer_nes.apu2a03 import oscillators
 
         experts = {
             **{f"mode{i}": {"noise_mode_tag": i} for i in range(2)},

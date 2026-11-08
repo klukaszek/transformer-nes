@@ -14,15 +14,15 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import time
 from collections import defaultdict
 
-from transformer_nes.cpu6502.backends.reference import Cpu6502
+from transformer_nes.build import FIXTURES_DIR
+from transformer_nes.cpu6502.reference import Cpu6502
 
 logger = logging.getLogger(__name__)
 
-KLAUS_BIN = os.path.join(os.path.dirname(__file__), "6502_functional_test.bin")
+KLAUS_BIN = str(FIXTURES_DIR / "klaus" / "6502_functional_test.bin")
 START_PC = 0x0400
 SUCCESS_PC = 0x3469
 DEFAULT_MAX_STEPS = 100_000_000
@@ -105,7 +105,7 @@ def run_weights(
     streaming reference (engine state is O(1)) -- the
     full 30.6M-instruction suite fits in ~75 s.
     """
-    from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
+    from transformer_nes.cpu6502.runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(bcd=True, union_only=union_only)

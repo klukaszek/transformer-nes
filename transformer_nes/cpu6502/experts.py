@@ -12,7 +12,7 @@ from typing import Literal
 
 import numpy as np
 
-from transformer_nes.cpu6502.backends.weights.execution import (
+from transformer_nes.cpu6502.execution import (
     SEQUENCE_ROOT_DIMS,
     STATE_FIELDS,
     WRITE_RECEIPTS,
@@ -24,7 +24,7 @@ from transformer_nes.cpu6502.backends.weights.execution import (
     shape_timing,
     step_spec_base,
 )
-from transformer_nes.cpu6502.backends.weights.folds import (
+from transformer_nes.cpu6502.folds import (
     SEQUENCE_FEEDBACK,
     SequenceFolder,
     check_reads_licensed,
@@ -33,7 +33,7 @@ from transformer_nes.cpu6502.backends.weights.folds import (
     opcode_pins,
     sequence_shape_pins,
 )
-from transformer_nes.cpu6502.backends.weights.shapes import (
+from transformer_nes.cpu6502.shapes import (
     COUNTERS,
     SHAPE_LIBRARY,
     counter_recurrence_graph,

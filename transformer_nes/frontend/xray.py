@@ -152,7 +152,7 @@ def layer_steps(named, snap, f_bits, slot_of, read_label, headline=()) -> dict:
 
 
 class CpuXray:
-    """X-ray of the weights CPU (cpu6502/backends/weights/runner.py)."""
+    """X-ray of the weights CPU (cpu6502/runner.py)."""
 
     def __init__(self, runtime):
         self.runtime = runtime

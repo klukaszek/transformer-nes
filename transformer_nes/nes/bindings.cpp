@@ -2,7 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "../cpu6502/backends/weights/native/machine_abi.h"
+#include "machine_abi.h"
 #include "nes/apu.h"
 #include "nes/bus.h"
 #include "nes/cartridge.h"
@@ -436,8 +436,8 @@ public:
     }
     console_ =
         std::make_unique<Console>(std::move(mapper), std::move(ppu), Apu(sample_rate), *machine_);
-    const py::object audio = py::module_::import("transformer_nes.nes.audio");
-    const py::object oscillators = py::module_::import("transformer_nes.nes.oscillators");
+    const py::object audio = py::module_::import("transformer_nes.apu2a03.audio");
+    const py::object oscillators = py::module_::import("transformer_nes.apu2a03.oscillators");
     const int maximum = static_cast<int>(std::clamp(
         std::ceil(console_->apu.cycles_per_sample), 1.0,
         static_cast<double>(oscillators.attr("MAX_CYCLES").cast<int>())));

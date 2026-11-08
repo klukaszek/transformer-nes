@@ -15,8 +15,8 @@ mode, BRK/RTI, stack wrap).
 
 import pytest
 
-from transformer_nes.cpu6502.backends.reference import Cpu6502
-from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
+from transformer_nes.cpu6502.reference import Cpu6502
+from transformer_nes.cpu6502.runner import Cpu6502TransformerMachine
 
 
 def assert_full_trace_match(image, start_pc, max_steps, *, bcd):
@@ -38,7 +38,7 @@ def assert_full_trace_match(image, start_pc, max_steps, *, bcd):
 
 @pytest.mark.slow
 def test_nestest_trace_fields_match_reference():
-    from transformer_nes.cpu6502.examples.nestest import START_PC, load_image
+    from transformer_nes.cpu6502.conformance.nestest import START_PC, load_image
 
     n = assert_full_trace_match(load_image(), START_PC, 8991, bcd=False)
     assert n == 8991
@@ -46,6 +46,6 @@ def test_nestest_trace_fields_match_reference():
 
 @pytest.mark.slow
 def test_klaus_prefix_trace_fields_match_reference():
-    from transformer_nes.cpu6502.examples.klaus.harness import START_PC, load_image
+    from transformer_nes.cpu6502.conformance.klaus import START_PC, load_image
 
     assert_full_trace_match(load_image(), START_PC, 200_000, bcd=True)

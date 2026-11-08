@@ -70,7 +70,7 @@ def test_manifest_preserves_concurrent_publishers(cache):
 
 
 def test_cpu_cache_hit_rechecks_after_waiting_for_artifact(cache, monkeypatch):
-    from transformer_nes.cpu6502.backends.weights import engine
+    from transformer_nes.cpu6502 import engine
 
     monkeypatch.setattr(build, "CACHE_DIR", str(cache))
     digest = "1111111111111111"

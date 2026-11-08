@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, deque
 
-from transformer_nes.nes.xray import (
+from transformer_nes.frontend.xray import (
     PATHS,
     CpuXray,
     PpuXray,

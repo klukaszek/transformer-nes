@@ -16,15 +16,14 @@ import logging
 import os
 import time
 
-from transformer_nes.build import PACKAGE_DIR
-from transformer_nes.cpu6502.backends import reference
-from transformer_nes.cpu6502.backends.reference import Cpu6502
+from transformer_nes.build import FIXTURES_DIR
+from transformer_nes.cpu6502 import reference
+from transformer_nes.cpu6502.reference import Cpu6502
 from transformer_nes.cpu6502.spec import opcode_for
 
 logger = logging.getLogger(__name__)
 
-# Keep the CPU harness outside nes/; only its ROM and golden log are NES assets.
-NESTEST_DIR = str(PACKAGE_DIR / "nes" / "examples")
+NESTEST_DIR = str(FIXTURES_DIR / "roms")
 NESTEST_ROM = os.path.join(NESTEST_DIR, "nestest.nes")
 NESTEST_LOG = os.path.join(NESTEST_DIR, "nestest.log")
 START_PC = 0xC000
@@ -115,8 +114,8 @@ def run_weights(
     union_only: bool = False,
 ) -> tuple[bool, int, float, float, str]:
     """Run the real weights-based transformer in lockstep with the reference."""
-    from transformer_nes.cpu6502.backends.weights.runner import Cpu6502TransformerMachine
-    from transformer_nes.cpu6502.examples.klaus.harness import lockstep_arrays_vs_reference
+    from transformer_nes.cpu6502.conformance.klaus import lockstep_arrays_vs_reference
+    from transformer_nes.cpu6502.runner import Cpu6502TransformerMachine
 
     build_start = time.perf_counter()
     machine = Cpu6502TransformerMachine(bcd=False, union_only=union_only)
