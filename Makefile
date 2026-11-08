@@ -1,7 +1,9 @@
 # Native NES build: the two Python extension modules (hardware console,
-# sokol frontend) plus the native hardware test, all into bin/.  app.py
+# sokol frontend) plus the native hardware test, all into bin/.  Sources
+# live under native/: console/ (devices), frontend/ (window and overlay),
+# reference/ (the conventional PPU test oracle) and tests/.  frontend/app.py
 # uses build.py to run `make` and import the artifacts; transformer kernel
-# compilation (model/_engine_cache) is separate and stays torch-driven.
+# compilation (.cache/engine) is separate and stays torch-driven.
 #
 # pybind11 is the vendored copy (same version torch bundles); Python.h
 # comes from the interpreter invoking make (PYTHON=... from app.py).
@@ -11,7 +13,8 @@
 PYTHON ?= $(shell test -x .venv/bin/python && echo .venv/bin/python || echo python3)
 UNAME := $(shell uname -s)
 
-NES := transformer_nes/nes
+NATIVE := native
+CPU_ABI := transformer_nes/cpu6502/native
 VENDOR := vendor
 BIN := bin
 OBJ := $(BIN)/obj
@@ -21,7 +24,7 @@ PY_INCLUDE := $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_paths(
 CXX ?= c++
 CC ?= cc
 CXXFLAGS := -O2 -std=c++20 -Wall -Wextra -Wpedantic -fPIC -fvisibility=hidden
-NES_INCLUDES := -I$(NES) -I$(NES)/include -Itransformer_nes/cpu6502/native
+NES_INCLUDES := -I$(NATIVE) -I$(NATIVE)/include -I$(CPU_ABI)
 PY_INCLUDES := -I$(VENDOR)/pybind11/include -I$(PY_INCLUDE)
 UI_INCLUDES := -I$(VENDOR)/sokol -I$(VENDOR)/imgui
 
@@ -55,16 +58,22 @@ $(REF_OBJ):
 	mkdir -p $(REF_OBJ)
 
 # The conventional PPU exists only as an independent test oracle.
-$(REF_OBJ)/%.o: $(NES)/%.cpp Makefile | $(REF_OBJ)
+$(REF_OBJ)/%.o: $(NATIVE)/console/%.cpp Makefile | $(REF_OBJ)
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) -DTRANSFORMER_NES_PPU_REFERENCE -MMD -MP -c $< -o $@
 
-$(OBJ)/%.o: $(NES)/%.cpp Makefile | $(OBJ)
+$(REF_OBJ)/bindings.o: $(NATIVE)/bindings.cpp Makefile | $(REF_OBJ)
+	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) -DTRANSFORMER_NES_PPU_REFERENCE -MMD -MP -c $< -o $@
+
+$(OBJ)/%.o: $(NATIVE)/console/%.cpp Makefile | $(OBJ)
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) -MMD -MP -c $< -o $@
 
-$(OBJ)/app.o: $(NES)/app.cpp Makefile | $(OBJ)
+$(OBJ)/bindings.o: $(NATIVE)/bindings.cpp Makefile | $(OBJ)
+	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) -MMD -MP -c $< -o $@
+
+$(OBJ)/app.o: $(NATIVE)/frontend/app.cpp Makefile | $(OBJ)
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(PY_INCLUDES) $(UI_INCLUDES) -MMD -MP -c $< -o $@
 
-$(OBJ)/debug_ui.o: $(NES)/ui/debug_ui.cpp Makefile | $(OBJ)
+$(OBJ)/debug_ui.o: $(NATIVE)/frontend/debug_ui.cpp Makefile | $(OBJ)
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) $(UI_INCLUDES) -MMD -MP -c $< -o $@
 
 # Vendored code builds warning-silent; its style is not ours to fix.
@@ -72,8 +81,8 @@ $(OBJ)/debug_ui.o: $(NES)/ui/debug_ui.cpp Makefile | $(OBJ)
 $(OBJ)/%.o: $(VENDOR)/imgui/%.cpp Makefile | $(OBJ)
 	$(CXX) -O2 -std=c++20 -fPIC -w -I$(VENDOR)/imgui -c $< -o $@
 
-$(OBJ)/sokol_impl.o: $(NES)/sokol_impl.m $(NES)/ui/sokol_platform.h Makefile | $(OBJ)
-	$(CC) -std=c17 -O2 -fPIC -w -x $(SOKOL_LANG) -I$(VENDOR)/sokol -I$(NES) -c $< -o $@
+$(OBJ)/sokol_impl.o: $(NATIVE)/frontend/sokol_impl.m $(NATIVE)/frontend/sokol_platform.h Makefile | $(OBJ)
+	$(CC) -std=c17 -O2 -fPIC -w -x $(SOKOL_LANG) -I$(VENDOR)/sokol -I$(NATIVE) -c $< -o $@
 
 $(BIN)/nes_hardware.so: $(HW_OBJS)
 	$(LDSHARED) $^ -o $@
@@ -84,7 +93,7 @@ $(BIN)/nes_hardware_reference.so: $(REF_OBJS)
 $(BIN)/nes_app.so: $(FRONTEND_OBJS)
 	$(LDSHARED) $^ -o $@ $(FRONTEND_LIBS)
 
-$(BIN)/native_hardware_test: $(NES)/tests/native_hardware_test.cpp $(NES)/ui/frame_clock.h Makefile \
+$(BIN)/native_hardware_test: $(NATIVE)/tests/native_hardware_test.cpp $(NATIVE)/frontend/frame_clock.h Makefile \
 		$(REF_OBJ)/bus.o $(REF_OBJ)/ppu.o $(REF_OBJ)/apu.o $(REF_OBJ)/console.o $(REF_OBJ)/tape.o
 	$(CXX) $(CXXFLAGS) $(NES_INCLUDES) -DTRANSFORMER_NES_PPU_REFERENCE $(filter %.cpp %.o,$^) -o $@
 

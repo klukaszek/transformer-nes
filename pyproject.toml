@@ -45,8 +45,6 @@ include = ["transformer_nes*"]
     "model/native/*.cpp",
     "cpu6502/native/*.h",
     "cpu6502/native/*.cpp",
-    "nes/*.cpp",
-    "nes/*.m",
 ]
 
 [tool.ruff]

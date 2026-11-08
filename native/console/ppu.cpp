@@ -15,7 +15,7 @@
 namespace transformer_nes::nes {
 
 #ifdef TRANSFORMER_NES_PPU_REFERENCE
-#include "tests/ppu_reference.inc"
+#include "reference/ppu_reference.inc"
 #endif
 
 Ppu::Ppu(vector<uint8_t> chr_data, bool writable, bool vertical_mirroring)

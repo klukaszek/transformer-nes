@@ -3,7 +3,7 @@
 #include "nes/mappers/mappers.h"
 #include "nes/ppu.h"
 #include "nes/tape.h"
-#include "ui/frame_clock.h"
+#include "frontend/frame_clock.h"
 
 #include <cassert>
 

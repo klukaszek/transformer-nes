@@ -2,7 +2,7 @@
 // (SOKOL_IMGUI_IMPL) so the ObjC/C sokol implementation unit stays
 // ImGui-free.
 
-#include "ui/sokol_platform.h"
+#include "frontend/sokol_platform.h"
 
 #include "sokol_app.h"
 #include "sokol_gfx.h"
@@ -13,7 +13,7 @@
 #define SOKOL_IMGUI_IMPL
 #include "sokol_imgui.h"
 
-#include "ui/debug_ui.h"
+#include "frontend/debug_ui.h"
 
 #include <algorithm>
 #include <array>

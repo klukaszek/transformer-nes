@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-#include "ui/sokol_platform.h"
+#include "frontend/sokol_platform.h"
 
 #include "sokol_app.h"
 #include "sokol_audio.h"
@@ -25,8 +25,8 @@
 #include "sokol_log.h"
 
 #include "nes/palette.h"
-#include "ui/debug_ui.h"
-#include "ui/frame_clock.h"
+#include "frontend/debug_ui.h"
+#include "frontend/frame_clock.h"
 
 namespace py = pybind11;
 

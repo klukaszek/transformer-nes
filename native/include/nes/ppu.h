@@ -452,7 +452,7 @@ private:
   RegisterFile register_file() const;
   bool schedule_changed_ = false;
 #ifdef TRANSFORMER_NES_PPU_REFERENCE
-#include "tests/ppu_reference.h"
+#include "reference/ppu_reference.h"
 #endif
   // Dry-run preview state: no frame writes, events go to the probe,
   // and the loop stops at the first status change or probe IRQ.
