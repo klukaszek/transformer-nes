@@ -237,7 +237,7 @@ def test_fetch_is_the_native_sprite_fetch(engine):
             for j in range(4):
                 engine.write(sprite + j, int(memory[sprite + j]))
         latch, wide_low = [int(rng.integers(2)), int(rng.integers(2))], int(rng.integers(2))
-        inputs = [1, line, ctrl, count, *index, *latch, wide_low, *[0] * 8]
+        inputs = [1, line, ctrl, count, *index, *latch, wide_low, *[0] * 8, 0]  # CHR windows
         # The full model, and the expert for the size on a cart without
         # latches (inputs 0, no flips).
         expert = f"tall{int(height == 16)}_count{count}"

@@ -63,12 +63,18 @@ vector<string> fields(std::initializer_list<Fields> spec) {
         out.push_back(f.name + std::to_string(i));
   return out;
 }
+// A mapper bank layout reads its register state, then the board's ROM
+// sizes (nes/mappers.py BOARD; BankControl::board).
+vector<string> with_board(vector<string> state) {
+  state.insert(state.end(), {"prg_16k", "chr_4k"});
+  return state;
+}
 // ppu2c02/render.py INPUTS, OUTPUTS, ppu2c02/sprites.py's tokens and
 // ppu2c02/registers.py's.
 const vector<string> render_inputs = fields(
     {"is_slot", "slot", "hit_set", "fine_x", "ctrl", "mask", {"nt_page", 4}, "latch_lo",
      "latch_hi", "wide_low", "ext_mode", "chr_upper", "v_cx", "v_cy", "v_nt", "v_fy", {"bg", 16},
-     {"sprite", 8}});
+     {"sprite", 8}, "chr_4k"});
 const vector<string> render_outputs =
     fields({{"pixel", 8}, {"tile", 8}, "new_v_cx", "new_v_cy", "new_v_nt", "new_v_fy", "fetched",
             {"hit", 8}, "new_latch_lo", "new_latch_hi"});
@@ -76,7 +82,7 @@ const vector<string> evaluate_inputs = fields({"is_evaluate", "line", "ctrl", "s
 const vector<string> evaluate_outputs = fields({"count", {"index", 8}});
 const vector<string> fetch_inputs =
     fields({"is_fetch", "line", "ctrl", "count", {"index", 8}, "latch_lo", "latch_hi", "wide_low",
-            {"bank", 8}});
+            {"bank", 8}, "whole_chr"});
 const vector<string> fetch_outputs = [] {
   vector<string> out;
   for (int k = 0; k < 8; ++k)
@@ -91,7 +97,7 @@ const vector<string> fetch_outputs = [] {
 const vector<string> register_inputs =
     fields({"is_access", "reg", "value", "is_write", "status", "rendering", {"nt_page", 4},
             "chr_writable", "latch_lo", "latch_hi", {"bank", 8}, "t_cx", "t_cy", "t_nt", "t_fy", "v_cx", "v_cy", "v_nt", "v_fy",
-            "fine_x", "w", "ctrl", "mask", "oam_addr", "read_buffer"});
+            "fine_x", "w", "ctrl", "mask", "oam_addr", "read_buffer", "whole_chr"});
 const vector<string> register_outputs =
     fields({"new_t_cx", "new_t_cy", "new_t_nt", "new_t_fy", "new_v_cx", "new_v_cy", "new_v_nt",
             "new_v_fy", "new_fine_x", "new_w", "new_ctrl", "new_mask", "new_oam_addr",
@@ -334,7 +340,7 @@ public:
     Ppu ppu(mapper->take_chr(), chr_writable, vertical);
     if (auto* bank = mapper->bank_state()) {
       const auto module = py::module_::import("transformer_nes.nes.mappers");
-      mapper_bank_engine_ = module.attr("mapper_bank_engine")(bank->chip, bank->n_prg, bank->n_chr);
+      mapper_bank_engine_ = module.attr("mapper_bank_engine")(bank->chip);
       const py::dict graphs = mapper_bank_engine_.attr("graphs");
       const py::object transition = graphs["transition"], layout = graphs["layout"];
       const auto inputs = transition.attr("inputs").cast<vector<string>>();
@@ -355,7 +361,7 @@ public:
       }
       if (vector<string>(inputs.end() - 4, inputs.end()) != fields({"event", "port", "value", "original"}) ||
           transition.attr("outputs").cast<vector<string>>() != outputs ||
-          layout.attr("inputs").cast<vector<string>>() != state ||
+          layout.attr("inputs").cast<vector<string>>() != with_board(state) ||
           layout.attr("outputs").cast<vector<string>>() != maps)
         throw std::invalid_argument("engine is not the mapper bank graphs");
       const auto abi = mapper_bank_engine_.attr("abi")().cast<py::tuple>();
@@ -536,7 +542,7 @@ public:
       control.models[i] = controller_engine_.attr("model_id")("controller", events[i]).cast<int>();
 #ifndef TRANSFORMER_NES_PPU_REFERENCE
     set_ppu_engine(py::module_::import("transformer_nes.ppu2c02.machine")
-                       .attr("ppu_engine")(console_->ppu.graph_chr_full()));
+                       .attr("ppu_engine")(console_->ppu.whole_chr()));
 #endif
   }
   py::array_t<uint8_t> run_frame() {
@@ -630,6 +636,7 @@ public:
       out.blank = static_cast<uint8_t>(d["blank"].cast<int>());
       std::ranges::copy(d["first"].cast<vector<int>>(), out.first.begin());
       std::ranges::copy(d["last"].cast<vector<int>>(), out.last.begin());
+      out.general = static_cast<uint8_t>(d["general"].cast<int>());
     }
     const py::dict sprites = engine.attr("sprite_dispatch");
     std::ranges::copy(sprites["evaluate"].cast<vector<int>>(), api.sprites.evaluate.begin());
@@ -791,8 +798,8 @@ PYBIND11_MODULE(nes_hardware, m) {
           [](ConsoleHost& h) { return h.console().ppu.force_full_render; },
           [](ConsoleHost& h, bool on) { h.console().ppu.force_full_render = on; },
           "render every graph slot with the full model (no folded experts)")
-      .def_property_readonly("ppu_graph_chr_full",
-                             [](ConsoleHost& h) { return h.console().ppu.graph_chr_full(); })
+      .def_property_readonly("ppu_whole_chr",
+                             [](ConsoleHost& h) { return h.console().ppu.whole_chr(); })
       .def_property_readonly("frame_index",
                              [](ConsoleHost& h) { return h.console().frame_index; })
       .def_property_readonly("cycles", [](ConsoleHost& h) { return h.console().cycles; })

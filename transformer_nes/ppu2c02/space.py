@@ -1,6 +1,7 @@
 """The PPU memory space the graphs read, and its addressing idioms.
 
-Physical layout of the WRITE-token log (4 KiB attention groups):
+Physical layout of the WRITE-token log (4 KiB attention groups below
+$10000, 32 KiB groups over the whole CHR):
 
     $0000-$1FFF   CHR window: the 8 KiB the pattern tables map now (under
                   MMC2/MMC4, the FD-latch banks)
@@ -9,7 +10,8 @@ Physical layout of the WRITE-token log (4 KiB attention groups):
     $3F00-$3F1F   palette RAM (mirrors resolved: $3F10 -> $3F00, ...)
     $4000-$40FF   OAM
     $5000-$6FFF   CHR window under the FE latches (MMC2/MMC4)
-    $10000-       the whole CHR ROM (MMC5 extended attributes)
+    $10000-$10FFFF the whole CHR, up to MMC5's 1 MiB (its extended
+                  attributes, sprite banks and $2007 reads)
 
 A mapper's nametable arrangement is the source each logical nametable
 reads (MMC5's $5105 in general; plain mirroring as its special cases),
@@ -27,6 +29,7 @@ from transformer_nes.graph.ops import (
     either,
     equals,
     gate,
+    group_spans,
     grouped_read,
     memory_site,
     read_bits,
@@ -39,24 +42,22 @@ OAM = (4,)
 CHR_ALT = (5, 6)
 CHR_ALT_BASE = 0x5000
 CHR_FULL_BASE = 0x10000
-BASE_GROUPS = 7  # $0000-$6FFF
-
-
-def memory_size(chr_full: int = 0) -> int:
-    """Bytes of graph memory, with `chr_full` bytes of whole-CHR region."""
-    return CHR_FULL_BASE + chr_full if chr_full else BASE_GROUPS * 0x1000
-
-
-def chr_full_groups(chr_full: int) -> tuple[int, ...]:
-    return tuple(range(CHR_FULL_BASE >> 12, (CHR_FULL_BASE + chr_full) >> 12))
+CHR_FULL_SIZE = 0x100000  # MMC5 addresses up to 1 MiB of CHR
+CHR_FULL_GROUP = 0x8000  # the largest group whose squared local address fits int32
+MEMORY_SIZE = CHR_FULL_BASE + CHR_FULL_SIZE
+# Lookup groups by index: 4 KiB over $0000-$FFFF (CHR, PAGES, ... above),
+# then the whole CHR in 32 KiB groups (CHR_FULL).
+SPANS = group_spans(CHR_FULL_BASE >> 12) + [
+    (lo, lo + CHR_FULL_GROUP - 1) for lo in range(CHR_FULL_BASE, MEMORY_SIZE, CHR_FULL_GROUP)
+]
+CHR_FULL = tuple(range(CHR_FULL_BASE >> 12, len(SPANS)))
 
 
 class Memory:
     """A graph's WRITE-token inputs, and reads over them."""
 
-    def __init__(self, is_write, addr, value, *, groups: int = BASE_GROUPS):
+    def __init__(self, is_write, addr, value):
         self.is_write, self.addr, self.value = is_write, addr, value
-        self.groups = groups
 
     def read(self, address: ExprLike, groups: tuple[int, ...], name: str) -> Expression:
         """The byte at `address` (within `groups`), as an annotated read
@@ -66,8 +67,8 @@ class Memory:
             self.value,
             self.addr,
             self.is_write,
-            group_count=self.groups,
-            groups=groups,
+            spans=[SPANS[g] for g in groups],
+            space_end=MEMORY_SIZE,
             dense=True,
         )
         return memory_site(persist(value, name=name), address, self.value, self.addr, self.is_write)

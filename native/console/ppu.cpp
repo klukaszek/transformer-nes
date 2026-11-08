@@ -121,6 +121,7 @@ Ppu::RegisterResult Ppu::graph_transition(const RegisterAccess& request,
   if (mmc5.active())
     for (int s = 0; s < 8; ++s)
       in[in_access_banks + s] = static_cast<int>(chr_bank[static_cast<size_t>(s)] >> 10);
+  in[in_access_whole] = whole_chr();
   int* field = in + in_access_state;
   for (const int32_t loopy : {before.t, before.v}) {
     *field++ = loopy & 0x1F;
@@ -333,17 +334,19 @@ void Ppu::render_slot(int slot, int64_t dot, bool clock_bus) {
     if (sprites)
       std::copy_n(r_.sprites.data() + slot * 8, 8, in + in_sprites);
   }
+  in[in_chr_4k] = static_cast<int>(chr.size() >> 12);
   // A folded expert only when its control pins hold. Disabled rendering
   // still computes palette output through the blank model. Ordinary slots
-  // select by pattern table/fine x; unsupported active modes use the union.
-  int model = 0;
+  // select by pattern table/fine x; other modes use the general expert,
+  // and only extended attributes (or a forced full render) the union.
+  const RenderDispatch& d = engine_.dispatch[chr_latch_active ? 1 : 0];
+  int model = extended || force_full_render ? 0 : d.general;
   if (!(mask & 0x18) && !force_full_render) {
-    model = engine_.dispatch[chr_latch_active ? 1 : 0].blank;
+    model = d.blank;
   } else if ((mask & 0x08) && !(mask & 0x01) && !extended && !force_full_render) {
-    const RenderDispatch& d = engine_.dispatch[chr_latch_active ? 1 : 0];
     const int table = (ctrl & 0x10) ? 1 : 0;
     if (slot == 0 || slot == 31)
-      model = sprites ? 0 : slot == 0 ? d.first[table] : d.last[table];
+      model = sprites ? d.general : slot == 0 ? d.first[table] : d.last[table];
     else
       model = sprites ? d.sprites : d.inner[table][fine_x];
   }
@@ -762,6 +765,7 @@ void Ppu::load_sprites_graph(int64_t dot) {
   if (mmc5.active())
     for (int s = 0; s < 8; ++s)
       in[in_banks + s] = static_cast<int>(sprite_banks()[s] >> 10);
+  in[in_fetch_whole] = whole_chr();
   const bool bus_only = dry_ && !track_status_;
   const bool status_only = dry_ && track_status_;
   const auto& models = bus_only      ? engine_.sprites.fetch_bus

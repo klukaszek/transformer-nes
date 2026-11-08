@@ -228,7 +228,7 @@ Automated tests run the transformer CPU and PPU through blargg's `ppu_vbl_nmi` (
 
 ### The PPU as weights
 
-`transformer_nes/ppu2c02/` builds the PPU as one transformer: a token type per kind of work, all over one memory: an append-only log of WRITE tokens read through the same grouped exact-address attention the 6502 uses, laid out in `space.py` (the CHR windows, the nametable source pages including MMC5's ExRAM and fill mode, palette, OAM).
+`transformer_nes/ppu2c02/` builds the PPU as one transformer: a token type per kind of work, all over one memory: an append-only log of WRITE tokens read through the same grouped exact-address attention the 6502 uses, laid out in `space.py` (the CHR windows, the nametable source pages including MMC5's ExRAM and fill mode, palette, OAM, and up to MMC5's 1 MiB of whole CHR). One PPU serves every cartridge: MMC5's whole-CHR addressing and extended attributes are inputs, and each has its own folded experts.
 
 - **The register file** (`registers.py`, 12 layers): one token per CPU access to `$2000-$2007`, carrying the access and loopy `t`/`v` as their fields (coarse x, coarse y, nametable, fine y). It computes the register file after the access, the value a read returns, and the memory write it makes; `$2007` reads see CHR through the MMC2/MMC4 latches or MMC5's banks.
 - **Background rendering and compositing** (`render.py`, 20 layers without extended CHR): one step per 8-pixel tile slot. It reads the nametable, attribute, pattern and palette bytes, fetches the next tile, steps `v`, composites the sprite line by priority, finds sprite-0 hits, and drives the MMC2/MMC4 latches; MMC5's extended attributes read the whole CHR ROM.

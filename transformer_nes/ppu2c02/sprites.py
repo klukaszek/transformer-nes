@@ -34,14 +34,13 @@ from transformer_nes.graph.core import (
 from transformer_nes.graph.ops import both, either, equals, extract_bits, gate, gate_nonzero, select
 from transformer_nes.ppu2c02.render import low_bits
 from transformer_nes.ppu2c02.space import (
-    BASE_GROUPS,
     CHR,
     CHR_ALT,
     CHR_ALT_BASE,
+    CHR_FULL,
     CHR_FULL_BASE,
     OAM,
     Memory,
-    chr_full_groups,
 )
 
 SPRITES = 8  # per line, the hardware's limit
@@ -62,8 +61,10 @@ FETCH_INPUTS = (
     "latch_lo",
     "latch_hi",
     "wide_low",
-    # MMC5's sprite banks ($5120-$5127), in 1 KiB units of the whole CHR.
+    # MMC5's sprite banks ($5120-$5127), in 1 KiB units of the whole CHR,
+    # and whether CHR is addressed through them (else the CHR windows).
     *(f"bank{s}" for s in range(8)),
+    "whole_chr",
 )
 FETCH_OUTPUTS = (
     *(f"sprite{k}_pixel{c}" for k in range(SPRITES) for c in range(8)),
@@ -76,28 +77,34 @@ FETCH_OUTPUTS = (
 
 # Folded experts: evaluation by sprite size; fetch by sprite size and
 # count (the slots past it fold to dummy fetches) with the CHR latches
-# pinned off (every cart without them).
+# pinned off (every cart without them), the same through MMC5's banks
+# (mmc5_*), and the CHR windows with live latches (MMC2/MMC4).
 EVALUATE_EXPERTS = {
     **{f"tall{t}": {"tall": t, "evaluation_start": 0} for t in range(2)},
     **{f"remaining_tall{t}": {"tall": t} for t in range(2)},
 }
 OVERFLOW_EXPERTS = {f"tall{t}": {"tall": t} for t in range(2)}
-FETCH_EXPERTS = {
-    f"tall{t}_count{n}": {
-        "tall": t,
-        **{f"present{k}": int(k < n) for k in range(SPRITES)},
-        "latch_in_lo": 0,
-        "latch_in_hi": 0,
-        **{f"set_fd{k}": 0 for k in range(SPRITES)},
-        **{f"set_fe{k}": 0 for k in range(SPRITES)},
-    }
+_COUNTS = {
+    f"tall{t}_count{n}": {"tall": t, **{f"present{k}": int(k < n) for k in range(SPRITES)}}
     for t in range(2)
     for n in range(SPRITES + 1)
+}
+_NO_LATCHES = {
+    "latch_in_lo": 0,
+    "latch_in_hi": 0,
+    **{f"set_fd{k}": 0 for k in range(SPRITES)},
+    **{f"set_fe{k}": 0 for k in range(SPRITES)},
+}
+FETCH_EXPERTS = {
+    "window": {"whole_chr": 0},
+    **{name: {**pins, **_NO_LATCHES, "whole_chr": 0} for name, pins in _COUNTS.items()},
+    **{f"mmc5_{name}": {**pins, "whole_chr": 1} for name, pins in _COUNTS.items()},
 }
 # Extra debug rows read the current latch window without changing it.
 DEBUG_FETCH_EXPERTS = {
     f"debug_tall{t}": {
         "tall": t,
+        "whole_chr": 0,
         **{f"set_fd{k}": 0 for k in range(SPRITES)},
         **{f"set_fe{k}": 0 for k in range(SPRITES)},
     }
@@ -105,10 +112,9 @@ DEBUG_FETCH_EXPERTS = {
 }
 
 
-def sprite_memory(chr_full: int):
+def sprite_memory():
     inputs = [InputDimension(n) for n in ("is_mem_write", "mem_addr", "mem_value")]
-    groups = chr_full_groups(chr_full)[-1] + 1 if chr_full else BASE_GROUPS
-    return inputs, Memory(*inputs, groups=groups)
+    return inputs, Memory(*inputs)
 
 
 def sprite_tokens(name: str, inp: dict, memory_inputs: list, outputs: dict):
@@ -124,10 +130,10 @@ def sprite_tokens(name: str, inp: dict, memory_inputs: list, outputs: dict):
     return input_tokens, {"READOUT": readout}
 
 
-def build_evaluation(chr_full: int = 0):
+def build_evaluation():
     one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in EVALUATE_INPUTS}
-    memory_inputs, memory = sprite_memory(chr_full)
+    memory_inputs, memory = sprite_memory()
     tall = persist(extract_bits(inp["ctrl"], "ctrl")[2], name="tall")
     start = persist(inp["start"], name="evaluation_start")
     height = 8 + 8 * tall
@@ -171,7 +177,7 @@ def build_evaluation(chr_full: int = 0):
     return sprite_tokens("EVALUATE", inp, memory_inputs, outputs)
 
 
-def build_overflow(chr_full: int = 0):
+def build_overflow():
     """First diagonal-scan match in eight candidates, or sentinel 64.
 
     The host advances start by eight after a miss, preserving the byte
@@ -180,7 +186,7 @@ def build_overflow(chr_full: int = 0):
     """
     one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in OVERFLOW_INPUTS}
-    memory_inputs, memory = sprite_memory(chr_full)
+    memory_inputs, memory = sprite_memory()
     tall = persist(extract_bits(inp["ctrl"], "ctrl")[2], name="tall")
     height = 8 + 8 * tall
     hits = []
@@ -219,12 +225,12 @@ def encode_row(lo, hi, flip_h, shown, meta):
     return result
 
 
-def build_fetch(chr_full: int = 0):
-    """`chr_full`: bytes of whole-CHR memory (MMC5, whose sprites fetch
-    through their own banks from it), or 0 for the CHR windows."""
+def build_fetch():
+    """Sprite rows through MMC5's sprite banks into the whole CHR, or through
+    the CHR windows and their MMC2/MMC4 latches (the whole_chr input)."""
     one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in FETCH_INPUTS}
-    memory_inputs, memory = sprite_memory(chr_full)
+    memory_inputs, memory = sprite_memory()
     ctrl_bits = extract_bits(inp["ctrl"], "ctrl")  # MSB first
     tall = persist(ctrl_bits[2], name="tall")
     table8 = ctrl_bits[4]  # 8x8 sprites' pattern table
@@ -234,6 +240,7 @@ def build_fetch(chr_full: int = 0):
         "lo": persist(inp["latch_lo"], name="latch_in_lo"),
         "hi": persist(inp["latch_hi"], name="latch_in_hi"),
     }
+    whole_chr = persist(inp["whole_chr"], name="whole_chr")
 
     outputs: dict[str, Expression] = {}
     for k in range(SPRITES):
@@ -260,27 +267,25 @@ def build_fetch(chr_full: int = 0):
         fetched = select(tall, tile - tile_b0 + row_bits[0], tile)
         address = 0x1000 * half + 16 * fetched + fine
 
-        if chr_full:
-            # MMC5: the 1 KiB slot's sprite bank in the whole CHR.
-            slot = 4 * half + 2 * tile_bits[0] + tile_bits[1]
-            bank = sum((gate(equals(slot, s), inp[f"bank{s}"]) for s in range(8)), Expression())
-            chr_address = CHR_FULL_BASE + 0x400 * bank + (address - 0x400 * slot)
-            groups = chr_full_groups(chr_full)
-        else:
-            # The half's latch picks the FD or FE window, then the fetch
-            # may flip it (high byte of tile $FD/$FE; MMC2's low half on
-            # row 0 only) for the fetches after it.
-            current = select(half, latch["hi"], latch["lo"])
-            chr_address = address + gate(current, CHR_ALT_BASE)
-            groups = CHR + CHR_ALT
-            row_ok = either(half, either(inp["wide_low"], equals(fine, 0)))
-            set_fd = persist(both(both(equals(fetched, 0xFD), row_ok), valid), name=f"set_fd{k}")
-            set_fe = persist(both(both(equals(fetched, 0xFE), row_ok), valid), name=f"set_fe{k}")
-            flipped = current - both(set_fd, current) + set_fe - both(set_fe, current)
-            latch = {
-                "lo": select(half, latch["lo"], flipped),
-                "hi": select(half, flipped, latch["hi"]),
-            }
+        # MMC5: the 1 KiB slot's sprite bank in the whole CHR.
+        slot = 4 * half + 2 * tile_bits[0] + tile_bits[1]
+        bank = sum((gate(equals(slot, s), inp[f"bank{s}"]) for s in range(8)), Expression())
+        full_address = CHR_FULL_BASE + 0x400 * bank + (address - 0x400 * slot)
+        # Otherwise the half's latch picks the FD or FE window, then the
+        # fetch may flip it (high byte of tile $FD/$FE; MMC2's low half on
+        # row 0 only) for the fetches after it.
+        current = select(half, latch["hi"], latch["lo"])
+        window_address = address + gate(current, CHR_ALT_BASE)
+        row_ok = either(half, either(inp["wide_low"], equals(fine, 0)))
+        set_fd = persist(both(both(equals(fetched, 0xFD), row_ok), valid), name=f"set_fd{k}")
+        set_fe = persist(both(both(equals(fetched, 0xFE), row_ok), valid), name=f"set_fe{k}")
+        flipped = current - both(set_fd, current) + set_fe - both(set_fe, current)
+        latch = {
+            "lo": select(half, latch["lo"], flipped),
+            "hi": select(half, flipped, latch["hi"]),
+        }
+        chr_address = select(whole_chr, full_address, window_address)
+        groups = CHR + CHR_ALT + CHR_FULL
         lo = Memory.bits(memory.read(chr_address, groups, f"pattern_lo{k}"), f"pattern_lo{k}")
         hi = Memory.bits(memory.read(chr_address + 8, groups, f"pattern_hi{k}"), f"pattern_hi{k}")
 
@@ -295,8 +300,9 @@ def build_fetch(chr_full: int = 0):
         outputs[f"sprite{k}_fetch"] = valid + 1 - present
         outputs[f"sprite{k}_a12"] = select(present, half, either(tall, table8))
 
-    outputs["new_latch_lo"] = latch["lo"] if not chr_full else inp["latch_lo"]
-    outputs["new_latch_hi"] = latch["hi"] if not chr_full else inp["latch_hi"]
+    # Whole-CHR fetches never flip a latch.
+    outputs["new_latch_lo"] = select(whole_chr, inp["latch_lo"], latch["lo"])
+    outputs["new_latch_hi"] = select(whole_chr, inp["latch_hi"], latch["hi"])
     outputs = {name: outputs[name] for name in FETCH_OUTPUTS}
     auto_name(locals())
     return sprite_tokens("FETCH", inp, memory_inputs, outputs)

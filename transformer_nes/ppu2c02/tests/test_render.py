@@ -61,7 +61,8 @@ def random_slot(rng, pins: dict) -> list[int]:
         int(rng.integers(2)) if pins.get("rendering") == 0 else 0,
         int(rng.integers(4)),
     ]  # extended mode pinned off; chr_upper
-    return head + pages + latches + mmc5 + v + bg + sprites
+    chr_4k = int(rng.integers(1, 257))  # whole-CHR size, up to MMC5's 1 MiB
+    return head + pages + latches + mmc5 + v + bg + sprites + [chr_4k]
 
 
 def test_experts_agree_with_the_full_graph():
@@ -287,9 +288,9 @@ def test_knock_out_breaks_rendering_until_restored():
     assert np.array_equal(native[7:], out[7:])
 
 
-@pytest.mark.parametrize("chr_full", [0, 0x20000], ids=["mapped-chr", "mmc5-chr"])
-def test_blank_expert_preserves_palette_and_disables_fetch_effects(chr_full):
-    engine = ppu_engine(chr_full)
+@pytest.mark.parametrize("whole_chr", [False, True], ids=["mapped-chr", "mmc5-chr"])
+def test_blank_expert_preserves_palette_and_disables_fetch_effects(whole_chr):
+    engine = ppu_engine(whole_chr)
     blank = engine.model_id("render", "blank")
     rng = np.random.default_rng(61)
     for address in range(0x3F00, 0x3F20):

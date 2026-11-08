@@ -1,11 +1,12 @@
 """Neural mapper register transitions, bank layouts and bus effects.
 
-Geometry is specialized at construction; mutable state stays with the caller.
-MMC3/MMC5 IRQ circuits also emit qualified-edge deadlines for timing previews.
+Cartridge geometry is a circuit input (BOARD), like the wiring of the board
+the chip sits on; one circuit per mapper chip serves every cartridge.
+Mutable state stays with the caller. MMC3/MMC5 IRQ circuits also emit
+qualified-edge deadlines for timing previews.
 """
 
 from functools import cache
-from math import gcd
 
 from transformer_nes.graph.core import (
     InputDimension,
@@ -15,7 +16,7 @@ from transformer_nes.graph.core import (
     reglu,
     stepglu,
 )
-from transformer_nes.graph.ops import both, either, equals, remainder, select
+from transformer_nes.graph.ops import both, either, equals, remainder, remainder_by, select
 from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
 
 STATE = ("counter", "target", "phase", "pending", "enabled")
@@ -147,6 +148,11 @@ BANK_PORTS = {
     9: (0xA000, 0xB000, 0xC000, 0xD000, 0xE000, 0xF000),
     10: (0xA000, 0xB000, 0xC000, 0xD000, 0xE000, 0xF000),
 }
+
+# The cartridge board: its ROM sizes, PRG in 16 KiB and CHR in 4 KiB units
+# (8 KiB of CHR RAM counts as 2). Each chip derives its own bank counts from
+# these, so every supported chip's counts are integer multiples.
+BOARD = ("prg_16k", "chr_4k")
 
 ACCESS_INPUTS = (
     "addr_lo", "addr_hi", "is_write", "original",
@@ -333,29 +339,34 @@ def bank_transition(chip: int):
 
 
 @construction
-def bank_layout(chip: int, n_prg: int, n_chr: int):
-    x = {name: InputDimension(name) for name in BANK_STATE[chip]}
+def bank_layout(chip: int):
+    x = {name: InputDimension(name) for name in (*BANK_STATE[chip], *BOARD)}
+    prg_16k, chr_4k = x["prg_16k"], x["chr_4k"]
     if chip == 1:
+        # PRG in 16 KiB banks; CHR in 1 KiB banks, switched in 4 KiB pairs.
+        n_prg, n_chr = prg_16k, 4 * chr_4k
         mode = remainder(x["control"], 16, 31)
         pair = 1 - stepglu(1, mode - 8)
         fixed_first = stepglu(1, mode - 8) - stepglu(1, mode - 12)
-        bank = remainder(remainder(x["prg"], 16, 31), n_prg, 15)
+        bank = remainder_by(remainder(x["prg"], 16, 31), n_prg, 15)
         even = bank - remainder(bank, 2, 15)
         prg = (
             select(pair, even, select(fixed_first, 0, bank)),
             select(pair, even + 1, select(fixed_first, bank, n_prg - 1)),
         )
         chr_mode = stepglu(1, x["control"] - 16)
-        base4 = [4 * remainder(x[f"chr{i}"], n_chr // 4, 31) for i in range(2)]
+        base4 = [4 * remainder_by(x[f"chr{i}"], chr_4k, 31) for i in range(2)]
         raw8 = x["chr0"] - remainder(x["chr0"], 2, 31)
-        base8 = 4 * remainder(raw8, n_chr // 4, 30)
+        base8 = 4 * remainder_by(raw8, chr_4k, 30)
         chr_ = []
         for i in range(8):
             address = select(chr_mode, base4[i // 4] + i % 4, base8 + i)
-            chr_.append(address - n_chr * stepglu(1, address - n_chr))
+            chr_.append(address - reglu(n_chr, stepglu(1, address - n_chr)))
         mirror = remainder(x["control"], 4, 31)
     elif chip == 4:
-        r6, r7 = (remainder(x[f"reg{i}"], n_prg, 255) for i in (6, 7))
+        # PRG in 8 KiB banks, CHR in 1 KiB banks.
+        n_prg, n_chr = 2 * prg_16k, 4 * chr_4k
+        r6, r7 = (remainder_by(x[f"reg{i}"], n_prg, 255, least=2) for i in (6, 7))
         prg = (
             select(x["prg_mode"], n_prg - 2, r6),
             r7,
@@ -365,18 +376,22 @@ def bank_layout(chip: int, n_prg: int, n_chr: int):
         pairs = []
         for i in range(2):
             even = x[f"reg{i}"] - remainder(x[f"reg{i}"], 2, 255)
-            pairs.extend(remainder(even + j, n_chr, 255) for j in range(2))
-        singles = [remainder(x[f"reg{i}"], n_chr, 255) for i in range(2, 6)]
+            pairs.extend(remainder_by(even + j, n_chr, 255, least=4) for j in range(2))
+        singles = [remainder_by(x[f"reg{i}"], n_chr, 255, least=4) for i in range(2, 6)]
         chr_ = [select(x["chr_mode"], singles[i], pairs[i]) for i in range(4)]
         chr_ += [select(x["chr_mode"], pairs[i], singles[i]) for i in range(4)]
         mirror = x["mirror"]
     elif chip == 5:
-        prg, chr_, extra = mmc5_layout(x, n_prg, n_chr)
+        prg, chr_, extra = mmc5_layout(x, 2 * prg_16k, 4 * chr_4k)
         mirror = x["mirror"]
     else:
-        slots = 4 if chip == 9 else 2
-        prg = (remainder(x["prg"], n_prg, 15), *(n_prg - (slots - i) for i in range(1, slots)))
-        chr_ = [remainder(x[f"chr{i}"], n_chr, 31) for i in range(4)]
+        # MMC2: 8 KiB PRG banks, MMC4: 16 KiB; both latch 4 KiB CHR banks.
+        slots, n_prg = (4, 2 * prg_16k) if chip == 9 else (2, prg_16k)
+        prg = (
+            remainder_by(x["prg"], n_prg, 15, least=slots // 2),
+            *(n_prg - (slots - i) for i in range(1, slots)),
+        )
+        chr_ = [remainder_by(x[f"chr{i}"], chr_4k, 31) for i in range(4)]
         mirror = x["mirror"]
     values = {
         **{f"map_prg{i}": v for i, v in enumerate(prg)},
@@ -391,7 +406,8 @@ def bank_layout(chip: int, n_prg: int, n_chr: int):
     )
 
 
-def mmc5_layout(x, n_prg: int, n_chr: int):
+def mmc5_layout(x, n_prg, n_chr):
+    """MMC5 banking for 8 KiB PRG and 1 KiB CHR bank counts (n_chr >= 8)."""
     mode = [equals(x["prg_mode"], i) for i in range(4)]
     registers = [remainder(x[f"prg{i}"], 128, 255) for i in range(4)]
     sources = ((3, 3, 3, 3), (1, 1, 3, 3), (1, 1, 2, 3), (0, 1, 2, 3))
@@ -406,8 +422,23 @@ def mmc5_layout(x, n_prg: int, n_chr: int):
             if source != 3:
                 is_ram = is_ram + both(mode[m], 1 - high_bit(x[f"prg{source}"]))
         ram.append(is_ram)
-        prg.append(select(is_ram, remainder(bank, 8, 127), remainder(bank, n_prg, 127)))
+        prg.append(select(is_ram, remainder(bank, 8, 127), remainder_by(bank, n_prg, 127, least=2)))
     chr_mode = [equals(x["chr_mode"], i) for i in range(4)]
+    upper = 256 * x["upper"]
+    based = {}
+
+    def base(source: int, span: int):
+        """span * (register + 256 * upper) mod n_chr. Each register is reduced
+        once; doubling a residue below n_chr wraps at most once."""
+        if (source, span) not in based:
+            if span == 1:
+                value = remainder_by(x[f"chr{source}"] + upper, n_chr, 1023, least=8)
+            else:
+                value = 2 * base(source, span // 2)
+                value = value - reglu(n_chr, stepglu(1, value - n_chr))
+            based[source, span] = value
+        return based[source, span]
+
     chr_ = []
     for background in (False, True):
         for slot in range(8):
@@ -415,13 +446,10 @@ def mmc5_layout(x, n_prg: int, n_chr: int):
             for m, span in enumerate((8, 4, 2, 1)):
                 source = slot // span * span + span - 1
                 source = 8 + source % 4 if background else source
-                # Reduce before expansion. Geometry can discard upper bits
-                # and entire registers (e.g. an 8 KiB CHR-RAM map) exactly.
-                period = n_chr // gcd(n_chr, span)
-                upper = 256 % period
-                register = x[f"chr{source}"] + upper * x["upper"]
-                base = span * remainder(register, period, 255 + 3 * upper)
-                mapped = remainder(base + slot % span, n_chr, period * span - 1)
+                # Slots within a span wrap at most once, since n_chr >= 8.
+                mapped = base(source, span) + slot % span
+                if slot % span:
+                    mapped = mapped - reglu(n_chr, stepglu(1, mapped - n_chr))
                 address = address + reglu(mapped, chr_mode[m])
             chr_.append(address)
     product = reglu(x["mul_a"], x["mul_b"])
@@ -442,13 +470,13 @@ def mmc5_layout(x, n_prg: int, n_chr: int):
 
 
 @cache
-def mapper_bank_engine(chip: int, n_prg: int, n_chr: int):
-    if chip not in BANK_STATE or n_prg < 1 or n_chr < 1 or (chip == 1 and n_chr % 4):
-        raise ValueError("invalid mapper bank geometry")
+def mapper_bank_engine(chip: int):
+    if chip not in BANK_STATE:
+        raise ValueError("unsupported mapper chip")
 
     def graphs():
         transition = bank_transition(chip)
-        layout = bank_layout(chip, n_prg, n_chr)
+        layout = bank_layout(chip)
         experts = {"reset": {"event": 0}}
         events = ((1, "write"), (2, "rmw")) if chip == 1 else ((1, "write"),)
         for i, name in events:
@@ -462,9 +490,9 @@ def mapper_bank_engine(chip: int, n_prg: int, n_chr: int):
                 (*transition.output_tokens,),
                 experts,
             ),
-            "layout": TokenGraph(layout, BANK_STATE[chip], (*layout.output_tokens,)),
+            "layout": TokenGraph(layout, (*BANK_STATE[chip], *BOARD), (*layout.output_tokens,)),
         }
 
     return CompiledGraph(
-        graphs, tag=f"mapper_banks_{chip}_{n_prg}_{n_chr}", sources=(__name__,), memory_size=1
+        graphs, tag=f"mapper_banks_{chip}", sources=(__name__,), memory_size=1
     )

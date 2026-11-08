@@ -42,15 +42,14 @@ from transformer_nes.graph.ops import (
     select,
 )
 from transformer_nes.ppu2c02.space import (
-    BASE_GROUPS,
     CHR,
     CHR_ALT,
     CHR_ALT_BASE,
+    CHR_FULL,
     CHR_FULL_BASE,
     PAGES,
     PALETTE,
     Memory,
-    chr_full_groups,
     in_palette_region,
     nametable_page,
     palette_offset,
@@ -76,6 +75,9 @@ INPUTS = (
     *(f"v_{f}" for f in LOOPY_FIELDS),
     *(f"bg{i}" for i in range(16)),
     *(f"sprite{i}" for i in range(8)),
+    # MMC5: the whole CHR's size in 4 KiB banks; extended-attribute banks
+    # wrap to it.
+    "chr_4k",
 )
 OUTPUTS = (
     *(f"pixel{i}" for i in range(8)),
@@ -132,14 +134,16 @@ EXPERTS = {
     **{name: {**pins, **_NO_LATCHES} for name, pins in _SLOT_EXPERTS.items()},
     **{f"{name}_latched": pins for name, pins in _SLOT_EXPERTS.items()},
     "blank": {"maskbit3": 0, "maskbit4": 0, "rendering": 0},
+    # Every other slot of a cart without extended attributes.
+    "general": {"extended": 0},
 }
 
 
 def dispatch(names: list[str]) -> list[dict]:
     """The native per-slot choice (nes/ppu.cpp:render_slot) as model ids
     (k runs names[k - 1]), without and then with the CHR latches: inner
-    slots per background table and fine x, sprite slots, and the edge
-    slots 0 and 31 per table."""
+    slots per background table and fine x, sprite slots, the edge slots
+    0 and 31 per table, and every other slot without extended attributes."""
     model = {name: k for k, name in enumerate(names, start=1)}
 
     def variant(suffix: str) -> dict:
@@ -151,6 +155,7 @@ def dispatch(names: list[str]) -> list[dict]:
             "blank": model["blank"],
             "first": [model[f"no_sprites_bg{t}_first{suffix}"] for t in range(2)],
             "last": [model[f"no_sprites_bg{t}_last{suffix}"] for t in range(2)],
+            "general": model["general"],
         }
 
     return [variant(""), variant("_latched")]
@@ -167,9 +172,7 @@ def low_bits(value, width: int) -> list[Expression]:
     return bits
 
 
-def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expression]]:
-    """`chr_full`: bytes of whole-CHR memory for MMC5 extended attributes
-    (a power of two), or 0 to leave that path out."""
+def build() -> tuple[dict[str, Expression], dict[str, Expression]]:
     one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in INPUTS}
     memory_inputs = [InputDimension(n) for n in ("is_mem_write", "mem_addr", "mem_value")]
@@ -177,8 +180,7 @@ def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expressio
         "SLOT": sum((to_expr(d) for d in inp.values()), Expression()),
         "WRITE": sum((to_expr(d) for d in memory_inputs), Expression()),
     }
-    full_groups = chr_full_groups(chr_full)
-    memory = Memory(*memory_inputs, groups=full_groups[-1] + 1 if chr_full else BASE_GROUPS)
+    memory = Memory(*memory_inputs)
     v = {f: inp[f"v_{f}"] for f in LOOPY_FIELDS}
 
     # Every condition a folded expert pins is a named persist.
@@ -193,7 +195,7 @@ def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expressio
     fine_x_bits = [
         persist(b, name=f"fine_x_bit{2 - k}") for k, b in enumerate(low_bits(inp["fine_x"], 3))
     ]
-    extended = persist(inp["ext_mode"] if chr_full else Expression(), name="extended")
+    extended = persist(inp["ext_mode"], name="extended")
 
     # ── Fetch the tile at v ─────────────────────────────────────────
     cy_bits = low_bits(v["cy"], 5)
@@ -227,25 +229,24 @@ def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expressio
     pattern = 0x1000 * bg_table + 16 * tile_no + v["fy"]
     latch = persist(select(bg_table, inp["latch_hi"], inp["latch_lo"]), name="latch")
     pattern_addr = pattern + gate(latch, CHR_ALT_BASE)
-    groups = CHR + CHR_ALT
-    if chr_full:
-        # MMC5 extended attributes: ExRAM byte e (the ExRAM page, same
-        # offset) gives the palette (bits 7-6) and the tile's 4 KiB CHR
-        # bank (chr_upper * 64 + bits 5-0, wrapped to the CHR size).
-        ex_bits = memory.bits(memory.read(0x2800 + offset, PAGES, "ex"), "ex")
-        bank_bits = (chr_full >> 12).bit_length() - 1
-        upper_bits = low_bits(inp["chr_upper"], 2)  # MSB first
-        bank = sum(
-            (
-                (1 << j) * (ex_bits[7 - j] if j < 6 else upper_bits[7 - j])
-                for j in range(min(bank_bits, 8))
-            ),
-            Expression(),
-        )
-        full_addr = CHR_FULL_BASE + 0x1000 * bank + 16 * tile_no + v["fy"]
-        pattern_addr = select(extended, full_addr, pattern_addr)
-        palette_select = select(extended, 2 * ex_bits[0] + ex_bits[1], palette_select)
-        groups = groups + full_groups
+    # MMC5 extended attributes: ExRAM byte e (the ExRAM page, same offset)
+    # gives the palette (bits 7-6) and the tile's 4 KiB CHR bank
+    # (chr_upper * 64 + bits 5-0). The bank wraps to the CHR size: bank bit
+    # j survives when the CHR holds at least 2^(j+1) banks.
+    ex_bits = memory.bits(memory.read(0x2800 + offset, PAGES, "ex"), "ex")
+    upper_bits = low_bits(inp["chr_upper"], 2)  # MSB first
+    bank = sum(
+        (
+            (1 << j) * both(ex_bits[7 - j] if j < 6 else upper_bits[7 - j],
+                            stepglu(one, inp["chr_4k"] - (2 << j)))
+            for j in range(8)
+        ),
+        Expression(),
+    )
+    full_addr = CHR_FULL_BASE + 0x1000 * bank + 16 * tile_no + v["fy"]
+    pattern_addr = select(extended, full_addr, pattern_addr)
+    palette_select = select(extended, 2 * ex_bits[0] + ex_bits[1], palette_select)
+    groups = CHR + CHR_ALT + CHR_FULL
     lo_bits = memory.bits(memory.read(pattern_addr, groups, "pattern_lo"), "pattern_lo")
     hi_bits = memory.bits(memory.read(pattern_addr + 8, groups, "pattern_hi"), "pattern_hi")
     tile = [

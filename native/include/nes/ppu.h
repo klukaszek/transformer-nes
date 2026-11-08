@@ -152,8 +152,9 @@ public:
   // The source page (0-3) each logical nametable reads, packed 2 bits
   // per table (MMC5's $5105 layout; plain mirroring is its special cases).
   [[nodiscard]] int nt_map() const;
-  // Whole-CHR bytes the PPU graphs need mapped (MMC5), else 0.
-  [[nodiscard]] size_t graph_chr_full() const { return mmc5.active() ? chr.size() : 0; }
+  // Whether the PPU graphs address the whole CHR through MMC5's banks
+  // (ppu2c02/space.py, at most CHR_FULL_SIZE bytes).
+  [[nodiscard]] bool whole_chr() const { return mmc5.active(); }
 
   // Token/expert IDs from ppu2c02/machine.py and control.py.
   // The host owns clocks and storage; neural readouts define state/effects.
@@ -162,6 +163,7 @@ public:
     uint8_t sprites = 0;
     uint8_t blank = 0;
     array<uint8_t, 2> first{}, last{}; // slots 0 and 31, per table
+    uint8_t general = 0;               // any other slot without extended attributes
   };
   // The sprite unit's models (ppu2c02/machine.py:sprite_dispatch):
   // evaluation: full, size experts from index 0, remaining-batch experts;
@@ -198,19 +200,19 @@ public:
     int dma_request_model = 0, dma_transfer_model = 0;
   };
   // The render graph's token layout (ppu2c02/render.py INPUTS, OUTPUTS).
-  static constexpr int render_inputs = 43, render_outputs = 31;
-  static constexpr int in_bg = 19, in_sprites = 35;
+  static constexpr int render_inputs = 44, render_outputs = 31;
+  static constexpr int in_bg = 19, in_sprites = 35, in_chr_4k = 43;
   static constexpr int out_tile = 8, out_v = 16, out_fetched = 20, out_hit = 21, out_latch = 29;
   // The register graph's (ppu2c02/registers.py INPUTS, OUTPUTS).
-  static constexpr int access_inputs = 35, access_outputs = 21;
-  static constexpr int in_access_banks = 13, in_access_state = 21;
+  static constexpr int access_inputs = 36, access_outputs = 21;
+  static constexpr int in_access_banks = 13, in_access_state = 21, in_access_whole = 35;
   // Finite event control (ppu2c02/control.py INPUTS, OUTPUTS).
   static constexpr int control_inputs = 23, control_outputs = 15, out_control_skip = 13;
   // The sprite graphs' (ppu2c02/sprites.py EVALUATE_*, FETCH_*).
   static constexpr int evaluate_inputs = 4, evaluate_outputs = 9;
-  static constexpr int fetch_inputs = 23, fetch_outputs = 90;
+  static constexpr int fetch_inputs = 24, fetch_outputs = 90;
   static constexpr int compose_inputs = 19, compose_outputs = 10;
-  static constexpr int in_index = 4, in_latch = 12, in_banks = 15;
+  static constexpr int in_index = 4, in_latch = 12, in_banks = 15, in_fetch_whole = 23;
   static constexpr int out_sprite_x = 64, out_sprite_fetch = 72, out_sprite_a12 = 80,
                        out_sprite_latch = 88;
   void set_engine(PpuEngine engine);

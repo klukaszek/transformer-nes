@@ -709,16 +709,18 @@ def test_shared_neurons_emit_once_without_importing_inductor(cache, monkeypatch)
         assert engine.step([value]).tolist() == expected
 
 
-def test_standard_ppu_source_stays_under_two_and_a_quarter_mebibytes():
+def test_ppu_source_stays_under_two_and_three_quarter_mebibytes():
     from transformer_nes.ppu2c02.machine import ppu_engine
 
     engine = ppu_engine()
     meta, source = CompiledGraph.generate_bank(engine.build_graphs(), engine.memory_size)
     assert meta["digest"] == engine.digest
     # Real rendering, fetch, status and register experts previously emitted
-    # over 20 MiB, then 4.1 MiB with scalar SSA. Preserve the shared-fragment
-    # and compact scalar representation (currently about 2.05 MiB).
-    assert len(source.encode()) < 9 * 1024**2 // 4
+    # over 20 MiB, then 4.1 MiB with scalar SSA, then about 2.05 MiB per CHR
+    # variant. One bank now serves every cart, MMC5's whole-CHR experts
+    # included (about 2.7 MiB): preserve the shared-fragment and compact
+    # scalar representation.
+    assert len(source.encode()) < 11 * 1024**2 // 4
 
 
 def test_float32_ssa_matches_fx_bits_at_rounding_boundaries():

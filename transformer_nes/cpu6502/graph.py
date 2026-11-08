@@ -59,6 +59,7 @@ from transformer_nes.graph.ops import (
     extract_bits,
     extract_bits_wide,
     gate,
+    group_spans,
     grouped_read,
     memory_site,
     multiply,
@@ -140,7 +141,10 @@ def build(*, bcd: bool = True, wide_bits: bool = False) -> tuple[dict[str, Expre
     def memory_at(address: ExprLike, name: str) -> Expression:
         """Latest WRITE at a 16-bit address, through attention."""
         write_addr = addr_lo + 256 * addr_hi
-        value = grouped_read(address, byte_value, write_addr, is_memory_write, group_count=16)
+        value = grouped_read(
+            address, byte_value, write_addr, is_memory_write,
+            spans=group_spans(16), space_end=0x10000,
+        )
         return memory_site(persist(value, name=name), address, byte_value, write_addr, is_memory_write)
 
     # ── Input dimensions ────────────────────────────────────────────

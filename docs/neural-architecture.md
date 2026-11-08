@@ -530,11 +530,14 @@ MMC1 serial writes and MMC3 selector-only writes therefore avoid layout work.
 MMC1 read-modify-write tokens combine the original-byte write and the qualified
 final reset into one transition, preserving their order.
 
-The layout weights specialize immutable cartridge geometry, while all register
-values remain runtime inputs. ROM contents never enter construction; cartridges
-with the same chip and bank counts share a model. Constant-modulus division uses
-bounded binary subtraction circuits, including for non-power-of-two capacities,
-without a state/outcome cache.
+Cartridge geometry is a circuit input, like the board wiring the chip sits
+on: the layout reads the PRG size in 16 KiB units and the CHR size in 4 KiB
+units (`mappers.py:BOARD`) after the register state. Each chip derives its own
+bank counts from them, so one model per chip serves every cartridge and neither
+ROM contents nor sizes enter construction. Division by the bank count is a
+restoring-division ladder (`graph/ops.py:remainder_by`): each stage compares
+against one power-of-two multiple of the count and a ReGLU subtracts it, which
+is exact for non-power-of-two capacities too.
 
 [`BankMapper`](../native/include/nes/mappers/banked.h) holds opaque
 register state and applies the returned maps. It copies changed
@@ -550,9 +553,10 @@ executable RAM.
 
 MMC5 shares that transition/layout interface. Its layout returns physical ROM
 or RAM banks, separate sprite/background CHR maps, RAM write permission and RAM
-bank selection, nametable/fill configuration and multiplier bytes. The MMC5 adapter owns storage and applies these packets. CHR construction reduces each register by the period implied
-by cartridge geometry before expanding a bank, discarding irrelevant upper bits
-and registers before compilation.
+bank selection, nametable/fill configuration and multiplier bytes. The MMC5 adapter owns storage and applies these packets. CHR construction reduces each register once modulo the
+CHR bank count, then forms its 2-, 4- and 8-bank span bases by doubling: a
+residue below the count doubles past it at most once, so each doubling is one
+comparison.
 
 Access tokens receive byte-split CPU addresses, write direction, an optional
 original RMW byte, and the live neural bank map. They return a register endpoint,
@@ -726,7 +730,7 @@ gameplay tape frames; all 264 tests pass.
 | Clock line transitions / materialized event readouts | 3,144 bytes inline / 1,200 bytes in vectors |
 | Sprite-row table within PPU state | 2,208 bytes |
 | PPU synchronization metadata within PPU state | 8,968 bytes plus CHR dirty bits |
-| Ordinary PPU graph byte image | 28 KiB; MMC5 variants grow with CHR geometry |
+| PPU graph byte image | 1,088 KiB: 64 KiB of windows and pages, then MMC5's 1 MiB whole CHR |
 
 PPU state includes two 60 KiB frames and two 7.5 KiB expert maps. The PPU owns
 CHR storage after mapper geometry setup; SMB3 avoids a duplicate 128 KiB payload.

@@ -512,11 +512,15 @@ def test_mapper_access_packets_execute_exact_weights(chip):
         np.testing.assert_array_equal(engine.step(packet, engine.model_id(f"address_{chip}")), expected[4:7])
 
 
-@pytest.mark.parametrize("chip,prg,chr_", [(1, 3, 12), (4, 6, 24), (9, 6, 3), (10, 3, 3)])
-def test_neural_bank_transitions_and_mapping_effects(chip, prg, chr_):
+# (chip, PRG banks, CHR banks) in the chip's own units, and the same
+# cartridge as the circuit's board inputs (16 KiB PRG, 4 KiB CHR units).
+@pytest.mark.parametrize(
+    "chip,prg,chr_,board", [(1, 3, 12, (3, 3)), (4, 6, 24, (3, 6)), (9, 6, 3, (3, 3)), (10, 3, 3, (3, 3))]
+)
+def test_neural_bank_transitions_and_mapping_effects(chip, prg, chr_, board):
     from transformer_nes.nes.mappers import BANK_STATE, mapper_bank_engine
 
-    engine = mapper_bank_engine(chip, prg, chr_)
+    engine = mapper_bank_engine(chip)
     state = [0] * len(BANK_STATE[chip])
 
     def step(port=0, value=0, original=0, event=1):
@@ -529,7 +533,7 @@ def test_neural_bank_transitions_and_mapping_effects(chip, prg, chr_):
         return int(out[-1])
 
     def layout():
-        return engine.step(state, engine.model_id("layout")).tolist()
+        return engine.step([*state, *board], engine.model_id("layout")).tolist()
 
     assert step(value=3, event=0) == 7
     if chip == 1:

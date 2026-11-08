@@ -208,8 +208,13 @@ def test_access_bus_latches_include_rows_halves_and_address_aliases():
                         )
 
 
-def random_access(rng, reg=None, is_write=None) -> dict[str, int]:
-    """An ACCESS token over every register and register-file state."""
+# 1 KiB banks the whole-CHR cases address (and the exact forward seeds).
+WHOLE_CHR_BANKS = 8
+
+
+def random_access(rng, reg=None, is_write=None, whole_chr=0) -> dict[str, int]:
+    """An ACCESS token over every register and register-file state, through
+    the CHR windows or (whole_chr) MMC5's banks into the whole CHR."""
     ranges = {
         "reg": 8, "value": 256, "is_write": 2, "status": 256, "rendering": 2,
         "chr_writable": 2, "latch_lo": 2, "latch_hi": 2, "fine_x": 8, "w": 2, "ctrl": 256,
@@ -218,20 +223,31 @@ def random_access(rng, reg=None, is_write=None) -> dict[str, int]:
         **{f"{r}_{f}": n for r in "tv" for f, n in (("cx", 32), ("cy", 32), ("nt", 4), ("fy", 8))},
     }  # fmt: skip
     access = {"is_access": 1, **{name: int(rng.integers(n)) for name, n in ranges.items()}}
-    access.update({f"bank{s}": 0 for s in range(8)})  # MMC5 builds only
+    access.update(
+        {f"bank{s}": int(rng.integers(WHOLE_CHR_BANKS)) if whole_chr else 0 for s in range(8)},
+        whole_chr=whole_chr,
+    )
     if reg is not None:
         access.update(reg=reg, is_write=is_write)
     return access
 
 
+# Every region an ACCESS token reads below the whole CHR: (base, bytes).
+REGIONS = {0: 0x2000, 0x2000: 0x1000, 0x3F00: 0x20, 0x4000: 0x100, 0x5000: 0x2000}
+
+
 def random_writes(rng, write, count: int) -> None:
     for _ in range(count):
-        region = rng.choice([0, 0x2000, 0x3F00, 0x4000, 0x5000])
-        size = {0: 0x2000, 0x2000: 0x1000, 0x3F00: 0x20, 0x4000: 0x100, 0x5000: 0x2000}[region]
-        write(int(region + rng.integers(size)), int(rng.integers(256)))
+        region = rng.choice(list(REGIONS))
+        write(int(region + rng.integers(REGIONS[region])), int(rng.integers(256)))
 
 
-def test_compiled_engine_is_the_exact_forward():
+@pytest.mark.parametrize(
+    "whole_chr",
+    [0, pytest.param(1, marks=pytest.mark.slow)],  # every seeded byte is a float64 forward
+    ids=["chr-windows", "whole-chr"],
+)
+def test_compiled_engine_is_the_exact_forward(whole_chr):
     """The native engine against model/inference.py's float64 forward of
     the same weights, on random memory writes and accesses."""
     graph = register_graph()
@@ -242,7 +258,7 @@ def test_compiled_engine_is_the_exact_forward():
         lambda: {"access": token},
         tag="ppu_registers",
         sources=("transformer_nes.ppu2c02.machine",),
-        memory_size=space.memory_size(),
+        memory_size=space.MEMORY_SIZE,
     )
     dims = {d.name: d for d in graph.all_dims}
     inputs = {d.name: d for d in graph.all_dims if isinstance(d, InputDimension)}
@@ -260,12 +276,16 @@ def test_compiled_engine_is_the_exact_forward():
         forward({"is_mem_write": 1, "mem_addr": addr, "mem_value": value})
 
     rng = np.random.default_rng(3)
-    # Every byte first, as the console seeds it: reads assume dense memory.
-    for addr in range(space.memory_size()):
+    # Every byte a read can reach first, as the console seeds it: reads
+    # assume dense memory.
+    seeded = [base + i for base, size in REGIONS.items() for i in range(size)]
+    if whole_chr:
+        seeded += range(space.CHR_FULL_BASE, space.CHR_FULL_BASE + 0x400 * WHOLE_CHR_BANKS)
+    for addr in seeded:
         write(addr, int(rng.integers(256)))
     for _ in range(300):
         random_writes(rng, write, 4)
-        access = random_access(rng)
+        access = random_access(rng, whole_chr=whole_chr)
         compiled = engine.step([access[name] for name in registers.INPUTS])
         residual = forward(access)
         expected = [round(residual[info.slot_of[dims[name]]]) for name in registers.OUTPUTS]

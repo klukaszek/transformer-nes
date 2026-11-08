@@ -6,8 +6,9 @@
 namespace transformer_nes::nes {
 
 // Opaque neural register state. A transition emits a dirty mask; only then
-// is the bank-layout projection evaluated. Geometry is immutable cartridge
-// metadata. Neither this adapter nor BankMapper computes banking formulas.
+// is the bank-layout projection evaluated, with the board's ROM sizes as its
+// last inputs. Neither this adapter nor BankMapper computes banking formulas;
+// the chip-unit counts here only bound-check the circuit's bank numbers.
 struct BankControl {
   enum Chip { Mmc1 = 1, Mmc3 = 4, Mmc5 = 5, Mmc2 = 9, Mmc4 = 10 };
   enum Effect { Prg = 1, Chr = 2, Mirror = 4 };
@@ -24,6 +25,8 @@ struct BankControl {
   } engine;
   int chip, state_count = 0, initial_mirror;
   size_t unit, n_prg, n_chr, prg_count, chr_count;
+  // mappers.py BOARD: PRG in 16 KiB units, CHR in 4 KiB units (RAM counts as 8 KiB).
+  array<int, 2> board{};
   bool latches;
   array<array<int, 36>, 2> states{};
   int active = 0;
@@ -70,8 +73,10 @@ struct BankControl {
     engine.step(engine.ctx, model, in.data(), out.data());
     active ^= 1;
     const int dirty = out[state_count];
-    if (dirty)
+    if (dirty) {
+      std::copy(board.begin(), board.end(), out.begin() + state_count);
       engine.step(engine.ctx, engine.layout, out.data(), map.data());
+    }
     return dirty;
   }
   void reset() { transition(engine.reset, 0, 0, initial_mirror); }
@@ -86,6 +91,8 @@ public:
     if (cart_.prg.empty() || cart_.prg.size() % bank_.unit ||
         (bank_.latches && cart_.prg.size() < 0x8000))
       throw std::invalid_argument("invalid mapper PRG bank geometry");
+    if (cart_.prg.size() % BANK16 || cart_.chr.size() % 0x1000)
+      throw std::invalid_argument("cartridge ROM sizes must be whole 16 KiB PRG and 4 KiB CHR units");
     if ((chip == BankControl::Mmc1 && cart_.chr.size() % 0x1000) ||
         (bank_.latches && (cart_.chr.empty() || cart_.chr.size() % 0x1000)))
       throw std::invalid_argument("invalid mapper CHR bank geometry");
@@ -94,6 +101,8 @@ public:
                     : cart_.chr.size() / (bank_.latches ? 0x1000 : CHR_BANK1);
     if (!bank_.n_chr || (chip == BankControl::Mmc3 && bank_.n_prg < 2))
       throw std::invalid_argument("invalid mapper bank count");
+    bank_.board = {static_cast<int>(cart_.prg.size() / BANK16),
+                   static_cast<int>(cart_.chr.empty() ? 2 : cart_.chr.size() / 0x1000)};
     bank_.prg_count = 0x8000 / bank_.unit;
     bank_.chr_count = bank_.latches ? 4 : 8;
     bank_.initial_mirror = cart_.mirroring == Mirroring::Vertical ? 2 : 3;

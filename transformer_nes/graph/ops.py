@@ -50,6 +50,23 @@ def remainder(value, modulus: int, maximum: int):
     return value
 
 
+def remainder_by(value: ExprLike, modulus: ExprLike, maximum: int, *, least: int = 1):
+    """Reduce integers in [0, maximum] modulo an integer expression >= `least`.
+
+    Restoring division: each stage compares against one power-of-two multiple
+    of the modulus and subtracts it when it fits. The comparison is a 0/1
+    gate, so a ReGLU forms the product with the variable multiple. One more
+    neuron per stage than `remainder` with a constant modulus.
+    """
+    if least < 1 or maximum < 0:
+        raise ValueError("least modulus must be positive and maximum nonnegative")
+    value, modulus = to_expr(value), to_expr(modulus)
+    for shift in reversed(range((maximum // least).bit_length())):
+        multiple = modulus * (1 << shift)
+        value = value - reglu(multiple, stepglu(1, value - multiple))
+    return value
+
+
 def wrap8(value: ExprLike) -> Expression:
     """Reduce an integer expression to an unsigned 8-bit value."""
     one = graph.current_graph().one
@@ -107,56 +124,59 @@ def extract_bits(value: ExprLike, name: str) -> list[Expression]:
     return bits
 
 
+def group_spans(count: int, size: int = 4096) -> list[tuple[int, int]]:
+    """`count` consecutive lookup groups of `size` bytes from address 0."""
+    return [(g * size, g * size + size - 1) for g in range(count)]
+
+
 def grouped_read(
     address: ExprLike,
     byte_value: ExprLike,
     write_addr: ExprLike,
     is_write: ExprLike,
     *,
-    group_count: int | None = None,
-    groups: Sequence[int] | None = None,
+    spans: Sequence[tuple[int, int]],
+    space_end: int,
     dense: bool = False,
-    group_size: int = 4096,
 ) -> Expression:
     """The latest WRITE token's value at `address`, 0 if never written.
 
-    The space splits into 4 KiB lookup groups, each a nearest-address
-    attention over its own writes with a 12-bit local-address parabola.
-    Equal keys resolve to the latest write; a read whose nearest write is
-    another address is masked to 0.
+    The space splits into lookup groups (inclusive address spans), each a
+    nearest-address attention over its own writes with a local-address
+    parabola. Its square must fit the int32 residual: groups of at most
+    32 KiB. Equal keys resolve to the latest write; a read whose nearest
+    write is another address is masked to 0.
 
-    `groups` (ascending, default all `group_count`) restricts the read to
-    groups the address is known to fall in: the gating that picks among
-    them skips the bound below the lowest and above the highest, and a
-    single group needs none.  `dense` asserts every address the read can ask for has been
-    written (the harness seeds the region), so the nearest write is the
-    exact one and the exact-address mask is dropped."""
+    `spans` (ascending, disjoint) are the groups the address is known to fall
+    in: the gating that picks among them skips the bound below the lowest
+    and above the highest, and a single group needs none. Writes can land
+    anywhere in [0, space_end). `dense` asserts every address the read can
+    ask for has been written (the harness seeds the region), so the nearest
+    write is the exact one and the exact-address mask is dropped."""
     one = graph.current_graph().one
     address = to_expr(address)
     write_addr = to_expr(write_addr)
-    if groups is None:
-        assert group_count is not None
-        groups = range(group_count)
-    if list(groups) != sorted(set(groups)):
-        raise ValueError(f"read groups must ascend: {tuple(groups)}")
+    spans = [tuple(span) for span in spans]
+    if any(hi < lo or hi - lo >= 0x8000 for lo, hi in spans) or any(
+        a[1] >= b[0] for a, b in zip(spans, spans[1:], strict=False)
+    ):
+        raise ValueError(f"read spans must ascend, not overlap, and span at most 32 KiB: {spans}")
     value = Expression()
-    for group in groups:
-        lo = group * group_size
-        hi = lo + group_size - 1
+    for lo, hi in spans:
         # Reads: only boundaries between the allowed groups need a test.
         query_checks = []
-        if group != groups[0]:
+        if (lo, hi) != spans[0]:
             query_checks.append(stepglu(one, address - lo))
-        if group != groups[-1]:
+        if (lo, hi) != spans[-1]:
             query_checks.append(stepglu(one, hi - address))
         query_in_group = query_checks[0] if query_checks else None
         for check in query_checks[1:]:
             query_in_group = multiply(query_in_group, check)
         # Writes can land anywhere: both bounds, except the space's ends.
         write_checks = []
-        if group > 0:
+        if lo > 0:
             write_checks.append(stepglu(one, write_addr - lo))
-        if group_count is None or group < group_count - 1:
+        if hi < space_end - 1:
             write_checks.append(stepglu(one, hi - write_addr))
         write_in_group = write_checks[0]
         for check in write_checks[1:]:
@@ -170,7 +190,7 @@ def grouped_read(
             clear_key=1 - group_write,
             tie_break="latest",
         )
-        group_value.lookup.memory_group = group
+        group_value.lookup.memory_group = lo >> 12
         read = group_value if dense else multiply(group_value, match_zero(address - found_addr))
         if query_in_group is not None:
             read = multiply(query_in_group, read)

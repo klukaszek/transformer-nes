@@ -20,16 +20,15 @@ from transformer_nes.graph.core import (
 )
 from transformer_nes.graph.ops import both, equals, extract_bits, gate, select, wrap8
 from transformer_nes.ppu2c02.space import (
-    BASE_GROUPS,
     CHR,
     CHR_ALT,
     CHR_ALT_BASE,
+    CHR_FULL,
     CHR_FULL_BASE,
     OAM,
     PAGES,
     PALETTE,
     Memory,
-    chr_full_groups,
     in_palette_region,
     nametable_page,
     palette_offset,
@@ -63,7 +62,9 @@ ACCESS_FIELDS = (
     "latch_hi",
     *(f"bank{s}" for s in range(8)),
 )
-INPUTS = ("is_access", *ACCESS_FIELDS, *STATE_FIELDS)
+# whole_chr: CHR is addressed through MMC5's banks into the whole CHR,
+# rather than through the CHR windows.
+INPUTS = ("is_access", *ACCESS_FIELDS, *STATE_FIELDS, "whole_chr")
 EFFECT_FIELDS = (
     "read_value",
     "mem_write",
@@ -75,15 +76,20 @@ EFFECT_FIELDS = (
 )
 OUTPUTS = tuple(f"new_{f}" for f in STATE_FIELDS) + EFFECT_FIELDS
 
-# Folded experts, one per register and direction: an access always meets
+# Folded experts, one per register and direction, for carts with CHR
+# windows and (mmc5_*) with whole-CHR addressing: an access always meets
 # exactly one's pins, so the full graph never has to run.
-EXPERTS = {
+_ACCESS_EXPERTS = {
     f"{'write' if writing else 'read'}{r}": {
         "writing": writing,
         **{f"reg{j}": int(j == r) for j in range(8)},
     }
     for writing in range(2)
     for r in range(8)
+}
+EXPERTS = {
+    **{name: {**pins, "whole_chr": 0} for name, pins in _ACCESS_EXPERTS.items()},
+    **{f"mmc5_{name}": {**pins, "whole_chr": 1} for name, pins in _ACCESS_EXPERTS.items()},
 }
 
 
@@ -96,18 +102,17 @@ def gated(default: ExprLike, cases: list[tuple[ExprLike, ExprLike]]) -> Expressi
     return out
 
 
-def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expression]]:
-    """`chr_full`: bytes of whole-CHR memory (MMC5), or 0 for the CHR
-    windows."""
+def build() -> tuple[dict[str, Expression], dict[str, Expression]]:
     one = graph.current_graph().one
     inp = {name: InputDimension(name) for name in (*ACCESS_FIELDS, *STATE_FIELDS)}
     is_access = InputDimension("is_access")
     is_mem_write = InputDimension("is_mem_write")
     mem_addr = InputDimension("mem_addr")
     mem_value = InputDimension("mem_value")
+    whole_input = InputDimension("whole_chr")
 
     input_tokens = {
-        "ACCESS": is_access + sum((to_expr(d) for d in inp.values()), Expression()),
+        "ACCESS": is_access + sum((to_expr(d) for d in inp.values()), Expression()) + whole_input,
         "WRITE": is_mem_write + mem_addr + mem_value,
     }
 
@@ -176,23 +181,21 @@ def build(chr_full: int = 0) -> tuple[dict[str, Expression], dict[str, Expressio
     phys = gate(chr_region, address) + gate(nt_region, nt_phys) + gate(palette_region, palette_phys)
     # A palette read still refills the buffer from the nametable byte
     # "underneath" ($2F00-$2FFF shares the nametable fields).
-    # CHR as $2007 sees it (a CHR address has fy_low 0 or 1, its bit 12).
-    if chr_full:
-        slot = 4 * fy_low + v["nt"]  # the address's 1 KiB slot
-        bank = sum((gate(equals(slot, s), inp[f"bank{s}"]) for s in range(8)), Expression())
-        chr_phys = CHR_FULL_BASE + 0x400 * bank + 32 * v["cy"] + v["cx"]
-        chr_groups = chr_full_groups(chr_full)
-    else:
-        latch = select(fy_low, inp["latch_hi"], inp["latch_lo"])
-        chr_phys = address + gate(latch, CHR_ALT_BASE)
-        chr_groups = CHR + CHR_ALT
+    # CHR as $2007 sees it (a CHR address has fy_low 0 or 1, its bit 12):
+    # through MMC5's 1 KiB banks into the whole CHR, or through the windows.
+    slot = 4 * fy_low + v["nt"]  # the address's 1 KiB slot
+    bank = sum((gate(equals(slot, s), inp[f"bank{s}"]) for s in range(8)), Expression())
+    full_phys = CHR_FULL_BASE + 0x400 * bank + 32 * v["cy"] + v["cx"]
+    latch = select(fy_low, inp["latch_hi"], inp["latch_lo"])
+    window_phys = address + gate(latch, CHR_ALT_BASE)
+    chr_phys = select(persist(whole_input, name="whole_chr"), full_phys, window_phys)
+    chr_groups = CHR + CHR_ALT + CHR_FULL
     buffer_phys = gate(chr_region, chr_phys) + gate(1 - chr_region, nt_phys)
 
     # ── Memory reads ────────────────────────────────────────────────
     # The harness seeds every byte of PPU memory, so reads are dense, and
     # each read only spans the groups its address can fall in.
-    groups = chr_full_groups(chr_full)[-1] + 1 if chr_full else BASE_GROUPS
-    memory = Memory(is_mem_write, mem_addr, mem_value, groups=groups)
+    memory = Memory(is_mem_write, mem_addr, mem_value)
     buffer_fill = memory.read(buffer_phys, tuple(sorted(chr_groups + PAGES)), "buffer_fill")
     direct_addr = select(selected[4], 0x4000 + oam_addr, palette_phys)
     direct_byte = memory.read(direct_addr, PALETTE + OAM, "direct_byte")

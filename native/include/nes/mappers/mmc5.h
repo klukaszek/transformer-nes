@@ -9,12 +9,14 @@ namespace transformer_nes::nes {
 class Mmc5 final : public Mapper {
 public:
   explicit Mmc5(Cartridge cart) : Mapper(std::move(cart)), prg_ram_(0x10000) {
-    if (cart_.prg.empty() || cart_.prg.size() % BANK8 || cart_.chr.size() % CHR_BANK1)
-      throw std::invalid_argument("MMC5 requires 8 KiB PRG and 1 KiB CHR banks");
+    if (cart_.prg.empty() || cart_.prg.size() % BANK16 || cart_.chr.size() % 0x2000)
+      throw std::invalid_argument("MMC5 requires 16 KiB PRG and 8 KiB CHR units");
     bank_.chip = BankControl::Mmc5;
     bank_.unit = BANK8;
     bank_.n_prg = cart_.prg.size() / BANK8;
     bank_.n_chr = cart_.chr.empty() ? CHR_RAM_BANKS : cart_.chr.size() / CHR_BANK1;
+    bank_.board = {static_cast<int>(cart_.prg.size() / BANK16),
+                   static_cast<int>(cart_.chr.empty() ? 2 : cart_.chr.size() / 0x1000)};
     bank_.prg_count = 4;
     bank_.chr_count = 16;
     bank_.initial_mirror = 0;
