@@ -14,31 +14,19 @@ import logging
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from transformer_nes import build
-from transformer_nes.graph.core import (
-    Expression,
-    InputDimension,
-    ProgramGraph,
-    project_program_graph,
-)
 from transformer_nes.graph.fold import GraphFolder
 from transformer_nes.model.compiler import bank_source
-from transformer_nes.model.schedule import asap_schedule
-from transformer_nes.model.weights import build_model
+from transformer_nes.model.construct import TokenGraph, construct, describe
 
 logger = logging.getLogger(__name__)
 NATIVE_DIR = Path(__file__).with_name("native")
-
-
-def construct(program_graph: ProgramGraph):
-    schedule = asap_schedule(program_graph, log=lambda _: None)
-    return build_model(program_graph=program_graph, schedule=schedule)
 
 
 def generate_graph_source(models: list[dict], memory_size: int = 0x10000) -> tuple[str, int]:
@@ -67,30 +55,6 @@ def generate_graph_source(models: list[dict], memory_size: int = 0x10000) -> tup
     }.items():
         adapter = adapter.replace(key, value)
     return bank_source(models, adapter, memory_size=memory_size), f_bits
-
-
-@dataclass(frozen=True)
-class TokenGraph:
-    """A token type an engine runs: its graph, the caller's input and
-    output order for it, and its folded experts (name -> pins: persist
-    dim name -> constant)."""
-
-    program_graph: ProgramGraph
-    inputs: Sequence[str]
-    outputs: Sequence[str]
-    experts: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
-    # Reassociation is exact for int32, but changes native register allocation.
-    # Hot tokens can retain their measured projection grouping.
-    reassociate_residuals: bool = True
-
-    def project(self, outputs: Sequence[str]) -> TokenGraph:
-        """Compile only the dependency closure of selected readouts."""
-        if not set(outputs) <= set(self.outputs):
-            raise ValueError("projection must select existing token outputs")
-        dims = {d.name: d for d in self.program_graph.all_dims}
-        readout = Expression({dims[name]: 1e-6 for name in outputs})
-        projected = project_program_graph(self.program_graph, {"READOUT": readout})
-        return replace(self, program_graph=projected, outputs=tuple(outputs))
 
 
 @dataclass(frozen=True)
@@ -200,7 +164,7 @@ class CompiledGraph:
                 token.program_graph, root_names=list(token.outputs), structural_reads=True
             ).fold({}, label=name)
             models.append(
-                CompiledGraph.compile_token(
+                describe(
                     token, full.program_graph, list(full.dim_of_name.values()), dtype=dtype
                 )
             )
@@ -214,7 +178,7 @@ class CompiledGraph:
                     fold = folder.fold(dict(pins), label=expert)
                     model_ids.append((name, expert, len(models)))
                     models.append(
-                        CompiledGraph.compile_token(
+                        describe(
                             token,
                             fold.program_graph,
                             list(fold.dim_of_name.values()),
@@ -254,34 +218,6 @@ class CompiledGraph:
     def model_id(self, graph: str, expert: str | None = None) -> int:
         return self.model_ids[graph, expert]
 
-    @staticmethod
-    def compile_token(token: TokenGraph, program_graph, dims, *, dtype="int32") -> dict:
-        model, _idx, info = construct(program_graph)
-        by_name = {}
-        for d in dims:
-            by_name.setdefault(d.name, d)
-        inputs = {d.name: d for d in program_graph.all_dims if isinstance(d, InputDimension)}
-        return {
-            "model": model,
-            "dtype": dtype,
-            "reassociate_residuals": token.reassociate_residuals,
-            # Integer coefficients preserve integer residuals. Fractional
-            # projections need the same half-unit encoding as the CPU.
-            "fraction_bits": int(dtype == "int32" and any(
-                (weight.weight != np.rint(weight.weight)).any()
-                for weight in [
-                    *model.ff_in, *model.ff_out,
-                    *(attn.out_proj for attn in model.attn),
-                ]
-            )),
-            "n_layers": info.n_layers,
-            "d_model": info.d_model,
-            "input_slots": [
-                info.slot_of.get(inputs[n], -1) if n in inputs else -1 for n in token.inputs
-            ],
-            "output_slots": [info.slot_of[by_name[n]] for n in token.outputs],
-        }
-
     def debug_kernel(self, trace: bool):
         if trace not in self._debug_modules:
             key = f"graph_debug:{self.digest}:{trace}"
@@ -298,7 +234,7 @@ class CompiledGraph:
             fold = GraphFolder(
                 token.program_graph, root_names=list(token.outputs), structural_reads=True
             ).fold({}, label="primary")
-            model = self.compile_token(
+            model = describe(
                 token, fold.program_graph, list(fold.dim_of_name.values()), dtype=self.dtype.name
             )
             model["fraction_bits"] = self.f_bits

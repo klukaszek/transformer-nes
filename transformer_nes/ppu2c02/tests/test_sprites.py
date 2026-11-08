@@ -16,7 +16,7 @@ def test_row_circuit_exhausts_patterns_flip_visibility_and_metadata():
 
     from transformer_nes.graph.core import InputDimension, construction, current_graph, persist
     from transformer_nes.model.compiler import weight_module
-    from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+    from transformer_nes.model.construct import TokenGraph, describe
     from transformer_nes.ppu2c02.sprites import encode_row
 
     @construction
@@ -29,7 +29,7 @@ def test_row_circuit_exhausts_patterns_flip_visibility_and_metadata():
         return TokenGraph(graph, names, [f"pixel{i}" for i in range(8)])
 
     token = row()
-    expert = CompiledGraph.compile_token(token, token.program_graph, token.program_graph.all_dims)
+    expert = describe(token, token.program_graph, token.program_graph.all_dims)
     forward = weight_module(expert, memory_size=1)
     pairs = np.arange(65536, dtype=np.int32)
     low, high = pairs & 255, pairs >> 8
@@ -60,7 +60,7 @@ def test_row_circuit_exhausts_patterns_flip_visibility_and_metadata():
 
 def test_composition_executes_exact_weights_and_ordered_clipped_updates():
     from transformer_nes.graph.core import InputDimension
-    from transformer_nes.model.graph_engine import construct
+    from transformer_nes.model.construct import construct
     from transformer_nes.model.inference import ExactInference
     from transformer_nes.ppu2c02 import control
 

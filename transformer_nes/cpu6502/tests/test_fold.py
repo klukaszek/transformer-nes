@@ -10,7 +10,7 @@ import pytest
 from transformer_nes.cpu6502.engine import generate_source
 from transformer_nes.cpu6502.execution import (
     SEQUENCE_ROOT_DIMS,
-    SEQUENCE_STATE_DIMS,
+    STATE_FIELDS,
     project_sequence_execution,
 )
 from transformer_nes.cpu6502.experts import (
@@ -22,10 +22,10 @@ from transformer_nes.cpu6502.folds import (
     SEQUENCE_FEEDBACK,
     SequenceFolder,
     opcode_pins,
-    sequence_pins,
+    sequence_shape_pins,
 )
 from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, build
-from transformer_nes.cpu6502.shapes import decode_ops, last_a_bit_step
+from transformer_nes.cpu6502.shapes import last_a_bit_step
 from transformer_nes.cpu6502.spec import FLAG_C, OPCODES
 from transformer_nes.graph.core import (
     MEMORY_GROUP_FUSED,
@@ -115,16 +115,13 @@ def test_opcode_fold_is_materially_smaller(folder, union_fold, byte):
 
 # ── Sequence fold: the poll trio and the JMP spin as one step ────────
 
-POLL_HEAD = 0x0400
-SPIN_HEAD = 0x0408
-
 
 def test_sequence_execution_projection_keeps_only_final_state(folder):
     """The execution model is built from the licensed fold after removing
     the per-instruction trace receipt. A write-free three-instruction poll
     keeps exactly one final architectural receipt."""
     code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
-    pin_list = sequence_pins(POLL_HEAD, code, OPCODES)
+    pin_list, offsets = sequence_shape_pins(code, OPCODES)
     # Projection consumes individual flag roots, which need not remain live
     # under the packed new_p readout after affine circuit simplification.
     proof = SequenceFolder(folder.pg, root_names=(*RUNTIME_READ_DIMS, *SEQUENCE_ROOT_DIMS))
@@ -132,6 +129,7 @@ def test_sequence_execution_projection_keeps_only_final_state(folder):
         pin_list,
         SEQUENCE_FEEDBACK,
         label="projected_poll",
+        pc_offsets=offsets,
     )
     proof_dims = len(r.program_graph.all_dims)
     execution = project_sequence_execution(
@@ -141,16 +139,16 @@ def test_sequence_execution_projection_keeps_only_final_state(folder):
 
     assert execution.memory_writes == ()
     classified = {output.name for output in execution.outputs}
-    assert classified == set(SEQUENCE_STATE_DIMS)
+    assert classified == {name for name, _final, _input in STATE_FIELDS}
     assert len(execution.program_graph.all_dims) < proof_dims * 0.76
     assert len(r.program_graph.all_dims) == proof_dims
+    # Interior trace receipts are gone; the symbolic pc chain and effective
+    # address that later steps compute from remain.
     for k in range(len(pin_list) - 1):
         for name in (
-            "current_pc",
             "fetched_opcode",
             "fetched_operand_lo",
             "fetched_operand_hi",
-            "ea",
             "data_out",
             "next_pc",
             "is_store",
@@ -160,59 +158,9 @@ def test_sequence_execution_projection_keeps_only_final_state(folder):
             assert f"{name}__s{k}" not in execution.dim_of_name
 
 
-def test_sequence_execution_projection_keeps_only_the_pinned_state_dependencies(folder):
-    """Pinned control flow retains at most the carry-flag identity circuit."""
-    import numpy as np
-
-    from transformer_nes.model.inference import ExactInference
-    pins = (
-        sequence_pins(
-            SPIN_HEAD,
-            bytes([0x4C, 0x08, 0x04]),
-            OPCODES,
-        )
-        * 8
-    )
-    structural = SequenceFolder(
-        folder.pg,
-        root_names=SEQUENCE_ROOT_DIMS,
-        structural_reads=True,
-    )
-    execution = structural.fold_execution_sequence(
-        pins,
-        SEQUENCE_FEEDBACK,
-        label="execution_spin",
-        inline_linear=True,
-    )
-    execution_graph = project_sequence_execution(
-        execution,
-        len(pins),
-    )
-    model, _rows, execution_info = schedule_and_build(execution_graph)
-
-    live = [output for output in execution_graph.outputs if output.source == "model"]
-    assert {output.name for output in live} <= {"p_c"}
-    assert {
-        dim.name
-        for dim in execution_graph.program_graph.all_dims
-        if isinstance(dim, InputDimension)
-    } <= {"one", "in_p_c"}
-    # The existing circuit retains C as a model output. Check the numerical
-    # identity rather than assuming the folder classifies it as preservation.
-    eager = ExactInference(model)
-    for carry in (0, 1):
-        values = np.zeros(execution_info.d_model)
-        for dim, slot in execution_info.slot_of.items():
-            if isinstance(dim, InputDimension):
-                values[slot] = 1 if dim.name == "one" else carry
-        residual = eager.forward(values)
-        for output in live:
-            assert residual[execution_info.slot_of[output.dimension]] == carry
-
-
 def test_structural_execution_uses_external_memory_reads(folder):
     code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
-    pins = sequence_pins(POLL_HEAD, code, OPCODES)
+    pins, offsets = sequence_shape_pins(code, OPCODES)
     structural = SequenceFolder(
         folder.pg,
         root_names=SEQUENCE_ROOT_DIMS,
@@ -222,6 +170,7 @@ def test_structural_execution_uses_external_memory_reads(folder):
         pins,
         SEQUENCE_FEEDBACK,
         label="external_poll",
+        pc_offsets=offsets,
         inline_linear=True,
     )
     execution = project_sequence_execution(
@@ -254,7 +203,7 @@ def test_structural_execution_uses_external_memory_reads(folder):
 
 
 def test_execution_ir_retains_ordered_writes(folder):
-    pins = sequence_pins(SPIN_HEAD, bytes([0x85, 0x10]), OPCODES)
+    pins, offsets = sequence_shape_pins(bytes([0x85, 0x10]), OPCODES)
     structural = SequenceFolder(
         folder.pg,
         root_names=SEQUENCE_ROOT_DIMS,
@@ -264,6 +213,7 @@ def test_execution_ir_retains_ordered_writes(folder):
         pins,
         SEQUENCE_FEEDBACK,
         label="ordered_store",
+        pc_offsets=offsets,
         inline_linear=True,
     )
     execution = project_sequence_execution(
@@ -284,8 +234,8 @@ def test_external_memory_read_exposes_only_consumed_bits():
     input_tokens, output_tokens = build(bcd=False, wide_bits=True)
     pg = current_graph().capture(input_tokens, output_tokens)
     code = bytes([0x6D, 0x00, 0x07])  # ADC $0700 consumes only operand bit 7.
-    pins = sequence_pins(SPIN_HEAD, code, OPCODES)
-    ops = decode_ops(code)
+    pins, offsets = sequence_shape_pins(code, OPCODES)
+    ops = [OPCODES[code[o]] for o in offsets]
     folder = SequenceFolder(
         pg,
         root_names=SEQUENCE_ROOT_DIMS,
@@ -295,6 +245,7 @@ def test_external_memory_read_exposes_only_consumed_bits():
         pins,
         SEQUENCE_FEEDBACK,
         label="selective_bits",
+        pc_offsets=offsets,
         inline_linear=True,
         bit_feedback_until=last_a_bit_step(ops),
     )
@@ -303,15 +254,17 @@ def test_external_memory_read_exposes_only_consumed_bits():
         len(pins),
     )
 
+    # The symbolic shape reads its operand bytes (no bits), then the operand,
+    # of which only bit 7 is served.
     assert [read.output_kinds for read in execution.program_graph.all_memory_reads] == [
-        ("value", "address", "bit7"),
+        ("value", "address"), ("value", "address"), ("value", "address", "bit7"),
     ]
 
 
 def test_execution_proof_materializes_only_license_facts(folder):
     code = bytes([0xAD, 0x00, 0x07, 0x29, 0x40, 0xF0, 0xF9])
-    pins = sequence_pins(POLL_HEAD, code, OPCODES)
-    ops = decode_ops(code)
+    pins, offsets = sequence_shape_pins(code, OPCODES)
+    ops = [OPCODES[code[o]] for o in offsets]
     structural = SequenceFolder(
         folder.pg,
         root_names=SEQUENCE_ROOT_DIMS,
@@ -321,6 +274,7 @@ def test_execution_proof_materializes_only_license_facts(folder):
         pins,
         SEQUENCE_FEEDBACK,
         label="proof_facts",
+        pc_offsets=offsets,
         inline_linear=True,
         bit_feedback_until=last_a_bit_step(ops),
     )

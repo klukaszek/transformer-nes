@@ -9,7 +9,8 @@ and extended attributes are inputs, with experts for each.
 from __future__ import annotations
 
 from transformer_nes.graph.core import GraphContext, ProgramGraph, construction, current_graph
-from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+from transformer_nes.model.construct import TokenGraph
+from transformer_nes.model.graph_engine import CompiledGraph
 from transformer_nes.ppu2c02 import registers, render, space, sprites
 
 

@@ -56,7 +56,7 @@ def compile_bank(bcd: bool):
     from transformer_nes.cpu6502.graph import RUNTIME_READ_DIMS, Cpu6502Graph
     from transformer_nes.graph.fold import GraphFolder
     from transformer_nes.model.compiler import bank_source
-    from transformer_nes.model.graph_engine import construct
+    from transformer_nes.model.construct import construct
 
     digest = bank_digest(bcd)
     name = f"torch_bank_{digest}"

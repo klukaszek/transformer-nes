@@ -141,6 +141,18 @@ INT = torch.int32
 logger = logging.getLogger(__name__)
 
 
+def circuit_layers(expert) -> tuple[list[dict], int, int]:
+    """(per-layer arrays, d_model, one_slot) of a circuit: its own
+    ``layers`` (a model.transformer.Transformer's buffers), else cut from
+    its ``model`` (a weights.WeightModel)."""
+    if "layers" in expert:
+        return expert["layers"], expert["d_model"], expert["one_slot"]
+    model = expert["model"]
+    floating = expert.get("dtype") == "float32"
+    layers = [layer_arrays(model, li, floating=floating) for li in range(len(model.attn))]
+    return layers, model.tok.weight.shape[1], model.one_slot
+
+
 def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     """Expand actual matrices at their exact residual scale.
 
@@ -148,14 +160,14 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     let the compiler simplify the transformer's arithmetic on valid inputs.
     Only declared ABI readouts escape; other residual slots are dead.
     """
-    model, spec = expert["model"], expert.get("step_spec")
+    spec = expert.get("step_spec")
     dtype = torch.float32 if expert.get("dtype") == "float32" else INT
     floating = dtype == torch.float32
     if floating and spec is not None:
         raise ValueError("float32 circuits require a graph token input contract")
     f_bits = expert.get("fraction_bits", 1)
     scale = 1 << f_bits
-    D = model.tok.weight.shape[1]
+    layers, D, one_slot = circuit_layers(expert)
     g = Graph()
     x = g.placeholder("x")
     ram = g.placeholder("memory")
@@ -244,7 +256,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
             if slot >= 0:
                 value = op(operator.getitem, x, slice(field, field + 1))
                 state[slot] = op(operator.mul, value, scale) if f_bits else value
-    state[model.one_slot] = one
+    state[one_slot] = one
 
     def dot(weights, values):
         result = None
@@ -351,8 +363,7 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
     reads, snapshots = [], []
     if trace:
         snapshots.append(op(torch.cat, state))
-    for li in range(len(model.attn)):
-        a = layer_arrays(model, li, floating=floating)
+    for li, a in enumerate(layers):
         nvalues = len(a["read_kind"])
         qrows = len(a["w_in"]) - a["w_out"].shape[1] + nvalues
         projected = linear(a["w_in"], [state[s] for s in a["in_slots"]])
@@ -470,7 +481,33 @@ def weight_module(expert, *, memory_size=65536, trace=False, ablation=False):
 
 
 def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=False):
+    """A bank's kernels with a native adapter appended (graph_engine banks)."""
+    kernels, metadata, scalar = bank_kernels(
+        experts, memory_size=memory_size, trace=trace, ablation=ablation
+    )
+    entries = ",\n".join(
+        f"{{circuit_{m['circuit']}, {m['width']}, {m['reads']}, {str(m['checks_division']).lower()}}}"
+        for m in metadata
+    )
+    runtime = (NATIVE_DIR / "torch_bank.h").read_text()
+    hook = runtime + "\n" + adapter
+    for name, value in {
+        "@ENTRIES@": entries,
+        "@SCALAR@": scalar,
+        "@MAX_WIDTH@": str(max(meta["width"] for meta in metadata)),
+        "@MAX_AUX@": str(max(1, max(meta["reads"] for meta in metadata))),
+        "@INPUT_WIDTHS@": ", ".join(str(meta["input_width"]) for meta in metadata),
+    }.items():
+        hook = hook.replace(name, value)
+    return ssa.CPP_PREAMBLE + kernels + "\n" + hook
+
+
+def bank_kernels(experts, *, memory_size=65536, trace=False, ablation=False) -> tuple[str, list[dict], str]:
     """Lower weight-derived arithmetic once per value to compact native SSA.
+
+    Returns (kernels, metadata per circuit, scalar type). The kernels need
+    ssa.CPP_PREAMBLE before them; ``circuit_<m["circuit"]>`` runs circuit i,
+    whose metadata also gives its output width, reported reads and input width.
 
     The IR cancels integer residual clears, shares affine forms and treats
     half shifts, ReGLUs and memory loads as explicit arithmetic boundaries.
@@ -526,19 +563,5 @@ def bank_source(experts, adapter, *, memory_size=65536, trace=False, ablation=Fa
     else:
         helpers = ""
     logger.info("shared %d compiled fragments", helpers.count("always_inline"))
-    entries = ",\n".join(
-        f"{{circuit_{m['circuit']}, {m['width']}, {m['reads']}, {str(m['checks_division']).lower()}}}"
-        for m in metadata
-    )
-    runtime = (NATIVE_DIR / "torch_bank.h").read_text()
-    hook = runtime + "\n" + adapter
-    for name, value in {
-        "@ENTRIES@": entries,
-        "@SCALAR@": scalar,
-        "@MAX_WIDTH@": str(max(meta["width"] for meta in metadata)),
-        "@MAX_AUX@": str(max(1, max(meta["reads"] for meta in metadata))),
-        "@INPUT_WIDTHS@": ", ".join(str(meta["input_width"]) for meta in metadata),
-    }.items():
-        hook = hook.replace(name, value)
     shared = helpers + "\n" if helpers else ""
-    return ssa.CPP_PREAMBLE + f"using V = {scalar};\n" + shared + "\n".join(bodies) + "\n" + hook
+    return f"using V = {scalar};\n" + shared + "\n".join(bodies), metadata, scalar

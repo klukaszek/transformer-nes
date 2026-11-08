@@ -97,7 +97,7 @@ def opcode_pins(byte: int, opcodes, *, pin_fetched_byte: bool = True) -> dict[st
 
 # State-input persist -> previous step's output, for fold_execution_sequence over the
 # 6502 graph.  pc and the trace-context bytes are pinned per step instead
-# (sequence_pins knows them); ea feeds back as a byte split, so it must fold
+# (sequence_shape_pins knows them); ea feeds back as a byte split, so it must fold
 # constant -- true for the write-free poll/spin windows this is built for.
 SEQUENCE_FEEDBACK = {
     "current_a": "new_a",
@@ -144,47 +144,6 @@ def sequence_shape_pins(code: bytes, opcodes) -> tuple[list[dict[str, float]], l
     if off != len(code):
         raise ValueError("window does not end on an instruction boundary")
     return pin_list, offsets
-
-
-def sequence_pins(head_pc: int, code: bytes, opcodes) -> list[dict[str, float]]:
-    """Per-step pins for a K-instruction window: the bytes at head_pc, in
-    execution order (an absolute JMP or JSR before the last step continues
-    the window at its target). Interior conditional branches are rejected.
-
-    Each step gets its opcode pins plus its pc and every in-window operand
-    byte pinned (the router verifies pc == head_pc and the whole window's
-    bytes, so all of it is router-guaranteed).  current_halted is pinned 0:
-    the run loop never dispatches a halted machine, and the runner checks
-    each step's folded new_halted is constant 0.
-    """
-    pin_list = []
-    pc = head_pc
-    off = 0
-    while off < len(code):
-        op = opcodes.get(code[off])
-        if op is None:
-            raise ValueError(f"byte {code[off]:02X} at +{off} is not an opcode")
-        pins = opcode_pins(op.byte, opcodes)
-        pins["current_pc_lo"] = float(pc & 0xFF)
-        pins["current_pc_hi"] = float((pc >> 8) & 0xFF)
-        pins["current_halted"] = 0.0
-        if off + 1 < len(code):
-            pins["fetched_operand_lo_all"] = float(code[off + 1])
-        if off + 2 < len(code):
-            pins["fetched_operand_hi_all"] = float(code[off + 2])
-        pin_list.append(pins)
-        interior = off + op.length < len(code)
-        if interior and op.operation in ("jmp", "jsr") and op.mode == "abs":
-            pc = code[off + 1] | (code[off + 2] << 8)
-        elif interior and op.mode == "rel":
-            raise ValueError(f"interior branch at +{off} is not licensed")
-        else:
-            pc += op.length
-        pc &= 0xFFFF
-        off += op.length
-    if off != len(code):
-        raise ValueError("window does not end on an instruction boundary")
-    return pin_list
 
 
 class SequenceFolder(GraphFolder):

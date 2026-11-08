@@ -12,16 +12,15 @@ namespace transformer_nes::nes {
 struct BankControl {
   enum Chip { Mmc1 = 1, Mmc3 = 4, Mmc5 = 5, Mmc2 = 9, Mmc4 = 10 };
   enum Effect { Prg = 1, Chr = 2, Mirror = 4 };
-  struct Port { int address, write, rmw; };
+  // The chip's model ids (nes/mappers.py:chip).
   struct Engine {
     void* ctx = nullptr;
     void (*step)(void*, int, const int*, int*) = nullptr;
-    int reset = 0, layout = 0;
+    int transition = 0, layout = 0;
     void* access_ctx = nullptr;
     void (*access_step)(void*, int, const int*, int*) = nullptr;
     array<int, 2> access_models{};
     int address_model = 0;
-    vector<Port> ports;
   } engine;
   int chip, state_count = 0, initial_mirror;
   size_t unit, n_prg, n_chr, prg_count, chr_count;
@@ -33,6 +32,7 @@ struct BankControl {
   array<int, 40> map{}; // PRG banks, CHR banks, mirroring, chip-specific effects
 
   enum Storage { Literal, Rom, Ram, Exram, Irq };
+  // port: the register written (its address), or 0.
   struct Access {
     int port, event, irq_event, schedule, source, index, value, write, repair;
   };
@@ -61,7 +61,7 @@ struct BankControl {
     packet.source = out[0]; packet.index = out[1]; packet.value = out[2];
   }
 
-  int transition(int model, int event, int port, int value, int original = 0) {
+  int transition(int event, int port, int value, int original = 0) {
     if (!engine.step)
       throw std::runtime_error("mapper bank transformer is required");
     auto& in = states[active];
@@ -70,7 +70,7 @@ struct BankControl {
     in[state_count + 1] = port;
     in[state_count + 2] = value;
     in[state_count + 3] = original;
-    engine.step(engine.ctx, model, in.data(), out.data());
+    engine.step(engine.ctx, engine.transition, in.data(), out.data());
     active ^= 1;
     const int dirty = out[state_count];
     if (dirty) {
@@ -79,7 +79,7 @@ struct BankControl {
     }
     return dirty;
   }
-  void reset() { transition(engine.reset, 0, 0, initial_mirror); }
+  void reset() { transition(0, 0, initial_mirror); }
 };
 
 class BankMapper final : public Mapper {
@@ -162,12 +162,10 @@ private:
   void apply_write(int addr, int value, int original) {
     auto packet = bank_.access(addr, true, original);
     int dirty = 0;
-    if (packet.port >= 0) {
-      const auto& entry = bank_.engine.ports[static_cast<size_t>(packet.port)];
+    if (packet.port) {
       array<int, 4> before;
       std::copy_n(bank_.map.begin(), bank_.prg_count, before.begin());
-      dirty = bank_.transition(packet.event == 2 ? entry.rmw : entry.write, packet.event,
-                                entry.address, value & 0xFF, original);
+      dirty = bank_.transition(packet.event, packet.port, value & 0xFF, original);
       if (dirty & BankControl::Prg)
         for (size_t i = 0; i < bank_.prg_count; ++i)
           if (before[i] != bank_.map[i])

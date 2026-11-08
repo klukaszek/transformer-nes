@@ -6,7 +6,7 @@ evaluation, matrix construction and native execution.
 ```
 transformer_nes/          Python only: nothing generated, no console C++, no ROMs
   graph/                  graph DSL
-  model/                  generic scheduler, weights, compiler, token engine
+  model/                  the transformer model and the machinery around it
   cpu6502/                the 6502 (construction, runtime, oracle, checkpoints)
   ppu2c02/                the PPU
   apu2a03/                the APU
@@ -15,8 +15,25 @@ transformer_nes/          Python only: nothing generated, no console C++, no ROM
   build.py                paths, source identities, caches, native loading
 native/                   the C++ console, bindings, window and test oracle
 fixtures/                 ROMs, golden logs and test binaries
-.cache/engine/            generated kernels and banks (untracked, disposable)
+.cache/                   the built model and its library, kernels and older banks
+                          (untracked, disposable)
 ```
+
+## Four layers
+
+| Layer | Owns | Files |
+|---|---|---|
+| Construct | circuits to weights | the graph DSL, `model/construct.py` (token types, folding into specializations), `model/schedule.py`, `model/weights.py` |
+| Model | the NES as PyTorch modules: sparse exact weights, eager forward | `model/transformer.py` (imports only torch), `nes/model.py` (`NES`, saved as `nes.safetensors` and `nes.json`) |
+| Compile | one native library for the whole model | `model/backend.py`, `model/compiler.py`, `model/ssa.py`, `model/native/` |
+| Run | the console: clock, devices, I/O | `native/`, handed its compiled chips by Python |
+
+The model holds weights only; memory is the runtime's state, passed to each
+forward. A specialization is its own smaller circuit, valid where its pins
+hold. The library is keyed by the model's weights and the backend's sources,
+built on first use and published by rename. Chips move onto this path one by
+one: the controller, mapper chips and APU have; the PPU and CPU still build
+through `model/graph_engine.py` and their own caches.
 
 ## A reading order
 
@@ -34,9 +51,10 @@ fixtures/                 ROMs, golden logs and test binaries
    neural forward context; `engine.py` emits the native scheduling shell, whose
    runtime logic lives in `cpu6502/native/engine.cpp`.
 
-For a smaller circuit, read `nes/controller.py`, then follow its `TokenGraph`
-through `model/graph_engine.py`. It uses the same scheduler, weights and
-compiler.
+For a smaller circuit, read `nes/controller.py`: `chip()` builds its
+`model.transformer.Chip` through `model/construct.py`. `model/transformer.py`
+is the PyTorch model it becomes, and `model/backend.py` compiles every chip of
+`nes/model.py:NES` into one library.
 
 ## Boundaries
 

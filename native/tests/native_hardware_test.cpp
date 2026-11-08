@@ -18,9 +18,10 @@ static vector<uint8_t> banks(size_t count, size_t bank_size) {
 
 // Independent conventional oracle for this stand-alone hardware test.
 // Production consoles attach the compiled mappers.py weights instead.
+// Model id: the chip (MapperIrq::Chip); the event is an input, as in the circuit.
 static void reference_mapper_irq(void*, int model, const int* in, int* out) {
-  const bool mmc5 = model / MapperIrq::event_count == MapperIrq::Mmc5;
-  const int event = model % MapperIrq::event_count;
+  const bool mmc5 = model == MapperIrq::Mmc5;
+  const int event = in[5];
   int counter = in[0], target = in[1], phase = in[2], pending = in[3], enabled = in[4];
   int fire = 0, read = 0;
   switch (event) {
@@ -81,7 +82,8 @@ static void reference_mapper_irq(void*, int model, const int* in, int* out) {
 }
 
 // A conventional oracle, confined to this standalone test executable.
-// Model 0 resets, 1 writes, 2 applies an RMW, and 3 projects the bank map.
+// Model 0 is the register transition (event 0 resets, 1 writes, 2 applies
+// an RMW) and model 3 projects the bank map.
 static void reference_mapper_banks(void* context, int model, const int* in, int* out) {
   const auto& b = *static_cast<BankControl*>(context);
   const int n = b.state_count;
@@ -137,10 +139,10 @@ static void reference_mapper_banks(void* context, int model, const int* in, int*
     }
     return;
   }
-  const int port = in[n + 1], value = in[n + 2], original = in[n + 3];
+  const int event = in[n], port = in[n + 1], value = in[n + 2], original = in[n + 3];
   std::copy_n(in, n, out);
   int dirty = 0;
-  if (model == 0) {
+  if (event == 0) {
     std::fill_n(out, n, 0);
     if (b.chip == BankControl::Mmc1) { out[0] = 12 + value; out[4] = 16; }
     else if (b.chip == BankControl::Mmc3) {
@@ -166,8 +168,8 @@ static void reference_mapper_banks(void* context, int model, const int* in, int*
       out[4] = 16;
       dirty |= reg == 0 ? 7 : reg == 3 ? BankControl::Prg : BankControl::Chr;
     };
-    serial(model == 2 ? original : value);
-    if (model == 2 && (value & 0x80)) serial(value);
+    serial(event == 2 ? original : value);
+    if (event == 2 && (value & 0x80)) serial(value);
   } else if (b.chip == BankControl::Mmc3) {
     if (port == 0x8000) {
       const int p = !!(value & 0x40), c = !!(value & 0x80);
@@ -195,11 +197,24 @@ static void reference_mapper_banks(void* context, int model, const int* in, int*
   out[n] = dirty;
 }
 
+// Each chip's register ports (nes/mappers.py BANK_PORTS), for the oracle below.
+static vector<int> chip_ports(int chip) {
+  switch (chip) {
+  case BankControl::Mmc1: return {0x8000, 0xA000, 0xC000, 0xE000};
+  case BankControl::Mmc3: return {0x8000, 0x8001, 0xA000};
+  case BankControl::Mmc5: return {0x5100, 0x5101, 0x5102, 0x5103, 0x5104, 0x5105, 0x5106, 0x5107,
+                                  0x5113, 0x5114, 0x5115, 0x5116, 0x5117, 0x5120, 0x5121, 0x5122,
+                                  0x5123, 0x5124, 0x5125, 0x5126, 0x5127, 0x5128, 0x5129, 0x512A,
+                                  0x512B, 0x5130, 0x5205, 0x5206};
+  default: return {0xA000, 0xB000, 0xC000, 0xD000, 0xE000, 0xF000};
+  }
+}
+
 // Independent address/port oracle, excluded from the production extension.
 static void reference_mapper_access(void* context, int model, const int* in, int* out) {
   const auto& bank = *static_cast<BankControl*>(context);
   const int address = in[0] | (in[1] << 8), writing = in[2];
-  int packet[9]{-1, 1, -1, 0, 0, 0, 0, 0, 0};
+  int packet[9]{0, 1, -1, 0, 0, 0, 0, 0, 0};
   int port = address;
   if (bank.chip == BankControl::Mmc1) {
     port &= 0xE000;
@@ -207,8 +222,8 @@ static void reference_mapper_access(void* context, int model, const int* in, int
   } else if (bank.chip == BankControl::Mmc3) port &= 0xE001;
   else if (bank.chip != BankControl::Mmc5) port &= 0xF000;
   if (writing)
-    for (size_t i = 0; i < bank.engine.ports.size(); ++i)
-      if (bank.engine.ports[i].address == port) packet[0] = static_cast<int>(i);
+    for (const int p : chip_ports(bank.chip))
+      if (p == port) packet[0] = port;
   if (address >= 0x8000) {
     const int slot = (address - 0x8000) / bank.unit;
     packet[4] = BankControl::Rom;
@@ -277,22 +292,11 @@ static void wire(Mapper& mapper, array<uint8_t, 0x10000>& memory, ImageMachine& 
     bank->state_count = bank->chip == BankControl::Mmc1 ? 5 : bank->chip == BankControl::Mmc3 ? 12 : bank->chip == BankControl::Mmc5 ? 28 : 6;
     bank->engine.ctx = bank;
     bank->engine.step = reference_mapper_banks;
-    bank->engine.reset = 0;
+    bank->engine.transition = 0;
     bank->engine.layout = 3;
     bank->engine.access_ctx = bank;
     bank->engine.access_step = reference_mapper_access;
     bank->engine.address_model = 3;
-    if (bank->chip == BankControl::Mmc1)
-      for (int p : {0x8000, 0xA000, 0xC000, 0xE000}) bank->engine.ports.push_back({p, 1, 2});
-    else if (bank->chip == BankControl::Mmc3)
-      for (int p : {0x8000, 0x8001, 0xA000}) bank->engine.ports.push_back({p, 1, 2});
-    else if (bank->chip == BankControl::Mmc5) {
-      for (int p : {0x5100,0x5101,0x5102,0x5103,0x5104,0x5105,0x5106,0x5107,
-                    0x5113,0x5114,0x5115,0x5116,0x5117,0x5120,0x5121,0x5122,0x5123,
-                    0x5124,0x5125,0x5126,0x5127,0x5128,0x5129,0x512A,0x512B,0x5130,0x5205,0x5206})
-        bank->engine.ports.push_back({p, 1, 2});
-    } else
-      for (int p : {0xA000, 0xB000, 0xC000, 0xD000, 0xE000, 0xF000}) bank->engine.ports.push_back({p, 1, 2});
     bank->reset();
   }
   auto image = mapper.cpu_image();
@@ -300,9 +304,7 @@ static void wire(Mapper& mapper, array<uint8_t, 0x10000>& memory, ImageMachine& 
   irq.machine = &machine;
   if (auto* state = mapper.irq_state()) {
     state->engine.step = reference_mapper_irq;
-    for (int i = 0; i < MapperIrq::event_count; ++i)
-      state->engine.models[static_cast<size_t>(i)] =
-          static_cast<int>(state->chip) * MapperIrq::event_count + i;
+    state->engine.model = static_cast<int>(state->chip);
   }
   mapper.connect({&ppu, &machine, &irq});
 }
@@ -481,7 +483,8 @@ static void test_bus_and_controller() {
   assert(mirror_bus.read_ram(0x1803) == 0xA7);
 
   Controller controller;
-  controller.engine.step = +[](void*, int event, const int* in, int* out) {
+  controller.engine.step = +[](void*, int, const int* in, int* out) {
+    const int event = in[10];
     int strobe = in[0], index = in[1];
     out[2] = 64 | (strobe ? in[2] : index == 8 ? 1 : in[2 + index]);
     out[3] = strobe ? 0 : 8 - index;
@@ -494,7 +497,6 @@ static void test_bus_and_controller() {
     else if (!strobe && event == Controller::Consume) index = std::min(8, index + std::max(0, in[12]));
     out[0] = strobe; out[1] = index;
   };
-  for (int i = 0; i < Controller::EventCount; ++i) controller.engine.models[i] = i;
   controller.set_button(0, true);
   controller.write(0x4016, 1, 0);
   controller.write(0x4016, 0, 0);
@@ -771,8 +773,8 @@ static void reference_audio(void*, int model, const int* in, int* out) {
     reference_audio_dmc(in, out);
     return;
   }
-  if (model >= 4) {
-    const int event = model - 4;
+  if (model == 4) {
+    const int event = in[4];  // the frame event is an input, as in the circuit
     int five = in[0], inhibit = in[1], irq = in[2], step = in[3];
     int reset = 0, quarter = 0, half = 0;
     if (event == 0) {
@@ -819,7 +821,10 @@ static void reference_audio(void*, int model, const int* in, int* out) {
     }
     result[0] = start; result[1] = divider; result[2] = decay;
   };
-  const bool quarter = model == 0 || model == 2, half = model == 1 || model == 2;
+  // Model 0: the channel clock, whose event (quarter, half, both) is input 0;
+  // model 3: the gains helper for reference_sample.
+  const int event = model == 0 ? in[0] : -1;
+  const bool quarter = event == 0 || event == 2, half = event == 1 || event == 2;
   for (int i = 0; i < 2; ++i) {
     const int* p = in + 1 + i * 17;
     int timer = p[0], divider = p[8];
@@ -883,7 +888,7 @@ static void reference_sample(void* context, int model, const float* in, float* o
 static void attach_audio(Apu& apu, array<int, 2>* sample_calls = nullptr) {
   Apu::Engine engine;
   engine.ctx = &apu; engine.step = reference_audio;
-  engine.control = {0, 1, 2}; engine.frame = {4, 5, 6, 7};
+  engine.control = 0; engine.frame = 4;
   engine.sample_ctx = sample_calls;
   engine.sample_step = [](void* context, int model, const float* in, float* out) {
     if (context)
@@ -892,10 +897,9 @@ static void attach_audio(Apu& apu, array<int, 2>* sample_calls = nullptr) {
   };
   engine.parameter_model = 1;
   engine.program = 8;
-  engine.program_writes.fill(8);
-  engine.dmc = {9, 10, 11, 12};
-  engine.dmc_writes.fill(9);
+  engine.dmc = {9, 10, 11};
   engine.oscillators = {13, 14};
+  engine.span = 41;
   engine.noise = {{{15, 15}, {15, 15}}};
   apu.set_engine(engine);
 }

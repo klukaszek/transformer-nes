@@ -1,12 +1,11 @@
-"""Neural mapper register transitions, bank layouts and bus effects.
+"""Neural mapper chips: register transitions, bank layouts, bus effects, IRQs.
 
-Cartridge geometry is a circuit input (BOARD), like the wiring of the board
-the chip sits on; one circuit per mapper chip serves every cartridge.
-Mutable state stays with the caller. MMC3/MMC5 IRQ circuits also emit
-qualified-edge deadlines for timing previews.
+Each mapper chip is one model.transformer.Chip (``chip``). Cartridge
+geometry is a circuit input (BOARD), like the wiring of the board the chip
+sits on, so one chip serves every cartridge. Mutable state stays with the
+caller. MMC3/MMC5 IRQ circuits also emit qualified-edge deadlines for timing
+previews.
 """
-
-from functools import cache
 
 from transformer_nes.graph.core import (
     InputDimension,
@@ -17,7 +16,8 @@ from transformer_nes.graph.core import (
     stepglu,
 )
 from transformer_nes.graph.ops import both, either, equals, remainder, remainder_by, select
-from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+from transformer_nes.model.construct import TokenGraph, construct_chip
+from transformer_nes.model.transformer import Chip
 
 STATE = ("counter", "target", "phase", "pending", "enabled")
 INPUTS = (*STATE, "event", "value")
@@ -86,32 +86,6 @@ def irq_graph(mmc5: bool):
     return current_graph().capture({"STATE": sum(x.values())}, outputs)
 
 
-@cache
-def mapper_control_engine():
-    def graphs():
-        graphs = {
-            name: TokenGraph(
-                irq_graph(mmc5),
-                INPUTS,
-                OUTPUTS,
-                {event: {"event": i} for i, event in enumerate(EVENTS)},
-            )
-            for name, mmc5 in (("mmc3", False), ("mmc5", True))
-        }
-        for chip in BANK_PORTS:
-            access = TokenGraph(
-                access_graph(chip), ACCESS_INPUTS, ACCESS_OUTPUTS,
-                {"read": {"access_writing": 0}, "write": {"access_writing": 1}},
-            )
-            graphs[f"access_{chip}"] = access
-            graphs[f"address_{chip}"] = TokenGraph(
-                access.program_graph, ACCESS_INPUTS, ACCESS_OUTPUTS
-            ).project(ADDRESS_OUTPUTS)
-        return graphs
-
-    return CompiledGraph(graphs, tag="mapper_control", sources=(__name__,), memory_size=1)
-
-
 BANK_STATE = {
     1: ("control", "prg", "chr0", "chr1", "shift"),
     4: ("select", "prg_mode", "chr_mode", *(f"reg{i}" for i in range(8)), "mirror"),
@@ -160,7 +134,7 @@ ACCESS_INPUTS = (
     "ram_bank", "writable", "mul_lo", "mul_hi",
 )
 ACCESS_OUTPUTS = (
-    "port_index", "bank_event", "irq_event", "schedule_changed",
+    "port", "bank_event", "irq_event", "schedule_changed",
     "read_source", "read_index", "read_value", "write_source", "repair",
 )
 ADDRESS_OUTPUTS = ACCESS_OUTPUTS[4:7]
@@ -196,7 +170,8 @@ def access_graph(chip: int):
             if chip == 4:
                 match = both(match, odd if port & 1 else 1 - odd)
         matches.append(both(writing, match))
-    port_index = -1 + sum(reglu(i + 1, match) for i, match in enumerate(matches))
+    # The register written: its address (BANK_PORTS), or 0 for none.
+    port = sum(p * match for p, match in zip(BANK_PORTS[chip], matches, strict=True))
     bank_event = 1 + (stepglu(1, x["original"]) if chip == 1 else 0)
 
     irq_event, schedule = -1, 0
@@ -234,7 +209,7 @@ def access_graph(chip: int):
         writable = both(x["writable"], ram_window + ram)
         write_source = reglu(RAM * writable + EXRAM * exram, writing)
         repair = both(writing, mapped + both(ram_window, 1 - x["writable"]))
-    values = (port_index, bank_event, irq_event, schedule, read_source, read_index,
+    values = (port, bank_event, irq_event, schedule, read_source, read_index,
               read_value, write_source, repair)
     outputs = {name: persist(value, name=name)
                for name, value in zip(ACCESS_OUTPUTS, values, strict=True)}
@@ -469,30 +444,31 @@ def mmc5_layout(x, n_prg, n_chr):
     return prg, chr_, extra
 
 
-@cache
-def mapper_bank_engine(chip: int):
-    if chip not in BANK_STATE:
+# Mapper chips by iNES board family (BankControl::Chip).
+CHIPS = {1: "mmc1", 4: "mmc3", 5: "mmc5", 9: "mmc2", 10: "mmc4"}
+
+
+def chip(number: int) -> Chip:
+    """One mapper chip: its register transitions, bank layout, bus access
+    (specialized by direction) with its address projection, and, for MMC3
+    and MMC5, its IRQ counter."""
+    if number not in CHIPS:
         raise ValueError("unsupported mapper chip")
-
-    def graphs():
-        transition = bank_transition(chip)
-        layout = bank_layout(chip)
-        experts = {"reset": {"event": 0}}
-        events = ((1, "write"), (2, "rmw")) if chip == 1 else ((1, "write"),)
-        for i, name in events:
-            experts.update(
-                {f"{name}_{port:X}": {"event": i, "port": port} for port in BANK_PORTS[chip]}
-            )
-        return {
-            "transition": TokenGraph(
-                transition,
-                (*BANK_STATE[chip], "event", "port", "value", "original"),
-                (*transition.output_tokens,),
-                experts,
-            ),
-            "layout": TokenGraph(layout, (*BANK_STATE[chip], *BOARD), (*layout.output_tokens,)),
-        }
-
-    return CompiledGraph(
-        graphs, tag=f"mapper_banks_{chip}", sources=(__name__,), memory_size=1
+    transition = bank_transition(number)
+    layout = bank_layout(number)
+    access = TokenGraph(
+        access_graph(number), ACCESS_INPUTS, ACCESS_OUTPUTS,
+        {"read": {"access_writing": 0}, "write": {"access_writing": 1}},
     )
+    tokens = {
+        "transition": TokenGraph(
+            transition, (*BANK_STATE[number], "event", "port", "value", "original"),
+            (*transition.output_tokens,),
+        ),
+        "layout": TokenGraph(layout, (*BANK_STATE[number], *BOARD), (*layout.output_tokens,)),
+        "access": access,
+        "address": TokenGraph(access.program_graph, ACCESS_INPUTS, ACCESS_OUTPUTS).project(ADDRESS_OUTPUTS),
+    }
+    if number in (4, 5):
+        tokens["irq"] = TokenGraph(irq_graph(number == 5), INPUTS, OUTPUTS)
+    return construct_chip(tokens, memory_size=1)

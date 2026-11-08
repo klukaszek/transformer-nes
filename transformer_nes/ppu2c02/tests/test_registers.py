@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 
 from transformer_nes.graph.core import InputDimension
-from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph, construct
+from transformer_nes.model.construct import TokenGraph, construct
+from transformer_nes.model.graph_engine import CompiledGraph
 from transformer_nes.model.inference import ExactInference
 from transformer_nes.ppu2c02 import registers, space
 from transformer_nes.ppu2c02.machine import ppu_engine, register_graph

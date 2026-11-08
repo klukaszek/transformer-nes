@@ -148,7 +148,6 @@ STATE_FIELDS = (
     ("new_s", "new_s", "in_s"),
     *((name, final, input_name) for name, final, _mask, input_name in SEQUENCE_FLAG_DIMS),
 )
-SEQUENCE_STATE_DIMS = tuple(name for name, _final, _input in STATE_FIELDS)
 
 WRITE_RECEIPTS = (
     ("is_store", "write_addr_out", "write_value_out"),

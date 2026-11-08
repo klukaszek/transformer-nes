@@ -16,7 +16,7 @@ struct MapperIrq {
   struct Engine {
     void* ctx = nullptr;
     void (*step)(void*, int, const int*, int*) = nullptr;
-    std::array<int, event_count> models{};
+    int model = 0;
   } engine;
   explicit MapperIrq(Chip chip_in) : chip(chip_in) {}
   Chip chip;
@@ -29,7 +29,7 @@ struct MapperIrq {
       throw std::runtime_error("mapper IRQ transformer is required");
     const int in[]{state[0], state[1], state[2], state[3], state[4], event, value};
     int out[10];
-    engine.step(engine.ctx, engine.models[event], in, out);
+    engine.step(engine.ctx, engine.model, in, out);
     std::copy_n(out, state.size(), state.begin());
     level = out[5];
     read_value = out[6];

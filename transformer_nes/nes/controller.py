@@ -1,10 +1,9 @@
 """Controller state transitions and bounded serial reply packets as weights."""
 
-from functools import cache
-
 from transformer_nes.graph.core import InputDimension, construction, current_graph, persist, reglu
 from transformer_nes.graph.ops import both, either, equals, remainder, select
-from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+from transformer_nes.model.construct import TokenGraph, construct_chip
+from transformer_nes.model.transformer import Chip
 
 EVENTS = ("write", "read", "lease", "consume")
 INPUTS = ("strobe", "index", *(f"button{i}" for i in range(8)), "event", "value", "count")
@@ -34,18 +33,6 @@ def controller_graph():
     return current_graph().capture({"STATE": sum(x.values())}, outputs)
 
 
-@cache
-def controller_engine():
-    return CompiledGraph(
-        lambda: {
-            "controller": TokenGraph(
-                controller_graph(),
-                INPUTS,
-                OUTPUTS,
-                {name: {"event": i} for i, name in enumerate(EVENTS)},
-            )
-        },
-        tag="controller",
-        sources=(__name__,),
-        memory_size=1,
-    )
+def chip() -> Chip:
+    """The controller port: one token type."""
+    return construct_chip({"controller": TokenGraph(controller_graph(), INPUTS, OUTPUTS)}, memory_size=1)

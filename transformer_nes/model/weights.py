@@ -77,7 +77,6 @@ class WeightModel:
     # groups, lookup provenance, and erase masks.
     head_kinds: list[list[int]]
     ffn_kinds: list[list[int]]
-    head_tiebreak: list[list[int]]
     head_memory_groups: list[list[int]]
     head_lookup_ids: list[list[int]]
     head_pairs: list[list[int]]
@@ -315,7 +314,6 @@ def build_model(program_graph, schedule, recycle_slots=True):
         model.head.weight[idx] = expr_to_tensor(expr)
 
     # ── Per-layer weights ─────────────────────────────────────
-    all_tiebreak = []
     all_ffn_kinds = []
     # Emit only the metadata consumed by inference, lowering, and export.
     # Provenance maps folded experts onto their union's attention state.
@@ -342,7 +340,6 @@ def build_model(program_graph, schedule, recycle_slots=True):
         # ── ATTENTION HALF-LAYER ──────────────────────────────
         head_idx = 0
         lookup_dim_to_head = {}
-        layer_tiebreak = []
 
         # 1) LookUp heads
         kinds = [0] * n_heads
@@ -356,19 +353,16 @@ def build_model(program_graph, schedule, recycle_slots=True):
                 value_exprs = [Expression() for _ in lu.dims]
                 query_exprs = [lu.address, one_expr]
                 key_exprs = [Expression(), Expression()]
-                tie_break = "latest"
                 memory_group = MEMORY_GROUP_FUSED
             else:
                 value_exprs = lu.value_exprs
                 query_exprs = lu.query_exprs
                 key_exprs = lu.key_exprs
-                tie_break = lu.tie_break
                 memory_group = lu.memory_group
             nv = len(value_exprs)
             for p in range((nv + 1) // 2):
                 h = head_idx
                 head_idx += 1
-                layer_tiebreak.append(1 if tie_break == "latest" else 0)
                 ip[h * 2] = expr_to_tensor(query_exprs[0]) * HARD_K * sqrt_dh
                 ip[h * 2 + 1] = expr_to_tensor(query_exprs[1]) * HARD_K * sqrt_dh
                 ip[k_base + h * 2] = expr_to_tensor(key_exprs[0])
@@ -434,14 +428,7 @@ def build_model(program_graph, schedule, recycle_slots=True):
                     op_w[dst, h * 2 + 1] += coeff
 
         n_pt_h += len(pt_items)
-        # Passthrough/erase heads rely on the LATEST tie-break (constant
-        # keys tie every token; latest == self).
-        while len(layer_tiebreak) < head_idx:
-            layer_tiebreak.append(1)
         assert head_idx <= n_heads, f"L{layer_idx} attn: {head_idx} heads > {n_heads}"
-        while len(layer_tiebreak) < n_heads:
-            layer_tiebreak.append(1)
-        all_tiebreak.append(layer_tiebreak)
         model.head_kinds.append(kinds)
         model.head_memory_groups.append(memory_groups)
         model.head_lookup_ids.append(lookup_ids)
@@ -491,7 +478,6 @@ def build_model(program_graph, schedule, recycle_slots=True):
         assert j <= d_ffn, f"L{layer_idx} ffn: {j} neurons > {d_ffn}"
         all_ffn_kinds.append(layer_ffn_kinds)
 
-    model.head_tiebreak = all_tiebreak
     # FFN neuron classification per layer: 0 unused, 1 ReGLU, 2 linear
     # passthrough/erase neuron.  Fast engines can fuse kind-2 neurons into a
     # direct linear residual update without changing the represented model.

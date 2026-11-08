@@ -15,7 +15,11 @@ from transformer_nes.graph.core import (
 )
 from transformer_nes.graph.ops import both, equals, gate, remainder, select
 
-MAX_CYCLES = 429
+# The longest span one oscillator forward covers: CPU cycles per sample at
+# 44.1 kHz, rounded up (1789773 / 44100 = 40.6). The host splits longer spans,
+# so one circuit serves every sample rate; at 44.1 kHz and above each sample
+# takes one forward.
+SPAN = 41
 CLOCK_INPUTS = (
     "cycles",
     "apu_tick",
@@ -105,9 +109,9 @@ def noise_jump(state, count, tap):
 
 
 @construction
-def clock_graph(maximum=MAX_CYCLES):
-    if not 1 <= maximum <= MAX_CYCLES:
-        raise ValueError("oscillator span bound must be in 1..429")
+def clock_graph(maximum=SPAN):
+    if maximum < 1:
+        raise ValueError("an oscillator span covers at least one cycle")
     x = {name: InputDimension(name) for name in CLOCK_INPUTS}
     if maximum == 1:
         low, half = x["cycles"], Expression()
@@ -133,9 +137,9 @@ def clock_graph(maximum=MAX_CYCLES):
 
 
 @construction
-def noise_graph(maximum=MAX_CYCLES):
-    if not 1 <= maximum <= MAX_CYCLES:
-        raise ValueError("oscillator span bound must be in 1..429")
+def noise_graph(maximum=SPAN):
+    if maximum < 1:
+        raise ValueError("an oscillator span covers at least one cycle")
     x = {name: InputDimension(name) for name in NOISE_INPUTS}
     steps = persist(x["steps"], name="noise_steps_tag")
     mode = persist(x["noise_mode"], name="noise_mode_tag")

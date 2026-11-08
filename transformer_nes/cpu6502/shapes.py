@@ -159,12 +159,3 @@ def last_a_bit_step(ops) -> int:
     return last
 
 
-def decode_ops(code: bytes) -> list:
-    ops, off = [], 0
-    while off < len(code):
-        op = OPCODES[code[off]]
-        ops.append(op)
-        off += op.length
-    return ops
-
-

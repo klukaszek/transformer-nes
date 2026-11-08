@@ -384,9 +384,9 @@ descriptor supplies neural control without one forward per transferred byte.
 
 ## Audio transitions and recurrent sample construction
 
-[`apu2a03/audio.py`](../transformer_nes/apu2a03/audio.py) constructs seven integer token graphs
-for the 2A03 and a separate float32 sample bank. Quarter, half and combined modulation experts advance all three
-envelopes, four length counters, the triangle linear counter and both pulse
+[`apu2a03/audio.py`](../transformer_nes/apu2a03/audio.py) constructs the 2A03's APU as two chips:
+`apu`, seven integer token types, and `apu_mixer`, float32 gains and samples. The channel-clock token
+advances, for a quarter, half or combined event, all three envelopes, four length counters, the triangle linear counter and both pulse
 sweeps together. The combined event preserves quarter-then-half
 order, including immediate clocks from a five-step sequencer write. Pulse 1's
 negative sweep subtracts the extra unit; target overflow and the shift-zero
@@ -394,11 +394,11 @@ case retain their distinct update and mute rules.
 
 The sample construction prunes state updates and computes pulse duty gates,
 envelope/constant volume selection, triangle amplitude and channel muting
-from current state. A diagnostic projection exposes its four digital DAC levels. Binary decomposition
+from current state. Binary decomposition
 and gated shifts implement sweep arithmetic; thresholds express the periodic
 waveforms without state/outcome caches or native duty/triangle tables.
 
-Frame-event experts handle sequencer clocks, control writes, status-read IRQ
+The frame token handles sequencer clocks, control writes, status-read IRQ
 acknowledgement and observation. They return the next phase, frame IRQ,
 quarter/half clock effects and the next cycle deadline. The host advances to
 this deadline, with no duplicate native sequencer table or phase-decision rule.
@@ -408,8 +408,14 @@ arithmetically. All CPU backends require these audio weights.
 Register-access tokens decode all APU ports, including channel enable/length
 clears, timer programming, status reads and control effects. The chip's fixed
 length and period ROMs become decoder weights. Frame-control and DMC
-write effects route to the corresponding event experts, preserving their
-ordering after the channel register updates.
+write effects route to the frame and DMC tokens, preserving their ordering
+after the channel register updates.
+
+Specializations are kept only where they run hot: the noise recurrence by
+mode and for a single step (its callers always choose one, so it has no
+full circuit), and the DMC's fetch and bit clock. Register programming,
+channel clocks and frame events run a few times a frame and use their full
+circuits, which have fewer weights than their specializations combined.
 
 The program token's DMC-write effect also ends the CPU chunk and re-plans
 the next fetch without another forward.
@@ -424,11 +430,11 @@ token. It decrements the returned timer budget without rerunning the circuit
 on each empty cycle; period changes leave the current budget intact.
 
 [`apu2a03/oscillators.py`](../transformer_nes/apu2a03/oscillators.py) constructs clock
-transitions for all four oscillators. The construction bound is
-`S = min(429, max(1, ceil(cpu_frequency / sample_rate)))`: the DMC and sample
-deadlines bound every span before a forward runs. It cannot cross a frame event
-or audio sample. The sample rate is immutable console geometry, so the compiler
-specializes the clock and noise circuits once at setup.
+transitions for all four oscillators. One forward covers at most `SPAN` = 41
+CPU cycles, the cycles per sample at 44.1 kHz rounded up. The host ends a span
+at the next DMC, frame or sample deadline and splits anything longer than
+`SPAN`, so one circuit serves every sample rate, exactly: audio at 22.05 kHz
+and 48 kHz is bit-identical to a circuit built for that rate.
 Bounded restoring division returns exact timer expiries and remaining counts,
 including when a period write leaves the current counter above its new reload.
 The same token computes CPU/APU parity and pulse/triangle phase advances.
@@ -559,8 +565,9 @@ residue below the count doubles past it at most once, so each doubling is one
 comparison.
 
 Access tokens receive byte-split CPU addresses, write direction, an optional
-original RMW byte, and the live neural bank map. They return a register endpoint,
-bank event, IRQ event, scheduling effect, storage handle, physical byte index,
+original RMW byte, and the live neural bank map. They return the written
+register's address (0 for none), bank event, IRQ event, scheduling effect,
+storage handle, physical byte index,
 literal reply, permitted write and CPU-image repair request. Weights compute
 MMC1/MMC3/MMC2/MMC4 port aliases, MMC3 IRQ register selection, MMC5 IRQ reads and
 writes, multiplier read selection, RAM/ROM/ExRAM selection and write protection.
@@ -569,16 +576,19 @@ Read/write experts and address projections share each chip's access graph.
 After a PRG-changing write, the address projection consumes the **new** neural
 bank map before repairing the CPU's already-committed byte. It cannot reuse the
 pre-write physical address. Other accesses need one access forward. The mapper
-adapters dispatch returned endpoint/storage handles, copy changed windows and
-apply effects; they contain no request-address classification or physical-index formula.
-The control bank is shared with IRQ tokens, independent of ROM contents and
-bank counts, and uses a fixed sixteen-word input packet with no address table.
+adapters pass the returned register address to the transition, dispatch
+storage handles, copy changed windows and apply effects; they contain no
+request-address classification, port table or physical-index formula. Each
+mapper chip (`mappers.py:chip`) is one model of transition, layout, access,
+address and IRQ tokens, independent of ROM contents and bank counts.
 
 For IRQ tokens, inputs are counter, latch/target, phase,
 pending and enable state, plus an event and its data. Phase means a pending
-reload on MMC3 and in-frame on MMC5. Event experts pin only the event tag;
-register values and state remain live inputs. Both chips share one small,
-ROM-independent control bank with no outcome table or growing history.
+reload on MMC3 and in-frame on MMC5. The event, register values and state are
+all live inputs to one circuit, with no outcome table or growing history.
+Register transitions and the controller likewise run one circuit each: a
+specialization must pin a persist dim, and pinning an input event folds
+nothing, so per-event copies would only duplicate the weights.
 
 Outputs include next state, IRQ level and a conditional IRQ-line write,
 MMC5 status-read data, prediction eligibility and the qualified-edge distance

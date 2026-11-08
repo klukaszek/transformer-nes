@@ -29,9 +29,7 @@ Apu::AccessResult Apu::access(int port, int value, bool writing) {
                          dmc.bytes_remaining, int(dmc.irq), int(frame_irq)})
     *field++ = data;
   int out[57];
-  const int model = writing && port >= 0 && port < 24 ?
-      engine_.program_writes[static_cast<size_t>(port)] : engine_.program;
-  engine_.step(engine_.ctx, model, in, out);
+  engine_.step(engine_.ctx, engine_.program, in, out);
   load_program_state(out);
   sample_parameters_dirty_ |= writing;
   if (out[54])
@@ -92,8 +90,8 @@ void Apu::dmc_event(DmcEvent event, int port, int value) {
   in[15] = port;
   in[16] = value;
   int out[20];
-  const int model = event == DmcEvent::Write && port >= 0 && port < 24 ?
-      engine_.dmc_writes[static_cast<size_t>(port)] : engine_.dmc[static_cast<size_t>(event)];
+  const int model = event == DmcEvent::Fetch ? engine_.dmc[1]
+                    : event == DmcEvent::Clock ? engine_.dmc[2] : engine_.dmc[0];
   engine_.step(engine_.ctx, model, in, out);
   array<int, 14> next;
   std::copy_n(out, next.size(), next.begin());
@@ -126,7 +124,7 @@ void Apu::clock_dmc() {
 // Neural frame/modulation transitions (nes/audio.py).
 
 void Apu::set_engine(Engine engine) {
-  if (!engine.ctx || !engine.step || !engine.sample_step)
+  if (!engine.ctx || !engine.step || !engine.sample_step || engine.span < 1)
     throw std::invalid_argument("APU transformer engine is required");
   engine_ = engine;
   sample_parameters_dirty_ = true;
@@ -158,7 +156,7 @@ array<int, Apu::channel_input_count> Apu::channel_inputs(int event) const {
 void Apu::channel_event(int event) {
   const auto in = channel_inputs(event);
   int out[channel_output_count];
-  engine_.step(engine_.ctx, engine_.control[static_cast<size_t>(event)], in.data(), out);
+  engine_.step(engine_.ctx, engine_.control, in.data(), out);
   const int* field = out;
   auto envelope = [&field](Envelope& e) {
     e.start = *field++ != 0;
@@ -185,7 +183,7 @@ void Apu::frame_event(FrameEvent event, int value) {
     throw std::logic_error("APU transformer engine is required");
   const int in[]{five_step, irq_inhibit, frame_irq, seq_step, static_cast<int>(event), value};
   int out[8];
-  engine_.step(engine_.ctx, engine_.frame[static_cast<size_t>(event)], in, out);
+  engine_.step(engine_.ctx, engine_.frame, in, out);
   five_step = out[0] != 0;
   irq_inhibit = out[1] != 0;
   frame_irq = out[2] != 0;
@@ -268,8 +266,10 @@ void Apu::advance_to(int64_t cpu_cycle) {
     int64_t span = cpu_cycle - clocked_cycles - 1;
     span = std::min<int64_t>(span, frame_deadline - seq_cycle - 1);
     span = std::min<int64_t>(span, dmc_timer_);
-    // Reach the sample boundary in one oscillator transition.
+    // Reach the sample boundary in one oscillator transition where the
+    // circuit's span allows (always at 44.1 kHz and above).
     span = std::min<int64_t>(span, static_cast<int64_t>(std::ceil(cycles_per_sample - sample_accum)) - 1);
+    span = std::min<int64_t>(span, engine_.span - 1);
     if (dmc_fetch_due_)
       span = 0; // a fetch is due this cycle
     const int n = static_cast<int>(std::max<int64_t>(span, 0));

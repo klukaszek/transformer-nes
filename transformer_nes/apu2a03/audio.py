@@ -1,12 +1,14 @@
-"""2A03 register, frame, oscillator and DMC transitions as weights.
+"""The 2A03's APU as two chips of weights.
 
-The float32 sample circuit owns digital levels, DAC mixing and filtering.
-The host schedules deadlines, transports DMA bytes and plays returned samples.
+``chip()``: register programming, the frame sequencer, envelopes, sweeps and
+lengths, oscillator spans, the noise recurrence and the DMC, in int32.
+``mixer_chip()``: digital levels, nonlinear DAC mixing, the output filter and
+clipping, in float32. The host schedules deadlines, transports DMA bytes and
+plays the returned samples.
 """
 
-from functools import cache
-
-from transformer_nes.apu2a03.oscillators import MAX_CYCLES, bits
+from transformer_nes.apu2a03 import oscillators
+from transformer_nes.apu2a03.oscillators import bits
 from transformer_nes.graph.core import (
     Expression,
     InputDimension,
@@ -17,7 +19,8 @@ from transformer_nes.graph.core import (
     stepglu,
 )
 from transformer_nes.graph.ops import both, either, equals, gate, select
-from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+from transformer_nes.model.construct import TokenGraph, construct_chip
+from transformer_nes.model.transformer import Chip
 
 ENVELOPE = ("env_start", "env_loop", "env_constant", "env_period", "env_divider", "env_decay")
 PULSE = (
@@ -333,8 +336,8 @@ def pulse_level(gain, duty, pos):
 def channel_graph():
     x = {name: InputDimension(name) for name in INPUTS}
     event = persist(x["event"], name="event_tag")
-    quarter = 1 - equals(event, 1)
-    half = 1 - equals(event, 0)
+    quarter = 1 - equals(event, EVENTS.index("half"))
+    half = 1 - equals(event, EVENTS.index("quarter"))
     state = {}
 
     def channel(prefix, fields):
@@ -410,7 +413,6 @@ SAMPLE_INPUTS = (
     "dmc_output", "previous_mix", "previous_filter",
 )
 SAMPLE_OUTPUTS = ("mixed", "filtered", "sample")
-DAC_INPUTS = ("pulse", "triangle", "noise", "dmc")
 
 
 def reciprocal_unit_interval(value):
@@ -489,31 +491,24 @@ def sample_graph():
     })
 
 
-@construction
-def dac_graph():
-    x = {name: InputDimension(name) for name in DAC_INPUTS}
-    mixed = mixed_level(*(x[n] for n in DAC_INPUTS))
-    return current_graph().capture({"DAC": sum(x.values())}, {"mixed": mixed})
-
-
-@cache
-def sample_engine():
-    def graphs():
-        full = TokenGraph(sample_graph(), SAMPLE_INPUTS, (*SAMPLE_OUTPUTS, *LEVELS))
-        return {
-            "sample": full.project(SAMPLE_OUTPUTS), "levels": full.project(LEVELS),
-            "dac": TokenGraph(dac_graph(), DAC_INPUTS, ("mixed",)),
-            "parameters": TokenGraph(parameter_graph(), PARAMETER_INPUTS, PARAMETER_OUTPUTS),
-        }
-
-    return CompiledGraph(graphs, tag="apu_sample", sources=(__name__,), memory_size=1, dtype="float32")
+def mixer_chip() -> Chip:
+    """The mixer: channel gains (``gains``), then per sample the digital
+    levels, DAC mix, output filter and clipping (``sample``)."""
+    full = TokenGraph(sample_graph(), SAMPLE_INPUTS, (*SAMPLE_OUTPUTS, *LEVELS))
+    return construct_chip(
+        {
+            "sample": full.project(SAMPLE_OUTPUTS),
+            "gains": TokenGraph(parameter_graph(), PARAMETER_INPUTS, PARAMETER_OUTPUTS),
+        },
+        memory_size=1, dtype="float32",
+    )
 
 
 @construction
 def frame_graph():
     x = {name: InputDimension(name) for name in FRAME_INPUTS}
     event = persist(x["event"], name="event_tag")
-    clock, write, read = (equals(event, i) for i in range(3))
+    clock, write, read = (equals(event, FRAME_EVENTS.index(name)) for name in ("clock", "write", "read"))
     value_bits = bits(x["value"], 8)
     five, inhibit = (
         select(write, value_bits[7], x["five_step"]),
@@ -537,51 +532,29 @@ def frame_graph():
     return current_graph().capture({"EVENT": sum(x.values())}, outputs)
 
 
-@cache
-def audio_engine(maximum=MAX_CYCLES):
-    """Specialize clock widths to the console's immutable sample deadline."""
-    if not 1 <= maximum <= MAX_CYCLES:
-        raise ValueError("oscillator span bound must be in 1..429")
-
-    def graphs():
-        from transformer_nes.apu2a03 import oscillators
-
-        experts = {
-            **{f"mode{i}": {"noise_mode_tag": i} for i in range(2)},
-            **{f"tick_mode{i}": {"noise_mode_tag": i, "noise_steps_tag": 1} for i in range(2)},
-        }
-        return {
-            "oscillate": TokenGraph(oscillators.clock_graph(maximum), oscillators.CLOCK_INPUTS,
-                                    oscillators.CLOCK_OUTPUTS),
-            "tick": TokenGraph(oscillators.clock_graph(1), oscillators.CLOCK_INPUTS,
-                               oscillators.CLOCK_OUTPUTS),
-            "noise": TokenGraph(oscillators.noise_graph(maximum), oscillators.NOISE_INPUTS,
-                                oscillators.NOISE_OUTPUTS, experts),
-            "control": TokenGraph(
-                channel_graph(), INPUTS, OUTPUTS,
-                {name: {"event_tag": i} for i, name in enumerate(EVENTS)},
-            ),
-            "frame": TokenGraph(
-                frame_graph(),
-                FRAME_INPUTS,
-                FRAME_OUTPUTS,
-                {name: {"event_tag": i} for i, name in enumerate(FRAME_EVENTS)},
-            ),
-            "program": TokenGraph(
-                program_graph(),
-                PROGRAM_INPUTS,
-                PROGRAM_OUTPUTS,
-                {f"write_{p}": {"port_tag": p, "writing": 1} for p in WRITE_PORTS},
-            ),
-            "dmc": TokenGraph(
-                dmc_graph(),
-                DMC_INPUTS,
-                DMC_OUTPUTS,
-                {
-                    **{name: {"event_tag": i} for i, name in enumerate(DMC_EVENTS) if i},
-                    **{f"write_{p}": {"event_tag": 0, "port_tag": p} for p in DMC_WRITE_PORTS},
-                },
-            ),
-        }
-
-    return CompiledGraph(graphs, tag=f"apu_{maximum}", sources=(__name__,), memory_size=1)
+def chip() -> Chip:
+    """The APU's digital chip. Only hot tokens keep specializations: the
+    noise recurrence by mode (callers always choose one, so it has no full
+    circuit) and single step, and the DMC's fetch and output clock. Register
+    programming and frame events are rare enough to run their full circuits."""
+    span = oscillators.SPAN
+    noise = {
+        **{f"mode{i}": {"noise_mode_tag": i} for i in range(2)},
+        **{f"tick_mode{i}": {"noise_mode_tag": i, "noise_steps_tag": 1} for i in range(2)},
+    }
+    tokens = {
+        "oscillate": TokenGraph(oscillators.clock_graph(span), oscillators.CLOCK_INPUTS, oscillators.CLOCK_OUTPUTS),
+        "tick": TokenGraph(oscillators.clock_graph(1), oscillators.CLOCK_INPUTS, oscillators.CLOCK_OUTPUTS),
+        "noise": TokenGraph(
+            oscillators.noise_graph(span), oscillators.NOISE_INPUTS, oscillators.NOISE_OUTPUTS, noise,
+            full_circuit=False,
+        ),
+        "control": TokenGraph(channel_graph(), INPUTS, OUTPUTS),
+        "frame": TokenGraph(frame_graph(), FRAME_INPUTS, FRAME_OUTPUTS),
+        "program": TokenGraph(program_graph(), PROGRAM_INPUTS, PROGRAM_OUTPUTS),
+        "dmc": TokenGraph(
+            dmc_graph(), DMC_INPUTS, DMC_OUTPUTS,
+            {name: {"event_tag": DMC_EVENTS.index(name)} for name in ("fetch", "clock")},
+        ),
+    }
+    return construct_chip(tokens, memory_size=1, constants={"span": span})

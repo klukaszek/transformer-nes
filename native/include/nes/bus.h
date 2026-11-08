@@ -177,7 +177,7 @@ public:
   struct Engine {
     void* ctx = nullptr;
     void (*step)(void*, int, const int*, int*) = nullptr;
-    array<int, EventCount> models{};
+    int model = 0;
   } engine;
   void set_button(size_t index, bool pressed);
   int read(int addr, int64_t) override;

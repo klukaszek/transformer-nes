@@ -11,7 +11,8 @@ import pytest
 
 from transformer_nes import build
 from transformer_nes.graph.core import InputDimension, construction, current_graph, persist, reglu
-from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+from transformer_nes.model.construct import TokenGraph, describe
+from transformer_nes.model.graph_engine import CompiledGraph
 
 
 def _configure(root):
@@ -98,7 +99,8 @@ def _compile_graph(root, size, connection):
     import torch.utils.cpp_extension as extension
 
     from transformer_nes.graph.core import InputDimension, construction, current_graph, persist
-    from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+    from transformer_nes.model.construct import TokenGraph
+    from transformer_nes.model.graph_engine import CompiledGraph
 
     _configure(root)
     original_load = extension.load
@@ -407,7 +409,7 @@ def test_constant_one_survives_implicit_linear_gates(gate, input_value):
     import torch
 
     from transformer_nes.model.compiler import weight_module
-    from transformer_nes.model.graph_engine import construct
+    from transformer_nes.model.construct import construct
 
     @construction
     def token():
@@ -423,7 +425,7 @@ def test_constant_one_survives_implicit_linear_gates(gate, input_value):
     pg = token.program_graph
     _model, _idx, info = construct(pg)
     assert (pg.one, info.slot_of[pg.one], 0, info.n_layers + 1) in info.lives
-    compiled = CompiledGraph.compile_token(token, pg, pg.all_dims)
+    compiled = describe(token, pg, pg.all_dims)
     forward = weight_module(compiled)
     assert forward.f_bits == int(gate == 0.5)
     result, _reads = forward(
@@ -466,7 +468,7 @@ def test_integer_expansion_preserves_memory_bounds_and_half_rounding(reassociate
     # invalid addresses and the fixed-point rescaling at the raw ABI.
     token = graphs()["read"]
     folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
-    expert = CompiledGraph.compile_token(token, folded.program_graph, list(folded.dim_of_name.values()))
+    expert = describe(token, folded.program_graph, list(folded.dim_of_name.values()))
     from transformer_nes.model.compiler import weight_module
 
     forward = weight_module(expert, memory_size=256)
@@ -740,7 +742,7 @@ def test_float32_ssa_matches_fx_bits_at_rounding_boundaries():
     engine = CompiledGraph(graphs, tag="ssa_float_bits", sources=(), memory_size=1, dtype="float32")
     token = graphs()["real"]
     folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
-    model = CompiledGraph.compile_token(token, folded.program_graph, list(folded.dim_of_name.values()), dtype="float32")
+    model = describe(token, folded.program_graph, list(folded.dim_of_name.values()), dtype="float32")
     forward = weight_module(model, memory_size=1)
     values = np.concatenate([
         np.array([-0.0, 0.0, -2, 2**-24, 1, np.nextafter(np.float32(1), np.float32(2))], dtype=np.float32),
@@ -788,7 +790,7 @@ def test_shared_fragments_preserve_bound_values_and_projection_grouping(dtype):
 
         token = graphs()["xy"]
         folded = GraphFolder(token.program_graph, root_names=list(token.outputs), structural_reads=True).fold({})
-        model = CompiledGraph.compile_token(token, folded.program_graph, list(folded.dim_of_name.values()), dtype=dtype)
+        model = describe(token, folded.program_graph, list(folded.dim_of_name.values()), dtype=dtype)
         forward = weight_module(model, memory_size=1)
         result, _ = forward(torch.tensor(np.array(pairs).T, dtype=torch.float32), torch.zeros(1, dtype=torch.uint8))
         expected = result.numpy().ravel()

@@ -38,20 +38,21 @@ def reference_channel_gains(state):
     return gains
 
 
-@pytest.mark.parametrize("token", ["control", "parameters", "levels", "sample", "dac", "frame", "program", "dmc", "oscillate", "tick", "noise"])
+@pytest.mark.parametrize("token", ["control", "gains", "sample", "frame", "program", "dmc", "oscillate", "tick", "noise"])
 def test_audio_tokens_execute_the_constructed_weights(token):
     from transformer_nes.apu2a03 import audio, oscillators
     from transformer_nes.graph.core import InputDimension
-    from transformer_nes.model.graph_engine import construct
+    from transformer_nes.model.construct import construct
     from transformer_nes.model.inference import ExactInference
+    from transformer_nes.nes.model import compiled
 
-    floating = token in ("parameters", "sample", "levels", "dac")
-    engine = audio.sample_engine() if floating else audio.audio_engine(41)
-    graph = {"control": audio.channel_graph, "parameters": audio.parameter_graph, "levels": audio.sample_graph,
-             "sample": audio.sample_graph, "dac": audio.dac_graph,
-             "frame": audio.frame_graph, "program": audio.program_graph,
-             "dmc": audio.dmc_graph, "oscillate": lambda: oscillators.clock_graph(41),
-             "tick": lambda: oscillators.clock_graph(1), "noise": lambda: oscillators.noise_graph(41)}[token]()
+    floating = token in ("gains", "sample")
+    engine = compiled().chip("apu_mixer" if floating else "apu")
+    span = oscillators.SPAN
+    graph = {"control": audio.channel_graph, "gains": audio.parameter_graph,
+             "sample": audio.sample_graph, "frame": audio.frame_graph, "program": audio.program_graph,
+             "dmc": audio.dmc_graph, "oscillate": lambda: oscillators.clock_graph(span),
+             "tick": lambda: oscillators.clock_graph(1), "noise": lambda: oscillators.noise_graph(span)}[token]()
     model, _, info = construct(graph)
     eager = ExactInference(model)
     dims = {d.name: d for d in graph.all_dims}
@@ -69,7 +70,7 @@ def test_audio_tokens_execute_the_constructed_weights(token):
                   port=24, dmc_remaining=4082, output_level=128, sample_address=65536,
                   sample_length=4082, current_address=65536, bytes_remaining=4082,
                   sample_buffer=256, shift_register=256)
-    ranges.update(cycles=2 if token == "tick" else 42, triangle_period=2048,
+    ranges.update(cycles=2 if token == "tick" else span + 1, triangle_period=2048,
                   triangle_counter=2048, triangle_pos=32, triangle_linear=128, noise_counter=4069)
     ranges.update(steps=22, pulse=31, triangle=16, noise=16, dmc=128, dmc_output=128)
     ranges.update(pulse0_gain=16, pulse1_gain=16, noise_gain=16)
@@ -80,7 +81,7 @@ def test_audio_tokens_execute_the_constructed_weights(token):
     io = engine.graphs[token]
     for _ in range(128):
         values = {name: int(rng.integers(ranges.get(name, 2))) for name in io.inputs}
-        if token in ("sample", "levels"):
+        if token == "sample":
             values.update(previous_mix=float(rng.random()), previous_filter=float(rng.uniform(-1, 1)))
         if token == "dmc":
             values.update(bits_remaining=int(rng.integers(1, 9)),
@@ -93,38 +94,31 @@ def test_audio_tokens_execute_the_constructed_weights(token):
         expected = [actual[info.slot_of[dims[name]]] if floating else round(actual[info.slot_of[dims[name]]])
                     for name in io.outputs]
         packet = [values[name] for name in io.inputs]
-        np.testing.assert_allclose(engine.step(packet, engine.model_id(token)), expected, rtol=0, atol=5e-7 if floating else 0)
-        if token == "parameters":
+        # The circuit the console runs for this token: noise by mode, the DMC's
+        # fetch and clock specializations, otherwise the full circuit.
+        spec = None
+        if token == "noise":
+            spec = f"mode{values['noise_mode']}"
+        elif token == "dmc" and audio.DMC_EVENTS[values["event"]] in ("fetch", "clock"):
+            spec = audio.DMC_EVENTS[values["event"]]
+        np.testing.assert_allclose(engine.step(packet, engine.model_id(token, spec)), expected,
+                                   rtol=0, atol=5e-7 if floating else 0)
+        if token == "gains":
             np.testing.assert_array_equal(expected, reference_channel_gains(values))
-        elif token in ("control", "frame"):
-            events = audio.FRAME_EVENTS if token == "frame" else audio.EVENTS
-            np.testing.assert_array_equal(
-                engine.step(packet, engine.model_id(token, events[values["event"]])), expected
-            )
-        elif token == "program" and values["is_write"] and values["port"] in audio.WRITE_PORTS:
-            np.testing.assert_array_equal(
-                engine.step(packet, engine.model_id(token, f"write_{values['port']}")), expected
-            )
-        elif token == "dmc":
-            name = (f"write_{values['port']}" if values["event"] == 0 and values["port"] in audio.DMC_WRITE_PORTS
-                    else audio.DMC_EVENTS[values["event"]] if values["event"] else None)
-            np.testing.assert_array_equal(engine.step(packet, engine.model_id(token, name)), expected)
         elif token == "noise":
-            np.testing.assert_array_equal(
-                engine.step(packet, engine.model_id(token, f"mode{values['noise_mode']}")), expected
-            )
-            # The single-step expert is a folded recurrence, not a host LFSR.
+            # The single-step circuit is a folded recurrence, not a host LFSR.
             packet[0] = 1
             np.testing.assert_array_equal(
-                engine.step(packet, engine.model_id(token, f"tick_mode{values['noise_mode']}")),
-                engine.step(packet, engine.model_id(token)),
+                engine.step(packet, engine.model_id(token, f"tick_{spec}")),
+                engine.step(packet, engine.model_id(token, spec)),
             )
 
 
 def test_neural_audio_filter_tracks_the_nonlinear_reference_and_clips():
     from transformer_nes.apu2a03 import audio
+    from transformer_nes.nes.model import compiled
 
-    engine = audio.sample_engine()
+    engine = compiled().chip("apu_mixer")
     x = dict.fromkeys(audio.SAMPLE_INPUTS, 0)
     x.update(pulse0_seq_pos=1, pulse1_seq_pos=1, triangle_gain=1)
     rng = np.random.default_rng(89)
@@ -153,13 +147,14 @@ def test_neural_audio_filter_tracks_the_nonlinear_reference_and_clips():
     assert clipped
 
 
-@pytest.mark.parametrize("maximum", [1, 41, 429])
 @pytest.mark.parametrize("mode", [0, 1])
 @pytest.mark.parametrize("parity", [0, 1])
-def test_audio_oscillator_spans_match_literal_clocks_and_compose(mode, parity, maximum):
-    from transformer_nes.apu2a03 import audio, oscillators
+def test_audio_oscillator_spans_match_literal_clocks_and_compose(mode, parity):
+    from transformer_nes.apu2a03 import oscillators
+    from transformer_nes.nes.model import compiled
 
-    engine = audio.audio_engine(maximum)
+    engine = compiled().chip("apu")
+    maximum = oscillators.SPAN
     rng = np.random.default_rng(67)
 
     def advance(x, cycles):
@@ -221,8 +216,9 @@ def test_audio_oscillator_spans_match_literal_clocks_and_compose(mode, parity, m
 
 def test_audio_dmc_fetch_wrap_reload_irq_and_disable():
     from transformer_nes.apu2a03 import audio
+    from transformer_nes.nes.model import compiled
 
-    engine = audio.audio_engine()
+    engine = compiled().chip("apu")
     state = dict.fromkeys(audio.DMC_STATE, 0)
     state.update(irq_enabled=1, period=428, output_level=125, sample_address=0xC000,
                  sample_length=1, current_address=0xFFFF, bytes_remaining=1,
@@ -230,9 +226,9 @@ def test_audio_dmc_fetch_wrap_reload_irq_and_disable():
 
     def event(kind, value=0, port=0):
         packet = [state[n] for n in audio.DMC_STATE] + [audio.DMC_EVENTS.index(kind), port, value]
-        expert = f"write_{port}" if kind == "write" else kind
-        out = engine.step(packet, engine.model_id("dmc", expert))
-        np.testing.assert_array_equal(out, engine.step(packet, engine.model_id("dmc")))
+        out = engine.step(packet, engine.model_id("dmc"))
+        if kind in ("fetch", "clock"):
+            np.testing.assert_array_equal(out, engine.step(packet, engine.model_id("dmc", kind)))
         state.update(zip(audio.DMC_STATE, out[:14].tolist(), strict=True))
         return dict(zip(audio.DMC_OUTPUTS[14:], out[14:].tolist(), strict=True))
 
@@ -262,9 +258,9 @@ def test_audio_dmc_fetch_wrap_reload_irq_and_disable():
 
 
 def test_audio_frame_reset_irq_and_immediate_clocks():
-    from transformer_nes.apu2a03 import audio
+    from transformer_nes.nes.model import compiled
 
-    engine = audio.audio_engine()
+    engine = compiled().chip("apu")
     for five, inhibit, irq, step, event, value in itertools.product(
         range(2), range(2), range(2), range(4), range(4), range(256)
     ):
@@ -281,15 +277,17 @@ def test_audio_frame_reset_irq_and_immediate_clocks():
                     clock or immediate, (clock and step in (1, 3)) or immediate,
                     (7457, 14913, 22371, 37281 if next_five else 29829)[next_step]]
         packet = [five, inhibit, irq, step, event, value]
-        np.testing.assert_array_equal(
-            engine.step(packet, engine.model_id("frame", audio.FRAME_EVENTS[event])), expected
-        )
+        np.testing.assert_array_equal(engine.step(packet, engine.model_id("frame")), expected)
 
 
 def test_audio_joint_clock_reloads_and_distinct_pulse_negation():
     from transformer_nes.apu2a03 import audio
+    from transformer_nes.graph.core import InputDimension
+    from transformer_nes.model.construct import construct
+    from transformer_nes.model.inference import ExactInference
+    from transformer_nes.nes.model import compiled
 
-    engine = audio.audio_engine()
+    engine = compiled().chip("apu")
     x = dict.fromkeys(audio.INPUTS, 0)
     x["event"] = 2
     for i in range(2):
@@ -300,18 +298,26 @@ def test_audio_joint_clock_reloads_and_distinct_pulse_negation():
     x.update(triangle_timer=8, triangle_length=2, triangle_enabled=1,
              triangle_linear_reload=1, triangle_linear_reload_value=127,
              noise_length=2, noise_enabled=1, noise_env_loop=1, noise_env_period=3)
-    out = engine.step([x[n] for n in audio.INPUTS], engine.model_id("control", "both"))
+    out = engine.step([x[n] for n in audio.INPUTS], engine.model_id("control"))
     # Pulse 1's negative sweep subtracts an extra unit.
     expected = [0, 3, 15, 1, 49, 0, 7, 0, 3, 15, 1, 50, 0, 7, 1, 0, 127, 0, 3, 15, 2]
     np.testing.assert_array_equal(out, expected)
     x.update(zip(audio.STATE_OUTPUTS, out.tolist(), strict=True))
-    samples = audio.sample_engine()
-    gains = samples.step([x[n] for n in audio.PARAMETER_INPUTS], samples.model_id("parameters"))
+    samples = compiled().chip("apu_mixer")
+    gains = samples.step([x[n] for n in audio.PARAMETER_INPUTS], samples.model_id("gains"))
     x.update(zip(audio.PARAMETER_OUTPUTS, gains.tolist(), strict=True))
     x.update(dmc_output=0, previous_mix=0, previous_filter=0)
-    np.testing.assert_array_equal(
-        samples.step([x[n] for n in audio.SAMPLE_INPUTS], samples.model_id("levels")), [15, 15, 15, 15]
-    )
+    # The sample circuit's digital levels, evaluated from its constructed weights.
+    graph = audio.sample_graph()
+    model, _, info = construct(graph)
+    residual = np.zeros(info.d_model)
+    residual[info.slot_of[graph.one]] = 1
+    for d in graph.all_dims:
+        if isinstance(d, InputDimension) and d is not graph.one and d in info.slot_of:
+            residual[info.slot_of[d]] = x[d.name]
+    result = ExactInference(model).forward(residual)
+    dims = {d.name: d for d in graph.all_dims}
+    assert [round(result[info.slot_of[dims[n]]]) for n in audio.LEVELS] == [15, 15, 15, 15]
 
 
 def run_console(hardware, cart, backend, frames, script=SCRIPT):
@@ -464,9 +470,7 @@ def irq_step(engine, chip, event, state, value=0):
     from transformer_nes.nes.mappers import EVENTS
 
     inputs = np.array([*state, EVENTS.index(event), value], dtype=np.int32)
-    full = engine.engine.step(engine.model_id(chip), inputs)
-    routed = engine.engine.step(engine.model_id(chip, event), inputs)
-    np.testing.assert_array_equal(routed, full)
+    routed = engine.step(inputs, engine.model_id("irq"))
     clock_fire = (
         event == "clock"
         and state[4]
@@ -481,11 +485,12 @@ def irq_step(engine, chip, event, state, value=0):
 @pytest.mark.parametrize("chip", [1, 4, 5, 9, 10])
 def test_mapper_access_packets_execute_exact_weights(chip):
     from transformer_nes.graph.core import InputDimension
-    from transformer_nes.model.graph_engine import construct
+    from transformer_nes.model.construct import construct
     from transformer_nes.model.inference import ExactInference
     from transformer_nes.nes import mappers
+    from transformer_nes.nes.model import compiled
 
-    engine = mappers.mapper_control_engine()
+    engine = compiled().mapper(chip)
     graph = mappers.access_graph(chip)
     model, _, info = construct(graph)
     eager = ExactInference(model)
@@ -508,8 +513,8 @@ def test_mapper_access_packets_execute_exact_weights(chip):
         expected = [round(result[info.slot_of[dims[n]]]) for n in mappers.ACCESS_OUTPUTS]
         packet = [values[n] for n in mappers.ACCESS_INPUTS]
         for expert in (None, "write" if values["is_write"] else "read"):
-            np.testing.assert_array_equal(engine.step(packet, engine.model_id(f"access_{chip}", expert)), expected)
-        np.testing.assert_array_equal(engine.step(packet, engine.model_id(f"address_{chip}")), expected[4:7])
+            np.testing.assert_array_equal(engine.step(packet, engine.model_id("access", expert)), expected)
+        np.testing.assert_array_equal(engine.step(packet, engine.model_id("address")), expected[4:7])
 
 
 # (chip, PRG banks, CHR banks) in the chip's own units, and the same
@@ -518,17 +523,15 @@ def test_mapper_access_packets_execute_exact_weights(chip):
     "chip,prg,chr_,board", [(1, 3, 12, (3, 3)), (4, 6, 24, (3, 6)), (9, 6, 3, (3, 3)), (10, 3, 3, (3, 3))]
 )
 def test_neural_bank_transitions_and_mapping_effects(chip, prg, chr_, board):
-    from transformer_nes.nes.mappers import BANK_STATE, mapper_bank_engine
+    from transformer_nes.nes.mappers import BANK_STATE
+    from transformer_nes.nes.model import compiled
 
-    engine = mapper_bank_engine(chip)
+    engine = compiled().mapper(chip)
     state = [0] * len(BANK_STATE[chip])
 
     def step(port=0, value=0, original=0, event=1):
         nonlocal state
-        inputs = [*state, event, port, value, original]
-        expert = "reset" if event == 0 else f"{'rmw' if event == 2 else 'write'}_{port:X}"
-        out = engine.step(inputs, engine.model_id("transition", expert))
-        np.testing.assert_array_equal(out, engine.step(inputs, engine.model_id("transition")))
+        out = engine.step([*state, event, port, value, original], engine.model_id("transition"))
         state = out[:-1].tolist()
         return int(out[-1])
 
@@ -572,9 +575,9 @@ def test_neural_bank_transitions_and_mapping_effects(chip, prg, chr_, board):
 
 @pytest.mark.parametrize("chip", ["mmc3", "mmc5"])
 def test_mapper_irq_clock_and_neural_deadline(chip):
-    from transformer_nes.nes.mappers import mapper_control_engine
+    from transformer_nes.nes.model import compiled
 
-    engine = mapper_control_engine()
+    engine = compiled().chip(chip)
     for counter, target, phase, pending, enabled in itertools.product(
         (0, 1, 2, 127, 128, 239, 255), (0, 1, 2, 127, 128, 239, 255), range(2), range(2), range(2)
     ):
@@ -606,9 +609,9 @@ def test_mapper_irq_clock_and_neural_deadline(chip):
 
 @pytest.mark.parametrize("chip", ["mmc3", "mmc5"])
 def test_mapper_irq_acknowledgement_and_frame_epoch(chip):
-    from transformer_nes.nes.mappers import mapper_control_engine
+    from transformer_nes.nes.model import compiled
 
-    engine = mapper_control_engine()
+    engine = compiled().chip(chip)
     state = [0] * 5
 
     def step(event, value=0):
@@ -642,9 +645,10 @@ def test_mapper_irq_acknowledgement_and_frame_epoch(chip):
 
 
 def test_controller_reply_packets_match_serial_reads():
-    from transformer_nes.nes.controller import EVENTS, controller_engine
+    from transformer_nes.nes.controller import EVENTS
+    from transformer_nes.nes.model import compiled
 
-    engine = controller_engine()
+    engine = compiled().chip("controller")
     full = engine.model_id("controller")
     for mask, strobe, index in itertools.product(range(256), range(2), range(9)):
         buttons = [(mask >> i) & 1 for i in range(8)]
@@ -658,7 +662,7 @@ def test_controller_reply_packets_match_serial_reads():
             ("write", 255, 0),
         ):
             inputs = [strobe, index, *buttons, EVENTS.index(event), value, count]
-            out = engine.step(inputs, engine.model_id("controller", event)).tolist()
+            out = engine.step(inputs, full).tolist()
             next_strobe, next_index = strobe, index
             if event == "write":
                 next_strobe = value & 1
@@ -667,7 +671,6 @@ def test_controller_reply_packets_match_serial_reads():
             elif not strobe:
                 next_index = min(8, index + (1 if event == "read" else count))
             assert out == [next_strobe, next_index, reply, 0 if strobe else 8 - index, *packet]
-            assert out == engine.step(inputs, full).tolist()
 
 
 @pytest.mark.parametrize("backend", ["reference", "weights"])
@@ -764,3 +767,19 @@ def test_mmc5_bank_matcher_refreshes_writable_code(backend):
     if backend == "weights":
         assert bytes((0xCA, 0xD0, 0xFD, 0x60)) in matched
         assert bytes((0xE8, 0xD0, 0xFD, 0x60)) in matched
+
+
+@pytest.mark.parametrize("rate", [22050.0, 44100.0, 48000.0])
+def test_console_audio_at_any_sample_rate(rate):
+    """One APU circuit serves every rate: spans longer than its span bound
+    are split, so each frame yields its share of samples, all clipped."""
+    hardware = load_nes_extension("hardware")
+    cart = hardware.Cartridge.load(os.path.join(EXAMPLES, "nestest.nes"))
+    console = hardware.Console(cart, backend_factory("weights"), rate)
+    total = 0
+    for _ in range(30):
+        console.run_frame()
+        audio = console.audio()
+        assert audio.dtype == np.float32 and np.isfinite(audio).all() and np.abs(audio).max(initial=0) <= 1
+        total += audio.size
+    assert abs(total - rate * 30 * 29780.5 / 1789773) <= 2

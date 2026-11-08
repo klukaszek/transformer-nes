@@ -102,17 +102,15 @@ public:
   enum class DmcEvent { Write, Fetch, Clock, Observe };
   static constexpr int channel_input_count = 52, channel_output_count = 21;
   static constexpr int sample_input_count = 13, sample_parameter_count = 4;
+  // The APU chips' model ids (apu2a03/audio.py:chip, mixer_chip).
   struct Engine {
     void* ctx = nullptr;
     void (*step)(void*, int, const int*, int*) = nullptr;
-    array<int, 3> control{}; // quarter, half, both
-    array<int, 4> frame{}; // clock, write, read, observe
-    int program = 0;
-    array<int, 24> program_writes{};
-    array<int, 4> dmc{}; // write (full), fetch, clock, observe
-    array<int, 24> dmc_writes{};
+    int control = 0, frame = 0, program = 0;
+    array<int, 3> dmc{}; // full (writes, observation), fetch, clock
     array<int, 2> oscillators{}; // [one clock]
     array<array<int, 2>, 2> noise{}; // [one noise step][noise mode]
+    int span = 0; // the longest span one oscillator forward covers
     void* sample_ctx = nullptr;
     void (*sample_step)(void*, int, const float*, float*) = nullptr;
     int sample_model = 0;

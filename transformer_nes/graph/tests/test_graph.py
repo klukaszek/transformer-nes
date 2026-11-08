@@ -32,7 +32,7 @@ def test_nonzero_mask_handles_unsigned_values_signed_payloads_and_half_units(sim
 
     from transformer_nes.graph.ops import gate_nonzero, nonzero
     from transformer_nes.model.compiler import weight_module
-    from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+    from transformer_nes.model.construct import TokenGraph, describe
 
     @construction
     def circuit():
@@ -48,7 +48,7 @@ def test_nonzero_mask_handles_unsigned_values_signed_payloads_and_half_units(sim
         return TokenGraph(pg, ("enabled", "value", "payload"), ("masked", "flag"))
 
     token = circuit()
-    expert = CompiledGraph.compile_token(token, token.program_graph, token.program_graph.all_dims)
+    expert = describe(token, token.program_graph, token.program_graph.all_dims)
     forward = weight_module(expert, memory_size=1)
     assert forward.f_bits == 1
     g, v, p = np.meshgrid([0, 1], np.arange(256), [-511, -255, -1, 0, 1, 255, 511], indexing="ij")
@@ -390,7 +390,7 @@ def test_boolean_selection_is_affine_for_constants_and_exact_for_signed_halves()
 
     from transformer_nes.graph.ops import gate, select
     from transformer_nes.model.compiler import weight_module
-    from transformer_nes.model.graph_engine import CompiledGraph, TokenGraph
+    from transformer_nes.model.construct import TokenGraph, describe
 
     with GraphContext().activate() as ctx:
         enabled, value = InputDimension("enabled"), InputDimension("value")
@@ -400,7 +400,7 @@ def test_boolean_selection_is_affine_for_constants_and_exact_for_signed_halves()
         pg = ctx.capture({"VALUE": enabled + value}, {"READOUT": sum(outputs)})
         assert sum(isinstance(d, ReGLUDimension) for d in ctx.dims) == 2
     token = TokenGraph(pg, ("enabled", "value"), ("signed", "constant", "half"))
-    expert = CompiledGraph.compile_token(token, pg, pg.all_dims)
+    expert = describe(token, pg, pg.all_dims)
     forward = weight_module(expert, memory_size=1)
     g, x = np.meshgrid([0, 1], np.arange(-512, 512), indexing="ij")
     actual, _ = forward(torch.tensor(np.stack([g.ravel(), x.ravel()]), dtype=torch.int32),

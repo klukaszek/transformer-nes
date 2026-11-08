@@ -52,12 +52,11 @@ public:
   void write(int addr, int value) override {
     value &= 0xFF;
     const auto packet = bank_.access(addr, true);
-    if (packet.port >= 0) {
-      const auto& port = bank_.engine.ports[static_cast<size_t>(packet.port)];
+    if (packet.port) {
       array<pair<int, int>, 4> before;
       for (size_t i = 0; i < before.size(); ++i)
         before[i] = {bank_.map[i], bank_.map[Ram + i]};
-      const int dirty = bank_.transition(port.write, packet.event, port.address, value);
+      const int dirty = bank_.transition(packet.event, packet.port, value);
       if (dirty & BankControl::Prg)
         for (size_t i = 0; i < 4; ++i)
           if (before[i] != pair{bank_.map[i], bank_.map[Ram + i]})

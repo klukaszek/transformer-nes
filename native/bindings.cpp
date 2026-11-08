@@ -332,17 +332,39 @@ private:
 
 class ConsoleHost {
 public:
-  ConsoleHost(Cartridge cart, py::object factory, double sample_rate) {
+  // `nes`: the compiled NES (nes/model.py:compiled()) whose chips this
+  // console runs; None for the process's own.
+  ConsoleHost(Cartridge cart, py::object factory, double sample_rate, py::object nes) {
+    if (nes.is_none())
+      nes = py::module_::import("transformer_nes.nes.model").attr("compiled")();
+    nes_ = nes;
     const bool chr_writable = cart.chr.empty();
     const bool vertical = cart.mirroring == Mirroring::Vertical;
     auto mapper = make_mapper(std::move(cart));
     // Mapper constructors retain geometry; the PPU owns the CHR payload.
     Ppu ppu(mapper->take_chr(), chr_writable, vertical);
+    // The mapper chip's circuits (nes/mappers.py:chip): register transitions,
+    // bank layout, bus access and address projection, and its IRQ counter.
+    if (mapper->bank_state() || mapper->irq_state()) {
+      const int number = mapper->bank_state() ? mapper->bank_state()->chip
+                         : mapper->irq_state()->chip == MapperIrq::Mmc3 ? BankControl::Mmc3
+                                                                        : BankControl::Mmc5;
+      mapper_engine_ = nes.attr("mapper")(number);
+    }
+    const auto engine_of = [](const py::object& chip) {
+      const auto abi = chip.attr("abi")().cast<py::tuple>();
+      return std::pair{reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>()),
+                       reinterpret_cast<void (*)(void*, int, const int*, int*)>(abi[2].cast<std::uintptr_t>())};
+    };
+    const auto token_is = [](const py::object& chip, const char* name, const vector<string>& in,
+                             const vector<string>& out) {
+      const py::dict graphs = chip.attr("graphs");
+      return graphs.contains(name) &&
+             graphs[name].attr("inputs").cast<vector<string>>() == in &&
+             graphs[name].attr("outputs").cast<vector<string>>() == out;
+    };
     if (auto* bank = mapper->bank_state()) {
-      const auto module = py::module_::import("transformer_nes.nes.mappers");
-      mapper_bank_engine_ = module.attr("mapper_bank_engine")(bank->chip);
-      const py::dict graphs = mapper_bank_engine_.attr("graphs");
-      const py::object transition = graphs["transition"], layout = graphs["layout"];
+      const py::object transition = mapper_engine_.attr("graphs")["transition"];
       const auto inputs = transition.attr("inputs").cast<vector<string>>();
       if (inputs.size() < 5 || inputs.size() > bank->states.front().size())
         throw std::invalid_argument("invalid mapper register count");
@@ -359,73 +381,36 @@ public:
                                    "map_mul_lo", "map_mul_hi"});
         maps.insert(maps.end(), extra.begin(), extra.end());
       }
-      if (vector<string>(inputs.end() - 4, inputs.end()) != fields({"event", "port", "value", "original"}) ||
-          transition.attr("outputs").cast<vector<string>>() != outputs ||
-          layout.attr("inputs").cast<vector<string>>() != with_board(state) ||
-          layout.attr("outputs").cast<vector<string>>() != maps)
-        throw std::invalid_argument("engine is not the mapper bank graphs");
-      const auto abi = mapper_bank_engine_.attr("abi")().cast<py::tuple>();
-      bank->engine.ctx = reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>());
-      bank->engine.step = reinterpret_cast<void (*)(void*, int, const int*, int*)>(
-          abi[2].cast<std::uintptr_t>());
-      bank->engine.reset = mapper_bank_engine_.attr("model_id")("transition", "reset").cast<int>();
-      bank->engine.layout = mapper_bank_engine_.attr("model_id")("layout").cast<int>();
-      mapper_control_engine_ = module.attr("mapper_control_engine")();
-      const string access_name = "access_" + std::to_string(bank->chip);
-      const string address_name = "address_" + std::to_string(bank->chip);
-      const py::dict control_graphs = mapper_control_engine_.attr("graphs");
       const auto access_inputs = fields({"addr_lo", "addr_hi", "is_write", "original",
                                          {"bank", 4}, {"ram", 4}, "ram_bank", "writable", "mul_lo", "mul_hi"});
-      for (const auto& name : {access_name, address_name}) {
-        const py::object token = control_graphs[py::str(name)];
-        const auto outputs = name == access_name ?
-            fields({"port_index", "bank_event", "irq_event", "schedule_changed", "read_source",
-                    "read_index", "read_value", "write_source", "repair"}) :
-            fields({"read_source", "read_index", "read_value"});
-        if (token.attr("inputs").cast<vector<string>>() != access_inputs ||
-            token.attr("outputs").cast<vector<string>>() != outputs)
-          throw std::invalid_argument("engine is not the mapper access graphs");
-      }
-      const auto control_abi = mapper_control_engine_.attr("abi")().cast<py::tuple>();
-      bank->engine.access_ctx = reinterpret_cast<void*>(control_abi[0].cast<std::uintptr_t>());
-      bank->engine.access_step = reinterpret_cast<void (*)(void*, int, const int*, int*)>(
-          control_abi[2].cast<std::uintptr_t>());
-      bank->engine.access_models = {
-          mapper_control_engine_.attr("model_id")(access_name, "read").cast<int>(),
-          mapper_control_engine_.attr("model_id")(access_name, "write").cast<int>()};
-      bank->engine.address_model = mapper_control_engine_.attr("model_id")(address_name).cast<int>();
-      for (int port : module.attr("BANK_PORTS")[py::int_(bank->chip)].cast<vector<int>>()) {
-        char name[32];
-        std::snprintf(name, sizeof name, "write_%X", port);
-        const int write = mapper_bank_engine_.attr("model_id")("transition", name).cast<int>();
-        int rmw = write;
-        if (bank->chip == BankControl::Mmc1) {
-          std::snprintf(name, sizeof name, "rmw_%X", port);
-          rmw = mapper_bank_engine_.attr("model_id")("transition", name).cast<int>();
-        }
-        bank->engine.ports.push_back({port, write, rmw});
-      }
+      if (vector<string>(inputs.end() - 4, inputs.end()) != fields({"event", "port", "value", "original"}) ||
+          !token_is(mapper_engine_, "transition", inputs, outputs) ||
+          !token_is(mapper_engine_, "layout", with_board(state), maps) ||
+          !token_is(mapper_engine_, "access", access_inputs,
+                    fields({"port", "bank_event", "irq_event", "schedule_changed", "read_source",
+                            "read_index", "read_value", "write_source", "repair"})) ||
+          !token_is(mapper_engine_, "address", access_inputs,
+                    fields({"read_source", "read_index", "read_value"})))
+        throw std::invalid_argument("engine is not the mapper chip");
+      std::tie(bank->engine.ctx, bank->engine.step) = engine_of(mapper_engine_);
+      std::tie(bank->engine.access_ctx, bank->engine.access_step) = engine_of(mapper_engine_);
+      const auto model_id = [&](const char* token, py::object spec) {
+        return mapper_engine_.attr("model_id")(token, spec).cast<int>();
+      };
+      bank->engine.transition = model_id("transition", py::none());
+      bank->engine.layout = model_id("layout", py::none());
+      bank->engine.access_models = {model_id("access", py::str("read")), model_id("access", py::str("write"))};
+      bank->engine.address_model = model_id("address", py::none());
       bank->reset();
     }
     if (auto* irq = mapper->irq_state()) {
-      mapper_control_engine_ = py::module_::import("transformer_nes.nes.mappers")
-                               .attr("mapper_control_engine")();
-      const char* chip = irq->chip == MapperIrq::Mmc3 ? "mmc3" : "mmc5";
-      const py::object graph = mapper_control_engine_.attr("graphs")[py::str(chip)];
-      if (graph.attr("inputs").cast<vector<string>>() !=
-              fields({"counter", "target", "phase", "pending", "enabled", "event", "value"}) ||
-          graph.attr("outputs").cast<vector<string>>() !=
-              fields({"new_counter", "new_target", "new_phase", "new_pending", "new_enabled",
-                      "irq", "read_value", "predictable", "next_edge", "irq_write"}))
+      if (!token_is(mapper_engine_, "irq",
+                    fields({"counter", "target", "phase", "pending", "enabled", "event", "value"}),
+                    fields({"new_counter", "new_target", "new_phase", "new_pending", "new_enabled",
+                            "irq", "read_value", "predictable", "next_edge", "irq_write"})))
         throw std::invalid_argument("engine is not the mapper IRQ graphs");
-      const auto abi = mapper_control_engine_.attr("abi")().cast<py::tuple>();
-      irq->engine.ctx = reinterpret_cast<void*>(abi[0].cast<std::uintptr_t>());
-      irq->engine.step = reinterpret_cast<void (*)(void*, int, const int*, int*)>(
-          abi[2].cast<std::uintptr_t>());
-      const array<const char*, MapperIrq::event_count> events{
-          "clock", "idle", "target", "reload", "enable", "disable", "ack"};
-      for (size_t i = 0; i < events.size(); ++i)
-        irq->engine.models[i] = mapper_control_engine_.attr("model_id")(chip, events[i]).cast<int>();
+      std::tie(irq->engine.ctx, irq->engine.step) = engine_of(mapper_engine_);
+      irq->engine.model = mapper_engine_.attr("model_id")("irq").cast<int>();
     }
     auto image = mapper->cpu_image();
     int start = image[0xFFFC] | (image[0xFFFD] << 8);
@@ -442,104 +427,55 @@ public:
     }
     console_ =
         std::make_unique<Console>(std::move(mapper), std::move(ppu), Apu(sample_rate), *machine_);
-    const py::object audio = py::module_::import("transformer_nes.apu2a03.audio");
-    const py::object oscillators = py::module_::import("transformer_nes.apu2a03.oscillators");
-    const int maximum = static_cast<int>(std::clamp(
-        std::ceil(console_->apu.cycles_per_sample), 1.0,
-        static_cast<double>(oscillators.attr("MAX_CYCLES").cast<int>())));
-    audio_engine_ = audio.attr("audio_engine")(maximum);
+    // The APU's chips (apu2a03/audio.py): the digital chip, then the mixer.
+    audio_engine_ = nes.attr("chip")("apu");
+    sample_engine_ = nes.attr("chip")("apu_mixer");
     const py::dict audio_graphs = audio_engine_.attr("graphs");
-    for (const auto& [name, input, output] :
-         {std::tuple{"control", "INPUTS", "OUTPUTS"},
-          {"frame", "FRAME_INPUTS", "FRAME_OUTPUTS"}, {"program", "PROGRAM_INPUTS", "PROGRAM_OUTPUTS"},
-          {"dmc", "DMC_INPUTS", "DMC_OUTPUTS"}}) {
-      const py::object graph = audio_graphs[name];
-      if (graph.attr("inputs").cast<vector<string>>() != audio.attr(input).cast<vector<string>>() ||
-          graph.attr("outputs").cast<vector<string>>() != audio.attr(output).cast<vector<string>>())
-        throw std::invalid_argument("engine is not the APU graphs");
-    }
-    if (py::len(audio.attr("INPUTS")) != Apu::channel_input_count ||
-        py::len(audio.attr("OUTPUTS")) != Apu::channel_output_count ||
-        py::len(audio.attr("PROGRAM_INPUTS")) != 59 || py::len(audio.attr("PROGRAM_OUTPUTS")) != 57 ||
-        py::len(audio.attr("DMC_INPUTS")) != 17 || py::len(audio.attr("DMC_OUTPUTS")) != 20)
-      throw std::invalid_argument("invalid APU token size");
-    for (const auto& [name, inputs, outputs, ni, no] :
-         {std::tuple{"oscillate", "CLOCK_INPUTS", "CLOCK_OUTPUTS", size_t{15}, size_t{9}},
-          {"tick", "CLOCK_INPUTS", "CLOCK_OUTPUTS", size_t{15}, size_t{9}},
-          {"noise", "NOISE_INPUTS", "NOISE_OUTPUTS", size_t{17}, size_t{15}}}) {
-      const py::object graph = audio_graphs[name];
-      if (graph.attr("inputs").cast<vector<string>>() != oscillators.attr(inputs).cast<vector<string>>() ||
-          graph.attr("outputs").cast<vector<string>>() != oscillators.attr(outputs).cast<vector<string>>() ||
-          py::len(graph.attr("inputs")) != ni || py::len(graph.attr("outputs")) != no)
-        throw std::invalid_argument("engine is not the oscillator graphs");
-    }
-    const auto audio_abi = audio_engine_.attr("abi")().cast<py::tuple>();
+    const auto size_is = [&](const char* name, size_t ni, size_t no) {
+      return py::len(audio_graphs[name].attr("inputs")) == ni && py::len(audio_graphs[name].attr("outputs")) == no;
+    };
+    if (!size_is("control", Apu::channel_input_count, Apu::channel_output_count) ||
+        !size_is("frame", 6, 8) || !size_is("program", 59, 57) || !size_is("dmc", 17, 20) ||
+        !size_is("oscillate", 15, 9) || !size_is("tick", 15, 9) || !size_is("noise", 17, 15))
+      throw std::invalid_argument("engine is not the APU chip");
+    const py::dict mixer_graphs = sample_engine_.attr("graphs");
+    if (py::len(mixer_graphs["sample"].attr("inputs")) != Apu::sample_input_count ||
+        py::len(mixer_graphs["sample"].attr("outputs")) != 3 ||
+        py::len(mixer_graphs["gains"].attr("inputs")) != Apu::channel_input_count - 1 ||
+        py::len(mixer_graphs["gains"].attr("outputs")) != Apu::sample_parameter_count ||
+        sample_engine_.attr("chip").attr("f_bits").cast<int>() != 0)
+      throw std::invalid_argument("engine is not the APU mixer chip");
     Apu::Engine audio_api;
-    audio_api.ctx = reinterpret_cast<void*>(audio_abi[0].cast<std::uintptr_t>());
-    audio_api.step = reinterpret_cast<void (*)(void*, int, const int*, int*)>(
-        audio_abi[2].cast<std::uintptr_t>());
-    const array<const char*, 3> channel_events{"quarter", "half", "both"};
-    const array<const char*, 4> frame_events{"clock", "write", "read", "observe"};
-    for (size_t i = 0; i < channel_events.size(); ++i)
-      audio_api.control[i] = audio_engine_.attr("model_id")("control", channel_events[i]).cast<int>();
-    for (size_t i = 0; i < frame_events.size(); ++i)
-      audio_api.frame[i] = audio_engine_.attr("model_id")("frame", frame_events[i]).cast<int>();
-    audio_api.program = audio_engine_.attr("model_id")("program").cast<int>();
-    audio_api.program_writes.fill(audio_api.program);
-    for (const int port : audio.attr("WRITE_PORTS").cast<vector<int>>())
-      audio_api.program_writes[static_cast<size_t>(port)] =
-          audio_engine_.attr("model_id")("program", "write_" + std::to_string(port)).cast<int>();
-    audio_api.dmc[0] = audio_engine_.attr("model_id")("dmc").cast<int>();
-    const array<const char*, 3> dmc_events{"fetch", "clock", "observe"};
-    for (size_t i = 0; i < dmc_events.size(); ++i)
-      audio_api.dmc[i + 1] = audio_engine_.attr("model_id")("dmc", dmc_events[i]).cast<int>();
-    audio_api.dmc_writes.fill(audio_api.dmc[0]);
-    for (const int port : audio.attr("DMC_WRITE_PORTS").cast<vector<int>>())
-      audio_api.dmc_writes[static_cast<size_t>(port)] =
-          audio_engine_.attr("model_id")("dmc", "write_" + std::to_string(port)).cast<int>();
-    for (size_t tick = 0; tick < 2; ++tick) {
-      audio_api.oscillators[tick] = audio_engine_.attr("model_id")(
-          tick ? "tick" : "oscillate").cast<int>();
+    std::tie(audio_api.ctx, audio_api.step) = engine_of(audio_engine_);
+    const auto audio_model = [&](const char* token, py::object spec) {
+      return audio_engine_.attr("model_id")(token, spec).cast<int>();
+    };
+    audio_api.control = audio_model("control", py::none());
+    audio_api.frame = audio_model("frame", py::none());
+    audio_api.program = audio_model("program", py::none());
+    audio_api.dmc = {audio_model("dmc", py::none()), audio_model("dmc", py::str("fetch")),
+                     audio_model("dmc", py::str("clock"))};
+    audio_api.oscillators = {audio_model("oscillate", py::none()), audio_model("tick", py::none())};
+    for (size_t tick = 0; tick < 2; ++tick)
       for (size_t mode = 0; mode < 2; ++mode)
-        audio_api.noise[tick][mode] = audio_engine_.attr("model_id")(
-            "noise", string(tick ? "tick_mode" : "mode") + std::to_string(mode)).cast<int>();
-    }
-    sample_engine_ = audio.attr("sample_engine")();
-    const py::object sample_token = sample_engine_.attr("graphs")["sample"];
-    if (sample_token.attr("inputs").cast<vector<string>>() != audio.attr("SAMPLE_INPUTS").cast<vector<string>>() ||
-        sample_token.attr("outputs").cast<vector<string>>() != audio.attr("SAMPLE_OUTPUTS").cast<vector<string>>() ||
-        py::len(sample_token.attr("inputs")) != Apu::sample_input_count || py::len(sample_token.attr("outputs")) != 3 ||
-        sample_engine_.attr("dtype").attr("name").cast<string>() != "float32")
-      throw std::invalid_argument("engine is not the float32 APU sample graph");
-    const py::object parameters = sample_engine_.attr("graphs")["parameters"];
-    if (parameters.attr("inputs").cast<vector<string>>() != audio.attr("PARAMETER_INPUTS").cast<vector<string>>() ||
-        parameters.attr("outputs").cast<vector<string>>() != audio.attr("PARAMETER_OUTPUTS").cast<vector<string>>() ||
-        py::len(parameters.attr("inputs")) != Apu::channel_input_count - 1 ||
-        py::len(parameters.attr("outputs")) != Apu::sample_parameter_count)
-      throw std::invalid_argument("engine is not the float32 APU parameter graph");
+        audio_api.noise[tick][mode] =
+            audio_model("noise", py::str(string(tick ? "tick_mode" : "mode") + std::to_string(mode)));
+    audio_api.span = audio_engine_.attr("chip").attr("constants")["span"].cast<int>();
     const auto sample_abi = sample_engine_.attr("abi")().cast<py::tuple>();
     audio_api.sample_ctx = reinterpret_cast<void*>(sample_abi[0].cast<std::uintptr_t>());
     audio_api.sample_step = reinterpret_cast<void (*)(void*, int, const float*, float*)>(
         sample_abi[2].cast<std::uintptr_t>());
     audio_api.sample_model = sample_engine_.attr("model_id")("sample").cast<int>();
-    audio_api.parameter_model = sample_engine_.attr("model_id")("parameters").cast<int>();
+    audio_api.parameter_model = sample_engine_.attr("model_id")("gains").cast<int>();
     console_->apu.set_engine(audio_api);
-    controller_engine_ = py::module_::import("transformer_nes.nes.controller")
-                             .attr("controller_engine")();
-    const py::object token = controller_engine_.attr("graphs")["controller"];
-    if (token.attr("inputs").cast<vector<string>>() !=
-            fields({"strobe", "index", {"button", 8}, "event", "value", "count"}) ||
-        token.attr("outputs").cast<vector<string>>() !=
-            fields({"new_strobe", "new_index", "reply", "length", {"byte", 8}}))
-      throw std::invalid_argument("engine is not the controller graph");
-    const auto controller_abi = controller_engine_.attr("abi")().cast<py::tuple>();
+    controller_engine_ = nes.attr("chip")("controller");
+    if (!token_is(controller_engine_, "controller",
+                  fields({"strobe", "index", {"button", 8}, "event", "value", "count"}),
+                  fields({"new_strobe", "new_index", "reply", "length", {"byte", 8}})))
+      throw std::invalid_argument("engine is not the controller chip");
     auto& control = console_->controller.engine;
-    control.ctx = reinterpret_cast<void*>(controller_abi[0].cast<std::uintptr_t>());
-    control.step = reinterpret_cast<void (*)(void*, int, const int*, int*)>(
-        controller_abi[2].cast<std::uintptr_t>());
-    const array<const char*, Controller::EventCount> events{"write", "read", "lease", "consume"};
-    for (size_t i = 0; i < events.size(); ++i)
-      control.models[i] = controller_engine_.attr("model_id")("controller", events[i]).cast<int>();
+    std::tie(control.ctx, control.step) = engine_of(controller_engine_);
+    control.model = controller_engine_.attr("model_id")("controller").cast<int>();
 #ifndef TRANSFORMER_NES_PPU_REFERENCE
     set_ppu_engine(py::module_::import("transformer_nes.ppu2c02.machine")
                        .attr("ppu_engine")(console_->ppu.whole_chr()));
@@ -745,11 +681,11 @@ public:
   py::object ppu_engine() const { return ppu_engine_; }
 
 private:
-  py::object mapper_bank_engine_ = py::none();
+  py::object nes_ = py::none();
+  py::object mapper_engine_ = py::none();
   py::object controller_engine_ = py::none();
   py::object audio_engine_ = py::none();
   py::object sample_engine_ = py::none();
-  py::object mapper_control_engine_ = py::none();
   py::object ppu_engine_ = py::none();
   py::object ppu_control_engine_ = py::none();
   unique_ptr<PythonSteppedRuntime> stepped_;
@@ -775,9 +711,15 @@ PYBIND11_MODULE(nes_hardware, m) {
       .def_readonly("mapper", &Cartridge::mapper)
       .def_readonly("battery", &Cartridge::battery);
   py::class_<ConsoleHost>(m, "Console", py::module_local())
-      .def(py::init<Cartridge, py::object, double>(), py::arg("cartridge"),
-           py::arg("backend_factory"), py::arg("sample_rate") = 44100.0)
+      .def(py::init<Cartridge, py::object, double, py::object>(), py::arg("cartridge"),
+           py::arg("backend_factory"), py::arg("sample_rate") = 44100.0, py::arg("nes") = py::none())
       .def("run_frame", &ConsoleHost::run_frame)
+      .def("audio", [](ConsoleHost& h) {
+             const auto& samples = h.console().last_audio;
+             py::array_t<float> out(samples.size());
+             std::copy(samples.begin(), samples.end(), out.mutable_data());
+             return out;
+           }, "The samples the last frame produced (float32, at the console's sample rate)")
       .def("set_buttons", &ConsoleHost::set_buttons)
       .def("run_tape", &ConsoleHost::run_tape, py::arg("path"), py::arg("tail_frames") = 120,
            py::arg("max_frames") = 0)

@@ -76,7 +76,7 @@ array<int, 12> Controller::apply(Event event, int value, int count) {
   in[11] = value;
   in[12] = count;
   array<int, 12> out;
-  engine.step(engine.ctx, engine.models[event], in.data(), out.data());
+  engine.step(engine.ctx, engine.model, in.data(), out.data());
   std::copy_n(out.begin(), state_.size(), state_.begin());
   return out;
 }
